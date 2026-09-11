@@ -749,7 +749,18 @@ Run state is write-only today (`engine/run.rs:237-247`; `stage` is a `{:?}` stri
    auth for Claude verified by the user only), the new sections from WP5/WP10/WP11, and the version.
 3. `CHANGELOG.md` v0.2.0 entries for every WP. Tag `v0.2.0` on the merge commit; attach the Linux x86_64
    release binary (`cargo build --release`, replace `mantra-linux-x86_64` at repo root).
-4. Final gate before tagging: `cargo build` (0 warnings) · `cargo test` (all green incl. the new tests) ·
+4. **One-line installer** (`install.sh` at the repo root, POSIX sh, Linux + macOS):
+   `curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh`.
+   Behaviour: detect `uname -s`/`uname -m`; try to download the matching asset from the latest GitHub release
+   (`mantra-linux-x86_64`, `mantra-linux-aarch64`, `mantra-macos-arm64`, `mantra-macos-x86_64`; verify the
+   `.sha256` next to it); if no asset matches, build from source: ensure `git` and `cargo` (install rustup
+   non-interactively with `-y --profile minimal` if `cargo` is missing, then source `$HOME/.cargo/env`), clone
+   the repo to a temp dir, `cargo build --release`, copy the binary. Install to `$HOME/.local/bin/mantra`
+   (or `$MANTRA_INSTALL_DIR`), add that dir to PATH in the user's shell rc if missing (print what was added),
+   then run `mantra doctor`. Idempotent (re-running upgrades). Never needs sudo. README "Install" leads with
+   this line; the tar/cargo instructions move below it. Release workflow: `.github/workflows/release.yml`
+   builds the four assets on tag push and uploads them with sha256 files.
+5. Final gate before tagging: `cargo build` (0 warnings) · `cargo test` (all green incl. the new tests) ·
    `./scripts/stress.sh` (3 runs, no panics) · `scripts/live-env.sh` Solo + Mandala + Claude-Solo all complete ·
    manual review of the six `snap` frames listed in WP8/WP9 for visual coherence (band colours, hints, no
    overlap at 80×24 and 120×36).
