@@ -144,7 +144,8 @@ Then in the Studio: select `security` → `model` → `←/→` to `glm`.
 
 Every agent shows how full its context window is (side panel gauge, `ctx %` in the header and on cards). The gauge marks the model's auto-compact threshold (`┊`), turns amber/red as it fills, and Mantra warns you once at 85%.
 
-- **Automatic:** set `context_window` + `auto_compact_percent` per model (`/models`, `+/-` to step); Mantra passes them to Codex, which compacts by itself mid-turn. Without them, Codex's own defaults apply (shown as `codex`).
+- **Automatic, always on:** Mantra always tells Codex a `model_context_window` and `model_auto_compact_token_limit` for every agent, so compaction never depends on a provider's own (unreliable) defaults. Set `context_window` + `auto_compact_percent` per model (`/models`, `+/-` to step) to be exact; leave them unset and Mantra assumes a conservative 200k / 85% (shown dim as `(assumed)` / `(default)` in `/models`).
+- If a worker still hits a context-full error while running on the *assumed* 200k, Mantra halves the assumption for that task's next attempt and logs why — set the model's real `context_window` in `/models` to stop the guessing.
 - **Manual:** `/compact` (Solo, zoom) or `c` on the stage. If the agent is mid-turn, it compacts right after the turn instead of erroring.
 - Each compaction appears once in the log as `── ⇣ context compacted · 182k → 31k tokens ──`, and the gauge drains smoothly.
 - In Mandala runs: context-full errors trigger a compaction and a retry; the orchestrator is reset (or compacted) between phases; workers are short-lived and archived. Compaction turns never count as "the agent finished its work".

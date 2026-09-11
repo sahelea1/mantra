@@ -195,17 +195,6 @@ pub fn effort_color(e: &str) -> (u8, u8, u8) {
     }
 }
 
-pub fn status_color(a: &Agent) -> (u8, u8, u8) {
-    match &a.status {
-        Status::Busy => theme::named(&a.color),
-        Status::Waiting | Status::Retrying(_) => theme::AMBER,
-        Status::Failed(_) | Status::Crashed(_) => theme::RED,
-        Status::Stopped => theme::GRAY,
-        Status::Starting => theme::MUTED,
-        Status::Idle => theme::GREEN,
-    }
-}
-
 /// How long a toast stays up: longer messages get more reading time.
 pub fn toast_life(text: &str) -> u128 {
     (3000 + text.chars().count() as u128 * 35).min(9000)

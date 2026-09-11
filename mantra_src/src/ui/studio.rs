@@ -594,20 +594,24 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
     }
     header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
-    let widths = [10usize, 9, 18, 9, 8, 8, 30, 30];
+    let widths = [10usize, 9, 18, 14, 14, 8, 30, 30];
     let mk_head = |cols: &[&str], ws: &[usize]| Line::from(cols.iter().zip(ws).map(|(c, w)| Span::styled(format!(" {:<w$}", c, w = *w), theme::bold(theme::muted()))).collect::<Vec<_>>());
     let mut l = vec![mk_head(MODEL_COLS, &widths)];
+    // Whole-thousands tokens print as "200k" (no decimal); anything else falls back to fmt_tokens.
+    let short_tokens = |n: u64| if n > 0 && n % 1000 == 0 { format!("{}k", n / 1000) } else { fmt_tokens(n) };
     for (ri, m) in app.registry.models.iter().enumerate() {
         let status = app.models_ui.status.get(&m.alias).cloned().unwrap_or_else(|| m.note.clone());
         let vals = [
             m.alias.clone(),
             m.provider.clone(),
             m.model.clone(),
-            m.context_window.map(fmt_tokens).unwrap_or_else(|| "default".into()),
-            match (m.auto_compact_percent, m.context_window) {
-                (Some(p), Some(_)) => format!("{p}%"),
-                (Some(p), None) => format!("{p}% {}", theme::g("⚠", "!")),
-                _ => "codex".into(),
+            match m.context_window {
+                Some(cw) => short_tokens(cw),
+                None => format!("{} (assumed)", short_tokens(m.effective_context())),
+            },
+            match m.auto_compact_percent {
+                Some(p) => format!("{p}%"),
+                None => format!("{}% (default)", m.effective_compact_percent()),
             },
             if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
             if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
@@ -616,8 +620,11 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         let mut spans = vec![];
         for (ci, v) in vals.iter().enumerate() {
             let is = !app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
+            let derived = (ci == 3 && m.context_window.is_none()) || (ci == 4 && m.auto_compact_percent.is_none());
             let st = if is {
                 Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if derived {
+                theme::dim()
             } else if ci == 5 {
                 theme::fg(effort_color(v))
             } else if ci == 7 && v.starts_with("ok") {
@@ -635,8 +642,8 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         l.push(Line::from(spans));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled(" context + compact % are passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
-    l.push(Line::from(Span::styled(" compact \"codex\" = Codex's own default · a % needs a context size to take effect (⚠) · +/- steps values", theme::faint())));
+    l.push(Line::from(Span::styled(" context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
+    l.push(Line::from(Span::styled(" dim \"(assumed)\" / \"(default)\" = not set here, using Mantra's built-in 200k / 85% · +/- steps values", theme::faint())));
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 

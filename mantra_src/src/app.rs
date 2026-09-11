@@ -168,6 +168,9 @@ pub struct AgentOpts {
     pub instructions: String,
     pub tools: Vec<Value>,
     pub extra_writable: Vec<PathBuf>,
+    /// Explicit context-window override (from a halved assumption); `None` uses the model's own
+    /// effective context.
+    pub context_override: Option<u64>,
 }
 
 fn toml_str(s: &str) -> String {
@@ -179,14 +182,14 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     let m = reg.resolve(&o.model_alias);
     let effort = m.resolve_effort(o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort));
     let mut extra = reg.provider_args();
-    if let Some(cw) = m.context_window {
-        extra.push("-c".into());
-        extra.push(format!("model_context_window={cw}"));
-        if let Some(p) = m.auto_compact_percent {
-            extra.push("-c".into());
-            extra.push(format!("model_auto_compact_token_limit={}", cw * p.min(99) as u64 / 100));
-        }
-    }
+    // Always tell Codex a context window and compaction limit — an assumed 200k / 85% when the
+    // model doesn't have its own, so auto-compaction never relies on a provider's own defaults.
+    let cw = o.context_override.unwrap_or_else(|| m.effective_context());
+    let compact_pct = m.effective_compact_percent();
+    extra.push("-c".into());
+    extra.push(format!("model_context_window={cw}"));
+    extra.push("-c".into());
+    extra.push(format!("model_auto_compact_token_limit={}", cw * compact_pct.min(99) as u64 / 100));
     if m.is_custom_provider() {
         extra.push("-c".into());
         if m.efforts().is_empty() {
@@ -221,7 +224,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.model_alias = m.alias.clone();
     a.model = m.model.clone();
     a.effort = effort;
-    a.ctx_window = m.context_window;
+    a.ctx_window = Some(cw);
     agents.insert(id, a);
     hub.spawn(id, spec);
     id
@@ -280,6 +283,7 @@ impl Ctx for Ctxt<'_> {
                 instructions: r.instructions,
                 tools: r.tools,
                 extra_writable: r.extra_writable,
+                context_override: r.context_override,
             },
         )
     }
@@ -429,6 +433,7 @@ impl App {
                 instructions: String::new(),
                 tools: vec![],
                 extra_writable: vec![],
+                context_override: None,
             },
         );
         self.solo = Some(id);
@@ -604,6 +609,7 @@ impl App {
                 instructions: tools::ARCHITECT_PROMPT.into(),
                 tools: tools::architect_tools(),
                 extra_writable: vec![],
+                context_override: None,
             },
         );
         self.studio.architect = Some(id);
@@ -628,6 +634,7 @@ impl App {
                 instructions: String::new(),
                 tools: vec![],
                 extra_writable: vec![],
+                context_override: None,
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));

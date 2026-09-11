@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 
 pub type AgentId = u32;
@@ -54,16 +55,22 @@ pub enum HubEvent {
     Exited { agent: AgentId },
 }
 
+/// Minimum gap Mantra tries to keep between two Codex spawns: starting several `codex app-server`
+/// processes in the same instant against a fresh `CODEX_HOME` has been observed to crash the first
+/// one or two (F2) — they recover via the normal restart path, but staggering avoids the noise.
+const SPAWN_STAGGER: Duration = Duration::from_millis(300);
+
 pub struct Hub {
     ev: mpsc::UnboundedSender<HubEvent>,
     agents: HashMap<AgentId, mpsc::UnboundedSender<Cmd>>,
     next: AgentId,
     pub codex_cmd: Vec<String>,
+    last_spawn: Option<Instant>,
 }
 
 impl Hub {
     pub fn new(codex_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>) -> Hub {
-        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd }
+        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, last_spawn: None }
     }
 
     pub fn alloc_id(&mut self) -> AgentId {
@@ -77,7 +84,13 @@ impl Hub {
         self.agents.insert(id, tx);
         let ev = self.ev.clone();
         let cmd = self.codex_cmd.clone();
-        tokio::spawn(agent_task(id, spec, cmd, ev, rx));
+        let now = Instant::now();
+        let delay = match self.last_spawn {
+            Some(prev) => SPAWN_STAGGER.saturating_sub(now.duration_since(prev)),
+            None => Duration::ZERO,
+        };
+        self.last_spawn = Some(now);
+        tokio::spawn(agent_task(id, spec, cmd, ev, rx, delay));
     }
 
     pub fn send(&self, id: AgentId, c: Cmd) {
@@ -107,7 +120,11 @@ async fn agent_task(
     codex_cmd: Vec<String>,
     ev: mpsc::UnboundedSender<HubEvent>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    initial_delay: Duration,
 ) {
+    if initial_delay > Duration::ZERO {
+        tokio::time::sleep(initial_delay).await;
+    }
     let mut thread_id = spec.resume_thread.clone();
     let mut effort = spec.effort.clone();
     let mut model = spec.model.clone();
@@ -244,8 +261,13 @@ async fn run_process(
     let v = match result {
         Ok(v) => v,
         Err(e) => {
+            let tail = conn.stderr_tail();
             let _ = child.kill().await;
-            return Exit::Crashed(format!("thread start failed: {e}"));
+            return Exit::Crashed(if tail.trim().is_empty() {
+                format!("thread start failed: {e}")
+            } else {
+                format!("thread start failed: {e} — {}", tail.replace('\n', " / ").trim())
+            });
         }
     };
     let tid = v.pointer("/thread/id").and_then(|t| t.as_str()).unwrap_or_default().to_string();
@@ -322,9 +344,14 @@ async fn run_process(
                         let _ = ev.send(HubEvent::Request { agent: id, id: rid, method, params });
                     }
                     Some(Incoming::Closed { stderr_tail }) => {
-                        let _ = child.kill().await;
-                        let last = stderr_tail.lines().last().unwrap_or("").to_string();
-                        return Exit::Crashed(if last.is_empty() { "codex process exited".into() } else { format!("codex exited: {last}") });
+                        let code = reap_exit_code(&mut child).await;
+                        let code_s = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+                        let last = last_significant_stderr_line(&stderr_tail);
+                        return Exit::Crashed(if last.is_empty() {
+                            format!("codex exited (code {code_s})")
+                        } else {
+                            format!("codex exited (code {code_s}): {last}")
+                        });
                     }
                     None => {
                         let _ = child.kill().await;
@@ -334,6 +361,35 @@ async fn run_process(
             }
         }
     }
+}
+
+/// Get the real exit code: check if it already exited, else give it up to 2s to finish on its own
+/// (stdout closing usually means it's already exiting), else kill it. `None` means it could not be
+/// determined (killed, or the platform doesn't report a code).
+async fn reap_exit_code(child: &mut Child) -> Option<i32> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return status.code();
+    }
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        _ => {
+            let _ = child.kill().await;
+            None
+        }
+    }
+}
+
+/// The last non-empty stderr line that isn't just sandbox noise (a line containing `WARNING` or
+/// `bubblewrap`) — falling back to the actual last line when every line is noise.
+fn last_significant_stderr_line(tail: &str) -> String {
+    let lines: Vec<&str> = tail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .find(|l| !(l.contains("WARNING") || l.contains("bubblewrap")))
+        .or_else(|| lines.last())
+        .map(|l| l.to_string())
+        .unwrap_or_default()
 }
 
 /// `turn/start` params. Models without a reasoning-effort setting get no `effort` at all.
@@ -359,4 +415,18 @@ fn fire(conn: &Conn, ev: &mpsc::UnboundedSender<HubEvent>, id: AgentId, method: 
             let _ = ev.send(HubEvent::CmdFailed { agent: id, what, error: e.message, text });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn picks_the_last_non_noise_stderr_line() {
+        assert_eq!(last_significant_stderr_line("boot ok\nWARNING: bubblewrap sandbox degraded\n"), "boot ok");
+        assert_eq!(last_significant_stderr_line("panic: thread start failed"), "panic: thread start failed");
+        // when every line is noise, fall back to the last one rather than showing nothing
+        assert_eq!(last_significant_stderr_line("WARNING: a\nWARNING: bubblewrap: b\n"), "WARNING: bubblewrap: b");
+        assert_eq!(last_significant_stderr_line(""), "");
+        assert_eq!(last_significant_stderr_line("  \n  \n"), "");
+    }
 }

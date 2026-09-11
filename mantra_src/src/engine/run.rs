@@ -43,6 +43,9 @@ pub struct SpawnReq {
     pub tools: Vec<Value>,
     pub effort: Option<String>,
     pub extra_writable: Vec<PathBuf>,
+    /// Explicit context-window override for this spawn (set after a ContextFull halving); `None`
+    /// means "use the model's own effective context".
+    pub context_override: Option<u64>,
 }
 
 /// What the engine needs from the app. Keeps the engine free of UI/process details (and testable).
@@ -96,7 +99,6 @@ pub struct Worker {
     pub effort: Option<String>,
     pub agent: Option<AgentId>,
     pub attempt: u32,
-    pub auto_retries: u32,
     pub state: WState,
     pub report: String,
     pub wt: Option<PathBuf>,
@@ -108,6 +110,9 @@ pub struct Worker {
     pub paused: bool,
     pub stall_flagged: bool,
     pub budget_flagged: bool,
+    /// Set once a ContextFull error is seen while the assumed context was in effect; carried
+    /// forward across attempts of the same task (see `spawn_task`).
+    pub context_override: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -212,7 +217,10 @@ impl Run {
     // ───────────────────────────── bookkeeping ─────────────────────────────
 
     pub fn log(&mut self, glyph: &str, color: &'static str, text: impl Into<String>) {
-        let p = Pulse { at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text: text.into() };
+        // Defensive: crash reasons and agent-supplied text can carry ANSI from a subprocess's
+        // stderr; the journal and pulse feed must never show raw escape codes.
+        let text = crate::util::strip_ansi(&text.into());
+        let p = Pulse { at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
         crate::mlog!("[run {}] {} {}", self.id, p.glyph, p.text);
         let line = json!({"t": crate::util::unix_secs(), "glyph": p.glyph, "text": p.text}).to_string();
         let _ = std::fs::create_dir_all(&self.dir);
@@ -403,6 +411,7 @@ impl Run {
             tools: tools::planner_tools(&wr),
             effort: None,
             extra_writable: vec![],
+            context_override: None,
             role,
         });
         self.planner = Some(id);
@@ -476,6 +485,7 @@ impl Run {
                     tools: tools::orchestrator_tools(),
                     effort: None,
                     extra_writable: vec![],
+                    context_override: None,
                     role,
                 });
                 self.orchestrator = Some(id);
@@ -515,13 +525,14 @@ impl Run {
         let queued = running >= self.pattern.settings.max_parallel;
         let tid = task.id.clone();
         let adhoc = task.id.starts_with("fix-");
+        // A halved context from an earlier attempt of the same task carries forward.
+        let context_override = self.workers.iter().rev().find(|w| w.task.id == tid).and_then(|w| w.context_override);
         self.workers.push(Worker {
             task,
             prompt,
             effort,
             agent: None,
             attempt,
-            auto_retries: 0,
             state: if queued { WState::Queued } else { WState::Preparing },
             report: String::new(),
             wt: None,
@@ -532,6 +543,7 @@ impl Run {
             adhoc,
             paused: false,
             stall_flagged: false,
+            context_override,
             budget_flagged: false,
         });
         if queued {
@@ -578,7 +590,8 @@ impl Run {
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
-        let id = ctx.spawn(SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: vec![], effort, extra_writable: vec![] });
+        let context_override = w.context_override;
+        let id = ctx.spawn(SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: vec![], effort, extra_writable: vec![], context_override });
         let w = &mut self.workers[wi];
         w.agent = Some(id);
         w.wt = Some(dir);
@@ -689,6 +702,7 @@ impl Run {
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
             effort: None,
             extra_writable: self.integ_writable(),
+            context_override: None,
             role: role.clone(),
         });
         self.gate_agent = Some(id);
@@ -801,6 +815,7 @@ impl Run {
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
                 effort: None,
                 extra_writable: self.integ_writable(),
+                context_override: None,
                 role: role.clone(),
             })
         };
@@ -924,9 +939,9 @@ impl Run {
                     self.alert(ctx, format!("phase {} gate still failing after {} rounds — fix manually or re-prompt, then press space to resume", phase + 1, round));
                 }
             }
-            (JobTag::Cleanup { .. }, JobOut::Text(r)) => {
+            (JobTag::Cleanup { phase }, JobOut::Text(r)) => {
                 if let Err(e) = r {
-                    self.log("⚠", "amber", format!("phase commit: {e}"));
+                    self.log("⚠", "amber", format!("phase {} commit: {e}", phase + 1));
                 }
                 self.cleanup_done = true;
                 self.maybe_next_phase(ctx);
@@ -938,6 +953,24 @@ impl Run {
             (JobTag::Finish, _) => {}
             _ => {}
         }
+    }
+
+    /// A worker that hit ContextFull while running on the *assumed* 200k window (no explicit
+    /// `context_window` set for its model) gets that assumption halved for its next attempt.
+    /// A model with an explicit setting is left alone — the user made that choice deliberately.
+    fn shrink_assumed_context(&mut self, ctx: &mut dyn Ctx, a: AgentId) {
+        let Some(wi) = self.worker_idx(a) else { return };
+        if self.workers[wi].context_override.is_some() {
+            return; // already shrunk once for this attempt's live process
+        }
+        let Some(agent) = ctx.agent(a) else { return };
+        if agent.ctx_window != Some(crate::discover::ASSUMED_CONTEXT) {
+            return; // an explicit context_window is in effect — leave it to the user
+        }
+        let halved = crate::discover::ASSUMED_CONTEXT / 2;
+        let model = agent.model_alias.clone();
+        self.workers[wi].context_override = Some(halved);
+        self.log("⚠", "amber", format!("context window assumed 200k was too large for {model}; using {}k — set it in /models", halved / 1000));
     }
 
     pub fn on_turn_done(&mut self, ctx: &mut dyn Ctx, a: AgentId, status: &str, error: Option<String>, kind: Option<ErrKind>) {
@@ -959,6 +992,7 @@ impl Run {
                     let wait = Duration::from_secs(4 * count as u64);
                     if kind == Some(ErrKind::ContextFull) {
                         ctx.compact(a);
+                        self.shrink_assumed_context(ctx, a);
                     }
                     let name = self.name_of(a);
                     if let Some(wi) = self.worker_idx(a) {

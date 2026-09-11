@@ -34,10 +34,6 @@ pub fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn unix_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-}
-
 /// Local-ish clock string HH:MM:SS (UTC offset not applied; good enough for relative event feeds).
 pub fn clock() -> String {
     let s = unix_secs() + tz_offset_secs();
@@ -187,6 +183,50 @@ pub fn diff_stats(diff: &str) -> (usize, usize) {
     (a, d)
 }
 
+/// Strip ANSI escape sequences: CSI (`ESC [ … final-byte`), OSC (`ESC ] … BEL|ST`), and lone `ESC`.
+/// Codex/subprocess stderr is sometimes colourized; this keeps journal lines and crash reasons plain.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next(); // consume '['
+                // parameter bytes 0x30-0x3F, then intermediate bytes 0x20-0x2F
+                while let Some(&nc) = chars.peek() {
+                    if ('0'..='?').contains(&nc) || (' '..='/').contains(&nc) {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                chars.next(); // consume the final byte, if any
+            }
+            Some(']') => {
+                chars.next(); // consume ']'
+                loop {
+                    match chars.next() {
+                        Some('\u{7}') | None => break,
+                        Some('\u{1b}') => {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => continue,
+                    }
+                }
+            }
+            _ => {} // lone ESC: drop it, nothing else consumed
+        }
+    }
+    out
+}
+
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -224,5 +264,21 @@ mod tests {
     fn truncation() {
         assert_eq!(trunc("hello world", 6), "hello…");
         assert_eq!(trunc("hi", 6), "hi");
+    }
+    #[test]
+    fn strip_ansi_matches_the_f1_capture() {
+        // Exact stderr tail from the F1 finding (a dim-styled timestamp, then a truncated colour
+        // sequence cut off mid-escape by the old byte-limited tail).
+        let input = "planner: process crashed (codex exited: \u{1b}[2m2026-09-11T22:51:26.627070Z\u{1b}[0m \u{1b}[…) — restarting & resuming";
+        let out = strip_ansi(input);
+        assert!(!out.contains('\u{1b}'), "no ESC byte must survive: {out:?}");
+        assert_eq!(out, "planner: process crashed (codex exited: 2026-09-11T22:51:26.627070Z ) — restarting & resuming");
+    }
+    #[test]
+    fn strip_ansi_handles_osc_and_lone_esc() {
+        assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(strip_ansi("a\u{1b}]0;title\u{1b}\\b"), "ab");
+        assert_eq!(strip_ansi("a\u{1b}b"), "ab");
+        assert_eq!(strip_ansi("plain text"), "plain text");
     }
 }

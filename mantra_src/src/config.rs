@@ -181,6 +181,15 @@ impl ModelEntry {
     pub fn is_custom_provider(&self) -> bool {
         !self.provider.is_empty() && self.provider != "openai"
     }
+    /// The context window Mantra tells Codex to assume for this model: the configured value, or a
+    /// conservative 200k when none is set (so auto-compaction always has something to aim at).
+    pub fn effective_context(&self) -> u64 {
+        self.context_window.unwrap_or(crate::discover::ASSUMED_CONTEXT)
+    }
+    /// The auto-compact threshold as a percent of `effective_context`: the configured value, or 85%.
+    pub fn effective_compact_percent(&self) -> u8 {
+        self.auto_compact_percent.unwrap_or(85)
+    }
     pub fn efforts(&self) -> Vec<String> {
         if self.efforts.is_empty() && !self.is_custom_provider() {
             ["low", "medium", "high", "xhigh", "max"].iter().map(|s| s.to_string()).collect()
@@ -277,6 +286,8 @@ impl Registry {
                 ModelEntry {
                     alias: "astra".into(),
                     model: "gpt-6-astra".into(),
+                    context_window: Some(272_000),
+                    auto_compact_percent: Some(85),
                     default_effort: "high".into(),
                     efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
                     note: "most capable — planning & hard problems".into(),
@@ -285,6 +296,8 @@ impl Registry {
                 ModelEntry {
                     alias: "sol".into(),
                     model: "gpt-5.6-sol".into(),
+                    context_window: Some(272_000),
+                    auto_compact_percent: Some(85),
                     default_effort: "medium".into(),
                     efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
                     note: "frontier agentic coding".into(),
@@ -293,6 +306,8 @@ impl Registry {
                 ModelEntry {
                     alias: "terra".into(),
                     model: "gpt-5.6-terra".into(),
+                    context_window: Some(272_000),
+                    auto_compact_percent: Some(85),
                     default_effort: "medium".into(),
                     efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
                     note: "balanced everyday coding".into(),
@@ -301,6 +316,8 @@ impl Registry {
                 ModelEntry {
                     alias: "luna".into(),
                     model: "gpt-5.6-luna".into(),
+                    context_window: Some(272_000),
+                    auto_compact_percent: Some(85),
                     default_effort: "medium".into(),
                     efforts: all6(&["low", "medium", "high", "xhigh", "max"]),
                     note: "fast & affordable workers".into(),
@@ -423,6 +440,20 @@ mod tests {
         assert!(d.starts_with(home().join("runs")));
         assert!(d.file_name().unwrap().to_string_lossy().starts_with("some-project-"));
         assert_ne!(runs_dir(Path::new("/a/app")), runs_dir(Path::new("/b/app")));
+    }
+    #[test]
+    fn effective_context_and_compact_percent() {
+        let assumed = ModelEntry::default();
+        assert_eq!(assumed.effective_context(), crate::discover::ASSUMED_CONTEXT);
+        assert_eq!(assumed.effective_compact_percent(), 85);
+        let explicit = ModelEntry { context_window: Some(16_000), auto_compact_percent: Some(70), ..Default::default() };
+        assert_eq!(explicit.effective_context(), 16_000);
+        assert_eq!(explicit.effective_compact_percent(), 70);
+        // shipped built-ins are honest: explicit, not assumed
+        let r = Registry::defaults();
+        let sol = r.get("sol").unwrap();
+        assert_eq!(sol.effective_context(), 272_000);
+        assert_eq!(sol.effective_compact_percent(), 85);
     }
     #[test]
     fn registry_roundtrip() {

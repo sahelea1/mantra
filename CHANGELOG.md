@@ -1,0 +1,16 @@
+# Changelog
+
+All notable changes to Mantra are recorded here.
+
+## v0.2.0
+
+- WP1: bumped version to 0.2.0; removed the 7 dead-code warnings (`cargo build` is now clean); crash
+  reasons and journal lines are ANSI-stripped and include the process exit code and the last
+  non-warning stderr line; RPC errors during thread start keep their own message and append the
+  stderr tail; simultaneous agent spawns are staggered by 300ms to avoid startup crash storms.
+- WP2: context safety by default — Codex is always given an explicit `model_context_window` and
+  `model_auto_compact_token_limit` for every agent (a conservative 200k / 85% assumed when a model
+  doesn't set its own, shown dim as `(assumed)` / `(default)` in `/models`); the shipped built-in
+  models (astra/sol/terra/luna) now ship honest explicit 272k / 85% defaults; a worker that still
+  hits a context-full error while running on the assumed 200k gets that assumption halved for its
+  next attempt, logged so you know to set the model's real context window.

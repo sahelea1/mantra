@@ -133,7 +133,6 @@ pub struct Agent {
     pub queued: Vec<String>,
     pub created: Instant,
     pub finished: Option<Instant>,
-    pub flash: Option<Instant>,
     pub scroll: usize,
     pub follow: bool,
     pub retry_note: Option<String>,
@@ -178,7 +177,6 @@ impl Agent {
             queued: vec![],
             created: Instant::now(),
             finished: None,
-            flash: None,
             scroll: 0,
             follow: true,
             retry_note: None,
@@ -950,6 +948,8 @@ mod tests {
         assert_eq!(classify(&json!("serverOverloaded")), ErrKind::Transient);
         assert_eq!(classify(&json!({"responseStreamDisconnected": {"httpStatusCode": 502}})), ErrKind::Transient);
         assert_eq!(classify(&json!("unauthorized")), ErrKind::Auth);
+        assert_eq!(classify(&json!("contextWindowExceeded")), ErrKind::ContextFull);
+        assert_eq!(classify(&json!({"contextWindowExceeded": {}})), ErrKind::ContextFull);
     }
 
     #[test]
