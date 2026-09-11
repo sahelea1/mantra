@@ -1,0 +1,1549 @@
+//! Application state and event routing. The UI draws from this; the engine acts through `Ctxt`.
+
+use crate::agent::{Agent, Level, Signal, Status};
+use crate::config::{Registry, Settings};
+use crate::engine::pattern::Pattern;
+use crate::engine::run::{Ctx, JobOut, JobTag, Run, SpawnReq, Stage};
+use crate::engine::tools;
+use crate::hub::{AgentId, Cmd, Hub, HubEvent, SpawnSpec};
+use crate::ui::input::{Act, Input};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
+
+pub enum AppEvent {
+    Term(Event),
+    Hub(HubEvent),
+    Job(JobTag, JobOut),
+    /// One discovery source answered (Codex catalog or a provider's /models).
+    Discovered { source: String, result: Result<Vec<crate::discover::Candidate>, String> },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Screen {
+    Solo,
+    Stage,
+    Zoom(AgentId),
+    Studio,
+    Models,
+}
+
+#[derive(Clone, Debug)]
+pub enum EditTarget {
+    RoleField(String, String),
+    Setting(String),
+    FlowStep(usize, String),
+    ModelCell(usize, usize),
+    ProviderCell(usize, usize),
+    NewRole,
+    NewPattern,
+}
+
+pub enum Overlay {
+    Help,
+    ModelPicker { sel: usize, target: Option<AgentId> },
+    Diff { agent: AgentId, file: usize, scroll: usize },
+    Inbox { sel: usize },
+    Plan { scroll: usize },
+    Edit { title: String, input: Input, target: EditTarget },
+    Patterns { sel: usize, list: Vec<String> },
+    Discover(DiscoverState),
+}
+
+/// The model-discovery picker.
+pub struct DiscoverState {
+    pub items: Vec<crate::discover::Candidate>,
+    pub loading: Vec<String>,
+    pub errors: Vec<String>,
+    pub sel: usize,
+    pub filter: Input,
+}
+
+impl DiscoverState {
+    /// Indices of items matching the filter.
+    pub fn visible(&self) -> Vec<usize> {
+        let f = self.filter.text().to_lowercase();
+        (0..self.items.len()).filter(|i| f.is_empty() || format!("{} {}", self.items[*i].provider, self.items[*i].model).to_lowercase().contains(&f)).collect()
+    }
+}
+
+pub struct Approval {
+    pub agent: AgentId,
+    pub id: Value,
+    pub method: String,
+    pub title: String,
+    pub detail: String,
+    pub params: Value,
+    pub at: Instant,
+}
+
+pub struct StudioState {
+    pub pattern: Pattern,
+    pub sel: usize,
+    pub field: usize,
+    pub focus: u8, // 0 list, 1 fields, 2 architect input
+    pub errors: Vec<String>,
+    pub dirty: bool,
+    pub architect: Option<AgentId>,
+    pub input: Input,
+    pub flash: Option<Instant>,
+}
+
+pub struct ModelsState {
+    pub row: usize,
+    pub col: usize,
+    pub providers: bool,
+    pub status: HashMap<String, String>,
+    pub dirty: bool,
+}
+
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/model", "switch model (picker)"),
+    ("/effort", "set reasoning effort: low|medium|high|xhigh|max"),
+    ("/approvals", "approval mode: untrusted|on-request|never"),
+    ("/new", "start a fresh Solo session"),
+    ("/compact", "compact the current agent's context"),
+    ("/diff", "open the changes viewer"),
+    ("/mandala", "open the Mandala stage"),
+    ("/run", "start a Mandala run: /run <goal>"),
+    ("/pattern", "choose the pattern for new runs"),
+    ("/plan", "show the run's plan"),
+    ("/pause", "pause / resume the run"),
+    ("/land", "merge the finished run branch into your branch"),
+    ("/studio", "pattern studio (roles, flow, architect agent)"),
+    ("/models", "model registry (context, efforts, providers)"),
+    ("/inbox", "approvals & alerts"),
+    ("/verbose", "toggle verbose log (ctrl+e)"),
+    ("/help", "keys & commands"),
+    ("/quit", "exit Mantra"),
+];
+
+pub struct App {
+    pub settings: Settings,
+    pub registry: Registry,
+    pub project: PathBuf,
+    pub hub: Hub,
+    pub agents: BTreeMap<AgentId, Agent>,
+    pub screen: Screen,
+    pub overlays: Vec<Overlay>,
+    pub input: Input,
+    pub solo: Option<AgentId>,
+    pub run: Option<Run>,
+    pub approvals: Vec<Approval>,
+    pub toast: Option<(String, Instant, Level)>,
+    pub sel: usize,
+    pub canvas_focus: bool,
+    pub verbose: bool,
+    pub side_panel: bool,
+    pub pulse_panel: bool,
+    pub quit: bool,
+    ctrl_c: Option<Instant>,
+    pub tx: UnboundedSender<AppEvent>,
+    pub demo: bool,
+    pub studio: StudioState,
+    pub models_ui: ModelsState,
+    pub suggest: usize,
+    pub notes: Vec<String>,
+    pub pattern_name: String,
+    pub branch: String,
+    pub probes: HashMap<AgentId, (String, Instant)>,
+    pub pulse_scroll: usize,
+    pub force_clear: bool,
+}
+
+/// Options for creating any agent (Solo, run agents, architect, probes).
+pub struct AgentOpts {
+    pub name: String,
+    pub role: String,
+    pub glyph: String,
+    pub color: String,
+    pub model_alias: String,
+    pub effort: Option<String>,
+    pub cwd: PathBuf,
+    pub approval: String,
+    pub sandbox: String,
+    pub instructions: String,
+    pub tools: Vec<Value>,
+    pub extra_writable: Vec<PathBuf>,
+}
+
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, o: AgentOpts) -> AgentId {
+    let id = hub.alloc_id();
+    let m = reg.resolve(&o.model_alias);
+    let effort = m.resolve_effort(o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort));
+    let mut extra = reg.provider_args();
+    if let Some(cw) = m.context_window {
+        extra.push("-c".into());
+        extra.push(format!("model_context_window={cw}"));
+        if let Some(p) = m.auto_compact_percent {
+            extra.push("-c".into());
+            extra.push(format!("model_auto_compact_token_limit={}", cw * p.min(99) as u64 / 100));
+        }
+    }
+    if m.is_custom_provider() {
+        extra.push("-c".into());
+        if m.efforts().is_empty() {
+            // No effort control → don't send any reasoning block (strict gateways reject it).
+            extra.push("model_reasoning_summary=\"none\"".into());
+        } else {
+            // Codex only sends reasoning params to models it doesn't know when told they support them.
+            extra.push("model_supports_reasoning_summaries=true".into());
+        }
+    }
+    if !o.extra_writable.is_empty() {
+        let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
+        extra.push("-c".into());
+        extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
+    }
+    let spec = SpawnSpec {
+        cwd: o.cwd.clone(),
+        model: m.model.clone(),
+        provider: m.provider.clone(),
+        effort: effort.clone(),
+        approval: o.approval.clone(),
+        sandbox: if o.sandbox.is_empty() { "workspace-write".into() } else { o.sandbox.clone() },
+        developer_instructions: o.instructions.clone(),
+        dynamic_tools: o.tools.clone(),
+        config: serde_json::Map::new(),
+        extra_args: extra,
+        resume_thread: None,
+    };
+    let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
+    a.glyph = o.glyph;
+    a.color = o.color;
+    a.model_alias = m.alias.clone();
+    a.model = m.model.clone();
+    a.effort = effort;
+    a.ctx_window = m.context_window;
+    agents.insert(id, a);
+    hub.spawn(id, spec);
+    id
+}
+
+/// Send a prompt: new turn if idle, steer if busy, queue if a turn is starting.
+pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool) {
+    let Some(a) = agents.get_mut(&id) else { return };
+    if echo {
+        a.push_user(&text);
+    }
+    a.follow = true;
+    a.scroll = 0;
+    if matches!(a.status, Status::Stopped) {
+        a.notice(Level::Warn, "agent is stopped");
+        return;
+    }
+    if a.awaiting_start {
+        a.queued.push(text);
+    } else if a.turn_active {
+        hub.send(id, Cmd::Steer { text });
+    } else {
+        a.awaiting_start = true;
+        a.status = Status::Busy;
+        a.activity = "starting turn".into();
+        hub.send(id, Cmd::Turn { text });
+    }
+}
+
+/// The engine's window into the app.
+pub struct Ctxt<'a> {
+    pub hub: &'a mut Hub,
+    pub agents: &'a mut BTreeMap<AgentId, Agent>,
+    pub registry: &'a Registry,
+    pub tx: &'a UnboundedSender<AppEvent>,
+    pub notes: &'a mut Vec<String>,
+}
+
+impl Ctx for Ctxt<'_> {
+    fn spawn(&mut self, r: SpawnReq) -> AgentId {
+        let sandbox = if r.role.sandbox.is_empty() { "workspace-write".to_string() } else { r.role.sandbox.clone() };
+        spawn_agent(
+            self.hub,
+            self.agents,
+            self.registry,
+            AgentOpts {
+                name: r.name,
+                role: r.role_name,
+                glyph: r.role.glyph.clone(),
+                color: r.role.color.clone(),
+                model_alias: r.role.model.clone(),
+                effort: r.effort.or(Some(r.role.effort.clone())),
+                cwd: r.cwd,
+                approval: "never".into(),
+                sandbox,
+                instructions: r.instructions,
+                tools: r.tools,
+                extra_writable: r.extra_writable,
+            },
+        )
+    }
+    fn prompt(&mut self, a: AgentId, text: String) {
+        prompt_agent(self.hub, self.agents, a, text, true);
+    }
+    fn interrupt(&mut self, a: AgentId) {
+        self.hub.send(a, Cmd::Interrupt);
+    }
+    fn compact(&mut self, a: AgentId) {
+        if let Some(ag) = self.agents.get_mut(&a) {
+            ag.compacting = true;
+        }
+        self.hub.send(a, Cmd::Compact);
+    }
+    fn stop(&mut self, a: AgentId, archive: bool) {
+        if archive {
+            self.hub.send(a, Cmd::Archive);
+        }
+        self.hub.shutdown(a);
+        if let Some(ag) = self.agents.get_mut(&a) {
+            ag.status = Status::Stopped;
+            ag.turn_active = false;
+            ag.awaiting_start = false;
+            ag.finished.get_or_insert(Instant::now());
+            ag.activity = "archived".into();
+        }
+    }
+    fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool) {
+        self.hub.send(a, Cmd::Respond { id: req, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}) });
+    }
+    fn set_effort(&mut self, a: AgentId, effort: &str) -> String {
+        let Some(ag) = self.agents.get_mut(&a) else { return effort.to_string() };
+        let e = self.registry.resolve(&ag.model_alias).resolve_effort(effort);
+        ag.effort = e.clone();
+        self.hub.send(a, Cmd::SetEffort(e.clone()));
+        e
+    }
+    fn agent(&self, a: AgentId) -> Option<&Agent> {
+        self.agents.get(&a)
+    }
+    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + Send>) {
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let out = f();
+            let _ = tx.send(AppEvent::Job(tag, out));
+        });
+    }
+    fn notify(&mut self, text: &str) {
+        self.notes.push(text.to_string());
+    }
+}
+
+impl App {
+    pub fn new(settings: Settings, registry: Registry, project: PathBuf, hub: Hub, tx: UnboundedSender<AppEvent>, demo: bool) -> App {
+        let pattern_name = settings.default_pattern.clone();
+        let pattern = Pattern::load(&pattern_name, &project).unwrap_or_else(|_| Pattern::builtin());
+        let branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&project)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        App {
+            side_panel: settings.side_panel,
+            settings,
+            registry,
+            project,
+            hub,
+            agents: BTreeMap::new(),
+            screen: Screen::Solo,
+            overlays: vec![],
+            input: Input::default(),
+            solo: None,
+            run: None,
+            approvals: vec![],
+            toast: None,
+            sel: 0,
+            canvas_focus: false,
+            verbose: false,
+            pulse_panel: true,
+            quit: false,
+            ctrl_c: None,
+            tx,
+            demo,
+            studio: StudioState { pattern, sel: 0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
+            models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false },
+            suggest: 0,
+            notes: vec![],
+            pattern_name,
+            branch,
+            probes: HashMap::new(),
+            pulse_scroll: 0,
+            force_clear: false,
+        }
+    }
+
+    pub fn toast(&mut self, text: impl Into<String>, level: Level) {
+        self.toast = Some((text.into(), Instant::now(), level));
+    }
+
+    pub fn animating(&self) -> bool {
+        self.agents.values().any(|a| a.busy() || matches!(a.status, Status::Starting | Status::Retrying(_)))
+            || self.toast.as_ref().map(|t| t.1.elapsed().as_millis() < crate::ui::toast_life(&t.0) + 100).unwrap_or(false)
+            || self.agents.values().any(|a| a.compacting || a.ctx_anim.map(|(_, t)| t.elapsed().as_millis() < 950).unwrap_or(false))
+            || self.run.as_ref().map(|r| (r.is_active() && !r.paused && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
+            || self.studio.flash.map(|f| f.elapsed() < Duration::from_millis(900)).unwrap_or(false)
+    }
+
+    fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
+        let mut run = self.run.take()?;
+        let r = {
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            f(&mut run, &mut ctx)
+        };
+        self.run = Some(run);
+        Some(r)
+    }
+
+    fn in_run(&self, a: AgentId) -> bool {
+        self.run.as_ref().map(|r| r.all_agents().contains(&a)).unwrap_or(false)
+    }
+
+    // ─────────────────────────── agents ───────────────────────────
+
+    pub fn start_solo(&mut self) {
+        if let Some(old) = self.solo.take() {
+            self.hub.shutdown(old);
+            self.agents.remove(&old);
+        }
+        let id = spawn_agent(
+            &mut self.hub,
+            &mut self.agents,
+            &self.registry,
+            AgentOpts {
+                name: "solo".into(),
+                role: "solo".into(),
+                glyph: "●".into(),
+                color: "saffron".into(),
+                model_alias: self.settings.default_model.clone(),
+                effort: None,
+                cwd: self.project.clone(),
+                approval: self.settings.approval_mode.clone(),
+                sandbox: self.settings.sandbox.clone(),
+                instructions: String::new(),
+                tools: vec![],
+                extra_writable: vec![],
+            },
+        );
+        self.solo = Some(id);
+    }
+
+    /// The agent the current view is about (Solo agent, zoomed agent, or stage selection).
+    pub fn focus_agent(&self) -> Option<AgentId> {
+        match self.screen {
+            Screen::Solo => self.solo,
+            Screen::Zoom(a) => Some(a),
+            Screen::Stage => self.stage_nodes().get(self.sel).copied(),
+            Screen::Studio => self.studio.architect,
+            Screen::Models => None,
+        }
+    }
+
+    pub fn stage_nodes(&self) -> Vec<AgentId> {
+        let Some(r) = &self.run else { return vec![] };
+        let mut v = vec![];
+        v.extend(r.planner);
+        v.extend(r.orchestrator);
+        for w in &r.workers {
+            if let Some(a) = w.agent {
+                if !v.contains(&a) {
+                    v.push(a);
+                }
+            }
+        }
+        v.extend(r.gate_agent);
+        if let Some(f) = r.finale_agent {
+            if !v.contains(&f) {
+                v.push(f);
+            }
+        }
+        v
+    }
+
+    pub fn set_effort(&mut self, a: AgentId, e: &str) {
+        let Some(ag) = self.agents.get_mut(&a) else { return };
+        let m = self.registry.resolve(&ag.model_alias);
+        let e = m.resolve_effort(e);
+        ag.effort = e.clone();
+        self.hub.send(a, Cmd::SetEffort(e.clone()));
+        let name = ag.name.clone();
+        self.toast(format!("{name}: effort → {e} (next turn)"), Level::Info);
+    }
+
+    pub fn step_effort(&mut self, a: AgentId, delta: i32) {
+        let Some(ag) = self.agents.get(&a) else { return };
+        let m = self.registry.resolve(&ag.model_alias);
+        if m.efforts().is_empty() {
+            let alias = m.alias.clone();
+            self.toast(format!("{alias} has no reasoning-effort setting — add efforts for it in /models if the provider supports them"), Level::Info);
+            return;
+        }
+        let e = m.step_effort(&ag.effort, delta);
+        self.set_effort(a, &e);
+    }
+
+    pub fn set_model(&mut self, a: AgentId, alias: &str) {
+        let Some(ag) = self.agents.get(&a) else { return };
+        let old = self.registry.resolve(&ag.model_alias);
+        let new = self.registry.resolve(alias);
+        if Some(a) == self.solo && old.provider != new.provider {
+            self.settings.default_model = new.alias.clone();
+            let _ = self.settings.save();
+            self.start_solo();
+            self.toast(format!("new session on {} (provider changed)", new.alias), Level::Info);
+            return;
+        }
+        let effort = new.resolve_effort(&ag.effort);
+        self.hub.send(a, Cmd::SetModel(new.model.clone()));
+        self.hub.send(a, Cmd::SetEffort(effort.clone()));
+        if let Some(ag) = self.agents.get_mut(&a) {
+            ag.model_alias = new.alias.clone();
+            ag.model = new.model.clone();
+            ag.effort = effort;
+            ag.ctx_window = new.context_window.or(ag.ctx_window);
+            ag.notice(Level::Info, format!("model → {} ({})", new.alias, new.model));
+        }
+        if Some(a) == self.solo {
+            self.settings.default_model = new.alias.clone();
+            let _ = self.settings.save();
+        }
+    }
+
+    /// Compact an agent's context now, or right after its current turn.
+    pub fn compact_agent(&mut self, a: AgentId) {
+        let Some(ag) = self.agents.get_mut(&a) else { return };
+        if ag.compacting {
+            return;
+        }
+        if ag.busy() {
+            ag.compact_pending = true;
+            let n = ag.name.clone();
+            self.toast(format!("{n}: will compact when this turn ends"), Level::Info);
+        } else {
+            ag.compacting = true;
+            ag.activity = "compacting context".into();
+            self.hub.send(a, Cmd::Compact);
+        }
+    }
+
+    /// "⚑ 2" when approvals are waiting anywhere.
+    pub fn inbox_badge(&self) -> Option<String> {
+        let n = self.approvals.len();
+        (n > 0).then(|| format!("{} {n} waiting · ctrl+g ", crate::ui::theme::g("⚑", "!")))
+    }
+
+    /// Terminal / tmux pane title reflecting what's going on.
+    pub fn title(&self) -> String {
+        let busy = self.agents.values().filter(|a| a.busy()).count();
+        if !self.approvals.is_empty() {
+            return format!("⚑ mantra — {} waiting for you", self.approvals.len());
+        }
+        match (&self.run, self.screen) {
+            (Some(r), Screen::Stage | Screen::Zoom(_)) => {
+                let st = match &r.stage {
+                    Stage::Setup | Stage::Planning => "planning".to_string(),
+                    Stage::Review => "plan review".to_string(),
+                    Stage::Phase { idx, .. } => format!("phase {}/{}", idx + 1, r.plan.as_ref().map(|p| p.phases.len()).unwrap_or(0)),
+                    Stage::Finale { .. } => "finale".to_string(),
+                    Stage::Done => "done".to_string(),
+                    Stage::Failed(_) => "stopped".to_string(),
+                };
+                format!("{} mantra — {st}{}", if r.paused { "‖" } else { "◉" }, if busy > 0 { format!(" · {busy} active") } else { String::new() })
+            }
+            _ => format!("✦ mantra — {}{}", self.project.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), if busy > 0 { " · working" } else { "" }),
+        }
+    }
+
+    pub fn start_run(&mut self, goal: &str) {
+        if self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
+            self.toast("a run is already active — re-prompt it from the stage, or /pause", Level::Warn);
+            return;
+        }
+        let pattern = match Pattern::load(&self.pattern_name, &self.project) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(format!("pattern error: {e}"), Level::Error);
+                return;
+            }
+        };
+        let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
+        {
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            run.start(&mut ctx);
+        }
+        self.run = Some(run);
+        self.screen = Screen::Stage;
+        self.sel = 0;
+    }
+
+    fn start_architect(&mut self) -> AgentId {
+        if let Some(a) = self.studio.architect {
+            return a;
+        }
+        let model = if self.registry.get("astra").is_some() { "astra".to_string() } else { self.settings.default_model.clone() };
+        let id = spawn_agent(
+            &mut self.hub,
+            &mut self.agents,
+            &self.registry,
+            AgentOpts {
+                name: "architect".into(),
+                role: "architect".into(),
+                glyph: "★".into(),
+                color: "saffron".into(),
+                model_alias: model,
+                effort: Some("high".into()),
+                cwd: self.project.clone(),
+                approval: "never".into(),
+                sandbox: "read-only".into(),
+                instructions: tools::ARCHITECT_PROMPT.into(),
+                tools: tools::architect_tools(),
+                extra_writable: vec![],
+            },
+        );
+        self.studio.architect = Some(id);
+        id
+    }
+
+    pub fn probe_model(&mut self, alias: &str) {
+        let id = spawn_agent(
+            &mut self.hub,
+            &mut self.agents,
+            &self.registry,
+            AgentOpts {
+                name: format!("probe:{alias}"),
+                role: "probe".into(),
+                glyph: "·".into(),
+                color: "gray".into(),
+                model_alias: alias.to_string(),
+                effort: Some("low".into()),
+                cwd: self.project.clone(),
+                approval: "never".into(),
+                sandbox: "read-only".into(),
+                instructions: String::new(),
+                tools: vec![],
+                extra_writable: vec![],
+            },
+        );
+        self.probes.insert(id, (alias.to_string(), Instant::now()));
+        self.models_ui.status.insert(alias.to_string(), "testing…".into());
+        prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true);
+    }
+
+    /// Discover models: Codex's catalog + every custom provider (`only` = one provider id).
+    pub fn discover(&mut self, only: Option<String>) {
+        let mut sources: Vec<String> = vec![];
+        if only.is_none() {
+            sources.push("codex".into());
+        }
+        let provs: Vec<crate::config::ProviderEntry> = self.registry.providers.iter().filter(|p| !p.id.is_empty() && p.id != "openai" && only.as_ref().map(|o| *o == p.id).unwrap_or(true)).cloned().collect();
+        sources.extend(provs.iter().map(|p| p.id.clone()));
+        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, errors: vec![], sel: 0, filter: Input::default() }));
+        if only.is_none() {
+            let cmd = self.hub.codex_cmd.clone();
+            let args = self.registry.provider_args();
+            let cwd = self.project.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let r = async {
+                    let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd).map_err(|e| e.to_string())?;
+                    crate::rpc::handshake(&conn).await.map_err(|e| e.to_string())?;
+                    let v = conn.request_timeout("model/list", json!({"limit": 100}), Duration::from_secs(20)).await.map_err(|e| e.message)?;
+                    let _ = child.kill().await;
+                    Ok::<_, String>(v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(crate::discover::from_codex).collect()).unwrap_or_default())
+                }
+                .await;
+                let _ = tx.send(AppEvent::Discovered { source: "codex".into(), result: r });
+            });
+        }
+        for p in provs {
+            let tx = self.tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let r = crate::discover::list_models(&p.base_url, &p.env_key).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
+                let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
+            });
+        }
+    }
+
+    fn on_discovered(&mut self, source: String, result: Result<Vec<crate::discover::Candidate>, String>) {
+        let reg = &self.registry;
+        let Some(Overlay::Discover(st)) = self.overlays.iter_mut().rev().find(|o| matches!(o, Overlay::Discover(_))) else { return };
+        st.loading.retain(|s| *s != source);
+        match result {
+            Err(e) => st.errors.push(format!("{source}: {e}")),
+            Ok(mut cands) => {
+                for c in &mut cands {
+                    crate::discover::classify(reg, c);
+                }
+                st.items.extend(cands);
+                st.items.sort_by(|a, b| (a.state == crate::discover::CState::Configured, &a.provider, &a.model).cmp(&(b.state == crate::discover::CState::Configured, &b.provider, &b.model)));
+                // Pre-select when the list is small; big catalogues (OpenRouter…) start empty — filter & pick.
+                let n_new = st.items.iter().filter(|c| c.state != crate::discover::CState::Configured).count();
+                for c in &mut st.items {
+                    c.selected = c.state != crate::discover::CState::Configured && n_new <= 25;
+                }
+            }
+        }
+    }
+
+    pub fn apply_discover(&mut self, st: &DiscoverState) {
+        let (added, updated) = crate::discover::apply(&mut self.registry, &st.items);
+        if added + updated == 0 {
+            self.toast("nothing selected", Level::Info);
+            return;
+        }
+        match self.registry.save() {
+            Ok(()) => {
+                self.models_ui.dirty = false;
+                self.toast(format!("added {added}, updated {updated} model(s) — saved to models.toml"), Level::Ok);
+            }
+            Err(e) => {
+                self.models_ui.dirty = true;
+                self.toast(format!("added {added}, updated {updated}, but saving failed: {e}"), Level::Error);
+            }
+        }
+    }
+
+    // ─── approvals ───
+
+    /// App-wide approval mode. Solo's thread is updated live; anything that still asks while the
+    /// mode is "never" (e.g. mid-turn, or a run agent) is approved automatically.
+    pub fn set_approval_mode(&mut self, mode: &str) {
+        self.settings.approval_mode = mode.to_string();
+        let _ = self.settings.save();
+        if let Some(s) = self.solo {
+            self.hub.send(s, Cmd::SetApproval(mode.to_string()));
+        }
+        let label = match mode {
+            "never" => "never ask",
+            "untrusted" => "ask for anything untrusted",
+            _ => "ask when needed",
+        };
+        let pending = self.approvals.len();
+        if mode == "never" && pending > 0 {
+            self.auto_approve_pending();
+            self.toast(format!("approvals: {label} — {pending} waiting request(s) approved"), Level::Info);
+        } else {
+            self.toast(format!("approvals: {label}"), Level::Info);
+        }
+    }
+
+    fn auto_approve_pending(&mut self) {
+        while !self.approvals.is_empty() {
+            let q = self.approvals[0].method == "item/tool/requestUserInput";
+            let answer = q.then(|| "No human is available right now (approval mode: never ask). Proceed with your best judgment and state any assumptions.".to_string());
+            self.resolve_approval_ex(0, if q { 0 } else { 1 }, answer, true);
+        }
+    }
+
+    // ─────────────────────────── events ───────────────────────────
+
+    pub fn on_event(&mut self, ev: AppEvent) {
+        match ev {
+            AppEvent::Term(e) => self.on_term(e),
+            AppEvent::Hub(h) => self.on_hub(h),
+            AppEvent::Job(tag, out) => {
+                self.with_run(|r, c| r.on_job(c, tag, out));
+            }
+            AppEvent::Discovered { source, result } => self.on_discovered(source, result),
+        }
+    }
+
+    pub fn tick(&mut self) {
+        self.with_run(|r, c| r.tick(c));
+        if self.run.as_ref().map(|r| r.want_review).unwrap_or(false) && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. })) && self.screen == Screen::Stage {
+            if let Some(r) = self.run.as_mut() {
+                r.want_review = false;
+            }
+            self.overlays.push(Overlay::Plan { scroll: 0 });
+        }
+        if let Some(r) = &self.run {
+            let n = self.stage_nodes().len();
+            if n > 0 && self.sel >= n {
+                self.sel = n - 1;
+            }
+            let _ = r;
+        }
+    }
+
+    fn on_hub(&mut self, ev: HubEvent) {
+        match ev {
+            HubEvent::Ready { agent, thread_id, model, resumed } => {
+                let mut was_busy = false;
+                if let Some(a) = self.agents.get_mut(&agent) {
+                    was_busy = a.turn_active || a.awaiting_start;
+                    a.thread_id = Some(thread_id);
+                    if !model.is_empty() {
+                        a.model = model;
+                    }
+                    if resumed {
+                        a.turn_active = false;
+                        a.awaiting_start = false;
+                        a.notice(Level::Ok, "process restarted — conversation resumed");
+                    }
+                    if matches!(a.status, Status::Starting | Status::Crashed(_) | Status::Retrying(_)) || resumed {
+                        a.status = if a.awaiting_start { Status::Busy } else { Status::Idle };
+                        if !a.awaiting_start {
+                            a.activity = "idle".into();
+                        }
+                    }
+                }
+                if self.in_run(agent) {
+                    self.with_run(|r, c| r.on_ready(c, agent, resumed, was_busy));
+                } else if resumed && was_busy {
+                    if let Some(a) = self.agents.get_mut(&agent) {
+                        a.notice(Level::Warn, "the turn in progress was lost in the crash — send a message to continue");
+                    }
+                }
+            }
+            HubEvent::Notif { agent, method, params } => {
+                let signals = match self.agents.get_mut(&agent) {
+                    Some(a) => a.apply(&method, &params),
+                    None => return,
+                };
+                if method == "turn/started" {
+                    if let Some(a) = self.agents.get_mut(&agent) {
+                        for q in std::mem::take(&mut a.queued) {
+                            self.hub.send(agent, Cmd::Steer { text: q });
+                        }
+                    }
+                }
+                if method == "thread/tokenUsage/updated" && (Some(agent) == self.solo || self.screen == Screen::Zoom(agent)) {
+                    let mut warn = None;
+                    if let Some(a) = self.agents.get_mut(&agent) {
+                        let p = a.ctx_percent().unwrap_or(0);
+                        if p >= 85 && !a.ctx_warned && !a.compacting {
+                            a.ctx_warned = true;
+                            warn = Some(format!("context {p}% full — /compact frees space (Codex also auto-compacts)"));
+                        } else if p < 70 {
+                            a.ctx_warned = false;
+                        }
+                    }
+                    if let Some(w) = warn {
+                        self.toast(w, Level::Warn);
+                    }
+                }
+                if method == "turn/completed" {
+                    let pending = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.compact_pending)).unwrap_or(false);
+                    if pending {
+                        self.compact_agent(agent);
+                    }
+                    let queued = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+                    if !queued.is_empty() {
+                        prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false);
+                    }
+                }
+                for s in signals {
+                    match s {
+                        Signal::TurnDone { status, error, kind } => self.on_turn_done(agent, &status, error, kind),
+                        Signal::FilesChanged(paths) => {
+                            if self.in_run(agent) {
+                                self.with_run(|r, c| r.on_files_changed(c, agent, &paths));
+                            }
+                        }
+                        Signal::Activity => {}
+                    }
+                }
+            }
+            HubEvent::Request { agent, id, method, params } => self.on_request(agent, id, &method, params),
+            HubEvent::CmdFailed { agent, what, error, text } => match what {
+                "steer" => {
+                    if let (Some(a), Some(t)) = (self.agents.get_mut(&agent), text) {
+                        a.queued.push(t);
+                    }
+                }
+                "turn" => {
+                    if let Some(a) = self.agents.get_mut(&agent) {
+                        a.awaiting_start = false;
+                        a.status = Status::Failed(error.clone());
+                        a.notice(Level::Error, format!("couldn't start the turn: {error}"));
+                    }
+                    if self.in_run(agent) {
+                        self.with_run(|r, c| r.on_turn_done(c, agent, "failed", Some(error), Some(crate::agent::ErrKind::Transient)));
+                    }
+                }
+                "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
+                other => {
+                    if let Some(a) = self.agents.get_mut(&agent) {
+                        if other == "compact" {
+                            a.compacting = false;
+                        }
+                        a.notice(Level::Warn, format!("{other} failed: {error}"));
+                    }
+                }
+            },
+            HubEvent::Crashed { agent, reason, restarting, attempt } => {
+                if let Some(a) = self.agents.get_mut(&agent) {
+                    a.status = if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
+                    a.activity = if restarting { "restarting".into() } else { "crashed".into() };
+                    a.notice(Level::Error, format!("codex process {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                }
+                if self.in_run(agent) {
+                    self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));
+                }
+                if Some(agent) == self.solo && !restarting {
+                    self.toast("Solo agent is down — check `codex` is installed & logged in (see log), /new to retry", Level::Error);
+                }
+            }
+            HubEvent::Exited { agent } => {
+                if let Some(a) = self.agents.get_mut(&agent) {
+                    a.status = Status::Stopped;
+                    a.turn_active = false;
+                }
+            }
+        }
+    }
+
+    fn on_turn_done(&mut self, agent: AgentId, status: &str, error: Option<String>, kind: Option<crate::agent::ErrKind>) {
+        if let Some((alias, t0)) = self.probes.remove(&agent) {
+            let msg = match (status, &error) {
+                ("completed", _) => {
+                    let reply = self.agents.get(&agent).and_then(|a| a.final_message.clone()).unwrap_or_default();
+                    format!("ok {:.1}s · \"{}\"", t0.elapsed().as_secs_f32(), crate::util::trunc(reply.trim(), 16))
+                }
+                (_, Some(e)) => format!("error: {}", crate::util::trunc(e, 40)),
+                _ => status.to_string(),
+            };
+            self.models_ui.status.insert(alias, msg);
+            self.hub.shutdown(agent);
+            self.agents.remove(&agent);
+            return;
+        }
+        if self.in_run(agent) {
+            let st = status.to_string();
+            self.with_run(|r, c| r.on_turn_done(c, agent, &st, error, kind));
+        }
+        if Some(agent) == self.solo {
+            let long = self.agents.get(&agent).and_then(|a| a.turn_started).map(|t| t.elapsed() > Duration::from_secs(30)).unwrap_or(false);
+            if long {
+                self.notes.push(format!("Mantra: Solo turn {status}"));
+            }
+        }
+    }
+
+    fn on_request(&mut self, agent: AgentId, id: Value, method: &str, params: Value) {
+        match method {
+            "item/tool/call" => {
+                let tool = params.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                if Some(agent) == self.studio.architect {
+                    let (text, ok) = self.architect_tool(&tool, &args);
+                    self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}) });
+                } else if self.in_run(agent) {
+                    self.with_run(|r, c| r.on_tool_call(c, agent, id, &tool, &args));
+                } else {
+                    self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": "tool not available"}], "success": false}) });
+                }
+            }
+            "mcpServer/elicitation/request" => {
+                self.hub.send(agent, Cmd::Respond { id, result: json!({"action": "decline", "content": null, "_meta": null}) });
+                if let Some(a) = self.agents.get_mut(&agent) {
+                    a.notice(Level::Warn, "declined an MCP elicitation request (not supported in Mantra yet)");
+                }
+            }
+            "item/commandExecution/requestApproval" | "execCommandApproval" | "item/fileChange/requestApproval" | "applyPatchApproval" | "item/permissions/requestApproval" | "item/tool/requestUserInput" => {
+                let (title, detail) = match method {
+                    "item/commandExecution/requestApproval" | "execCommandApproval" => {
+                        let cmd = params.get("command").map(|c| match c {
+                            Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "),
+                            v => v.as_str().unwrap_or("").to_string(),
+                        }).unwrap_or_default();
+                        ("Run this command?".to_string(), format!("$ {cmd}{}", params.get("reason").and_then(|r| r.as_str()).map(|r| format!("\n  reason: {r}")).unwrap_or_default()))
+                    }
+                    "item/fileChange/requestApproval" | "applyPatchApproval" => ("Apply these file changes?".into(), params.get("reason").and_then(|r| r.as_str()).unwrap_or("the agent wants to write files").to_string()),
+                    "item/permissions/requestApproval" => ("Grant extra permissions?".into(), format!("{}", crate::util::trunc(&params.get("permissions").map(|p| p.to_string()).unwrap_or_default(), 200))),
+                    _ => {
+                        let q = params.pointer("/questions/0/question").and_then(|q| q.as_str()).unwrap_or("The agent has a question");
+                        ("Agent question (type your answer, ⏎ to send)".into(), q.to_string())
+                    }
+                };
+                let name = self.agents.get(&agent).map(|a| a.name.clone()).unwrap_or_default();
+                if Some(agent) != self.solo && Some(self.screen) != Some(Screen::Zoom(agent)) {
+                    self.toast(format!("{name} needs approval — ctrl+g"), Level::Warn);
+                    self.notes.push(format!("Mantra: {name} needs approval"));
+                }
+                self.approvals.push(Approval { agent, id, method: method.to_string(), title, detail, params, at: Instant::now() });
+                if self.settings.approval_mode == "never" {
+                    // Codex fixes a turn's policy when the turn starts, so a turn begun under another
+                    // mode (or a run agent) can still ask — honour "never ask" here.
+                    self.auto_approve_pending();
+                    self.toast = self.toast.take().filter(|t| !t.0.contains("needs approval"));
+                    self.notes.retain(|n| !n.contains("needs approval"));
+                }
+            }
+            _ => {
+                self.hub.send(agent, Cmd::RespondErr { id, message: format!("{method} is not supported by Mantra") });
+            }
+        }
+    }
+
+    /// decision: 0 = yes once, 1 = yes for session, 2 = no, 3 = cancel turn
+    pub fn resolve_approval(&mut self, idx: usize, decision: u8, answer: Option<String>) {
+        self.resolve_approval_ex(idx, decision, answer, false)
+    }
+
+    pub fn resolve_approval_ex(&mut self, idx: usize, decision: u8, answer: Option<String>, auto: bool) {
+        if idx >= self.approvals.len() {
+            return;
+        }
+        let ap = self.approvals.remove(idx);
+        let result = match ap.method.as_str() {
+            "execCommandApproval" | "applyPatchApproval" => json!({"decision": match decision { 0 => json!("approved"), 1 => json!("approved_for_session"), 3 => json!("abort"), _ => json!({"denied": {"rejection": "declined by the user"}}) }}),
+            "item/permissions/requestApproval" => {
+                if decision <= 1 {
+                    json!({"permissions": ap.params.get("permissions").cloned().unwrap_or(json!({})), "scope": if decision == 1 { "session" } else { "turn" }})
+                } else {
+                    json!({"permissions": {}, "scope": "turn"})
+                }
+            }
+            "item/tool/requestUserInput" => {
+                let mut answers = serde_json::Map::new();
+                if let Some(qs) = ap.params.get("questions").and_then(|q| q.as_array()) {
+                    for (i, q) in qs.iter().enumerate() {
+                        let qid = q.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let a = if i == 0 { answer.clone().unwrap_or_default() } else { String::new() };
+                        answers.insert(qid, json!({"answers": if a.is_empty() { vec![] } else { vec![a] }}));
+                    }
+                }
+                json!({"answers": answers})
+            }
+            _ => {
+                let d = ["accept", "acceptForSession", "decline", "cancel"][decision.min(3) as usize];
+                json!({ "decision": d })
+            }
+        };
+        self.hub.send(ap.agent, Cmd::Respond { id: ap.id, result });
+        if let Some(a) = self.agents.get_mut(&ap.agent) {
+            let verb = if auto { "auto-approved (never ask)" } else { ["approved", "approved for this session", "declined", "cancelled"][decision.min(3) as usize] };
+            a.notice(if decision <= 1 { Level::Ok } else { Level::Warn }, format!("{verb}: {}", crate::util::trunc(ap.detail.lines().next().unwrap_or(""), 80)));
+        }
+    }
+
+    pub fn approval_for(&self, agent: Option<AgentId>) -> Option<usize> {
+        let a = agent?;
+        self.approvals.iter().position(|x| x.agent == a)
+    }
+
+    fn architect_tool(&mut self, tool: &str, args: &Value) -> (String, bool) {
+        match tool {
+            "mantra_read_pattern" => (self.studio.pattern.to_toml(), true),
+            "mantra_write_pattern" => {
+                let t = args.get("toml").and_then(|t| t.as_str()).unwrap_or("");
+                match Pattern::from_toml(t) {
+                    Ok(p) => {
+                        self.studio.pattern = p;
+                        self.studio.dirty = true;
+                        self.studio.errors.clear();
+                        self.studio.flash = Some(Instant::now());
+                        ("OK — pattern updated live in the Studio (the user saves it with ctrl+s)".into(), true)
+                    }
+                    Err(e) => (format!("INVALID: {e}"), false),
+                }
+            }
+            _ => ("unknown tool".into(), false),
+        }
+    }
+
+    // ─────────────────────────── input ───────────────────────────
+
+    fn on_term(&mut self, e: Event) {
+        match e {
+            Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+            Event::Paste(s) => {
+                if let Some(Overlay::Edit { input, .. }) = self.overlays.last_mut() {
+                    input.insert_str(&s);
+                } else if self.screen == Screen::Studio && self.studio.focus == 2 {
+                    self.studio.input.insert_str(&s);
+                } else {
+                    self.input.insert_str(&s);
+                }
+            }
+            Event::Mouse(m) => {
+                let delta = match m.kind {
+                    MouseEventKind::ScrollUp => 3i32,
+                    MouseEventKind::ScrollDown => -3,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    self.scroll(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll(&mut self, delta: i32) {
+        match self.overlays.last_mut() {
+            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) => {
+                *scroll = (*scroll as i32 - delta).max(0) as usize;
+                return;
+            }
+            _ => {}
+        }
+        if self.screen == Screen::Stage {
+            self.pulse_scroll = (self.pulse_scroll as i32 + delta).max(0) as usize;
+            return;
+        }
+        if let Some(a) = self.focus_agent().and_then(|a| self.agents.get_mut(&a)) {
+            a.scroll = (a.scroll as i32 + delta).max(0) as usize;
+            a.follow = a.scroll == 0;
+        }
+    }
+
+    fn on_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        // Global keys
+        if ctrl && k.code == KeyCode::Char('c') {
+            if !self.overlays.is_empty() {
+                self.overlays.pop();
+                return;
+            }
+            if !self.input.is_empty() {
+                self.input.clear();
+                return;
+            }
+            if let Some(a) = self.focus_agent() {
+                if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
+                    self.hub.send(a, Cmd::Interrupt);
+                    self.toast("interrupting…", Level::Warn);
+                    return;
+                }
+            }
+            if self.ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) {
+                self.quit = true;
+            } else {
+                self.ctrl_c = Some(Instant::now());
+                self.toast("press ctrl+c again to quit", Level::Info);
+            }
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('o') {
+            self.overlays.clear();
+            self.screen = match self.screen {
+                Screen::Solo => Screen::Stage,
+                _ => Screen::Solo,
+            };
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('e') && self.overlays.is_empty() {
+            self.verbose = !self.verbose;
+            self.toast(if self.verbose { "verbose log on" } else { "verbose log off" }, Level::Info);
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('l') {
+            self.force_clear = true;
+            return;
+        }
+        if (ctrl && k.code == KeyCode::Char('t')) || k.code == KeyCode::F(2) {
+            if self.screen == Screen::Stage {
+                self.pulse_panel = !self.pulse_panel;
+            } else {
+                self.side_panel = !self.side_panel;
+            }
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('g') {
+            self.overlays.push(Overlay::Inbox { sel: 0 });
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('k') && self.overlays.is_empty() {
+            let target = self.focus_agent();
+            let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
+            let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
+            self.overlays.push(Overlay::ModelPicker { sel, target });
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('d') && self.overlays.is_empty() {
+            if let Some(a) = self.focus_agent() {
+                self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
+            }
+            return;
+        }
+        if k.code == KeyCode::F(1) {
+            self.overlays.push(Overlay::Help);
+            return;
+        }
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. })) {
+            self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
+            return;
+        }
+        if !self.overlays.is_empty() {
+            crate::ui::overlays::key(self, k);
+            return;
+        }
+        // Approval mode (shift+tab) works even while an approval card is showing —
+        // that's exactly when you want to flip to "never ask".
+        if k.code == KeyCode::BackTab && matches!(self.screen, Screen::Solo | Screen::Stage | Screen::Zoom(_)) {
+            let modes = ["untrusted", "on-request", "never"];
+            let i = modes.iter().position(|m| *m == self.settings.approval_mode).unwrap_or(1);
+            let next = modes[(i + 1) % 3];
+            self.set_approval_mode(next);
+            return;
+        }
+        // Approval card for the focused agent
+        if let Some(idx) = self.approval_for(self.focus_agent()) {
+            if matches!(self.screen, Screen::Solo | Screen::Zoom(_)) {
+                let is_question = self.approvals[idx].method == "item/tool/requestUserInput";
+                if is_question {
+                    if k.code == KeyCode::Enter {
+                        let ans = self.input.take();
+                        self.resolve_approval(idx, 0, Some(ans));
+                        return;
+                    }
+                    if k.code == KeyCode::Esc {
+                        self.resolve_approval(idx, 2, None);
+                        return;
+                    }
+                } else {
+                    match k.code {
+                        KeyCode::Char('y') | KeyCode::Enter => return self.resolve_approval(idx, 0, None),
+                        KeyCode::Char('a') => return self.resolve_approval(idx, 1, None),
+                        KeyCode::Char('n') => return self.resolve_approval(idx, 2, None),
+                        KeyCode::Esc => return self.resolve_approval(idx, 3, None),
+                        _ => return,
+                    }
+                }
+            }
+        }
+        match self.screen {
+            Screen::Studio => return crate::ui::studio::studio_key(self, k),
+            Screen::Models => return crate::ui::studio::models_key(self, k),
+            _ => {}
+        }
+        // effort / approvals shortcuts
+        if (alt || k.modifiers.contains(KeyModifiers::SHIFT)) && matches!(k.code, KeyCode::Up | KeyCode::Down) && !(self.screen == Screen::Stage && self.canvas_focus) {
+            if let Some(a) = self.focus_agent() {
+                self.step_effort(a, if k.code == KeyCode::Up { 1 } else { -1 });
+            }
+            return;
+        }
+        if self.screen == Screen::Stage {
+            if self.stage_key(k) {
+                return;
+            }
+        }
+        // slash suggestions navigation
+        let sugg = self.suggestions();
+        if !sugg.is_empty() {
+            match k.code {
+                KeyCode::Up => {
+                    self.suggest = self.suggest.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.suggest = (self.suggest + 1).min(sugg.len() - 1);
+                    return;
+                }
+                KeyCode::Tab => {
+                    let c = sugg[self.suggest.min(sugg.len() - 1)].0;
+                    self.input.set(&format!("{c} "));
+                    return;
+                }
+                KeyCode::Enter => {
+                    let c = sugg[self.suggest.min(sugg.len() - 1)].0;
+                    if self.input.text().trim() != c {
+                        self.input.set(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if k.code == KeyCode::Esc {
+            match self.screen {
+                Screen::Zoom(_) if self.input.is_empty() => {
+                    self.screen = Screen::Stage;
+                }
+                _ => {
+                    if let Some(a) = self.focus_agent() {
+                        if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) && self.input.is_empty() {
+                            self.hub.send(a, Cmd::Interrupt);
+                            self.toast("interrupting…", Level::Warn);
+                            return;
+                        }
+                    }
+                    self.input.clear();
+                    if self.screen == Screen::Stage {
+                        self.canvas_focus = true;
+                    }
+                }
+            }
+            return;
+        }
+        if k.code == KeyCode::Char('?') && self.input.is_empty() {
+            self.overlays.push(Overlay::Help);
+            return;
+        }
+        match self.input.key(k) {
+            Act::Submit => {
+                let text = self.input.take();
+                self.suggest = 0;
+                self.submit(text.trim_end().to_string());
+            }
+            Act::Changed => self.suggest = 0,
+            _ => {}
+        }
+    }
+
+    /// Stage keys. Returns true if consumed.
+    fn stage_key(&mut self, k: KeyEvent) -> bool {
+        let nodes = self.stage_nodes();
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        if k.code == KeyCode::Tab && self.suggestions().is_empty() {
+            self.canvas_focus = !self.canvas_focus;
+            return true;
+        }
+        let nav = self.canvas_focus || alt;
+        if nav {
+            match k.code {
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                    self.sel = self.sel.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                    if !nodes.is_empty() {
+                        self.sel = (self.sel + 1).min(nodes.len() - 1);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if k.code == KeyCode::Enter && (self.canvas_focus || self.input.is_empty()) {
+            if let Some(a) = nodes.get(self.sel) {
+                self.screen = Screen::Zoom(*a);
+                self.canvas_focus = false;
+            }
+            return true;
+        }
+        if !self.canvas_focus {
+            return false;
+        }
+        let selected = nodes.get(self.sel).copied();
+        match k.code {
+            KeyCode::Char(' ') => {
+                self.with_run(|r, c| r.toggle_pause(c));
+            }
+            KeyCode::Char('p') => self.overlays.push(Overlay::Plan { scroll: 0 }),
+            KeyCode::Char('a') => {
+                if self.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
+                    self.with_run(|r, c| r.approve_plan(c));
+                }
+            }
+            KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
+            KeyCode::Char('x') => {
+                if let Some(a) = selected {
+                    self.hub.send(a, Cmd::Interrupt);
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(a) = selected {
+                    let crashed = self.agents.get(&a).map(|x| matches!(x.status, Status::Crashed(_))).unwrap_or(false);
+                    if crashed {
+                        self.hub.send(a, Cmd::Restart);
+                    } else if let Some(msg) = self.with_run(|r, c| r.retry_worker(c, a, None)) {
+                        self.toast(msg, Level::Info);
+                    }
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                if let Some(a) = selected {
+                    self.step_effort(a, 1);
+                }
+            }
+            KeyCode::Char('-') => {
+                if let Some(a) = selected {
+                    self.step_effort(a, -1);
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(a) = selected {
+                    self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(a) = selected {
+                    self.compact_agent(a);
+                }
+            }
+            KeyCode::Char('s') => self.open_studio(),
+            KeyCode::Char('?') => self.overlays.push(Overlay::Help),
+            KeyCode::Char('/') | KeyCode::Char('@') => {
+                self.canvas_focus = false;
+                if let KeyCode::Char(c) = k.code {
+                    self.input.insert_str(&c.to_string());
+                }
+            }
+            KeyCode::Esc => {}
+            KeyCode::Char(c) if c.is_alphanumeric() => {
+                // start typing
+                self.canvas_focus = false;
+                self.input.insert_str(&c.to_string());
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let t = self.input.text();
+        if !t.starts_with('/') || t.contains(' ') || t.contains('\n') {
+            return vec![];
+        }
+        COMMANDS.iter().filter(|(c, _)| c.starts_with(t.as_str())).copied().collect()
+    }
+
+    pub fn open_studio(&mut self) {
+        if !self.studio.dirty {
+            if let Ok(p) = Pattern::load(&self.pattern_name, &self.project) {
+                self.studio.pattern = p;
+            }
+        }
+        self.screen = Screen::Studio;
+    }
+
+    pub fn submit(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if text.starts_with('/') {
+            return self.command(&text);
+        }
+        match self.screen {
+            Screen::Solo => {
+                if self.solo.is_none() {
+                    self.start_solo();
+                }
+                let Some(s) = self.solo else { return };
+                if let Some(cmd) = text.strip_prefix('!') {
+                    if let Some(a) = self.agents.get_mut(&s) {
+                        a.push_user(&text);
+                    }
+                    self.hub.send(s, Cmd::Shell { command: cmd.trim().to_string() });
+                    return;
+                }
+                prompt_agent(&self.hub, &mut self.agents, s, text, true);
+            }
+            Screen::Zoom(a) => {
+                if self.in_run(a) {
+                    let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
+                    let t = text.clone();
+                    self.with_run(|r, c| r.direct(c, &name, &t));
+                } else {
+                    prompt_agent(&self.hub, &mut self.agents, a, text, true);
+                }
+            }
+            Screen::Stage => {
+                if self.run.is_none() || !self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
+                    self.start_run(&text);
+                    return;
+                }
+                if let Some(rest) = text.strip_prefix('@') {
+                    let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let (name, msg) = (name.to_string(), msg.trim().to_string());
+                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg)).unwrap_or(false);
+                    if !ok {
+                        self.toast(format!("no agent named @{name}"), Level::Warn);
+                    }
+                    return;
+                }
+                self.with_run(|r, c| r.user_input(c, &text));
+            }
+            _ => {}
+        }
+    }
+
+    fn command(&mut self, line: &str) {
+        let (cmd, arg) = line.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((line, ""));
+        let target = self.focus_agent();
+        match cmd {
+            "/quit" | "/exit" | "/q" => self.quit = true,
+            "/help" => self.overlays.push(Overlay::Help),
+            "/model" => {
+                if arg.is_empty() {
+                    let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
+                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
+                    self.overlays.push(Overlay::ModelPicker { sel, target });
+                } else if let Some(a) = target {
+                    self.set_model(a, arg);
+                }
+            }
+            "/effort" => match target {
+                Some(a) if !arg.is_empty() => self.set_effort(a, arg),
+                _ => self.toast("usage: /effort low|medium|high|xhigh|max", Level::Info),
+            },
+            "/approvals" => {
+                if ["untrusted", "on-request", "never"].contains(&arg) {
+                    self.set_approval_mode(arg);
+                } else {
+                    self.toast("usage: /approvals untrusted|on-request|never", Level::Info);
+                }
+            }
+            "/new" | "/clear" => {
+                self.start_solo();
+                self.screen = Screen::Solo;
+                self.toast("fresh session", Level::Ok);
+            }
+            "/compact" => {
+                if let Some(a) = target {
+                    self.compact_agent(a);
+                }
+            }
+            "/diff" => {
+                if let Some(a) = target {
+                    self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
+                }
+            }
+            "/mandala" | "/stage" => self.screen = Screen::Stage,
+            "/solo" => self.screen = Screen::Solo,
+            "/run" => {
+                if arg.is_empty() {
+                    self.screen = Screen::Stage;
+                    self.toast("describe what to build in the stage prompt", Level::Info);
+                } else {
+                    self.start_run(arg);
+                }
+            }
+            "/pattern" => {
+                if arg.is_empty() {
+                    let list = Pattern::list(&self.project);
+                    let sel = list.iter().position(|p| *p == self.pattern_name).unwrap_or(0);
+                    self.overlays.push(Overlay::Patterns { sel, list });
+                } else {
+                    self.pattern_name = arg.to_string();
+                    self.toast(format!("pattern for new runs: {arg}"), Level::Info);
+                }
+            }
+            "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
+            "/pause" => {
+                self.with_run(|r, c| r.toggle_pause(c));
+            }
+            "/land" => {
+                if self.run.as_ref().map(|r| r.stage == Stage::Done).unwrap_or(false) {
+                    self.with_run(|r, c| r.land(c));
+                } else {
+                    self.toast("no finished run to land", Level::Warn);
+                }
+            }
+            "/studio" => self.open_studio(),
+            "/models" => self.screen = Screen::Models,
+            "/inbox" => self.overlays.push(Overlay::Inbox { sel: 0 }),
+            "/verbose" => self.verbose = !self.verbose,
+            _ => self.toast(format!("unknown command {cmd} — /help"), Level::Warn),
+        }
+    }
+
+    pub fn studio_architect_send(&mut self, text: String) {
+        let a = self.start_architect();
+        prompt_agent(&self.hub, &mut self.agents, a, text, true);
+    }
+
+    pub fn shutdown(&mut self) {
+        self.hub.shutdown_all();
+    }
+}

@@ -1,0 +1,767 @@
+//! Pattern Studio (roles, flow, settings + an architect agent) and the Models screen.
+
+use super::{theme, *};
+use crate::app::{App, EditTarget, Overlay, Screen};
+use crate::config::ProviderEntry;
+use crate::engine::pattern::{FinaleStep, Role, COLORS, KINDS};
+use crate::ui::input::{Act, Input};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Direction, Layout};
+
+const GLYPHS: &[&str] = &["✦", "◉", "◇", "◆", "◎", "▲", "■", "●", "★", "◈", "▣", "⬡", "♦", "▼"];
+const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "max_tokens", "description", "instructions"];
+const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase"];
+
+/// Entries in the left list: roles…, settings, flow
+fn entries(app: &App) -> Vec<String> {
+    let mut v: Vec<String> = app.studio.pattern.ordered_roles().into_iter().map(|(n, _)| n).collect();
+    v.push("⚙ settings".into());
+    v.push("⇢ flow".into());
+    v
+}
+
+fn flow_fields(app: &App) -> Vec<String> {
+    let mut v = vec!["planner".to_string(), "orchestrator".into(), "phase_gate".into(), "on_reprompt".into()];
+    for i in 0..app.studio.pattern.flow.finale.len() {
+        v.push(format!("finale[{i}].role"));
+        v.push(format!("finale[{i}].task"));
+        v.push(format!("finale[{i}].may_spawn"));
+    }
+    v.push("+ add finale step".into());
+    v
+}
+
+fn fields(app: &App, entry: &str) -> Vec<String> {
+    match entry {
+        "⚙ settings" => SETTING_FIELDS.iter().map(|s| s.to_string()).collect(),
+        "⇢ flow" => flow_fields(app),
+        _ => ROLE_FIELDS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn get_value(app: &App, entry: &str, field: &str) -> String {
+    let p = &app.studio.pattern;
+    match entry {
+        "⚙ settings" => {
+            let s = &p.settings;
+            match field {
+                "isolation" => s.isolation.clone(),
+                "max_parallel" => s.max_parallel.to_string(),
+                "worker_retries" => s.worker_retries.to_string(),
+                "review_plan" => s.review_plan.to_string(),
+                "orchestrator_context" => s.orchestrator_context.clone(),
+                "stall_minutes" => s.stall_minutes.to_string(),
+                "gate_max_rounds" => s.gate_max_rounds.to_string(),
+                "check_timeout_secs" => s.check_timeout_secs.to_string(),
+                "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
+                _ => String::new(),
+            }
+        }
+        "⇢ flow" => {
+            let f = &p.flow;
+            match field {
+                "planner" => f.planner.clone(),
+                "orchestrator" => f.orchestrator.clone(),
+                "phase_gate" => f.phase_gate.clone(),
+                "on_reprompt" => f.on_reprompt.clone(),
+                x if x.starts_with("finale[") => {
+                    let i: usize = x[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                    let st = f.finale.get(i).cloned().unwrap_or_default();
+                    if x.ends_with(".role") {
+                        st.role
+                    } else if x.ends_with(".task") {
+                        st.task
+                    } else {
+                        st.may_spawn.to_string()
+                    }
+                }
+                _ => String::new(),
+            }
+        }
+        role => {
+            let Some(r) = p.roles.get(role) else { return String::new() };
+            match field {
+                "kind" => r.kind.clone(),
+                "glyph" => r.glyph.clone(),
+                "color" => r.color.clone(),
+                "model" => r.model.clone(),
+                "effort" => r.effort.clone(),
+                "sandbox" => r.sandbox.clone(),
+                "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
+                "description" => r.description.clone(),
+                "instructions" => r.instructions.clone(),
+                _ => String::new(),
+            }
+        }
+    }
+}
+
+fn cycle<T: AsRef<str>>(list: &[T], cur: &str, d: i32) -> String {
+    let n = list.len() as i32;
+    if n == 0 {
+        return cur.to_string();
+    }
+    let i = list.iter().position(|x| x.as_ref() == cur).map(|i| i as i32).unwrap_or(-1);
+    list[((i + d).rem_euclid(n)) as usize].as_ref().to_string()
+}
+
+/// ←/→ on a field: cycle enumerations / step numbers / toggle booleans.
+fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
+    let aliases: Vec<String> = app.registry.models.iter().map(|m| m.alias.clone()).collect();
+    let roles: Vec<String> = app.studio.pattern.roles.keys().cloned().collect();
+    let p = &mut app.studio.pattern;
+    let step_u = |v: &mut usize, lo: usize| *v = ((*v as i64 + d as i64).max(lo as i64)) as usize;
+    match entry {
+        "⚙ settings" => {
+            let s = &mut p.settings;
+            match field {
+                "isolation" => s.isolation = cycle(&["auto", "worktree", "shared"], &s.isolation, d),
+                "max_parallel" => step_u(&mut s.max_parallel, 1),
+                "worker_retries" => s.worker_retries = (s.worker_retries as i32 + d).max(0) as u32,
+                "review_plan" => s.review_plan = !s.review_plan,
+                "orchestrator_context" => s.orchestrator_context = cycle(&["fresh", "compact"], &s.orchestrator_context, d),
+                "stall_minutes" => s.stall_minutes = (s.stall_minutes as i64 + d as i64).max(1) as u64,
+                "gate_max_rounds" => s.gate_max_rounds = (s.gate_max_rounds as i32 + d).max(1) as u32,
+                "check_timeout_secs" => s.check_timeout_secs = (s.check_timeout_secs as i64 + 60 * d as i64).max(60) as u64,
+                "max_tasks_per_phase" => step_u(&mut s.max_tasks_per_phase, 1),
+                _ => return,
+            }
+        }
+        "⇢ flow" => {
+            let f = &mut p.flow;
+            match field {
+                "planner" => f.planner = cycle(&roles, &f.planner, d),
+                "orchestrator" => f.orchestrator = cycle(&roles, &f.orchestrator, d),
+                "phase_gate" => f.phase_gate = cycle(&roles, &f.phase_gate, d),
+                "on_reprompt" => f.on_reprompt = cycle(&roles, &f.on_reprompt, d),
+                x if x.starts_with("finale[") => {
+                    let i: usize = x[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                    if let Some(st) = f.finale.get_mut(i) {
+                        if x.ends_with(".role") {
+                            st.role = cycle(&roles, &st.role, d);
+                        } else if x.ends_with(".may_spawn") {
+                            st.may_spawn = !st.may_spawn;
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+        role => {
+            let reg = app.registry.clone();
+            let Some(r) = p.roles.get_mut(role) else { return };
+            match field {
+                "kind" => r.kind = cycle(KINDS, &r.kind, d),
+                "glyph" => r.glyph = cycle(GLYPHS, &r.glyph, d),
+                "color" => r.color = cycle(COLORS, &r.color, d),
+                "model" => {
+                    r.model = cycle(&aliases, &r.model, d);
+                    r.effort = reg.resolve(&r.model).resolve_effort(&r.effort);
+                }
+                "effort" => {
+                    let effs = reg.resolve(&r.model).efforts();
+                    r.effort = cycle(&effs, &r.effort, d);
+                }
+                "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
+                "max_tokens" => {
+                    let cur = r.max_tokens.unwrap_or(0) as i64;
+                    let next = cur + d as i64 * 250_000;
+                    r.max_tokens = if next <= 0 { None } else { Some(next as u64) };
+                }
+                _ => return,
+            }
+        }
+    }
+    app.studio.dirty = true;
+}
+
+pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
+    match target {
+        EditTarget::RoleField(role, field) => {
+            if let Some(r) = app.studio.pattern.roles.get_mut(role) {
+                match field.as_str() {
+                    "description" => r.description = text.to_string(),
+                    "instructions" => r.instructions = text.to_string(),
+                    "glyph" => r.glyph = text.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+                    "model" => r.model = text.to_string(),
+                    "effort" => r.effort = text.to_string(),
+                    "max_tokens" => r.max_tokens = text.replace(['_', ','], "").parse().ok(),
+                    _ => {}
+                }
+                app.studio.dirty = true;
+            }
+        }
+        EditTarget::Setting(field) => {
+            let s = &mut app.studio.pattern.settings;
+            let n: Option<u64> = text.trim().parse().ok();
+            match (field.as_str(), n) {
+                ("max_parallel", Some(v)) => s.max_parallel = v.max(1) as usize,
+                ("worker_retries", Some(v)) => s.worker_retries = v as u32,
+                ("stall_minutes", Some(v)) => s.stall_minutes = v.max(1),
+                ("gate_max_rounds", Some(v)) => s.gate_max_rounds = v.max(1) as u32,
+                ("check_timeout_secs", Some(v)) => s.check_timeout_secs = v.max(10),
+                ("max_tasks_per_phase", Some(v)) => s.max_tasks_per_phase = v.max(1) as usize,
+                _ => {}
+            }
+            app.studio.dirty = true;
+        }
+        EditTarget::FlowStep(i, field) => {
+            if let Some(st) = app.studio.pattern.flow.finale.get_mut(*i) {
+                if field == "task" {
+                    st.task = text.to_string();
+                } else if field == "role" {
+                    st.role = text.to_string();
+                }
+                app.studio.dirty = true;
+            }
+        }
+        EditTarget::NewRole => {
+            let name = crate::util::slug(text);
+            if name.is_empty() || app.studio.pattern.roles.contains_key(&name) {
+                app.toast("role name empty or taken", crate::agent::Level::Warn);
+                return;
+            }
+            app.studio.pattern.roles.insert(name.clone(), Role { description: "new role".into(), ..Default::default() });
+            app.studio.dirty = true;
+            let es = entries(app);
+            app.studio.sel = es.iter().position(|e| *e == name).unwrap_or(0);
+            app.studio.focus = 1;
+        }
+        EditTarget::NewPattern => {
+            let name = crate::util::slug(text);
+            if name.is_empty() {
+                return;
+            }
+            app.studio.pattern.name = name.clone();
+            app.studio.dirty = true;
+            app.toast(format!("renamed to {name} — ctrl+s saves it as a new pattern"), crate::agent::Level::Info);
+        }
+        EditTarget::ModelCell(row, col) => {
+            if let Some(m) = app.registry.models.get_mut(*row) {
+                let t = text.trim().to_string();
+                match col {
+                    0 => m.alias = crate::util::slug(&t),
+                    1 => m.provider = t,
+                    2 => m.model = t,
+                    3 => m.context_window = parse_tokens(&t),
+                    4 => m.auto_compact_percent = t.trim_end_matches('%').parse().ok().map(|v: u8| v.clamp(10, 99)),
+                    5 => m.default_effort = t,
+                    6 => m.efforts = t.split([',', ' ']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    7 => m.note = t,
+                    _ => {}
+                }
+                app.models_ui.dirty = true;
+            }
+        }
+        EditTarget::ProviderCell(row, col) => {
+            if let Some(p) = app.registry.providers.get_mut(*row) {
+                let t = text.trim().to_string();
+                match col {
+                    0 => p.id = crate::util::slug(&t).replace('-', "_"),
+                    1 => p.name = t,
+                    2 => p.base_url = t,
+                    3 => p.env_key = t,
+                    _ => {}
+                }
+                app.models_ui.dirty = true;
+            }
+        }
+    }
+}
+
+fn parse_tokens(t: &str) -> Option<u64> {
+    let t = t.trim().to_lowercase().replace([',', '_'], "");
+    if t.is_empty() || t == "none" || t == "default" {
+        return None;
+    }
+    if let Some(k) = t.strip_suffix('k') {
+        return k.parse::<f64>().ok().map(|v| (v * 1000.0) as u64);
+    }
+    if let Some(m) = t.strip_suffix('m') {
+        return m.parse::<f64>().ok().map(|v| (v * 1_000_000.0) as u64);
+    }
+    t.parse().ok()
+}
+
+// ───────────────────────────── studio ─────────────────────────────
+
+pub fn draw_studio(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(8), Constraint::Length(9), Constraint::Length(1)]).split(area);
+    let errs = app.studio.pattern.validate().err().unwrap_or_default();
+    app.studio.errors = errs.clone();
+    let mut crumbs = vec![Span::styled(format!("  {} studio  ", theme::g("›", ">")), theme::faint()), Span::styled(app.studio.pattern.name.clone(), theme::bold(theme::fg(theme::VIOLET)))];
+    if app.studio.dirty {
+        crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
+    }
+    let right = if errs.is_empty() { vec![Span::styled(format!("{} valid ", theme::g("✓", "ok")), theme::fg(theme::GREEN))] } else { vec![Span::styled(format!("{} {} issue(s) ", theme::g("✗", "x"), errs.len()), theme::fg(theme::RED))] };
+    header(f, rows[0], crumbs, right);
+
+    let wide = rows[1].width >= 120;
+    let cols = if wide {
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(36), Constraint::Min(40), Constraint::Length(46)]).split(rows[1])
+    } else {
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
+    };
+    let es = entries(app);
+    let sel = app.studio.sel.min(es.len() - 1);
+    let flash = anim::fade(app.studio.flash, 900);
+    // list
+    let mut l = vec![];
+    for (i, e) in es.iter().enumerate() {
+        let is = i == sel;
+        let st = if is { theme::bold(theme::accent()) } else { theme::text() };
+        match app.studio.pattern.roles.get(e) {
+            Some(r) => l.push(Line::from(vec![
+                Span::styled(if is { format!(" {} ", theme::g("▶", ">")) } else { "   ".into() }, st),
+                Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
+                Span::styled(format!("{:<13}", trunc(e, 13)), st),
+                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (cols[0].width as usize).saturating_sub(22)), theme::faint()),
+            ])),
+            None => {
+                if i > 0 && app.studio.pattern.roles.contains_key(&es[i - 1]) {
+                    l.push(Line::default());
+                }
+                l.push(Line::from(vec![Span::styled(if is { format!(" {} ", theme::g("▶", ">")) } else { "   ".into() }, st), Span::styled(e.clone(), st)]));
+            }
+        }
+    }
+    let lcol = if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT };
+    let lcol_blk = if flash > 0.0 { theme::SAFFRON } else { lcol };
+    f.render_widget(Paragraph::new(l).block(block("roles", lcol_blk)), cols[0]);
+
+    // fields
+    let entry = es[sel].clone();
+    let fs = fields(app, &entry);
+    let fsel = app.studio.field.min(fs.len().saturating_sub(1));
+    let fw = cols[1].width.saturating_sub(22) as usize;
+    let mut fl = vec![];
+    if let Some(r) = app.studio.pattern.roles.get(&entry) {
+        fl.push(Line::from(vec![Span::styled(format!(" {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(entry.clone(), theme::bold(theme::text())), Span::styled(format!("  {}", r.description), theme::dim())]));
+        fl.push(Line::default());
+    }
+    for (i, fname) in fs.iter().enumerate() {
+        let v = get_value(app, &entry, fname);
+        let is = i == fsel && app.studio.focus == 1;
+        let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
+        let shown = if fname == "instructions" || fname.ends_with(".task") {
+            let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+            format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
+        } else {
+            trunc(&v, fw)
+        };
+        let vstyle = match fname.as_str() {
+            "effort" => theme::fg(effort_color(&v)),
+            "color" => theme::fg(theme::named(&v)),
+            _ => theme::text(),
+        };
+        let arrows = if is { format!(" {}", theme::g("◂ ▸", "< >")) } else { String::new() };
+        fl.push(Line::from(vec![Span::styled(format!(" {}{:<20}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
+    }
+    fl.push(Line::default());
+    fl.push(Line::from(Span::styled(" ←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())));
+    let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
+    f.render_widget(Paragraph::new(fl).block(block(&entry, fcol)), cols[1]);
+
+    // flow preview + validation
+    if wide {
+        let p = &app.studio.pattern;
+        let rg = |name: &str| -> Vec<Span<'static>> {
+            match p.roles.get(name) {
+                Some(r) => vec![Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(name.to_string(), theme::text()), Span::styled(format!(" {}·{}", r.model, r.effort), theme::faint())],
+                None => vec![Span::styled(format!("? {name}"), theme::fg(theme::RED))],
+            }
+        };
+        let arrow = |t: &str| Line::from(Span::styled(format!("   {} {t}", theme::g("↓", "v")), theme::faint()));
+        let mut pl = vec![];
+        let row = |v: Vec<Span<'static>>| -> Line<'static> {
+            let mut s = vec![Span::raw(" ")];
+            s.extend(v);
+            Line::from(s)
+        };
+        pl.push(row(rg(&p.flow.planner)));
+        pl.push(arrow("writes the phased plan"));
+        pl.push(row(rg(&p.flow.orchestrator)));
+        pl.push(arrow(&format!("spawns ≤{} in parallel / phase", p.settings.max_parallel)));
+        let mut ws = vec![];
+        for w in p.worker_roles() {
+            ws.extend(rg(&w));
+            ws.push(Span::raw("  "));
+        }
+        pl.push(row(ws));
+        pl.push(arrow(if p.settings.isolation == "shared" { "checks" } else { "merge + checks" }));
+        pl.push(row(rg(&p.flow.phase_gate)));
+        if !p.flow.finale.is_empty() {
+            pl.push(arrow("after the last phase"));
+            for s in &p.flow.finale {
+                let mut v = rg(&s.role);
+                if s.may_spawn {
+                    v.push(Span::styled(" +spawn", theme::fg(theme::ROSE)));
+                }
+                pl.push(row(v));
+            }
+        }
+        pl.push(Line::default());
+        pl.push(Line::from(vec![Span::styled(" re-prompt → ", theme::faint()), Span::styled(p.flow.on_reprompt.clone(), theme::text())]));
+        pl.push(Line::default());
+        for e in errs.iter().take(6) {
+            pl.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, 42)), theme::fg(theme::RED))));
+        }
+        f.render_widget(Paragraph::new(pl).block(block("flow", theme::FAINT)), cols[2]);
+    }
+
+    // architect
+    let acol = if app.studio.focus == 2 { theme::SAFFRON } else { theme::FAINT };
+    let blk = block(&format!("{} architect — describe a change, it edits the pattern live", theme::g("★", "*")), acol);
+    let inner = blk.inner(rows[2]);
+    f.render_widget(blk, rows[2]);
+    let mut al: Vec<Line> = vec![];
+    if let Some(a) = app.studio.architect.and_then(|a| app.agents.get(&a)) {
+        for t in a.tail_lines(inner.height.saturating_sub(2) as usize) {
+            al.push(Line::from(Span::styled(format!(" {}", trunc(&t, (inner.width as usize).saturating_sub(2))), theme::dim())));
+        }
+        if let Some(b) = busy_line(a) {
+            al.push(b);
+        }
+    } else {
+        al.push(Line::from(Span::styled(" e.g. \"add a docs writer after security\" · \"make workers cheaper\" · \"two QA gates per phase\"", theme::faint())));
+    }
+    let keep = inner.height.saturating_sub(1) as usize;
+    let start = al.len().saturating_sub(keep);
+    f.render_widget(Paragraph::new(al[start..].to_vec()), Rect { height: inner.height.saturating_sub(1), ..inner });
+    let ir = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+    let (rws, _, cc) = app.studio.input.layout(ir.width.saturating_sub(3) as usize);
+    let txt = rws.last().cloned().unwrap_or_default();
+    let shown = if app.studio.input.is_empty() && app.studio.focus != 2 { Span::styled("tab here to talk to the architect", theme::faint()) } else { Span::styled(txt, theme::text()) };
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{} ", theme::g("›", ">")), theme::bold(theme::accent())), shown])), ir);
+    if app.studio.focus == 2 {
+        f.set_cursor_position((ir.x + 2 + cc as u16, ir.y));
+    }
+    footer(f, rows[3], &[("tab", "focus"), ("↑↓", "select"), ("←→", "change"), ("⏎", "edit"), ("ctrl+s", "save"), ("esc", "back")]);
+}
+
+pub fn studio_key(app: &mut App, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && k.code == KeyCode::Char('s') {
+        match app.studio.pattern.validate() {
+            Ok(()) => match app.studio.pattern.save() {
+                Ok(p) => {
+                    app.studio.dirty = false;
+                    app.pattern_name = app.studio.pattern.name.clone();
+                    app.toast(format!("saved {}", home_rel(&p)), crate::agent::Level::Ok);
+                }
+                Err(e) => app.toast(format!("save failed: {e}"), crate::agent::Level::Error),
+            },
+            Err(errs) => app.toast(format!("fix first: {}", errs[0]), crate::agent::Level::Error),
+        }
+        return;
+    }
+    if k.code == KeyCode::Tab {
+        app.studio.focus = (app.studio.focus + 1) % 3;
+        return;
+    }
+    if k.code == KeyCode::BackTab {
+        app.studio.focus = (app.studio.focus + 2) % 3;
+        return;
+    }
+    if app.studio.focus == 2 {
+        if k.code == KeyCode::Esc {
+            app.studio.focus = 0;
+            return;
+        }
+        if let Act::Submit = app.studio.input.key(k) {
+            let t = app.studio.input.take();
+            if !t.trim().is_empty() {
+                app.studio_architect_send(t);
+            }
+        }
+        return;
+    }
+    let es = entries(app);
+    let entry = es[app.studio.sel.min(es.len() - 1)].clone();
+    let fs = fields(app, &entry);
+    match k.code {
+        KeyCode::Esc => {
+            app.screen = if app.run.is_some() { Screen::Stage } else { Screen::Solo };
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.studio.focus == 0 {
+                app.studio.sel = app.studio.sel.saturating_sub(1);
+                app.studio.field = 0;
+            } else {
+                app.studio.field = app.studio.field.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.studio.focus == 0 {
+                app.studio.sel = (app.studio.sel + 1).min(es.len() - 1);
+                app.studio.field = 0;
+            } else {
+                app.studio.field = (app.studio.field + 1).min(fs.len().saturating_sub(1));
+            }
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+            if app.studio.focus == 0 {
+                app.studio.focus = 1;
+                return;
+            }
+            let d = if matches!(k.code, KeyCode::Left | KeyCode::Char('h')) { -1 } else { 1 };
+            if let Some(fname) = fs.get(app.studio.field) {
+                nudge(app, &entry, fname, d);
+            }
+        }
+        KeyCode::Enter => {
+            if app.studio.focus == 0 {
+                app.studio.focus = 1;
+                return;
+            }
+            let Some(fname) = fs.get(app.studio.field).cloned() else { return };
+            if fname == "+ add finale step" {
+                let first_gate = app.studio.pattern.roles.iter().find(|(_, r)| r.kind == "gate").map(|(n, _)| n.clone()).unwrap_or_default();
+                app.studio.pattern.flow.finale.push(FinaleStep { role: first_gate, task: "Describe what this step should do.".into(), may_spawn: false });
+                app.studio.dirty = true;
+                return;
+            }
+            let target = match entry.as_str() {
+                "⚙ settings" => EditTarget::Setting(fname.clone()),
+                "⇢ flow" if fname.starts_with("finale[") => {
+                    let i: usize = fname[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                    if fname.ends_with(".task") {
+                        EditTarget::FlowStep(i, "task".into())
+                    } else {
+                        return nudge(app, &entry, &fname, 1);
+                    }
+                }
+                "⇢ flow" => return nudge(app, &entry, &fname, 1),
+                role => {
+                    if ["kind", "color", "sandbox", "effort", "model"].contains(&fname.as_str()) {
+                        return nudge(app, &entry, &fname, 1);
+                    }
+                    EditTarget::RoleField(role.to_string(), fname.clone())
+                }
+            };
+            let mut input = Input::default();
+            input.set(&get_value(app, &entry, &fname));
+            app.overlays.push(Overlay::Edit { title: format!("{entry} · {fname}"), input, target });
+        }
+        KeyCode::Char('n') => app.overlays.push(Overlay::Edit { title: "new role name".into(), input: Input::default(), target: EditTarget::NewRole }),
+        KeyCode::Char('r') => {
+            let mut input = Input::default();
+            input.set(&app.studio.pattern.name);
+            app.overlays.push(Overlay::Edit { title: "pattern name (saving under a new name creates a copy)".into(), input, target: EditTarget::NewPattern });
+        }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if entry == "⇢ flow" {
+                if let Some(fname) = fs.get(app.studio.field) {
+                    if let Some(i) = fname.strip_prefix("finale[").and_then(|x| x.split(']').next()).and_then(|n| n.parse::<usize>().ok()) {
+                        app.studio.pattern.flow.finale.remove(i);
+                        app.studio.dirty = true;
+                        app.studio.field = 0;
+                    }
+                }
+                return;
+            }
+            if app.studio.pattern.roles.contains_key(&entry) {
+                let fl = &app.studio.pattern.flow;
+                let used = [&fl.planner, &fl.orchestrator, &fl.phase_gate, &fl.on_reprompt].iter().any(|x| **x == entry) || fl.finale.iter().any(|s| s.role == entry);
+                if used {
+                    app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
+                } else {
+                    app.studio.pattern.roles.remove(&entry);
+                    app.studio.dirty = true;
+                    app.studio.sel = app.studio.sel.saturating_sub(1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ───────────────────────────── models ─────────────────────────────
+
+const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
+const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key"];
+
+pub fn draw_models(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let np = app.registry.providers.len() as u16;
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 7), Constraint::Length(1)]).split(area);
+    let mut crumbs = vec![Span::styled(format!("  {} models", theme::g("›", ">")), theme::faint())];
+    if app.models_ui.dirty {
+        crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
+    }
+    header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
+    let widths = [10usize, 9, 18, 9, 8, 8, 30, 30];
+    let mk_head = |cols: &[&str], ws: &[usize]| Line::from(cols.iter().zip(ws).map(|(c, w)| Span::styled(format!(" {:<w$}", c, w = *w), theme::bold(theme::muted()))).collect::<Vec<_>>());
+    let mut l = vec![mk_head(MODEL_COLS, &widths)];
+    for (ri, m) in app.registry.models.iter().enumerate() {
+        let status = app.models_ui.status.get(&m.alias).cloned().unwrap_or_else(|| m.note.clone());
+        let vals = [
+            m.alias.clone(),
+            m.provider.clone(),
+            m.model.clone(),
+            m.context_window.map(fmt_tokens).unwrap_or_else(|| "default".into()),
+            match (m.auto_compact_percent, m.context_window) {
+                (Some(p), Some(_)) => format!("{p}%"),
+                (Some(p), None) => format!("{p}% {}", theme::g("⚠", "!")),
+                _ => "codex".into(),
+            },
+            if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
+            if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
+            status,
+        ];
+        let mut spans = vec![];
+        for (ci, v) in vals.iter().enumerate() {
+            let is = !app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
+            let st = if is {
+                Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if ci == 5 {
+                theme::fg(effort_color(v))
+            } else if ci == 7 && v.starts_with("ok") {
+                theme::fg(theme::GREEN)
+            } else if ci == 7 && v.starts_with("error") {
+                theme::fg(theme::RED)
+            } else if ri == app.models_ui.row && !app.models_ui.providers {
+                theme::text()
+            } else {
+                theme::muted()
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{:<w$}", trunc(v, widths[ci]), w = widths[ci]), st));
+        }
+        l.push(Line::from(spans));
+    }
+    l.push(Line::default());
+    l.push(Line::from(Span::styled(" context + compact % are passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
+    l.push(Line::from(Span::styled(" compact \"codex\" = Codex's own default · a % needs a context size to take effect (⚠) · +/- steps values", theme::faint())));
+    let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
+    f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
+
+    let pw = [10usize, 14, 42, 18];
+    let mut pl = vec![mk_head(PROV_COLS, &pw)];
+    pl.push(Line::from(vec![Span::styled(format!(" {:<10} {:<12} {:<40}", "openai", "OpenAI", "(built into Codex — uses your codex login)"), theme::faint())]));
+    for (ri, p) in app.registry.providers.iter().enumerate() {
+        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()];
+        let mut spans = vec![];
+        for (ci, v) in vals.iter().enumerate() {
+            let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
+            let st = if is { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { theme::text() };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
+        }
+        let key_ok = !p.env_key.is_empty() && std::env::var(&p.env_key).is_ok();
+        spans.push(Span::styled(if key_ok { format!(" {} key set", theme::g("✓", "ok")) } else { format!(" {} ${} not set", theme::g("✗", "x"), p.env_key) }, if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+        let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
+        spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
+        pl.push(Line::from(spans));
+    }
+    pl.push(Line::from(Span::styled(" base_url = the provider's OpenAI-compatible API root (…/v1): Codex calls …/responses, discovery reads …/models", theme::faint())));
+    pl.push(Line::from(Span::styled(" env_key = the NAME of the environment variable holding the API key (the key itself is never stored) · D here = discover this provider", theme::faint())));
+    let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
+    f.render_widget(Paragraph::new(pl).block(block("providers (OpenAI Responses-compatible)", pcol)), rows[2]);
+    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", "test model"), ("D", "discover models"), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
+}
+
+pub fn models_key(app: &mut App, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let ui = &mut app.models_ui;
+    let (nrows, ncols) = if ui.providers { (app.registry.providers.len(), PROV_COLS.len()) } else { (app.registry.models.len(), MODEL_COLS.len()) };
+    if ctrl && k.code == KeyCode::Char('s') {
+        match app.registry.save() {
+            Ok(()) => {
+                app.models_ui.dirty = false;
+                app.toast("models saved — new agents use these settings", crate::agent::Level::Ok);
+            }
+            Err(e) => app.toast(format!("save failed: {e}"), crate::agent::Level::Error),
+        }
+        return;
+    }
+    match k.code {
+        KeyCode::Esc => app.screen = if app.run.is_some() { Screen::Stage } else { Screen::Solo },
+        KeyCode::Tab => {
+            ui.providers = !ui.providers;
+            ui.row = 0;
+            ui.col = 0;
+        }
+        KeyCode::Up => ui.row = ui.row.saturating_sub(1),
+        KeyCode::Down => ui.row = (ui.row + 1).min(nrows.saturating_sub(1)),
+        KeyCode::Left => ui.col = ui.col.saturating_sub(1),
+        KeyCode::Right => ui.col = (ui.col + 1).min(ncols - 1),
+        KeyCode::Char('+') | KeyCode::Char('-') if !ui.providers => {
+            let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
+            if let Some(m) = app.registry.models.get_mut(ui.row) {
+                match ui.col {
+                    3 => {
+                        const P: &[u64] = &[128_000, 200_000, 272_000, 400_000, 1_000_000];
+                        let cur = m.context_window.unwrap_or(0);
+                        let i = P.iter().position(|x| *x >= cur).unwrap_or(P.len()) as i64;
+                        let j = (i + d).clamp(0, P.len() as i64 - 1) as usize;
+                        m.context_window = Some(P[j]);
+                    }
+                    4 => m.auto_compact_percent = Some((m.auto_compact_percent.unwrap_or(85) as i64 + 5 * d).clamp(10, 99) as u8),
+                    5 => {
+                        let e = m.step_effort(&m.default_effort.clone(), d as i32);
+                        m.default_effort = e;
+                    }
+                    _ => {}
+                }
+                app.models_ui.dirty = true;
+            }
+        }
+        KeyCode::Enter => {
+            let (title, val, target) = if ui.providers {
+                let Some(p) = app.registry.providers.get(ui.row) else { return };
+                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()][ui.col.min(3)].clone();
+                (format!("provider · {}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
+            } else {
+                let Some(m) = app.registry.models.get(ui.row) else { return };
+                let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), m.note.clone()][ui.col].clone();
+                (format!("{} · {}  (context accepts 400k / 1m)", m.alias, MODEL_COLS[ui.col]), v, EditTarget::ModelCell(ui.row, ui.col))
+            };
+            let mut input = Input::default();
+            input.set(&val);
+            app.overlays.push(Overlay::Edit { title, input, target });
+        }
+        KeyCode::Char('n') => {
+            if ui.providers {
+                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into() });
+                ui.row = app.registry.providers.len() - 1;
+            } else {
+                app.registry.models.push(crate::config::ModelEntry { alias: format!("model{}", app.registry.models.len() + 1), model: "model-id".into(), ..Default::default() });
+                ui.row = app.registry.models.len() - 1;
+            }
+            app.models_ui.dirty = true;
+        }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if ui.providers {
+                if ui.row < app.registry.providers.len() {
+                    app.registry.providers.remove(ui.row);
+                }
+            } else if ui.row < app.registry.models.len() && app.registry.models.len() > 1 {
+                app.registry.models.remove(ui.row);
+            }
+            app.models_ui.row = app.models_ui.row.saturating_sub(1);
+            app.models_ui.dirty = true;
+        }
+        KeyCode::Char('t') if !ui.providers => {
+            if let Some(m) = app.registry.models.get(ui.row) {
+                let alias = m.alias.clone();
+                app.probe_model(&alias);
+            }
+        }
+        KeyCode::Char('D') | KeyCode::Char('d') => {
+            if ui.providers {
+                match app.registry.providers.get(ui.row).map(|p| p.id.clone()) {
+                    Some(id) => app.discover(Some(id)),
+                    None => app.toast("add a provider first (n)", crate::agent::Level::Info),
+                }
+            } else {
+                app.discover(None);
+            }
+        }
+        _ => {}
+    }
+}
