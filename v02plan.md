@@ -134,12 +134,15 @@ status_color` (delete), `ui/theme.rs:226 gauge` (delete), `util.rs:37 unix_milli
 **1.3 Process exit reporting (F1, F2).**
 - `util.rs`: add `pub fn strip_ansi(s: &str) -> String` (remove `ESC [ … final-byte` CSI sequences, `ESC ] … BEL/ST`
   OSC sequences, and lone `ESC`). Unit test with the exact string from F1.
-- `rpc.rs:138-172` reader task: when stdout closes, capture the child's exit status
-  (`child.wait()` with a 2 s timeout) and send `Incoming::Closed { code: Option<i32>, stderr_tail }` with the
-  tail already ANSI-stripped and limited to the last 5 lines.
+- `rpc.rs:138-172` reader task only owns `stdout`; the `Child` handle is returned to the caller
+  (`rpc.rs:174`) and lives in `run_process`. So the exit code is captured in **`hub.rs:322-326`** (the
+  `Incoming::Closed` arm of `run_process`, which already calls `child.kill()`): first `child.try_wait()`, else
+  `tokio::time::timeout(2s, child.wait())`, else kill. `Incoming::Closed { stderr_tail }` keeps its shape; the
+  tail is ANSI-stripped and limited to the last 5 lines in `rpc.rs` where `tail` is collected.
 - `hub.rs:185-337 run_process`: the crash reason becomes `"codex exited (code {code}): {last non-warning
-  stderr line}"`; when the failure was an RPC error (`thread start failed: …`, `hub.rs:246-249`) keep that
-  text first and append the stderr tail after ` — `.
+  stderr line}"` (a line containing `WARNING`/`bubblewrap` is skipped when a later line exists); when the failure
+  was an RPC error (`thread start failed: …`, `hub.rs:246-249`) keep that text first and append the stderr
+  tail after ` — `.
 - `engine/run.rs:214-227 Run::log`: apply `strip_ansi` to every journal line defensively.
 - `hub.rs:75-81 Hub::spawn`: keep a `last_spawn: Instant` on `Hub`; if the previous spawn was < 300 ms ago,
   sleep the difference inside `agent_task` before `run_process` (staggers F2 without changing callers).
@@ -173,8 +176,11 @@ Changes (`config.rs`, `app.rs`, `discover.rs`, `ui/studio.rs`):
    values are derived, instead of `codex` / the ⚠. Remove the ⚠ path (the coupling it warned about is gone).
 5. Context-full handling in `engine/run.rs:951-970` stays; additionally, when `ErrKind::ContextFull` is seen
    for a model whose `context_window` was *assumed*, halve the assumed value for that agent's next attempt and
-   log `context window assumed 200k was too large for <model>; using 100k — set it in /models`. Implement by
-   passing an `Option<u64>` override through `SpawnReq` (`engine/run.rs:37`) → `spawn_agent`.
+   log `context window assumed 200k was too large for <model>; using 100k — set it in /models`. Implement as a
+   two-hop field: `SpawnReq.context_override: Option<u64>` (`engine/run.rs:37-46`) is copied by `Ctxt::spawn`
+   (`app.rs:264-285`) into `AgentOpts.context_override` (`app.rs:158-171`), and `spawn_agent` (`app.rs:182`)
+   uses `o.context_override.unwrap_or(m.effective_context())`. `Run` remembers the halved value per task in
+   `Worker` so `retry_worker`/`respawn` reuse it.
 6. README "Context & compaction": replace the "Without them, Codex's own defaults apply" sentence with the
    new rule (200k assumed, 85%, always sent).
 
@@ -193,7 +199,8 @@ compacted` line instead of a failure.
 (`studio.rs:157`). Replace `sel: usize` with `sel: StudioSel` where
 `enum StudioSel { Role(String /*name*/), Settings, Flow }`. Provide `fn sel_index(app) -> usize` for drawing
 and `fn select_by_index(app, i)` for ↑/↓. Every mutation site that used `sel` numerically
-(`studio.rs:309-310,337,483-484,506-514,540-541,229-230`) goes through these two helpers. Renaming a role
+(`studio.rs:230` new-role select, `:310` and `:337` draw, `:484` key dispatch, `:492`/`:500` Up/Down,
+`:575` role delete) goes through these two helpers. Renaming a role
 updates `StudioSel::Role` to the new name.
 
 **3.2 Per-role `permission` field (`engine/pattern.rs:11-27`, `ui/studio.rs:13`, `app.rs:278`).**
@@ -236,7 +243,10 @@ Rows in the ctrl+k picker already carry `m.provider` (`ui/overlays.rs:84`) but o
 5. **4.4 Provider test sends a developer message (F4).** The `/models` `t` test (`studio.rs` → the live test
    path in `app.rs`) currently starts a plain turn. Make the test prompt include developer instructions
    (`developerInstructions` in `thread/start`, `hub.rs:207-243`, already supported) so a provider that rejects
-   the `developer` role fails the test with the provider's message shown in the `note / test` column.
+   the `developer` role fails the test with the provider's message shown in the `note / test` column. This
+   probe is Codex-specific (`developerInstructions` is a Codex `thread/start` param); the live test is
+   dispatched per backend — for a `ClaudeCode` provider (WP10.5) the test spawns the Claude process with
+   `--append-system-prompt` and a one-line prompt instead.
 
 Tests: snapshot `key:ctrl+k;snap:picker` at 120×36 shows `via`; `key:+` then reopen — the row shows the new
 context and `models.toml` on disk changed.
@@ -274,7 +284,8 @@ Today only the env var *name* is stored (`config.rs:227-240`) and the child inhe
 
 ### WP6 — Replace "Pause" with a typed Halt
 
-`run.paused` (`engine/run.rs:108`) is set by four sites with two different behaviours (`run.rs:1224-1252`
+`Run.paused` (`engine/run.rs:136`; **not** `Worker.paused` at `run.rs:108`, which is the planner's per-agent
+`mantra_pause_agents` flag and stays untouched) is set by four sites with two different behaviours (`run.rs:1224-1252`
 interrupts everything; `run.rs:923` and `run.rs:1052` just flip the flag), and the UI shows an opaque
 `‖ PAUSED` badge (`ui/stage.rs:196-199`) that the user does not understand.
 
@@ -448,7 +459,10 @@ Design (applies to Solo, Zoom and `@name` messages from the stage; `!cmd` is unc
   **ctrl+x on an empty input** discards the whole queue (toast `queue cleared`).
 - Esc keeps all its current meanings (`app.rs:1257-1277`): back from zoom with empty input, interrupt when busy,
   clear input. No new Esc semantics.
-- Why ctrl+f: it is unbound everywhere (`app.rs:1098-1291`, `overlays.rs`, `studio.rs`, `input.rs`); ctrl+s is
+- Why ctrl+f: it is unbound in `app.rs:1098-1291`, `studio.rs` and `input.rs`. One collision must be fixed:
+  the plan-review overlay's `f` ("focus canvas", `overlays.rs:437`) matches `KeyCode::Char('f')` with any
+  modifier and overlays are dispatched first (`app.rs:1176-1179`); since WP8 opens that overlay while zoomed,
+  guard that arm with `!k.modifiers.contains(KeyModifiers::CONTROL)` so ctrl+f reaches the input. Also ctrl+s is
   taken by the Edit overlay and is XOFF in some terminals; ctrl+j / alt+⏎ insert newlines (`input.rs:119-126`).
   Add ctrl+f to the help overlay (`overlays.rs:50-60`), the README key lists, and the footer hints.
 
@@ -634,8 +648,16 @@ unchanged) or `run_claude_process`. Both return the same `Exit` and emit the sam
   (created at startup when any Claude provider exists; removed at exit). Each bridge connection is tagged by
   `agent`; a `tools/call` becomes `HubEvent::Request { agent, id: "cc-call-<n>", method: "item/tool/call",
   params: {"name", "arguments"} }` — exactly the shape `App::on_request` (`app.rs:929-983`) already dispatches
-  to the engine (`Run::on_tool_call`). `Cmd::Respond{id,result}` / `RespondErr` for a `cc-call-*` id writes the
-  reply line back to that connection. No engine or app code changes beyond accepting the id prefix.
+  to the engine (`Run::on_tool_call`). Reply routing: `Cmd::Respond{id,result}` / `RespondErr` are delivered to
+  the *per-agent* `run_claude_process` task (`Hub.agents` is one `mpsc::Sender<Cmd>` per agent, `hub.rs:59,75-81`),
+  so the bridge must not be a single shared acceptor that the per-agent task cannot reach. Design: the
+  listener lives in `Hub` (one socket for the process), and its accept loop reads the first line of every
+  connection (`{"agent":<id>,"hello":true}`) and then **hands the connection to that agent's task** through a
+  new `Cmd::Bridge(UnixStream)`; from then on `run_claude_process` owns the stream, reads `tools/call`
+  lines from it, keeps `pending_calls: HashMap<String /*call id*/, ()>`, and writes the reply line on
+  `Cmd::Respond`/`RespondErr` whose `id` starts with `cc-call-`. If the agent task has no bridge stream yet
+  when a `Respond` arrives (restart race), the reply is dropped with a log line and the agent is re-prompted
+  by the existing `CmdFailed` path. No engine or app code changes beyond accepting the id prefix.
 - Role instructions (`engine/tools.rs:111,123,134,145,153` `mantra-role:` blocks and the developer
   instructions) are passed with `--append-system-prompt`; the text tells the agent that the `mantra_*` tools
   appear as `mcp__mantra__mantra_*`.
@@ -737,7 +759,7 @@ Run state is write-only today (`engine/run.rs:237-247`; `stage` is a `{:?}` stri
 ## 2. Definition of done (checklist for the final reviewer)
 
 - [ ] `Cargo.toml` 0.2.0, `CHANGELOG.md` present, README/DESIGN updated for every behaviour change.
-- [ ] No `paused` boolean left; every halt has a reason and a hint; `space` still pauses/resumes.
+- [ ] `Run.paused` is gone (`Worker.paused` stays); every halt has a reason and a hint; `space` still pauses/resumes.
 - [ ] A run whose orchestrator goes idle recovers without the user (WP7 demo scenario) and a wedged planner is
       respawned with `r`.
 - [ ] Zoom frames carry the role-colour band + spine; runs start zoomed on the planner; the review overlay opens
