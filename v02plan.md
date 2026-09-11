@@ -112,6 +112,15 @@ What was verified end to end in this session (so you know the baseline works):
 | F4 | `finale: Unexpected message role. — run paused (check the error, then press space to resume)` | Provider incompatibility. Resuming cannot help. Halt with a reason that names the role/model and offers `m` (switch model for that role) and `r` (retry). Also make the `/models` `t` test send a `developer` message so incompatible models are caught before a run | WP6, WP4.4 |
 | F5 | Stage text `Finale` in the phase rail matched `until:Finale` immediately | Test-harness only: use `finale 1/3` as the until-text | WP13 |
 
+### 0.5 User-reported logs from v0.1 on a real machine (`~/.mantra/logs/mantra.log`)
+
+| # | observation | root cause / action | WP |
+|---|---|---|---|
+| L1 | `ERROR codex_app_server: Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces.` on every spawn; planner reported "repository inspection is blocked: every exec_command…"; the worker was "blocked"; the QA gate failed 4 rounds in a row with "shell sandbox fails before any command runs (bwrap…)" | The host forbids unprivileged user namespaces, so Codex's sandbox cannot start and **no** agent can run a command. Mantra must (a) detect it in `doctor` and at startup with a cheap probe, (b) halt the run at the first command failure that names `bwrap`/`user namespaces` with `HaltReason::Environment` and a fix hint, and (c) offer the fallback `sandbox = "danger-full-access"` (workers stay isolated by git worktrees) | WP12.4, WP6 |
+| L2 | Thousands of `ERROR codex_core::util: OutputTextDelta without active item` lines (and `unsupported call: multi_agent_v1`, `cannot update goal because this thread has no goal`) copied into `mantra.log` | Mantra logs every codex stderr line verbatim (`rpc.rs:128`). Collapse repeats and drop known noise | WP12.5 |
+| L3 | `orchestrator: Missing environment variable: API. — run paused` after the plan was approved (the planner ran on another provider) | The key check happens only when Codex tries the request. Preflight every role's provider before a run starts, and halt with a hint naming the provider, the variable and `/models` | WP12.6, WP5 |
+| L4 | Gate rounds 1–4 each reported the same blocker; the run then paused with an opaque message | Add loop protection: if two consecutive gate reports share the same blocker signature (first 80 chars after "Blocked:"/"blocked"), halt with `Environment`/`GateExhausted` immediately instead of spending the remaining rounds | WP6, WP12.4 |
+
 ---
 
 ## 1. Work packages
@@ -293,7 +302,7 @@ interrupts everything; `run.rs:923` and `run.rs:1052` just flip the flag), and t
    ```rust
    pub halt: Option<Halt>;
    pub struct Halt { pub reason: HaltReason, pub agent: Option<AgentId>, pub message: String, pub since: Instant }
-   pub enum HaltReason { User, Auth, UsageLimit, ProviderRejected, GateExhausted, AttemptsExhausted, AgentTurnFailed }
+   pub enum HaltReason { User, Auth, UsageLimit, ProviderRejected, Environment, GateExhausted, AttemptsExhausted, AgentTurnFailed }
    ```
    `fn halted(&self) -> bool`. One function `halt(ctx, reason, agent, message)` (interrupts busy agents into
    `paused_agents`, journals `⛔ halted: …`, notifies) and one `resume(ctx)` (the current un-pause body).
@@ -301,7 +310,7 @@ interrupts everything; `run.rs:923` and `run.rs:1052` just flip the flag), and t
    sites call `halt`.
 2. Resume hints per reason (shown in the stage header band and the alert): User → `space resume`; Auth /
    UsageLimit → `fix credentials or quota, then space`; ProviderRejected → `m switch model for <role> · r
-   retry`; GateExhausted → `type feedback for the planner or space to give the gate N more rounds`;
+   retry`; Environment → the fix hint from WP12.4 (sandbox) or the missing-variable hint (WP12.6), plus `r retry`; GateExhausted → `type feedback for the planner or space to give the gate N more rounds`;
    AttemptsExhausted → `r retry <task> · type feedback`; AgentTurnFailed → `r respawn <agent> · space retry
    the turn`.
 3. Stage header (`stage.rs:181-209`): replace the badge with a full-width amber band on the line under the
@@ -735,6 +744,33 @@ Run state is write-only today (`engine/run.rs:237-247`; `stage` is a `{:?}` stri
 3. **Orchestrator verbosity** (README known limitation): add to the orchestrator instructions in
    `engine/tools.rs`: *"Never prompt a worker whose task is done. After spawning, call mantra_wait. One
    mantra_prompt per event."* Measured on the LibertAI run above: 3 unnecessary prompts in one phase.
+4. **Sandbox preflight (L1).** New `util::sandbox_probe() -> Result<(), String>` (Linux only; Ok on macOS):
+   read `/proc/sys/kernel/unprivileged_userns_clone` (exists and `0` → Err) and
+   `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` (`1` → Err), then try `unshare -U true` with a 2 s
+   timeout when the binary exists (non-zero → Err). `doctor` prints the result with the fix:
+   *"Codex's sandbox needs unprivileged user namespaces. Enable them (`sudo sysctl -w
+   kernel.unprivileged_userns_clone=1`, or on Ubuntu 24.04+ `sudo sysctl -w
+   kernel.apparmor_restrict_unprivileged_userns=0`), or set `sandbox = "danger-full-access"` in
+   `~/.mantra/settings.toml` and in the worker roles (Studio) — workers stay isolated by git worktrees."*
+   At startup Mantra runs the same probe once; when it fails, the welcome screen and the stage show a one-line
+   amber notice with the same hint, and `mantra run` asks `y/N` before starting (skip the question with
+   `--no-sandbox-check`). At runtime, a `commandExecution` item whose output contains `bwrap` or `user
+   namespaces` (`agent.rs:491` `apply_item`, `Kind::Command`) raises `Signal::EnvironmentBroken(msg)`; the run
+   halts with `HaltReason::Environment` on the first one (WP6) — never spend gate rounds on it (L4). The same
+   signature check applies to gate reports: two consecutive reports with the same blocker text halt the run.
+5. **stderr noise (L2).** In `rpc.rs` where stderr lines are logged (`rpc.rs:128`): keep a per-process
+   `(last_line, count)`; identical consecutive lines are not logged again — when a different line arrives, emit
+   `… previous line repeated N×`. Drop lines matching a small deny-list (`OutputTextDelta without active
+   item`, `unsupported call: multi_agent_v1`, `cannot update goal because this thread has no goal`,
+   `resources/read failed for codex_apps`) entirely except for one debug-level count per process. The crash
+   `stderr_tail` (WP1.3) also skips deny-listed lines.
+6. **Provider preflight (L3).** `Registry::preflight(pattern) -> Vec<String>` returns one message per role
+   whose provider has no usable key (`ProviderEntry::resolve_key()` is None, WP5) or whose alias is unknown.
+   `start_run` (`app.rs:563-583`) refuses to start when the list is non-empty and shows the messages in the
+   stage input area (`⚠ orchestrator uses astra via zai — $ZAI_API_KEY is not set (/models to fix)`); Solo
+   start (`app.rs:410-435`) does the same for the Solo model. `Ctxt::spawn` keeps a last-line defence: a
+   spawn for a role with a missing key halts the run with `HaltReason::Auth` and the same message instead of
+   letting Codex fail the first request.
 
 ---
 
