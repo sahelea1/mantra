@@ -269,6 +269,54 @@ pub fn draw_input(f: &mut Frame, area: Rect, app: &App, placeholder: &str, color
     }
 }
 
+/// Height (0 or 1) of the queued-message chip row for the given agent — 0 collapses the row
+/// entirely when nothing is queued.
+pub fn queue_chip_height(app: &App, id: Option<crate::hub::AgentId>) -> u16 {
+    if id.and_then(|a| app.agents.get(&a)).map(|a| !a.queued.is_empty()).unwrap_or(false) {
+        1
+    } else {
+        0
+    }
+}
+
+/// "⏳ queued 2 · "…" · ctrl+f send now · backspace on empty input to edit" — shown directly
+/// above the input box while the given agent (the focused agent in Solo/Zoom, the selected node
+/// on the stage) has messages waiting behind its current turn.
+pub fn draw_queue_chip(f: &mut Frame, area: Rect, app: &App, id: Option<crate::hub::AgentId>) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(a) = id.and_then(|a| app.agents.get(&a)) else { return };
+    if a.queued.is_empty() {
+        return;
+    }
+    let n = a.queued.len();
+    let preview = a.queued.last().map(|s| trunc(&s.replace('\n', " "), 40)).unwrap_or_default();
+    let line = Line::from(vec![
+        Span::styled(format!(" {} queued {n}", theme::g("⏳", "...")), theme::bold(theme::fg(theme::AMBER))),
+        Span::styled(format!(" · \"{preview}\""), theme::dim()),
+        Span::styled("  ctrl+f send now · backspace on empty input to edit", theme::faint()),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// A brief tint across the header right after switching between the overview and a zoomed
+/// agent, so the jump never feels silent. Never armed when `reduce_motion` is set (see
+/// `App::set_screen`), so this naturally does nothing in that case.
+pub fn draw_screen_flash(f: &mut Frame, area: Rect, app: &App, color: (u8, u8, u8)) {
+    let k = anim::fade(app.flash_screen, 400);
+    if k <= 0.0 {
+        return;
+    }
+    let bg = theme::mix(theme::FAINT, color, k);
+    let buf = f.buffer_mut();
+    for x in area.x..area.x + area.width {
+        if let Some(cell) = buf.cell_mut((x, area.y)) {
+            cell.set_bg(bg);
+        }
+    }
+}
+
 /// Slash-command suggestions above the input.
 pub fn draw_suggestions(f: &mut Frame, input_area: Rect, app: &App) {
     let s = app.suggestions();

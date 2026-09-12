@@ -37,3 +37,15 @@ All notable changes to Mantra are recorded here.
   (HTTP 400/422, "unexpected message role", …) is never retried and halts immediately, naming the
   role, model alias and provider. `m` on a selected stage agent opens the model picker to fix a
   `ProviderRejected` halt and resumes the run once a new model is picked.
+- WP8: zoom vs overview are now unmistakable — a zoomed agent gets a solid role-coloured header
+  band and a coloured spine down the log; a run starts zoomed into the planner (once it's spawned);
+  the plan-review overlay now opens over any screen (Solo, Zoom or Stage), not just the overview;
+  approving a plan always lands you back on the overview with the orchestrator selected; `1`-`9`
+  jump straight to the nth stage node and zoom in; every Stage↔Zoom switch flashes the header
+  briefly (skipped when `reduce_motion` is set).
+- WP9: busy-agent chat gets Claude-Code-style queueing — `⏎` while an agent is mid-turn appends
+  your message to a visible `⏳ queued N` chip above the input instead of steering immediately;
+  `ctrl+f` force-delivers the queue plus the current input into the running turn right away;
+  `backspace` on an empty input restores the last queued message for editing, `ctrl+x` discards
+  the whole queue. Applies to Solo, Zoom and `@name` messages from the stage; the engine's own
+  prompting (steering workers, waking the orchestrator, etc.) is unaffected.

@@ -137,12 +137,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Small terminals (tmux splits!) lose the peek strip first, then the rail's second line.
     let peek_h = if has_run && !app.stage_nodes().is_empty() && area.height >= 26 { 4 } else { 0 };
     let rail_h = if !has_run { 0 } else if area.height >= 20 { 2 } else { 1 };
+    let sel_agent = app.stage_nodes().get(app.sel).copied();
+    let chip_h = super::queue_chip_height(app, sel_agent);
     let in_h = input_height(app, area.width).min(area.height.saturating_sub(8).max(3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(rail_h), Constraint::Min(4), Constraint::Length(peek_h), Constraint::Length(in_h), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Length(rail_h), Constraint::Min(4), Constraint::Length(peek_h), Constraint::Length(chip_h), Constraint::Length(in_h), Constraint::Length(1)])
         .split(area);
     draw_header(f, rows[0], app);
+    super::draw_screen_flash(f, rows[0], app, theme::MUTED);
     draw_rail(f, rows[1], app);
     let show_pulse = app.pulse_panel && has_run && rows[2].width >= 110;
     let body = if show_pulse {
@@ -157,29 +160,35 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if peek_h > 0 {
         draw_peek(f, rows[3], app);
     }
-    let placeholder = match app.run.as_ref().map(|r| &r.stage) {
-        None | Some(Stage::Done) | Some(Stage::Failed(_)) => "describe what to build — the planner takes it from here…",
-        Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan",
-        Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…",
-        _ => "re-prompt the planner · @agent to talk to one agent directly",
+    super::draw_queue_chip(f, rows[4], app, sel_agent);
+    let placeholder = if app.canvas_focus {
+        "navigating — ←→↑↓ select · ⏎ zoom · 1-9 jump · tab to type".to_string()
+    } else {
+        match app.run.as_ref().map(|r| &r.stage) {
+            None | Some(Stage::Done) | Some(Stage::Failed(_)) => "describe what to build — the planner takes it from here…".to_string(),
+            Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan".to_string(),
+            Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…".to_string(),
+            _ => "re-prompt the planner · @agent to talk to one agent directly".to_string(),
+        }
     };
-    draw_input(f, rows[4], app, placeholder, theme::VIOLET, !app.canvas_focus);
-    draw_suggestions(f, rows[4], app);
+    draw_input(f, rows[5], app, &placeholder, theme::VIOLET, !app.canvas_focus);
+    draw_suggestions(f, rows[5], app);
     let hints: Vec<(&str, &str)> = if app.canvas_focus {
-        vec![("←→", "select"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
+        vec![("←→", "select"), ("1-9", "jump"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
     } else {
         let mode: &'static str = match app.settings.approval_mode.as_str() {
             "never" => "approvals: never ask",
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "send"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("alt+←→", "select"), ("⏎ empty", "zoom"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
+        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("alt+←→", "select"), ("⏎ empty", "zoom"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
     };
-    footer(f, rows[5], &hints);
+    footer(f, rows[6], &hints);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut crumbs = vec![Span::styled("  mandala", theme::bold(theme::fg(theme::VIOLET)))];
+    crumbs.push(Span::styled(format!("  {} overview", theme::g("›", ">")), theme::faint()));
     let mut right = vec![];
     if let Some(b) = app.inbox_badge() {
         right.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
@@ -189,7 +198,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             crumbs.push(Span::styled(format!("  {}", trunc(&r.id, if area.width < 110 { 18 } else { 30 })), theme::dim()));
             crumbs.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
             if app.demo {
-                crumbs.insert(1, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
+                crumbs.insert(2, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
             let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));

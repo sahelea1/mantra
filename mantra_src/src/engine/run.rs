@@ -48,17 +48,33 @@ pub struct SpawnReq {
     pub context_override: Option<u64>,
 }
 
+/// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
+/// steering behaviour (immediate `turn/steer`) and is what every `ctx.prompt(...)` call in this
+/// file uses. The UI uses `Queue` for a plain Enter — it waits behind the agent's current turn,
+/// shown as a chip — and `Force` for ctrl+f, which delivers it (plus anything already queued)
+/// into the running turn right away. Named `Send` per the design note; the two spots in this
+/// codebase that need `std::marker::Send` instead spell it out to avoid shadowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Send {
+    Auto,
+    Queue,
+    Force,
+}
+
 /// What the engine needs from the app. Keeps the engine free of UI/process details (and testable).
 pub trait Ctx {
     fn spawn(&mut self, req: SpawnReq) -> AgentId;
     fn prompt(&mut self, a: AgentId, text: String);
+    /// Like `prompt`, but lets a UI-originated message (queued or forced) say how it should
+    /// reach an agent that is already busy. Engine call sites always use plain `prompt`.
+    fn prompt_mode(&mut self, a: AgentId, text: String, mode: Send);
     fn interrupt(&mut self, a: AgentId);
     fn compact(&mut self, a: AgentId);
     fn stop(&mut self, a: AgentId, archive: bool);
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool);
     fn set_effort(&mut self, a: AgentId, effort: &str) -> String;
     fn agent(&self, a: AgentId) -> Option<&Agent>;
-    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + Send>);
+    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>);
     fn notify(&mut self, text: &str);
 }
 
@@ -1443,12 +1459,13 @@ impl Run {
         }
     }
 
-    /// `@agent message` from the user.
-    pub fn direct(&mut self, ctx: &mut dyn Ctx, name: &str, text: &str) -> bool {
+    /// `@agent message` from the user. `mode` is `Queue` for a plain Enter (waits behind a busy
+    /// agent's current turn) or `Force` for ctrl+f (delivered right away).
+    pub fn direct(&mut self, ctx: &mut dyn Ctx, name: &str, text: &str, mode: Send) -> bool {
         match self.resolve(name) {
             Some(a) => {
                 self.mark_edge(a);
-                ctx.prompt(a, format!("[from the user] {text}"));
+                ctx.prompt_mode(a, format!("[from the user] {text}"), mode);
                 self.log("›", "rose", format!("you → {name}: {}", trunc(text, 60)));
                 true
             }
@@ -1750,6 +1767,9 @@ mod halt_tests {
         fn prompt(&mut self, a: AgentId, text: String) {
             self.prompts.push((a, text));
         }
+        fn prompt_mode(&mut self, a: AgentId, text: String, _mode: Send) {
+            self.prompts.push((a, text));
+        }
         fn interrupt(&mut self, a: AgentId) {
             self.interrupted.push(a);
             if let Some(ag) = self.agents.get_mut(&a) {
@@ -1765,7 +1785,7 @@ mod halt_tests {
         fn agent(&self, a: AgentId) -> Option<&Agent> {
             self.agents.get(&a)
         }
-        fn job(&mut self, _tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + Send>) {}
+        fn job(&mut self, _tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {}
         fn notify(&mut self, _text: &str) {}
     }
 

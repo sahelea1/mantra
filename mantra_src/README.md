@@ -75,7 +75,7 @@ A Claude-Code-style single agent, with the things you actually want visible:
 - Streaming answers, collapsible reasoning (`ctrl+e` = verbose), commands with output tails, inline diffs
 - Thinking indicator: breathing glyph + shimmering activity (`Thinking…`, `$ cargo test`, `editing src/x.rs`) + elapsed + tokens
 - Approval card for commands/patches/permissions (`y` / `a` session / `n` / `esc`); `shift+tab` cycles the approval mode (see below)
-- Type while it works → your message **steers the running turn**
+- Type while it works → `⏎` **queues** your message behind the current turn (shown as a `⏳ queued N` chip above the input; `backspace` on an empty input edits the last one, `ctrl+x` clears the queue); `ctrl+f` **force-sends** it into the running turn right now
 
 Commands (`/` shows them, `tab` completes): `/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/pattern` `/plan` `/pause` `/land` `/studio` `/models` `/inbox` `/verbose` `/help` `/quit` — and `!cmd` runs a shell command.
 
@@ -97,11 +97,13 @@ You describe the goal. The default pattern (`mantra-default`) runs this workflow
 4. **Finale**: **heavy QA** (sol · xhigh) → **security sweep** (sol · max — point it at GLM or any other model in the Studio) → **planner verification**, which can spawn ad-hoc fix workers.
 5. `/land` merges the run branch into your branch. Everything is journaled in `~/.mantra/runs/<project>-<hash>/<id>/` (plan, per-phase outputs, merge logs, journal) — nothing is written into your project.
 
-**Talking to a running team:** plain text re-prompts the **planner** (it can pause agents, revise the plan, or brief the orchestrator); `@p2-api use axum` messages one agent directly.
+**Talking to a running team:** plain text re-prompts the **planner** (it can pause agents, revise the plan, or brief the orchestrator); `@p2-api use axum` messages one agent directly — `⏎` queues it behind that agent's turn, `ctrl+f` forces it in right away, same as Solo.
 
-**Stage keys:** `tab` switches between typing and navigating · `←→↑↓` (or `alt+←→` while typing) select · `⏎` zoom into an agent (full log, tools, thinking, diff; `esc` back) · `space` pause/resume everything · `r` retry worker / restart crashed agent · `x` interrupt · `c` compact · `+/-` effort · `p` plan · `d` diff · `s` studio · `ctrl+t` hide/show the pulse feed · `ctrl+g` inbox (approvals + alerts from all agents).
+A run starts **zoomed into the planner** so you watch it explore and plan; the header band (`✦ planner · astra · high  zoomed · esc back to overview`) and a coloured spine down the log make it unmistakable you're inside one agent, versus the **overview** (`mandala › overview`), where the whole team is visible at once. `esc` moves between them either way, with a brief flash on the header so the jump never feels silent (skipped when `reduce_motion` is on). Approving the plan always lands you back on the animated overview with the orchestrator selected.
 
-**Everywhere:** `ctrl+k` model picker · `alt+↑/↓` effort · `ctrl+d` diff · `ctrl+e` verbose · `ctrl+t` (or `F2`) side panel · `ctrl+l` redraw · `ctrl+c` clear → interrupt → quit.
+**Stage keys:** `tab` switches between typing and navigating · `←→↑↓` (or `alt+←→` while typing) select · `1`-`9` jump straight to the nth agent and zoom in · `⏎` zoom into an agent (full log, tools, thinking, diff; `esc` back to the overview) · `space` pause/resume everything · `r` retry worker / restart crashed agent · `x` interrupt · `c` compact · `+/-` effort · `p` plan · `d` diff · `s` studio · `ctrl+t` hide/show the pulse feed · `ctrl+g` inbox (approvals + alerts from all agents).
+
+**Everywhere:** `ctrl+k` model picker · `alt+↑/↓` effort · `ctrl+d` diff · `ctrl+e` verbose · `ctrl+f` force-send a queued message · `ctrl+t` (or `F2`) side panel · `ctrl+l` redraw · `ctrl+c` clear → interrupt → quit.
 
 ## Models, effort and context (`/models`)
 
