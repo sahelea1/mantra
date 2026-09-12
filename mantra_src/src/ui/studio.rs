@@ -3,15 +3,23 @@
 use super::{theme, *};
 use crate::app::{App, EditTarget, Overlay, Screen, StudioSel};
 use crate::config::ProviderEntry;
-use crate::engine::pattern::{FinaleStep, Role, COLORS, KINDS, PERMISSIONS};
+use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, KINDS, PERMISSIONS};
 use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 
 const GLYPHS: &[&str] = &["✦", "◉", "◇", "◆", "◎", "▲", "■", "●", "★", "◈", "▣", "⬡", "♦", "▼"];
+/// Sane upper bound (24h) for `watchdog_seconds`/`watchdog_escalate_seconds`: keeps
+/// `es_secs.saturating_mul(2)` in `Run::watchdog_tick` well clear of `u64::MAX` and rules out a
+/// typo (or a pasted huge number) leaving the watchdog effectively disabled.
+const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
+/// Floors for `watchdog_seconds`/`watchdog_escalate_seconds`, shared by the nudge (+/-) and
+/// free-text edit paths so the two don't disagree on what's a valid value.
+const WATCHDOG_SECONDS_MIN: u64 = 15;
+const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase"];
+const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -85,6 +93,8 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "gate_max_rounds" => s.gate_max_rounds.to_string(),
                 "check_timeout_secs" => s.check_timeout_secs.to_string(),
                 "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
+                "watchdog_seconds" => s.watchdog_seconds.to_string(),
+                "watchdog_escalate_seconds" => s.watchdog_escalate_seconds.to_string(),
                 _ => String::new(),
             }
         }
@@ -144,6 +154,17 @@ fn cycle<T: AsRef<str>>(list: &[T], cur: &str, d: i32) -> String {
     list[((i + d).rem_euclid(n)) as usize].as_ref().to_string()
 }
 
+/// Enforces the floors and the `escalate > seconds` invariant that `Pattern::validate` requires
+/// (`engine/pattern.rs`), so neither the nudge (+/-) nor the free-text edit path can leave the
+/// two watchdog fields in a combination validate() would only reject later at save time.
+fn clamp_watchdog(s: &mut PatternSettings) {
+    s.watchdog_seconds = s.watchdog_seconds.clamp(WATCHDOG_SECONDS_MIN, WATCHDOG_SECONDS_MAX);
+    s.watchdog_escalate_seconds = s.watchdog_escalate_seconds.clamp(WATCHDOG_ESCALATE_MIN, WATCHDOG_SECONDS_MAX);
+    if s.watchdog_escalate_seconds <= s.watchdog_seconds {
+        s.watchdog_escalate_seconds = (s.watchdog_seconds + 1).min(WATCHDOG_SECONDS_MAX);
+    }
+}
+
 /// ←/→ on a field: cycle enumerations / step numbers / toggle booleans.
 fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
     let aliases: Vec<String> = app.registry.models.iter().map(|m| m.alias.clone()).collect();
@@ -163,6 +184,14 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 "gate_max_rounds" => s.gate_max_rounds = (s.gate_max_rounds as i32 + d).max(1) as u32,
                 "check_timeout_secs" => s.check_timeout_secs = (s.check_timeout_secs as i64 + 60 * d as i64).max(60) as u64,
                 "max_tasks_per_phase" => step_u(&mut s.max_tasks_per_phase, 1),
+                "watchdog_seconds" => {
+                    s.watchdog_seconds = (s.watchdog_seconds as i64 + 15 * d as i64).clamp(WATCHDOG_SECONDS_MIN as i64, WATCHDOG_SECONDS_MAX as i64) as u64;
+                    clamp_watchdog(s);
+                }
+                "watchdog_escalate_seconds" => {
+                    s.watchdog_escalate_seconds = (s.watchdog_escalate_seconds as i64 + 30 * d as i64).clamp(WATCHDOG_ESCALATE_MIN as i64, WATCHDOG_SECONDS_MAX as i64) as u64;
+                    clamp_watchdog(s);
+                }
                 _ => return,
             }
         }
@@ -243,6 +272,14 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 ("gate_max_rounds", Some(v)) => s.gate_max_rounds = v.max(1) as u32,
                 ("check_timeout_secs", Some(v)) => s.check_timeout_secs = v.max(10),
                 ("max_tasks_per_phase", Some(v)) => s.max_tasks_per_phase = v.max(1) as usize,
+                ("watchdog_seconds", Some(v)) => {
+                    s.watchdog_seconds = v.clamp(WATCHDOG_SECONDS_MIN, WATCHDOG_SECONDS_MAX);
+                    clamp_watchdog(s);
+                }
+                ("watchdog_escalate_seconds", Some(v)) => {
+                    s.watchdog_escalate_seconds = v.clamp(WATCHDOG_ESCALATE_MIN, WATCHDOG_SECONDS_MAX);
+                    clamp_watchdog(s);
+                }
                 _ => {}
             }
             app.studio.dirty = true;
@@ -829,5 +866,27 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review fix: `nudge()` and `apply_edit()` used to enforce different floors (15/30 vs 5/10)
+    /// and neither checked `escalate > watchdog_seconds`, so a value `Pattern::validate` would
+    /// reject was only caught at save time. `clamp_watchdog` is the single place both paths now
+    /// go through.
+    #[test]
+    fn clamp_watchdog_enforces_floor_and_escalate_gt_seconds() {
+        let mut s = PatternSettings { watchdog_seconds: 1, watchdog_escalate_seconds: 1, ..Default::default() };
+        clamp_watchdog(&mut s);
+        assert_eq!(s.watchdog_seconds, WATCHDOG_SECONDS_MIN);
+        assert!(s.watchdog_escalate_seconds > s.watchdog_seconds);
+
+        // Both individually within their own floors, but the combination validate() forbids.
+        let mut s = PatternSettings { watchdog_seconds: 90, watchdog_escalate_seconds: 30, ..Default::default() };
+        clamp_watchdog(&mut s);
+        assert!(s.watchdog_escalate_seconds > s.watchdog_seconds, "escalate must never end up <= seconds");
     }
 }

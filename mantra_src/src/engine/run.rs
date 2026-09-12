@@ -11,7 +11,7 @@ use crate::agent::{Agent, ErrKind, Status};
 use crate::hub::AgentId;
 use crate::util::{clock, fmt_dur, fmt_tokens, trunc};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,32 @@ pub struct Worker {
     /// Set once a ContextFull error is seen while the assumed context was in effect; carried
     /// forward across attempts of the same task (see `spawn_task`).
     pub context_override: Option<u64>,
+    /// Timestamps of `mantra_prompt` calls the orchestrator made at this worker while it was idle
+    /// (turn ended but `WState` is still `Running` — an interrupted/failed turn the state machine
+    /// hasn't otherwise reclassified). F3 loop protection (WP7.2): three within five minutes with
+    /// no `completed` turn in between means the orchestrator is stuck nagging a dead worker —
+    /// respawn it instead of forwarding another prompt.
+    pub idle_prompts: Vec<Instant>,
+}
+
+/// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
+/// watchdog's model of "who must be busy and why". `Stage::Review` and the mechanical phase steps
+/// (`Merging`/`Checks`/`Handoff`) expect nobody and simply don't appear here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expect {
+    Planning,
+    Orchestrating,
+    Working(String),
+    Gating,
+    Finale(usize),
+}
+
+/// Per-agent watchdog progress: how far up the escalation ladder (WP7.2) this agent's *current*
+/// idle spell has gone, and the `last_event` we last saw from it (any new event resets the ladder
+/// back to the bottom — the plan text "cleared on any event from that agent").
+struct WatchState {
+    stage: u8,
+    last_seen: Instant,
 }
 
 #[derive(Clone)]
@@ -134,9 +160,8 @@ pub enum HaltReason {
     /// A deterministic provider/model incompatibility (HTTP 400/422, "unexpected message role", …)
     /// — retrying cannot help; the role's model must change.
     ProviderRejected,
-    /// The host environment itself can't run agents (e.g. no sandbox support). The actual probe
-    /// is WP12; this reason and its hint exist now so `halt()` has somewhere to route it.
-    #[allow(dead_code)]
+    /// The host environment itself can't run agents (WP12.4/L1): a command an agent ran failed
+    /// naming `bwrap` / user namespaces, so the sandbox cannot start.
     Environment,
     GateExhausted,
     AttemptsExhausted,
@@ -197,6 +222,18 @@ pub struct Run {
     adhoc_seq: u32,
     last_tick: Instant,
     tokens_prev: u64,
+    /// Watchdog escalation state per agent currently expected active (WP7.2).
+    watch: HashMap<AgentId, WatchState>,
+    /// Roles ("planner" | "orchestrator" | "gate" | "finale") that have already been given one
+    /// free respawn after a turn failure (WP7.3) — a second failure of the same role halts
+    /// instead of looping forever. Cleared when that role completes a turn successfully.
+    turn_fail_retried: HashSet<String>,
+    /// First-80-chars signature of the last *failing* gate report's reason (L4/WP12.4): two
+    /// consecutive identical signatures halt immediately instead of spending the remaining rounds.
+    last_gate_blocker: Option<String>,
+    /// Set when the watchdog wakes the planner about another agent's idleness (ladder step 3); if
+    /// the planner produces no event by the deadline, step 4 halts the run.
+    planner_watchdog: Option<(Instant, Instant)>,
 }
 
 impl Run {
@@ -240,6 +277,10 @@ impl Run {
             adhoc_seq: 0,
             last_tick: Instant::now(),
             tokens_prev: 0,
+            watch: HashMap::new(),
+            turn_fail_retried: HashSet::new(),
+            last_gate_blocker: None,
+            planner_watchdog: None,
         }
     }
 
@@ -376,6 +417,27 @@ impl Run {
         }
     }
 
+    /// Fixed tag for the non-worker roles the WP7.3 "one free respawn before halting" rule tracks
+    /// — stable across a respawn (which changes the `AgentId`) since it's keyed by the *slot*
+    /// (`self.planner`/`self.orchestrator`/…), not the id.
+    fn watchdog_role_tag(&self, a: AgentId) -> Option<String> {
+        // Same ambiguity as `respawn`: the shared planner/finale-agent id must resolve to
+        // "finale" while a finale step is in progress, not "planner".
+        if Some(a) == self.finale_agent || (Some(a) == self.planner && matches!(self.stage, Stage::Finale { .. })) {
+            return Some("finale".into());
+        }
+        if Some(a) == self.planner {
+            return Some("planner".into());
+        }
+        if Some(a) == self.orchestrator {
+            return Some("orchestrator".into());
+        }
+        if Some(a) == self.gate_agent {
+            return Some("gate".into());
+        }
+        None
+    }
+
     /// The pattern role name behind an agent (not `name_of`'s task id / flow-slot label) — used to
     /// persist a model switch back into this run's pattern copy.
     pub fn role_name_of(&self, a: AgentId) -> Option<String> {
@@ -462,6 +524,19 @@ impl Run {
         self.workers.iter().position(|w| w.agent == Some(a))
     }
 
+    /// F3 tool guard (WP7.5): once a worker's task is `Done`, refuse further steering tools on it
+    /// unless the phase is still `Orchestrating` — once merging/checks/gate has begun the worker
+    /// is about to be archived, and prompting it just starts a turn nobody will read.
+    fn worker_done_guard(&self, t: AgentId) -> Option<&'static str> {
+        let wi = self.worker_idx(t)?;
+        let orchestrating = matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. });
+        if self.workers[wi].state == WState::Done && !orchestrating {
+            Some("task is done; the phase is merging/gating — wait for the handoff")
+        } else {
+            None
+        }
+    }
+
     fn mark_edge(&mut self, a: AgentId) {
         self.edges.insert(a, Instant::now());
     }
@@ -513,6 +588,80 @@ impl Run {
             s.push_str("- no workers yet\n");
         }
         s
+    }
+
+    /// Who must be busy right now, and why (WP7.1) — the watchdog's ground truth. An agent not in
+    /// this list is never nudged no matter how long it has been idle (e.g. `Stage::Review`, where
+    /// nobody is expected to act until the user does).
+    pub fn expected_active(&self) -> Vec<(AgentId, Expect)> {
+        let mut v = vec![];
+        match &self.stage {
+            Stage::Planning => {
+                if let Some(p) = self.planner {
+                    v.push((p, Expect::Planning));
+                }
+            }
+            Stage::Phase { step, .. } => match step {
+                PhaseStep::Orchestrating => {
+                    for w in &self.workers {
+                        if w.state == WState::Running {
+                            if let Some(a) = w.agent {
+                                v.push((a, Expect::Working(w.task.id.clone())));
+                            }
+                        }
+                    }
+                    if self.orchestrator_needed() {
+                        if let Some(o) = self.orchestrator {
+                            v.push((o, Expect::Orchestrating));
+                        }
+                    }
+                }
+                PhaseStep::Gate { .. } => {
+                    if let Some(g) = self.gate_agent {
+                        v.push((g, Expect::Gating));
+                    }
+                }
+                PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Handoff => {}
+            },
+            Stage::Finale { idx } => {
+                if let Some(f) = self.finale_agent {
+                    v.push((f, Expect::Finale(*idx)));
+                }
+            }
+            Stage::Setup | Stage::Review | Stage::Done | Stage::Failed(_) => {}
+        }
+        v
+    }
+
+    /// WP7.6: the watchdog state to show on an agent's stage card, if any. `Some(idle)` once the
+    /// escalation ladder has fired at least once for this agent's current idle spell (`stage >=
+    /// 1` in `self.watch`) — the UI turns the card's border amber dotted and labels it `idle Nm ·
+    /// watchdog`. Cleared the moment the agent produces a new event (`watchdog_tick` resets the
+    /// entry's `stage` to 0), so a genuinely busy or freshly-active agent never shows it.
+    pub fn watchdog_idle(&self, a: AgentId) -> Option<Duration> {
+        let w = self.watch.get(&a)?;
+        if w.stage == 0 {
+            return None;
+        }
+        Some(w.last_seen.elapsed())
+    }
+
+    /// Is the orchestrator expected to act right now? Either it has queued events waiting
+    /// (`orch_inbox`), or nothing is running/starting and some task of the current phase is
+    /// queued, failed, or was never spawned — someone needs to decide what happens next. An
+    /// orchestrator legitimately asleep in `mantra_wait` while workers run is not "idle".
+    fn orchestrator_needed(&self) -> bool {
+        if !self.orch_inbox.is_empty() {
+            return true;
+        }
+        if self.workers.iter().any(|w| matches!(w.state, WState::Running | WState::Preparing | WState::Retrying(_))) {
+            return false;
+        }
+        let Some(phase) = self.current_phase() else { return false };
+        phase.tasks.iter().any(|t| match self.workers.iter().rev().find(|w| w.task.id == t.id) {
+            None => true,
+            Some(w) => matches!(w.state, WState::Queued | WState::Failed(_)),
+        })
     }
 
     // ───────────────────────────── lifecycle ─────────────────────────────
@@ -603,23 +752,7 @@ impl Run {
                 ctx.compact(o);
                 o
             }
-            _ => {
-                let name = self.pattern.flow.orchestrator.clone();
-                let role = self.role(&name);
-                let id = ctx.spawn(SpawnReq {
-                    name: "orchestrator".into(),
-                    role_name: name,
-                    instructions: format!("{}\n{}\n## Project-specific brief from the planner\n{}", role.instructions, tools::ORCHESTRATOR_PROTOCOL, plan.orchestrator_brief),
-                    cwd: self.workspace_dir(),
-                    tools: tools::orchestrator_tools(),
-                    effort: None,
-                    extra_writable: vec![],
-                    context_override: None,
-                    role,
-                });
-                self.orchestrator = Some(id);
-                id
-            }
+            _ => self.spawn_orchestrator(ctx),
         };
         let handoff = if self.handoff.is_empty() { String::new() } else { format!("Handoff from the previous phase's orchestrator:\n{}\n\n", self.handoff) };
         let phase_json = serde_json::to_string_pretty(&phase).unwrap_or_default();
@@ -673,6 +806,7 @@ impl Run {
             stall_flagged: false,
             context_override,
             budget_flagged: false,
+            idle_prompts: vec![],
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued (max_parallel = {})", self.pattern.settings.max_parallel));
@@ -803,9 +937,17 @@ impl Run {
     }
 
     fn spawn_gate(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+        self.spawn_gate_at_round(ctx, idx, 1);
+    }
+
+    /// Same as `spawn_gate` but for a caller-supplied round (WP7.4 `respawn_gate`), so respawning
+    /// a stuck gate agent does not silently reset the round counter — `gate_max_rounds` and the L4
+    /// identical-blocker halt are both keyed off `round`.
+    fn spawn_gate_at_round(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
         let Some(phase) = self.current_phase().cloned() else { return };
-        self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: 1 } };
+        self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
+        self.last_gate_blocker = None;
         let name = self.pattern.flow.phase_gate.clone();
         let role = self.role(&name);
         let reports: String = self.workers.iter().filter(|w| w.state == WState::Done).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 1500))).collect();
@@ -1142,6 +1284,19 @@ impl Run {
                 _ => None,
             };
             if let Some(reason) = reason {
+                // WP7.3: a planner/orchestrator/gate/finale turn that fails past the retry cap
+                // gets one free respawn (with a resume prompt) before the run gives up on it.
+                if reason == HaltReason::AgentTurnFailed {
+                    if let Some(tag) = self.watchdog_role_tag(a) {
+                        if self.turn_fail_retried.insert(tag) {
+                            let n = self.name_of(a);
+                            self.log("⏰", "amber", format!("{n}: turn failed ({}) — respawning once before halting (watchdog)", trunc(&msg, 60)));
+                            let _ = self.respawn(ctx, a, Some(format!("[mantra:watchdog] Your previous turn failed ({}). Continue where you left off.", trunc(&msg, 200))));
+                            self.retry_counts.remove(&a);
+                            return;
+                        }
+                    }
+                }
                 let n = self.name_of(a);
                 let detail = if reason == HaltReason::ProviderRejected {
                     let (alias, provider) = ctx.agent(a).map(|ag| (ag.model_alias.clone(), ag.provider.clone())).unwrap_or_default();
@@ -1159,6 +1314,9 @@ impl Run {
             // worker with a non-retryable error or out of retries: falls through → reported to the orchestrator
         } else if status == "completed" {
             self.retry_counts.remove(&a);
+            if let Some(tag) = self.watchdog_role_tag(a) {
+                self.turn_fail_retried.remove(&tag);
+            }
         }
 
         if Some(a) == self.planner && matches!(self.stage, Stage::Planning) {
@@ -1210,12 +1368,21 @@ impl Run {
                 let report = self.gate_report.clone().or_else(|| parse_gate_from_text(ctx.agent(a).and_then(|x| x.final_message.clone()).as_deref()));
                 match report {
                     Some((true, summary)) => {
+                        self.last_gate_blocker = None;
                         self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
                         self.run_checks(ctx, idx, round);
                     }
                     other => {
                         let why = other.map(|(_, s)| s).unwrap_or_else(|| "no gate report".into());
-                        if round < self.pattern.settings.gate_max_rounds {
+                        // L4 loop protection (WP12.4/WP6): two consecutive gate reports blocked on
+                        // the same thing will never resolve themselves — halt now instead of
+                        // spending the remaining rounds repeating the same failed fix.
+                        let sig = trunc(why.trim(), 80);
+                        let repeated = !sig.is_empty() && self.last_gate_blocker.as_deref() == Some(sig.as_str());
+                        self.last_gate_blocker = Some(sig);
+                        if repeated {
+                            self.halt(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate stuck on the same blocker twice: {}", idx + 1, trunc(&why, 80)));
+                        } else if round < self.pattern.settings.gate_max_rounds {
                             self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: round + 1 } };
                             self.gate_report = None;
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
@@ -1329,6 +1496,17 @@ impl Run {
         self.orch_event(ctx, format!("TRIPWIRE: {tid} edited files outside its scope ({scope}): {}. Decide whether that's OK; steer it with mantra_prompt if not.", outside.join(", ")));
     }
 
+    /// WP12.4/L1: a command an agent ran failed in a way that names `bwrap`/user namespaces — the
+    /// sandbox itself cannot start, so no agent can run any command. Never spend gate rounds or
+    /// retries on this: halt immediately, on the first occurrence, with the sandbox fix hint.
+    pub fn on_environment_broken(&mut self, ctx: &mut dyn Ctx, a: AgentId, msg: String) {
+        if self.halted() {
+            return;
+        }
+        let who = self.name_of(a);
+        self.halt(ctx, HaltReason::Environment, Some(a), format!("{who}: a command failed — the sandbox can't run commands here ({}). {}", trunc(&msg, 200), crate::util::sandbox_fix_hint()));
+    }
+
     pub fn on_crash(&mut self, ctx: &mut dyn Ctx, a: AgentId, reason: &str, restarting: bool) {
         let n = self.name_of(a);
         if restarting {
@@ -1390,7 +1568,114 @@ impl Run {
             self.log("⚠", "amber", e.clone());
             self.orch_event(ctx, e);
         }
+        self.watchdog_tick(ctx);
         self.wake_orch(ctx);
+    }
+
+    /// WP7.2: make sure every agent that should be working is working. Runs on the same 900ms
+    /// cadence as the rest of `tick`. An agent's ladder resets to the bottom the moment it produces
+    /// any new event (`Agent::last_event` moves past what we last saw), so a genuinely busy agent
+    /// is never escalated on.
+    fn watchdog_tick(&mut self, ctx: &mut dyn Ctx) {
+        if self.halted() {
+            return;
+        }
+        if let Some((set_at, deadline)) = self.planner_watchdog {
+            if Instant::now() >= deadline {
+                self.planner_watchdog = None;
+                let responded = self.planner.and_then(|p| ctx.agent(p)).map(|a| a.last_event > set_at || a.busy()).unwrap_or(true);
+                if !responded && !self.halted() {
+                    let p = self.planner;
+                    self.halt(ctx, HaltReason::AgentTurnFailed, p, "the planner did not act on a watchdog escalation — respawn it (r)".into());
+                    return;
+                }
+            }
+        }
+        let ws_secs = self.pattern.settings.watchdog_seconds.max(1);
+        let es_secs = self.pattern.settings.watchdog_escalate_seconds.max(ws_secs + 1);
+        let mut seen = vec![];
+        let mut actions: Vec<(AgentId, Expect, u8, Duration)> = vec![];
+        for (a, expect) in self.expected_active() {
+            seen.push(a);
+            let Some(agent) = ctx.agent(a) else { continue };
+            if agent.busy() {
+                self.watch.remove(&a);
+                continue;
+            }
+            let last_event = agent.last_event;
+            let idle = last_event.elapsed();
+            let entry = self.watch.entry(a).or_insert(WatchState { stage: 0, last_seen: last_event });
+            if last_event > entry.last_seen {
+                entry.last_seen = last_event;
+                entry.stage = 0;
+            }
+            let secs = idle.as_secs();
+            let target = if secs >= es_secs.saturating_mul(2) {
+                3
+            } else if secs >= es_secs {
+                2
+            } else if secs >= ws_secs {
+                1
+            } else {
+                0
+            };
+            if target > entry.stage {
+                entry.stage = target;
+                actions.push((a, expect, target, idle));
+            }
+        }
+        self.watch.retain(|a, _| seen.contains(a));
+        for (a, expect, stage, idle) in actions {
+            self.watchdog_act(ctx, a, expect, stage, idle);
+        }
+    }
+
+    fn watchdog_act(&mut self, ctx: &mut dyn Ctx, a: AgentId, expect: Expect, stage: u8, idle: Duration) {
+        let name = self.name_of(a);
+        let secs = idle.as_secs();
+        match stage {
+            1 => {
+                let what = match &expect {
+                    Expect::Working(tid) => format!("working on {tid}"),
+                    Expect::Orchestrating => "supervising the current phase".into(),
+                    Expect::Planning => "planning".into(),
+                    Expect::Gating => "clearing the phase gate".into(),
+                    Expect::Finale(_) => "finishing the finale step".into(),
+                };
+                self.log("⏰", "amber", format!("{name} idle {secs}s — nudging (watchdog)"));
+                self.mark_edge(a);
+                ctx.prompt(a, format!("[mantra:watchdog] You are expected to be {what} but have been idle for {secs}s. Continue, or call mantra_wait/mantra_log to say why you are waiting."));
+            }
+            2 => {
+                if Some(a) == self.orchestrator {
+                    self.log("⏰", "amber", format!("orchestrator idle {secs}s — respawning (watchdog)"));
+                    let _ = self.respawn(ctx, a, Some(format!("[mantra:watchdog] You were idle for {secs}s and were respawned. Pick up the phase.")));
+                } else if Some(a) == self.planner {
+                    // No orchestrator exists yet (the planner itself is the idle agent, i.e.
+                    // `Stage::Planning`) — pushing into `orch_event`/`orch_inbox` here would just
+                    // sit undelivered until the Phase-1 orchestrator spawns. Stage 1 already
+                    // nudged the planner directly; stage 3 escalates straight to a halt if it is
+                    // still unresponsive.
+                    self.log("⏰", "amber", format!("planner idle {secs}s — awaiting further escalation (watchdog)"));
+                } else {
+                    self.log("⏰", "amber", format!("{name} idle {secs}s — waking the orchestrator (watchdog)"));
+                    self.orch_event(ctx, format!("[mantra:watchdog] {name} has been idle for {secs}s. Decide what (if anything) to do."));
+                }
+            }
+            3 => {
+                if Some(a) == self.planner {
+                    let p = self.planner;
+                    self.halt(ctx, HaltReason::AgentTurnFailed, p, format!("the planner has been unresponsive for {secs}s (watchdog)"));
+                    return;
+                }
+                let Some(p) = self.planner else { return };
+                self.log("⏰", "amber", format!("{name} still idle {secs}s — waking the planner (watchdog)"));
+                self.mark_edge(p);
+                ctx.prompt(p, format!("[mantra:watchdog] The orchestrator did not act on {name} (idle {secs}s). Decide: mantra_brief_orchestrator, mantra_revise_plan, mantra_spawn_adhoc, or mantra_pause_agents."));
+                self.planner_watchdog = Some((Instant::now(), Instant::now() + Duration::from_secs(self.pattern.settings.watchdog_escalate_seconds.max(1))));
+            }
+            _ => {}
+        }
     }
 
     /// `space`: the user's own pause/resume, distinct from a failure halt only by `HaltReason`
@@ -1454,6 +1739,124 @@ impl Run {
             }
             None => false,
         }
+    }
+
+    /// Spawn a fresh orchestrator agent for the current phase (extracted out of `start_phase` so
+    /// `respawn` can reuse it, WP7.4). Does not touch `self.stage` or prompt the new agent.
+    fn spawn_orchestrator(&mut self, ctx: &mut dyn Ctx) -> AgentId {
+        let plan = self.plan.clone().unwrap_or_default();
+        let name = self.pattern.flow.orchestrator.clone();
+        let role = self.role(&name);
+        let id = ctx.spawn(SpawnReq {
+            name: "orchestrator".into(),
+            role_name: name,
+            instructions: format!("{}\n{}\n## Project-specific brief from the planner\n{}", role.instructions, tools::ORCHESTRATOR_PROTOCOL, plan.orchestrator_brief),
+            cwd: self.workspace_dir(),
+            tools: tools::orchestrator_tools(),
+            effort: None,
+            extra_writable: vec![],
+            context_override: None,
+            role,
+        });
+        self.orchestrator = Some(id);
+        id
+    }
+
+    /// Respawn any run agent in place (WP7.4): the planner, the orchestrator, the phase gate, the
+    /// finale agent, or a worker (delegates to `retry_worker`). `note` is an extra line prepended
+    /// to the resume prompt (used by the watchdog and by the `r` / `ctrl+r` / `/respawn` UI paths).
+    pub fn respawn(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<(), String> {
+        if self.worker_idx(a).is_some() {
+            let msg = self.retry_worker(ctx, a, note);
+            return if msg.starts_with("REFUSED") { Err(msg) } else { Ok(()) };
+        }
+        // The built-in default pattern's last finale step reuses `self.planner` as the finale
+        // agent id (`start_finale`), so this ambiguous case must be checked before the plain
+        // planner check below — mirrors the disambiguation `on_turn_done` already does.
+        if Some(a) == self.finale_agent || (Some(a) == self.planner && matches!(self.stage, Stage::Finale { .. })) {
+            return if self.respawn_finale(ctx, note) { Ok(()) } else { Err("that agent's stage has already moved on".into()) };
+        }
+        if Some(a) == self.planner {
+            self.respawn_planner(ctx, note);
+            return Ok(());
+        }
+        if Some(a) == self.orchestrator {
+            self.respawn_orchestrator(ctx, note);
+            return Ok(());
+        }
+        if Some(a) == self.gate_agent {
+            return if self.respawn_gate(ctx, note) { Ok(()) } else { Err("that agent's stage has already moved on".into()) };
+        }
+        Err("that agent is no longer part of the run".into())
+    }
+
+    fn respawn_planner(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        if let Some(old) = self.planner.take() {
+            self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(old, true);
+        }
+        let id = self.spawn_planner(ctx);
+        self.mark_edge(id);
+        let stage_txt = format!("{:?}", self.stage);
+        let resume = match &self.plan {
+            Some(p) => format!("[mantra:respawn] A plan v{} exists (attached). Continue from stage {stage_txt}.\n\n{}", self.plan_version, serde_json::to_string_pretty(p).unwrap_or_default()),
+            None => format!("[mantra:respawn] Continue from stage {stage_txt}.\n\n{}", self.planning_prompt()),
+        };
+        ctx.prompt(id, join_note(note, resume));
+        self.log("↻", "violet", "planner respawned (watchdog/manual)");
+    }
+
+    fn respawn_orchestrator(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        if let Some(old) = self.orchestrator.take() {
+            self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(old, true);
+        }
+        let id = self.spawn_orchestrator(ctx);
+        self.mark_edge(id);
+        let phase_json = self.current_phase().map(|p| serde_json::to_string_pretty(p).unwrap_or_default()).unwrap_or_default();
+        let status = self.status_text(ctx);
+        let (idx, total) = (self.phase_idx().unwrap_or(0), self.plan.as_ref().map(|p| p.phases.len()).unwrap_or(0));
+        let resume = format!(
+            "[mantra:respawn] Phase {}/{}: resuming after a respawn.\nCurrent phase:\n```json\n{phase_json}\n```\nCurrent worker states:\n{status}\nSpawn any tasks that still need spawning, steer running ones if needed, then call mantra_wait.",
+            idx + 1,
+            total
+        );
+        ctx.prompt(id, join_note(note, resume));
+        self.log("↻", "violet", "orchestrator respawned (watchdog/manual)");
+    }
+
+    fn respawn_gate(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> bool {
+        let Some(idx) = self.phase_idx() else { return false };
+        let round = match self.stage {
+            Stage::Phase { step: PhaseStep::Gate { round }, .. } => round,
+            _ => 1,
+        };
+        if let Some(old) = self.gate_agent.take() {
+            self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(old, true);
+        }
+        self.spawn_gate_at_round(ctx, idx, round);
+        if let (Some(n), Some(g)) = (note, self.gate_agent) {
+            ctx.prompt(g, format!("[mantra:respawn] {n}"));
+        }
+        self.log("↻", "violet", "gate respawned (watchdog/manual)");
+        true
+    }
+
+    fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> bool {
+        let Stage::Finale { idx } = self.stage else { return false };
+        if let Some(old) = self.finale_agent.take() {
+            if Some(old) != self.planner {
+                self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
+                ctx.stop(old, true);
+            }
+        }
+        self.start_finale(ctx, idx);
+        if let (Some(n), Some(a)) = (note, self.finale_agent) {
+            ctx.prompt(a, format!("[mantra:respawn] {n}"));
+        }
+        self.log("↻", "violet", "finale agent respawned (watchdog/manual)");
+        true
     }
 
     pub fn retry_worker(&mut self, ctx: &mut dyn Ctx, a: AgentId, prompt: Option<String>) -> String {
@@ -1595,6 +1998,31 @@ impl Run {
                 let m = s("message");
                 match self.resolve(&n) {
                     Some(t) if t != a => {
+                        if let Some(refusal) = self.worker_done_guard(t) {
+                            return (refusal.into(), false);
+                        }
+                        // F3 loop protection (WP7.2): the orchestrator nagging the same idle
+                        // (interrupted/failed but still `Running`) worker three times in five
+                        // minutes with no progress means it's stuck — respawn instead of relaying
+                        // another prompt into the void.
+                        if let Some(wi) = self.worker_idx(t) {
+                            let idle = self.workers[wi].state == WState::Running && ctx.agent(t).map(|ag| !ag.busy()).unwrap_or(false);
+                            if idle {
+                                let now = Instant::now();
+                                let w = &mut self.workers[wi];
+                                w.idle_prompts.retain(|t0| now.duration_since(*t0) < Duration::from_secs(300));
+                                w.idle_prompts.push(now);
+                                if w.idle_prompts.len() >= 3 {
+                                    let tid = w.task.id.clone();
+                                    w.idle_prompts.clear();
+                                    self.log("⏰", "amber", format!("{tid}: orchestrator prompted 3× without progress — respawning (watchdog)"));
+                                    return match self.respawn(ctx, t, Some("[mantra:watchdog] Respawned after repeated idle prompts without progress.".into())) {
+                                        Ok(()) => (format!("{tid} was stuck (prompted 3× with no progress) — respawned instead of forwarding this message"), true),
+                                        Err(e) => (e, false),
+                                    };
+                                }
+                            }
+                        }
                         self.mark_edge(t);
                         let from = self.name_of(a);
                         ctx.prompt(t, format!("[from the {from}] {m}"));
@@ -1605,23 +2033,32 @@ impl Run {
                 }
             }
             "mantra_interrupt" => match self.resolve(&s("agent")) {
-                Some(t) => {
-                    ctx.interrupt(t);
-                    ("interrupted".into(), true)
-                }
+                Some(t) => match self.worker_done_guard(t) {
+                    Some(refusal) => (refusal.into(), false),
+                    None => {
+                        ctx.interrupt(t);
+                        ("interrupted".into(), true)
+                    }
+                },
                 None => ("unknown agent".into(), false),
             },
             "mantra_set_effort" => match self.resolve(&s("agent")) {
-                Some(t) => {
-                    let e = ctx.set_effort(t, &s("effort"));
-                    (format!("effort set to {e} (applies from the next turn)"), true)
-                }
+                Some(t) => match self.worker_done_guard(t) {
+                    Some(refusal) => (refusal.into(), false),
+                    None => {
+                        let e = ctx.set_effort(t, &s("effort"));
+                        (format!("effort set to {e} (applies from the next turn)"), true)
+                    }
+                },
                 None => ("unknown agent".into(), false),
             },
             "mantra_retry" => {
                 let tid = s("task_id");
                 match self.resolve(&tid) {
                     Some(t) => {
+                        if let Some(refusal) = self.worker_done_guard(t) {
+                            return (refusal.into(), false);
+                        }
                         let p = Some(s("prompt")).filter(|x| !x.is_empty());
                         (self.retry_worker(ctx, t, p), true)
                     }
@@ -1701,6 +2138,14 @@ impl Run {
     }
 }
 
+/// Prepend an optional watchdog/manual note to a resume prompt.
+fn join_note(note: Option<String>, base: String) -> String {
+    match note {
+        Some(n) => format!("{n}\n\n{base}"),
+        None => base,
+    }
+}
+
 fn parse_gate_from_text(t: Option<&str>) -> Option<(bool, String)> {
     let t = t?;
     let low = t.to_lowercase();
@@ -1738,6 +2183,46 @@ mod halt_tests {
             a.turn_active = true;
             self.agents.insert(id, a);
             id
+        }
+        /// Register a fake agent that is idle (no turn in progress) — the watchdog's target state.
+        fn add_idle(&mut self) -> AgentId {
+            let id = self.next;
+            self.next += 1;
+            self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
+            id
+        }
+        /// Back-date an agent's `last_event` so it looks idle for `secs` (the watchdog's only
+        /// signal), without an actual sleep.
+        fn set_idle_secs(&mut self, a: AgentId, secs: u64) {
+            if let Some(ag) = self.agents.get_mut(&a) {
+                ag.last_event = Instant::now() - Duration::from_secs(secs);
+                ag.turn_active = false;
+                ag.awaiting_start = false;
+            }
+        }
+    }
+
+    /// A minimal `Worker` for tests that don't need a real workspace/prepare cycle.
+    fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
+        Worker {
+            task: Task { id: id.into(), role: role.into(), ..Default::default() },
+            prompt: String::new(),
+            effort: None,
+            agent: Some(agent),
+            attempt: 1,
+            state,
+            report: String::new(),
+            wt: None,
+            branch: String::new(),
+            spawned: Instant::now(),
+            finished: None,
+            tripwires: vec![],
+            adhoc: false,
+            paused: false,
+            stall_flagged: false,
+            budget_flagged: false,
+            context_override: None,
+            idle_prompts: vec![],
         }
     }
     impl Ctx for TestCtx {
@@ -1796,5 +2281,233 @@ mod halt_tests {
         assert!(run.alerts.is_empty(), "a manual pause is not an alert");
         run.toggle_pause(&mut ctx);
         assert!(!run.halted(), "space toggles a manual pause back off");
+    }
+
+    fn one_task_phase() -> Plan {
+        Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks: vec![Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() }], ..Default::default() }
+    }
+
+    // WP7.2 watchdog tests ---------------------------------------------------------------------
+
+    #[test]
+    fn watchdog_nudges_then_respawns_then_wakes_planner() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+
+        // 90s idle (default watchdog_seconds): nudge the orchestrator itself.
+        ctx.set_idle_secs(orch, 90);
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("[mantra:watchdog]")), "expected a nudge at 90s, got {:?}", ctx.prompts);
+
+        // 240s idle (default watchdog_escalate_seconds): respawn the orchestrator.
+        ctx.prompts.clear();
+        ctx.set_idle_secs(orch, 240);
+        run.watchdog_tick(&mut ctx);
+        let new_orch = run.orchestrator.expect("orchestrator still set after a respawn");
+        assert_ne!(new_orch, orch, "240s idle must respawn the orchestrator (a new agent id)");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == new_orch && t.contains("[mantra:respawn]")));
+
+        // 480s idle (2x escalate) on the respawned orchestrator: wake the planner instead.
+        ctx.prompts.clear();
+        ctx.set_idle_secs(new_orch, 480);
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("did not act")), "expected the planner to be woken at 480s, got {:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn watchdog_leaves_a_legitimately_sleeping_orchestrator_alone() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        let worker_agent = ctx.add_busy();
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+        ctx.set_idle_secs(orch, 500); // long idle, but a worker is running — this is legitimate
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.is_empty(), "an orchestrator asleep in mantra_wait while a worker runs must not be nudged: {:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn f3_loop_protection_respawns_a_repeatedly_prompted_idle_worker() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        // "idle" per the F3 rule: the turn ended (interrupted) but the worker is still `Running`.
+        let worker_agent = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+
+        for n in 0..2 {
+            let (msg, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": "t1", "message": "keep going"}));
+            assert!(ok, "prompt #{n} should be forwarded normally: {msg}");
+            assert!(msg.starts_with("sent to"), "prompt #{n}: {msg}");
+        }
+        let (msg, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": "t1", "message": "keep going"}));
+        assert!(ok, "{msg}");
+        assert!(msg.contains("respawned"), "the third idle prompt within 5 minutes must respawn the worker instead of forwarding: {msg}");
+        assert_eq!(run.workers.len(), 2, "the F3 respawn must produce a new worker attempt");
+        assert_eq!(run.workers[0].state, WState::Cancelled);
+        assert_eq!(run.workers[1].attempt, 2);
+    }
+
+    #[test]
+    fn tool_guard_refuses_steering_a_done_worker_outside_orchestrating() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        let worker_agent = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } }; // merging/gating, not Orchestrating
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Done));
+
+        let (msg, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": "t1", "message": "hi"}));
+        assert!(!ok);
+        assert!(msg.contains("wait for the handoff"), "{msg}");
+
+        let (msg, ok) = run.handle_tool(&mut ctx, orch, "mantra_interrupt", &json!({"agent": "t1"}));
+        assert!(!ok, "{msg}");
+    }
+
+    #[test]
+    fn respawn_planner_during_review_keeps_stage_review() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Review;
+        run.plan = Some(Plan { title: "x".into(), ..Default::default() });
+        run.plan_version = 1;
+
+        run.respawn(&mut ctx, planner, None).unwrap();
+
+        assert_eq!(run.stage, Stage::Review, "respawning the planner mid-review must not change the stage");
+        let new_planner = run.planner.expect("planner still set after respawn");
+        assert_ne!(new_planner, planner);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:respawn]")));
+    }
+
+    /// Review fix: the built-in default pattern's last finale step reuses `self.planner` as the
+    /// finale agent id (`start_finale`), so `respawn`/`watchdog_role_tag` must disambiguate via
+    /// `Stage::Finale` before falling back to the plain planner check — otherwise this shared id
+    /// silently misroutes to `respawn_planner` (wrong resume prompt, dangling `finale_agent`).
+    #[test]
+    fn respawn_shared_planner_finale_agent_routes_to_finale_not_planner() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.finale_agent = Some(planner); // shared id, exactly as `start_finale` leaves it
+        run.stage = Stage::Finale { idx: 2 }; // built-in pattern's finale[2].role == "planner"
+        run.plan = Some(Plan { title: "x".into(), ..Default::default() });
+
+        run.respawn(&mut ctx, planner, None).unwrap();
+
+        assert!(matches!(run.stage, Stage::Finale { idx: 2 }), "must stay on the finale step, got {:?}", run.stage);
+        assert_eq!(run.finale_agent, Some(planner), "the shared id keeps serving as the finale agent");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:finale]")), "expected the finale step's own prompt, got {:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("Continue from stage")), "must not fall through to the planner respawn's resume prompt");
+    }
+
+    /// Review fix: `respawn_gate` must reuse the gate's *current* round (via
+    /// `spawn_gate_at_round`), not silently reset it to 1 — `gate_max_rounds` and the L4
+    /// identical-blocker halt are both keyed off `round`.
+    #[test]
+    fn respawn_gate_preserves_the_current_round() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 2 } };
+
+        run.respawn(&mut ctx, gate, None).unwrap();
+
+        match run.stage {
+            Stage::Phase { step: PhaseStep::Gate { round }, .. } => assert_eq!(round, 2, "a respawned gate must keep its round, not reset to 1"),
+            other => panic!("expected Phase{{Gate}}, got {other:?}"),
+        }
+        let new_gate = run.gate_agent.expect("gate agent still set after respawn");
+        assert_ne!(new_gate, gate);
+    }
+
+    /// Review fix: if the stage has already moved on (gate agent still registered but the run
+    /// left `Stage::Phase{Gate}`, e.g. the round just finished), `respawn` must surface an error
+    /// instead of silently no-op'ing and letting the caller show a false "respawned" toast.
+    #[test]
+    fn respawn_gate_after_stage_moved_on_is_an_error() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.stage = Stage::Review; // no longer Phase{Gate} — phase_idx() is None
+
+        let err = run.respawn(&mut ctx, gate, None).unwrap_err();
+        assert!(err.contains("already moved on"), "{err}");
+        assert_eq!(run.gate_agent, Some(gate), "no-op must not tear down the still-registered agent");
+    }
+
+    /// Same guard for the finale agent: if `stage` is no longer `Stage::Finale`, `respawn` must
+    /// return an error rather than `Ok(())` with nothing having happened.
+    #[test]
+    fn respawn_finale_after_stage_moved_on_is_an_error() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let finale = ctx.add_idle();
+        run.finale_agent = Some(finale);
+        run.stage = Stage::Review; // no longer Stage::Finale
+
+        let err = run.respawn(&mut ctx, finale, None).unwrap_err();
+        assert!(err.contains("already moved on"), "{err}");
+        assert_eq!(run.finale_agent, Some(finale), "no-op must not tear down the still-registered agent");
+    }
+
+    // L4 gate-loop protection -------------------------------------------------------------------
+
+    #[test]
+    fn gate_loop_protection_halts_on_two_identical_blockers() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let blocked = "GATE: fail — Blocked: shell sandbox fails before any command runs (bwrap)";
+        ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
+
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert!(!run.halted(), "the first blocked round should just try again");
+
+        ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert!(run.halted(), "two consecutive identical blockers must halt immediately, not spend the remaining rounds");
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
+    }
+
+    // WP12.4/L1: EnvironmentBroken -------------------------------------------------------------
+
+    #[test]
+    fn environment_broken_halts_once_with_the_sandbox_hint() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let worker_agent = ctx.add_busy();
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+
+        run.on_environment_broken(&mut ctx, worker_agent, "bwrap: setting up uid map: Permission denied".into());
+        assert!(run.halted());
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::Environment);
+        assert!(run.alerts.iter().any(|a| a.to_lowercase().contains("sandbox")));
+
+        let first = run.halt.as_ref().unwrap().message.clone();
+        run.on_environment_broken(&mut ctx, worker_agent, "bwrap: a different failure".into());
+        assert_eq!(run.halt.as_ref().unwrap().message, first, "a second EnvironmentBroken must not overwrite the first halt");
     }
 }

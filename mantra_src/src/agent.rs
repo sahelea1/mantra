@@ -95,6 +95,9 @@ pub enum Signal {
     TurnDone { status: String, error: Option<String>, kind: Option<ErrKind> },
     FilesChanged(Vec<String>),
     Activity,
+    /// A finished `commandExecution` item's output names `bwrap`/user namespaces (WP12.4/L1): the
+    /// sandbox itself cannot run commands on this host. Carries the offending output, truncated.
+    EnvironmentBroken(String),
 }
 
 pub struct Agent {
@@ -562,6 +565,7 @@ impl Agent {
                 let agg = item.get("aggregatedOutput").and_then(|x| x.as_str()).map(|x| x.to_string());
                 let short = crate::util::trunc(cmd.lines().next().unwrap_or(""), 60);
                 let it = self.get_or_insert(&id, Kind::Command { cmd: cmd.clone(), output: String::new(), exit: None, status: status.clone(), dur_ms: None });
+                let mut out_for_probe = String::new();
                 if let Kind::Command { cmd: c, output, exit: e, status: st, dur_ms } = &mut it.kind {
                     if !cmd.is_empty() {
                         *c = cmd;
@@ -575,11 +579,19 @@ impl Agent {
                     *e = exit.or(*e);
                     *st = status;
                     *dur_ms = dur.or(*dur_ms);
+                    out_for_probe = output.clone();
                 }
                 it.done = done;
                 it.touch();
                 if !done {
                     self.activity = format!("$ {short}");
+                } else {
+                    // WP12.4/L1: a bubblewrap/user-namespace failure means every agent's shell
+                    // commands are dead on this host — surface it once as a run-level signal.
+                    let hay = out_for_probe.to_lowercase();
+                    if hay.contains("bwrap") || hay.contains("user namespaces") {
+                        signal = Some(Signal::EnvironmentBroken(crate::util::trunc(&out_for_probe, 300)));
+                    }
                 }
             }
             "fileChange" => {
