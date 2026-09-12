@@ -141,6 +141,25 @@ impl Pattern {
         toml::from_str(DEFAULT_PATTERN).expect("built-in pattern must parse")
     }
 
+    /// The default pattern with planner/orchestrator moved to a Claude Code model (`fable51`) and
+    /// workers to another (`sonnet5`) — gate roles are left on their Codex models, so this exercises
+    /// a genuinely mixed-backend run (`v02plan.md` §10.6). Built by editing `builtin()` in memory
+    /// rather than a second embedded TOML, so the two patterns can never silently drift apart on
+    /// anything but the models.
+    pub fn builtin_claude() -> Pattern {
+        let mut p = Pattern::builtin();
+        p.name = "mantra-default-claude".into();
+        p.description = format!("{} — planner/orchestrator on Claude Code (fable51), workers on Claude Code (sonnet5)", p.description);
+        for role in p.roles.values_mut() {
+            match role.kind.as_str() {
+                "planner" | "orchestrator" => role.model = "fable51".into(),
+                "worker" => role.model = "sonnet5".into(),
+                _ => {}
+            }
+        }
+        p
+    }
+
     pub fn from_toml(s: &str) -> Result<Pattern> {
         let p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
         p.validate().map_err(|errs| anyhow!(errs.join("; ")))?;
@@ -243,11 +262,14 @@ impl Pattern {
         if crate::util::slug(name) == "mantra-default" {
             return Ok(Pattern::builtin());
         }
+        if crate::util::slug(name) == "mantra-default-claude" {
+            return Ok(Pattern::builtin_claude());
+        }
         Err(anyhow!("pattern '{name}' not found"))
     }
 
     pub fn list(project: &Path) -> Vec<String> {
-        let mut v = vec!["mantra-default".to_string()];
+        let mut v = vec!["mantra-default".to_string(), "mantra-default-claude".to_string()];
         for dir in [project.join(".mantra").join("patterns"), crate::config::patterns_dir()] {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
@@ -428,5 +450,24 @@ mod tests {
         bad.roles.get_mut(&name).unwrap().permission = "sometimes".into();
         let errs = bad.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("permission") && e.contains("sometimes")), "{errs:?}");
+    }
+
+    #[test]
+    fn builtin_claude_is_valid_and_moves_only_planner_orchestrator_worker_models() {
+        let p = Pattern::builtin_claude();
+        assert!(p.validate().is_ok(), "{:?}", p.validate());
+        assert_eq!(p.name, "mantra-default-claude");
+        for (name, role) in &p.roles {
+            match role.kind.as_str() {
+                "planner" | "orchestrator" => assert_eq!(role.model, "fable51", "role '{name}'"),
+                "worker" => assert_eq!(role.model, "sonnet5", "role '{name}'"),
+                "gate" => assert_ne!(role.model, "fable51", "gate role '{name}' must keep its Codex model — only planner/orchestrator/worker move"),
+                _ => {}
+            }
+        }
+        // Loadable by name (`Pattern::load`), the same way "mantra-default" always is.
+        let loaded = Pattern::load("mantra-default-claude", Path::new("/nonexistent")).unwrap();
+        assert_eq!(loaded, p);
+        assert!(Pattern::list(Path::new("/nonexistent")).contains(&"mantra-default-claude".to_string()));
     }
 }

@@ -68,6 +68,28 @@ All notable changes to Mantra are recorded here.
   `backspace` on an empty input restores the last queued message for editing, `ctrl+x` discards
   the whole queue. Applies to Solo, Zoom and `@name` messages from the stage; the engine's own
   prompting (steering workers, waking the orchestrator, etc.) is unaffected.
+- WP10: Claude Code is a second agent backend, for any role. A provider now has a `kind`
+  (`codex` | `claude-code`) and, for Claude, an `auth` (`subscription` | `api_key`); when a
+  `claude` binary is on `PATH` a built-in `claude` provider appears with `opus46`/`opus48`/`opus5`/
+  `sonnet5`/`fable5`/`fable51` (+ `[1m]` variants). `hub::claude` runs one long-lived `claude -p
+  --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
+  --session-id|--resume … --model … [--effort] --autocompact … --append-system-prompt …` process
+  per agent (every inherited `CLAUDE*`/`ANTHROPIC_*` variable stripped, `IS_SANDBOX=1` set under
+  root, `--bare` + `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` for `api_key` auth through a gateway)
+  and translates its NDJSON stream into the Codex-shaped notifications the reducer already
+  understands, so the engine and UI have no backend branches; steering lands at the next tool
+  boundary, `x` sends a real `control_request` interrupt only while a turn is open, `/compact`
+  is the literal `/compact` line, a crash restarts with `--resume`, and a bad key halts as `Auth`
+  within seconds instead of the CLI's own ten retries. Mantra's tools reach Claude through MCP:
+  `Hub` opens `$MANTRA_HOME/run/<pid>.sock`, each Claude agent gets `--strict-mcp-config
+  --mcp-config` pointing at `mantra mcp-bridge --sock … --agent <id>` (spawned by `claude` itself),
+  `tools/list` is answered from the role's own tool schemas and `tools/call` becomes the same
+  `item/tool/call` request the Codex path produces. `mantra doctor` checks `claude --version` (5 s
+  timeout) and each Claude provider's auth; `D` on a Claude provider lists the six defaults (plus a
+  gateway's `/v1/models`); the Studio's providers grid gained `kind`/`auth` columns; the built-in
+  `mantra-default-claude` pattern runs planner/orchestrator on `fable51` and workers on `sonnet5`
+  with Codex gates; `mantra mock-claude` + `--demo --pattern mantra-default-claude` drive the whole
+  bridge chain in `scripts/stress.sh`; `scripts/live-claude.sh` holds the paste-ready live tests.
 - WP11: runs can be listed, resumed and deleted. `state.json` is now a typed snapshot (stage,
   workspace, workers with their worktrees/branches/reports, agents with their thread ids) rewritten
   atomically at every transition. `mantra runs` lists every run of every project (id, stage, when,

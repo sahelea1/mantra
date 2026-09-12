@@ -207,39 +207,58 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     let id = hub.alloc_id();
     let m = reg.resolve(&o.model_alias);
     let effort = m.resolve_effort(o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort));
-    let mut extra = reg.provider_args();
-    // Always tell Codex a context window and compaction limit — an assumed 200k / 85% when the
-    // model doesn't have its own, so auto-compaction never relies on a provider's own defaults.
+    let backend = reg.backend_of(&m);
+    // Always tell the backend a context window and compaction limit — an assumed 200k / 85% when
+    // the model doesn't have its own, so auto-compaction never relies on a provider's own defaults
+    // (Codex: `-c model_context_window=…`/`model_auto_compact_token_limit=…`; Claude: `--autocompact`).
     let cw = o.context_override.unwrap_or_else(|| m.effective_context());
     let compact_pct = m.effective_compact_percent();
-    extra.push("-c".into());
-    extra.push(format!("model_context_window={cw}"));
-    extra.push("-c".into());
-    extra.push(format!("model_auto_compact_token_limit={}", cw * compact_pct.min(99) as u64 / 100));
-    if m.is_custom_provider() {
-        extra.push("-c".into());
-        if m.efforts().is_empty() {
-            // No effort control → don't send any reasoning block (strict gateways reject it).
-            extra.push("model_reasoning_summary=\"none\"".into());
-        } else {
-            // Codex only sends reasoning params to models it doesn't know when told they support them.
-            extra.push("model_supports_reasoning_summaries=true".into());
+    let (extra, envs, claude) = if backend == crate::hub::Backend::ClaudeCode {
+        // WP10: no Codex `-c` args at all; auth/base_url/key come from the model's own provider
+        // entry, resolved here (not in `hub::claude`, which stays decoupled from `config::Registry`
+        // — see `SpawnSpec::claude`/`SpawnSpec::envs`).
+        let provider = reg.providers.iter().find(|p| p.id == m.provider);
+        let auth = provider.map(|p| p.auth.clone()).filter(|a| !a.is_empty()).unwrap_or_else(|| "subscription".into());
+        let base_url = provider.map(|p| p.base_url.clone()).unwrap_or_default();
+        let mut envs = vec![];
+        if auth == "api_key" {
+            if let Some(key) = provider.and_then(|p| p.resolve_key()) {
+                envs.push(("ANTHROPIC_API_KEY".to_string(), key));
+            }
         }
-    }
-    if !o.extra_writable.is_empty() {
-        let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }))
+    } else {
+        let mut extra = reg.provider_args();
         extra.push("-c".into());
-        extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
-    }
-    // Deliver a key stored directly in the provider (not just named by env_key) into the child's
-    // own environment — never on argv, never logged.
-    let envs: Vec<(String, String)> = reg
-        .providers
-        .iter()
-        .find(|p| p.id == m.provider)
-        .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
-        .into_iter()
-        .collect();
+        extra.push(format!("model_context_window={cw}"));
+        extra.push("-c".into());
+        extra.push(format!("model_auto_compact_token_limit={}", cw * compact_pct.min(99) as u64 / 100));
+        if m.is_custom_provider() {
+            extra.push("-c".into());
+            if m.efforts().is_empty() {
+                // No effort control → don't send any reasoning block (strict gateways reject it).
+                extra.push("model_reasoning_summary=\"none\"".into());
+            } else {
+                // Codex only sends reasoning params to models it doesn't know when told they support them.
+                extra.push("model_supports_reasoning_summaries=true".into());
+            }
+        }
+        if !o.extra_writable.is_empty() {
+            let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
+            extra.push("-c".into());
+            extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
+        }
+        // Deliver a key stored directly in the provider (not just named by env_key) into the
+        // child's own environment — never on argv, never logged.
+        let envs: Vec<(String, String)> = reg
+            .providers
+            .iter()
+            .find(|p| p.id == m.provider)
+            .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
+            .into_iter()
+            .collect();
+        (extra, envs, None)
+    };
     let spec = SpawnSpec {
         cwd: o.cwd.clone(),
         model: m.model.clone(),
@@ -252,7 +271,9 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         config: serde_json::Map::new(),
         extra_args: extra,
         resume_thread: o.resume_thread.clone(),
+        backend,
         envs,
+        claude,
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
     a.glyph = o.glyph;
@@ -911,8 +932,16 @@ impl App {
             sources.push("codex".into());
         }
         let provs: Vec<crate::config::ProviderEntry> = self.registry.providers.iter().filter(|p| !p.id.is_empty() && p.id != "openai" && only.as_ref().map(|o| *o == p.id).unwrap_or(true)).cloned().collect();
-        sources.extend(provs.iter().map(|p| p.id.clone()));
+        // ClaudeCode providers have no `/models` endpoint for a subscription; the six defaults
+        // (§10.2) are always known locally and answer instantly, with no loading spinner needed. A
+        // `base_url` (a third-party gateway) additionally gets queried live, exactly like a Codex
+        // custom provider (§10.5).
+        let net_provs: Vec<crate::config::ProviderEntry> = provs.iter().filter(|p| p.kind != crate::config::ProviderKind::ClaudeCode || !p.base_url.trim().is_empty()).cloned().collect();
+        sources.extend(net_provs.iter().map(|p| p.id.clone()));
         self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, errors: vec![], sel: 0, filter: Input::default() }));
+        for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
+            self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+        }
         if only.is_none() {
             let cmd = self.hub.codex_cmd.clone();
             let args = self.registry.provider_args();
@@ -930,7 +959,7 @@ impl App {
                 let _ = tx.send(AppEvent::Discovered { source: "codex".into(), result: r });
             });
         }
-        for p in provs {
+        for p in net_provs {
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
                 let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref()).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
@@ -1184,6 +1213,11 @@ impl App {
                     a.status = Status::Stopped;
                     a.turn_active = false;
                 }
+            }
+            HubEvent::BridgeConn { agent, stream } => {
+                // Routing by agent id is `Hub::send`'s job already (WP10.4) — a bridge connection
+                // for an agent that's since exited is just dropped, same as any other stale `Cmd`.
+                self.hub.send(agent, Cmd::Bridge(stream));
             }
         }
     }
@@ -1657,7 +1691,9 @@ impl App {
             KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
             KeyCode::Char('x') => {
                 if let Some(a) = selected {
-                    self.hub.send(a, Cmd::Interrupt);
+                    if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
+                        self.hub.send(a, Cmd::Interrupt);
+                    }
                 }
             }
             KeyCode::Char('r') => {
@@ -1980,7 +2016,7 @@ mod tests {
 
     fn test_hub_with(id: AgentId) -> (Hub, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec![], ev_tx);
+        let mut hub = Hub::new(vec![], vec![], ev_tx, false);
         let rx = hub.test_register(id);
         (hub, rx)
     }

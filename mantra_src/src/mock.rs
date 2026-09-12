@@ -506,7 +506,9 @@ async fn solo(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn mock_plan(first: bool) -> Value {
+/// Shared with `mock_claude.rs` (WP10.6): the same demo plan, so a phase spawned by a Claude-backed
+/// planner looks identical to one spawned by a Codex-backed planner.
+pub(crate) fn mock_plan(first: bool) -> Value {
     let t = |id: &str, title: &str, role: &str, scope: &str, prompt: &str| json!({"id": id, "title": title, "role": role, "scope": [scope], "prompt": prompt, "acceptance": "builds, tests pass"});
     let mut p1_tasks = vec![
         t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
@@ -616,7 +618,8 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn task_info(dev: &str) -> (String, String, Vec<String>) {
+/// Shared with `mock_claude.rs` (WP10.6).
+pub(crate) fn task_info(dev: &str) -> (String, String, Vec<String>) {
     let line = dev.lines().find(|l| l.starts_with("## Your task:")).unwrap_or("## Your task: task — work");
     let rest = line.trim_start_matches("## Your task:").trim();
     let mut parts = rest.splitn(2, " — ");
@@ -724,7 +727,8 @@ async fn architect(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn camel(s: &str) -> String {
+/// Shared with `mock_claude.rs` (WP10.6).
+pub(crate) fn camel(s: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|p| !p.is_empty()).map(|p| {
         let mut c = p.chars();
         c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()

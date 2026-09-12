@@ -79,6 +79,9 @@ pub fn log_path() -> PathBuf {
 pub struct Settings {
     /// Command used to launch one Codex app-server per agent.
     pub codex_command: Vec<String>,
+    /// Command used to launch one `claude` process per Claude Code agent (WP10.3). A `--demo`
+    /// override to a mock is WP10.6 territory, not wired up yet.
+    pub claude_command: Vec<String>,
     /// Model alias used by Solo mode.
     pub default_model: String,
     /// Approval mode for Solo: "untrusted" | "on-request" | "never".
@@ -104,6 +107,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             codex_command: vec!["codex".into(), "app-server".into()],
+            claude_command: vec!["claude".into()],
             default_model: "sol".into(),
             approval_mode: "on-request".into(),
             sandbox: "workspace-write".into(),
@@ -233,7 +237,20 @@ impl ModelEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+/// Which agent runtime a provider's models are launched through. `Codex` (the default, and the
+/// only kind before WP10) covers `openai` plus any custom OpenAI-Responses-compatible provider;
+/// `ClaudeCode` providers are launched via `hub::claude` (`run_claude_process`) instead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[default]
+    Codex,
+    /// Written as `kind = "claude-code"`; `claude_code` and `claudecode` are accepted too.
+    #[serde(alias = "claude_code", alias = "claudecode")]
+    ClaudeCode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ProviderEntry {
     pub id: String,
@@ -250,6 +267,17 @@ pub struct ProviderEntry {
     /// Still read from old files, never written.
     #[serde(skip_serializing)]
     pub wire_api: String,
+    /// Codex (default) or ClaudeCode (WP10).
+    pub kind: ProviderKind,
+    /// ClaudeCode only: "subscription" (OAuth login, no `--bare`) | "api_key" (`--bare` +
+    /// `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` for third parties). Irrelevant for `Codex`.
+    pub auth: String,
+}
+
+impl Default for ProviderEntry {
+    fn default() -> Self {
+        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into() }
+    }
 }
 
 impl ProviderEntry {
@@ -309,11 +337,57 @@ const REGISTRY_HEADER: &str = r#"# Mantra model registry.
 
 "#;
 
+/// Cheap, side-effect-free check for a `claude` executable on `PATH` (no subprocess spawn).
+/// Cached after the first call — `Registry::defaults()` may run more than once per process (a
+/// missing/invalid `models.toml` falls back to it, and tests call it directly).
+pub fn claude_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("claude").is_file()))
+            .unwrap_or(false)
+    })
+}
+
+/// The six default Claude Code models plus their `[1m]` long-context variants, alias -> model id,
+/// context window and note. (`v02plan.md` WP10.2.)
+const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
+    ("opus46", "claude-opus-4-6", 200_000, ""),
+    ("opus48", "claude-opus-4-8", 200_000, ""),
+    ("opus5", "claude-opus-5", 200_000, ""),
+    ("sonnet5", "claude-sonnet-5", 200_000, ""),
+    ("fable5", "claude-fable-5", 200_000, ""),
+    ("fable51", "claude-fable-5-1", 200_000, ""),
+    ("opus5-1m", "claude-opus-5[1m]", 1_000_000, "1M context; needs an eligible plan"),
+    ("sonnet5-1m", "claude-sonnet-5[1m]", 1_000_000, "1M context; needs an eligible plan"),
+];
+
+/// The six default Claude Code models plus their `[1m]` variants as full `ModelEntry`s for
+/// `provider_id` (`v02plan.md` WP10.2). Used by `Registry::defaults()` (only when `claude` is on
+/// PATH) and by `discover::claude_defaults` (WP10.5, any `ClaudeCode`-kind provider's `D` key), and
+/// injected in memory by `--demo` (WP10.6) regardless of `claude_available()` so
+/// `mantra --demo --pattern mantra-default-claude` needs no real `claude` install.
+pub fn claude_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
+    let claude_efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].iter().map(|s| s.to_string()).collect();
+    CLAUDE_MODELS
+        .iter()
+        .map(|(alias, model, context_window, note)| ModelEntry {
+            alias: (*alias).into(),
+            provider: provider_id.to_string(),
+            model: (*model).into(),
+            context_window: Some(*context_window),
+            auto_compact_percent: Some(85),
+            default_effort: "high".into(),
+            efforts: claude_efforts.clone(),
+            note: (*note).into(),
+        })
+        .collect()
+}
+
 impl Registry {
     pub fn defaults() -> Registry {
         let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        Registry {
-            models: vec![
+        let mut models = vec![
                 ModelEntry {
                     alias: "astra".into(),
                     model: "gpt-6-astra".into(),
@@ -354,9 +428,19 @@ impl Registry {
                     note: "fast & affordable workers".into(),
                     ..Default::default()
                 },
-            ],
-            providers: vec![],
+            ];
+        let mut providers = vec![];
+        // Only offered when `claude` is actually installed (WP10.2); `doctor` reports this check.
+        if claude_available() {
+            providers.push(ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+            models.extend(claude_default_model_entries("claude"));
         }
+        Registry { models, providers }
+    }
+
+    /// Which backend a model's provider launches through (`openai`/no provider = Codex).
+    pub fn backend_of(&self, m: &ModelEntry) -> ProviderKind {
+        self.providers.iter().find(|p| p.id == m.provider).map(|p| p.kind).unwrap_or_default()
     }
 
     pub fn path() -> PathBuf {
@@ -432,6 +516,9 @@ impl Registry {
         let Some(p) = self.providers.iter().find(|p| p.id == m.provider) else {
             return Some(format!("{alias} uses provider '{}' which is not in /models", m.provider));
         };
+        if p.kind == ProviderKind::ClaudeCode && p.auth != "api_key" {
+            return None; // subscription login: `claude` holds the credentials, nothing to check here
+        }
         if p.resolve_key().is_none() {
             let var = p.env_var_name();
             return Some(format!("{alias} via {} — ${var} is not set and no api_key is stored (/models to fix)", self.provider_name(&p.id)));
@@ -456,7 +543,7 @@ impl Registry {
     pub fn provider_args(&self) -> Vec<String> {
         let mut args = vec![];
         for p in &self.providers {
-            if p.id.is_empty() || p.id == "openai" {
+            if p.id.is_empty() || p.id == "openai" || p.kind == ProviderKind::ClaudeCode {
                 continue;
             }
             let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
@@ -579,8 +666,8 @@ mod tests {
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].starts_with(&format!("{sec}: glm via Z.ai")) && msgs[0].contains("MANTRA_TEST_NO_SUCH_VAR"), "{msgs:?}");
         assert!(msgs[0].contains("/models"));
-        // a stored key satisfies it
-        r.providers[0].api_key = Some("k".into());
+        // a stored key satisfies it (find zai by id: defaults() may also carry a `claude` provider)
+        r.providers.iter_mut().find(|p| p.id == "zai").unwrap().api_key = Some("k".into());
         assert!(r.preflight(&p).is_empty());
         assert!(r.alias_problem("nope").unwrap().contains("not in /models"));
     }
@@ -605,5 +692,41 @@ mod tests {
         let s = toml::to_string_pretty(&r).unwrap();
         let back: Registry = toml::from_str(&s).unwrap();
         assert_eq!(back.models.len(), r.models.len());
+    }
+    #[test]
+    fn backend_of_is_codex_unless_provider_says_claude_code() {
+        let mut r = Registry { models: vec![], providers: vec![] };
+        let openai_model = ModelEntry { provider: "openai".into(), ..Default::default() };
+        assert_eq!(r.backend_of(&openai_model), ProviderKind::Codex);
+        let unknown_model = ModelEntry { provider: "nope".into(), ..Default::default() };
+        assert_eq!(r.backend_of(&unknown_model), ProviderKind::Codex, "an unresolved provider id must never be treated as Claude Code");
+        r.providers.push(ProviderEntry { id: "claude".into(), kind: ProviderKind::ClaudeCode, ..Default::default() });
+        let claude_model = ModelEntry { provider: "claude".into(), ..Default::default() };
+        assert_eq!(r.backend_of(&claude_model), ProviderKind::ClaudeCode);
+    }
+    #[test]
+    fn claude_defaults_only_appear_when_claude_kind_provider_exists() {
+        // Registry::defaults() only adds the built-in `claude` provider when the `claude` binary is
+        // on PATH (config::claude_available()); assert the two are consistent either way, and that
+        // when present the models/provider shape matches WP10.2 (kind, model ids, [1m] variants).
+        let r = Registry::defaults();
+        let has_claude_provider = r.providers.iter().any(|p| p.kind == ProviderKind::ClaudeCode);
+        assert_eq!(has_claude_provider, claude_available());
+        if has_claude_provider {
+            let p = r.providers.iter().find(|p| p.id == "claude").expect("built-in provider id must be `claude`");
+            assert_eq!(p.auth, "subscription");
+            let sonnet = r.get("sonnet5").expect("sonnet5 alias");
+            assert_eq!(sonnet.model, "claude-sonnet-5");
+            assert_eq!(r.backend_of(sonnet), ProviderKind::ClaudeCode);
+            let sonnet_1m = r.get("sonnet5-1m").expect("sonnet5-1m alias");
+            assert_eq!(sonnet_1m.model, "claude-sonnet-5[1m]");
+            assert_eq!(sonnet_1m.effective_context(), 1_000_000);
+            assert!(sonnet_1m.note.contains("1M context"));
+        }
+    }
+    #[test]
+    fn provider_args_never_mention_claude_code_providers() {
+        let r = Registry { models: vec![], providers: vec![ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: ProviderKind::ClaudeCode, ..Default::default() }] };
+        assert!(r.provider_args().is_empty(), "ClaudeCode providers must not generate Codex model_providers.* args");
     }
 }

@@ -227,6 +227,44 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// A random (not cryptographically secure) UUID v4 string, for `claude --session-id` (WP10.3).
+/// No RNG crate is in the dependency list, so this mixes process/time entropy through a small
+/// xorshift — good enough for a session identifier the CLI never validates for randomness.
+pub fn uuid_v4() -> String {
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut x = seed | 1; // xorshift64 needs a non-zero state
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let (a, b) = (next(), next());
+    let bytes: [u8; 16] = [(a >> 56) as u8, (a >> 48) as u8, (a >> 40) as u8, (a >> 32) as u8, (a >> 24) as u8, (a >> 16) as u8, (a >> 8) as u8, a as u8, (b >> 56) as u8, (b >> 48) as u8, (b >> 40) as u8, (b >> 32) as u8, (b >> 24) as u8, (b >> 16) as u8, (b >> 8) as u8, b as u8];
+    let mut b = bytes;
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+/// True when the process's effective uid is 0 (root). Claude Code refuses
+/// `--dangerously-skip-permissions` for root unless `IS_SANDBOX=1` is set (WP10.3); Linux only
+/// (via `/proc/self/status`, no `libc` dependency) — always false elsewhere, which just means
+/// Mantra won't set `IS_SANDBOX` there, matching Codex's own root handling.
+pub fn effective_uid_is_root() -> bool {
+    if cfg!(not(target_os = "linux")) {
+        return false;
+    }
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").map(|rest| rest.split_whitespace().nth(1).unwrap_or("").to_string())))
+        .map(|euid| euid == "0")
+        .unwrap_or(false)
+}
+
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -273,6 +311,29 @@ mod tests {
         let out = strip_ansi(input);
         assert!(!out.contains('\u{1b}'), "no ESC byte must survive: {out:?}");
         assert_eq!(out, "planner: process crashed (codex exited: 2026-09-11T22:51:26.627070Z ) — restarting & resuming");
+    }
+    #[test]
+    fn uuid_v4_has_the_right_shape_and_is_not_constant() {
+        let a = uuid_v4();
+        let b = uuid_v4();
+        assert_ne!(a, b);
+        for u in [&a, &b] {
+            let parts: Vec<&str> = u.split('-').collect();
+            assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+            assert!(u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+            assert_eq!(parts[2].chars().next(), Some('4'), "version nibble must be 4: {u}");
+            let variant = parts[3].chars().next().unwrap().to_digit(16).unwrap();
+            assert!((0x8..=0xb).contains(&variant), "variant nibble must be 10xx: {u}");
+        }
+    }
+    #[test]
+    fn effective_uid_matches_proc_self_status_when_present() {
+        // Don't assert a fixed outcome (root vs non-root varies by environment); just check it
+        // agrees with a direct /proc/self/status read instead of always returning a fixed value.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            let want = s.lines().find(|l| l.starts_with("Uid:")).map(|l| l.split_whitespace().nth(2) == Some("0")).unwrap_or(false);
+            assert_eq!(effective_uid_is_root(), want);
+        }
     }
     #[test]
     fn strip_ansi_handles_osc_and_lone_esc() {

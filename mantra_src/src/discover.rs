@@ -176,6 +176,21 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+/// The six built-in Claude Code models (`config::claude_default_model_entries`) as discovery
+/// candidates: there is no `/models` endpoint for a subscription, so these are always "found"
+/// locally for any `ClaudeCode`-kind provider — the built-in `claude` provider (already
+/// pre-populated by `Registry::defaults()`, so these come back `Configured`), or a second,
+/// third-party-gateway provider a user adds by hand (`v02plan.md` §10.2, §10.5).
+pub fn claude_defaults(provider_id: &str) -> Vec<Candidate> {
+    crate::config::claude_default_model_entries(provider_id)
+        .into_iter()
+        .map(|m| {
+            let efforts = m.efforts();
+            Candidate { provider: provider_id.to_string(), model: m.model, context: m.context_window, context_known: true, efforts, default_effort: m.default_effort, note: m.note, state: CState::New, selected: false }
+        })
+        .collect()
+}
+
 /// A model found on a custom provider.
 pub fn from_provider(provider: &str, f: &Found) -> Candidate {
     let reasoning = f.reasoning == Some(true);
@@ -285,6 +300,16 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_defaults_are_new_candidates_with_known_context_and_efforts() {
+        let cands = claude_defaults("claude2");
+        assert_eq!(cands.len(), 8, "6 base models + 2 [1m] variants");
+        assert!(cands.iter().all(|c| c.provider == "claude2" && c.context_known && !c.efforts.is_empty()));
+        let sonnet = cands.iter().find(|c| c.model == "claude-sonnet-5").expect("sonnet5");
+        assert_eq!(sonnet.context, Some(200_000));
+        let sonnet_1m = cands.iter().find(|c| c.model == "claude-sonnet-5[1m]").expect("sonnet5-1m");
+        assert_eq!(sonnet_1m.context, Some(1_000_000));
+    }
     #[test]
     fn parses_common_provider_shapes() {
         let openai = r#"{"object":"list","data":[{"id":"glm-4.6","object":"model"},{"id":"text-embedding-3-small"},{"id":"glm-4.5-air"}]}"#;

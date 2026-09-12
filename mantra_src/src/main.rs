@@ -2,12 +2,13 @@
 
 mod agent;
 mod app;
-mod bridge;
 mod config;
 mod discover;
 mod engine;
 mod hub;
+mod mcp_bridge;
 mod mock;
+mod mock_claude;
 mod rpc;
 mod ui;
 mod util;
@@ -136,18 +137,24 @@ fn parse_args() -> Result<Option<Cli>> {
 }
 
 fn main() {
-    // The mock server is a separate mode of the same binary.
-    if std::env::args().nth(1).as_deref() == Some("mock-codex") {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        rt.block_on(mock::run());
-        return;
-    }
-    // So is the MCP bridge that Claude Code agents use to reach Mantra's tools.
-    if std::env::args().nth(1).as_deref() == Some("mcp-bridge") {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        let code = rt.block_on(bridge::run(args));
-        std::process::exit(code);
+    // The mock servers and the MCP bridge (WP10.4/10.6) are separate modes of the same binary.
+    match std::env::args().nth(1).as_deref() {
+        Some("mock-codex") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mock::run());
+            return;
+        }
+        Some("mock-claude") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mock_claude::run());
+            return;
+        }
+        Some("mcp-bridge") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mcp_bridge::run());
+            return;
+        }
+        _ => {}
     }
     let cli = match parse_args() {
         Ok(Some(c)) => c,
@@ -189,7 +196,7 @@ fn demo_project() -> Result<PathBuf> {
 
 async fn async_main(cli: Cli) -> Result<()> {
     let mut settings = config::Settings::load();
-    let registry = config::Registry::load();
+    let mut registry = config::Registry::load();
     let mut demo = cli.demo;
     if !demo && !codex_available(&settings.codex_command) {
         eprintln!("mantra: `{}` not found — starting in DEMO mode (simulated agents).\n        Install Codex with `npm i -g @openai/codex`, then `codex login`.", settings.codex_command.join(" "));
@@ -225,6 +232,15 @@ async fn async_main(cli: Cli) -> Result<()> {
     if demo {
         let exe = std::env::current_exe()?;
         settings.codex_command = vec![exe.to_string_lossy().to_string(), "mock-codex".into()];
+        // WP10.6: mirror the Codex override above for the Claude Code backend. Injected in memory
+        // (never saved) regardless of `config::claude_available()`, so `--demo --pattern
+        // mantra-default-claude` needs no real `claude` install: the demo's whole point is zero
+        // external dependencies.
+        settings.claude_command = vec![exe.to_string_lossy().to_string(), "mock-claude".into()];
+        if !registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode) {
+            registry.providers.push(config::ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+            registry.models.extend(config::claude_default_model_entries("claude"));
+        }
     }
     // L1: on a Linux box where unprivileged user namespaces are off, every worker command dies
     // in bubblewrap. Say so once, up front — and don't start a run on it without a nod.
@@ -253,7 +269,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
         });
     }
-    let hub = hub::Hub::new(settings.codex_command.clone(), hub_tx);
+    // The MCP-bridge socket (WP10.4) is only worth opening when a Claude Code agent could actually
+    // run — real or (in `--demo`) mocked.
+    let enable_bridge = registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode);
+    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), hub_tx, enable_bridge);
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
     if let Some(p) = cli.pattern {
         app.pattern_name = p;
@@ -591,6 +610,16 @@ fn doctor() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         println!("{} login: {}", ok(o.status.success()), t.lines().next().unwrap_or("").trim());
     }
+    // WP10.5: `claude --version` with a 5s timeout — run on a thread and `recv_timeout`, so a hung
+    // `claude` binary (observed in this sandbox for `subscription` auth, §0.3) can never hang doctor.
+    match version_with_timeout(&s.claude_command[0], Duration::from_secs(5)) {
+        Some(Ok(v)) => println!("{} claude: {v}", ok(true)),
+        Some(Err(e)) => println!("{} claude: {e}", ok(false)),
+        None => println!("{} claude: `{}` not found (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)", ok(false), s.claude_command[0]),
+    }
+    if crate::util::effective_uid_is_root() {
+        println!("  IS_SANDBOX note: running as root — Mantra sets IS_SANDBOX=1 for claude agents (--dangerously-skip-permissions is otherwise refused for uid 0)");
+    }
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
     match util::sandbox_probe() {
@@ -617,16 +646,64 @@ fn doctor() {
     let r = config::Registry::load();
     println!("  models: {}", r.models.iter().map(|m| format!("{}={}", m.alias, m.model)).collect::<Vec<_>>().join(", "));
     for p in &r.providers {
-        let src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
-            format!("${} set", p.env_key)
-        } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-            "key stored in models.toml".to_string()
-        } else if p.env_key.trim().is_empty() {
-            "no key".to_string()
-        } else {
-            format!("${} NOT set", p.env_key)
+        let key_src = |p: &config::ProviderEntry| -> String {
+            if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                format!("${} set", p.env_key)
+            } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                "key stored in models.toml".to_string()
+            } else if p.env_key.trim().is_empty() {
+                "no key".to_string()
+            } else {
+                format!("${} NOT set", p.env_key)
+            }
         };
-        println!("{} provider {}: {}", ok(p.resolve_key().is_some()), p.id, src);
+        if p.kind == config::ProviderKind::ClaudeCode {
+            if p.auth == "api_key" {
+                println!("{} provider {} (Claude Code, api_key): {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
+            } else {
+                match claude_auth_status(&s.claude_command[0]) {
+                    Some(line) => println!("{} provider {} (Claude Code, subscription): {line}", ok(true), p.id),
+                    None => println!("  provider {} (Claude Code, subscription): OAuth login — no `claude auth status` to check; run `claude` once and log in", p.id),
+                }
+            }
+        } else {
+            println!("{} provider {}: {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
+        }
     }
     println!("  log: {}", config::log_path().display());
+}
+
+/// Runs `<cmd0> --version` on a thread with a hard timeout: `Some(Ok(version))` on success,
+/// `Some(Err(reason))` if it ran but failed or timed out, `None` if the binary isn't even there
+/// (WP10.5 — a `claude` under `subscription` auth can hang indefinitely in some sandboxes, §0.3).
+fn version_with_timeout(cmd0: &str, timeout: Duration) -> Option<Result<String, String>> {
+    let cmd0 = cmd0.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new(&cmd0).arg("--version").output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(o)) if o.status.success() => Some(Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())),
+        Ok(Ok(o)) => Some(Err(format!("--version exited {:?}", o.status.code()))),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(e)) => Some(Err(e.to_string())),
+        Err(_) => Some(Err(format!("timed out after {}s", timeout.as_secs()))),
+    }
+}
+
+/// `claude auth status`, if the subcommand exists and says anything (§10.5: "if that subcommand
+/// exists else skip"). Real Claude Code answers JSON (`{"loggedIn":…,"authMethod":…,…}`) — pull
+/// out the two fields that matter rather than dumping raw `{`; fall back to the first line for
+/// whatever a future/older CLI shape prints instead.
+fn claude_auth_status(cmd0: &str) -> Option<String> {
+    let o = std::process::Command::new(cmd0).args(["auth", "status"]).output().ok()?;
+    let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t.trim()) {
+        if let Some(logged_in) = v.get("loggedIn").and_then(|b| b.as_bool()) {
+            let method = v.get("authMethod").and_then(|m| m.as_str()).unwrap_or("");
+            return Some(if logged_in { format!("logged in ({method})") } else { "not logged in".into() });
+        }
+    }
+    let first = t.lines().next().unwrap_or("").trim().to_string();
+    (!first.is_empty()).then_some(first)
 }
