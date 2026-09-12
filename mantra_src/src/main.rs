@@ -488,8 +488,16 @@ fn doctor() {
     let r = config::Registry::load();
     println!("  models: {}", r.models.iter().map(|m| format!("{}={}", m.alias, m.model)).collect::<Vec<_>>().join(", "));
     for p in &r.providers {
-        let set = std::env::var(&p.env_key).is_ok();
-        println!("{} provider {}: ${} {}", ok(set), p.id, p.env_key, if set { "set" } else { "NOT set" });
+        let src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            format!("${} set", p.env_key)
+        } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+            "key stored in models.toml".to_string()
+        } else if p.env_key.trim().is_empty() {
+            "no key".to_string()
+        } else {
+            format!("${} NOT set", p.env_key)
+        };
+        println!("{} provider {}: {}", ok(p.resolve_key().is_some()), p.id, src);
     }
     println!("  log: {}", config::log_path().display());
 }

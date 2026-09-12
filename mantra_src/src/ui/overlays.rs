@@ -55,8 +55,9 @@ fn help(f: &mut Frame, area: Rect) {
         k("tab", "toggle between typing and navigating the canvas"),
         k("←→↑↓ · alt+←→", "select an agent"),
         k("⏎", "zoom into the selected agent (esc to come back)"),
-        k("space", "pause / resume the whole run"),
+        k("space", "pause / resume everything"),
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
+        k("m", "switch model for the selected agent (fixes a halted ProviderRejected)"),
         k("p · a", "plan · approve plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
@@ -347,7 +348,10 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 KeyCode::Enter => {
                     let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
                     match target {
-                        Some(a) => app.set_model(a, &alias),
+                        Some(a) => {
+                            app.set_model(a, &alias);
+                            app.model_switched_for_run_agent(a);
+                        }
                         None => {
                             app.settings.default_model = alias;
                             let _ = app.settings.save();

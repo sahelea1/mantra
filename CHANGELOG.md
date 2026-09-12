@@ -14,3 +14,15 @@ All notable changes to Mantra are recorded here.
   models (astra/sol/terra/luna) now ship honest explicit 272k / 85% defaults; a worker that still
   hits a context-full error while running on the assumed 200k gets that assumption halved for its
   next attempt, logged so you know to set the model's real context window.
+- WP5: providers can now hold an API key directly (`api_key`, alongside `env_key`) — stored
+  `0600` on Unix, delivered to each agent's own process environment (never on argv, never logged),
+  with a synthesized `MANTRA_<ID>_API_KEY` variable name when `env_key` is left empty; the
+  `/models` providers table gained a masked `api_key` column and shows whether a key is set via
+  the environment or stored in `models.toml`.
+- WP6: `Run.paused` became a typed `Halt { reason, agent, message, since }` (`HaltReason::User |
+  Auth | UsageLimit | ProviderRejected | Environment | GateExhausted | AttemptsExhausted |
+  AgentTurnFailed`) with a reason-specific resume hint; the opaque `‖ PAUSED` badge is replaced by
+  a full-width amber `⛔ halted · … · …` band under the stage header. A new `ErrKind::ProviderRejected`
+  (HTTP 400/422, "unexpected message role", …) is never retried and halts immediately, naming the
+  role, model alias and provider. `m` on a selected stage agent opens the model picker to fix a
+  `ProviderRejected` halt and resumes the run once a new model is picked.

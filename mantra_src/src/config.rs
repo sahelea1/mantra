@@ -239,13 +239,44 @@ pub struct ProviderEntry {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    /// Environment variable holding the API key (never store keys in files).
+    /// Name of the environment variable holding the API key (preferred: never touches disk).
     pub env_key: String,
+    /// The key itself, stored directly — optional, alongside `env_key`. Written to `models.toml`
+    /// (0600 on Unix) only when the user pastes one in here; never logged or put on argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Codex only speaks the Responses API since Feb 2026.
     /// Legacy field: Codex only supports the Responses API, so Mantra always sends "responses".
     /// Still read from old files, never written.
     #[serde(skip_serializing)]
     pub wire_api: String,
+}
+
+impl ProviderEntry {
+    /// The environment variable name Codex is told (via `-c model_providers.<id>.env_key=`) to
+    /// read this provider's key from: the configured `env_key`, or — when a key is pasted
+    /// directly into `api_key` with no `env_key` set — a synthesized `MANTRA_<ID>_API_KEY`.
+    pub fn env_var_name(&self) -> String {
+        let e = self.env_key.trim();
+        if !e.is_empty() {
+            e.to_string()
+        } else {
+            format!("MANTRA_{}_API_KEY", self.id.trim().to_uppercase().replace(['-', '.'], "_"))
+        }
+    }
+    /// Resolve the actual key value: the named environment variable if it names one and it is
+    /// set and non-empty, else a key stored directly in `api_key`.
+    pub fn resolve_key(&self) -> Option<String> {
+        let e = self.env_key.trim();
+        if !e.is_empty() {
+            if let Ok(v) = std::env::var(e) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        self.api_key.clone().filter(|s| !s.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -353,7 +384,13 @@ impl Registry {
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(home())?;
         let body = toml::to_string_pretty(self).context("serialize models")?;
-        atomic_write(&Self::path(), &format!("{REGISTRY_HEADER}{body}"))
+        let text = format!("{REGISTRY_HEADER}{body}");
+        // A registry holding a pasted-in key is written 0600 (Unix) so it isn't world-readable.
+        if self.providers.iter().any(|p| p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false)) {
+            atomic_write_restricted(&Self::path(), &text)
+        } else {
+            atomic_write(&Self::path(), &text)
+        }
     }
 
     pub fn get(&self, alias: &str) -> Option<&ModelEntry> {
@@ -387,9 +424,12 @@ impl Registry {
                 args.push("-c".into());
                 args.push(format!("{base}.base_url={}", q(&p.base_url)));
             }
-            if !p.env_key.is_empty() {
+            let has_key = !p.env_key.trim().is_empty() || p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+            if has_key {
                 args.push("-c".into());
-                args.push(format!("{base}.env_key={}", q(&p.env_key)));
+                // Only the variable NAME is ever passed — the value goes into the child's
+                // environment (see `spawn_agent`), never on argv, in logs, or here.
+                args.push(format!("{base}.env_key={}", q(&p.env_var_name())));
             }
             args.push("-c".into());
             // Codex only speaks the Responses API to providers; any other value would be rejected.
@@ -401,11 +441,28 @@ impl Registry {
 
 /// Write via temp file + rename so a crash never leaves a half-written config.
 pub fn atomic_write(path: &Path, body: &str) -> Result<()> {
+    write_atomic(path, body, false)
+}
+
+/// Like `atomic_write`, but the file is `chmod 0600` (Unix) before the rename — used when the
+/// content holds a secret (an API key pasted into `models.toml`).
+pub fn atomic_write_restricted(path: &Path, body: &str) -> Result<()> {
+    write_atomic(path, body, true)
+}
+
+fn write_atomic(path: &Path, body: &str, restrict: bool) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
     let tmp = path.with_extension("tmp~");
     std::fs::write(&tmp, body)?;
+    if restrict {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -454,6 +511,21 @@ mod tests {
         let sol = r.get("sol").unwrap();
         assert_eq!(sol.effective_context(), 272_000);
         assert_eq!(sol.effective_compact_percent(), 85);
+    }
+    #[test]
+    fn provider_key_resolution_and_no_leak_on_argv() {
+        // no env_key, no api_key → synthesized name, no key
+        let p = ProviderEntry { id: "zai".into(), ..Default::default() };
+        assert_eq!(p.env_var_name(), "MANTRA_ZAI_API_KEY");
+        assert_eq!(p.resolve_key(), None);
+        // api_key set directly, no env_key → synthesized name carries the value
+        let p2 = ProviderEntry { id: "zai".into(), api_key: Some("sk-secret-123".into()), ..Default::default() };
+        assert_eq!(p2.resolve_key().as_deref(), Some("sk-secret-123"));
+        let mut r = Registry { models: vec![], providers: vec![p2] };
+        r.models.push(ModelEntry { alias: "glm".into(), provider: "zai".into(), model: "glm-5.2".into(), ..Default::default() });
+        let args = r.provider_args();
+        assert!(args.iter().any(|a| a.contains("MANTRA_ZAI_API_KEY")), "the env var name must be registered: {args:?}");
+        assert!(!args.iter().any(|a| a.contains("sk-secret-123")), "the raw key must never appear in generated args: {args:?}");
     }
     #[test]
     fn registry_roundtrip() {

@@ -97,13 +97,16 @@ impl Conn {
     }
 }
 
-/// Spawn `cmd` and wire up reader/writer tasks.
-pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path) -> Result<(Conn, mpsc::UnboundedReceiver<Incoming>, Child)> {
+/// Spawn `cmd` and wire up reader/writer tasks. `envs` are set on the child in addition to the
+/// inherited environment (used to deliver an API key that lives only in `models.toml`, never on
+/// argv) — never logged.
+pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs: &[(String, String)]) -> Result<(Conn, mpsc::UnboundedReceiver<Incoming>, Child)> {
     let (prog, args) = cmd.split_first().ok_or_else(|| anyhow!("empty codex command"))?;
     let mut c = Command::new(prog);
     c.args(args)
         .args(extra_args)
         .current_dir(cwd)
+        .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

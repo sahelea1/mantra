@@ -166,7 +166,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, rows[4], app, placeholder, theme::VIOLET, !app.canvas_focus);
     draw_suggestions(f, rows[4], app);
     let hints: Vec<(&str, &str)> = if app.canvas_focus {
-        vec![("←→", "select"), ("⏎", "zoom"), ("space", "pause"), ("r", "retry"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
+        vec![("←→", "select"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
     } else {
         let mode: &'static str = match app.settings.approval_mode.as_str() {
             "never" => "approvals: never ask",
@@ -193,10 +193,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
             let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-            if r.paused {
-                right.push(Span::styled(format!(" {} PAUSED ", theme::g("‖", "||")), Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED)));
-                right.push(Span::raw("  "));
-            }
+            // The halt band (drawn in the rail, just under this header) already says why and
+            // what to do — no separate badge needed here.
             right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.started.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
@@ -212,6 +210,14 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     let Some(r) = &app.run else {
         return;
     };
+    if let Some(h) = &r.halt {
+        let hint = r.halt_hint();
+        let text = format!(" {} halted {} · {} · {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()), h.message, hint);
+        let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
+        f.render_widget(Paragraph::new(vec![line]), area);
+        return;
+    }
     let names: Vec<String> = r.plan.as_ref().map(|p| p.phases.iter().map(|x| x.name.clone()).collect()).unwrap_or_default();
     // state per rail item: 0 pending, 1 active, 2 done
     let mut items: Vec<(String, u8)> = vec![];
@@ -516,7 +522,7 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     let r = Rect { x: (area.x as i32 + (area.width as i32 - w) / 2) as u16, y: area.y + 1, width: w as u16, height: h as u16 };
     let line2 = match (run.stage == Stage::Review, a.map(|a| &a.status)) {
         (true, _) => vec![Span::styled(format!("{} plan ready · p to review · tab → a to approve · or type feedback", theme::g("☰", "=")), theme::bold(theme::accent()))],
-        (_, _) if run.paused => vec![Span::styled(format!("{} paused — see the alert (ctrl+g), fix it, then space to resume", theme::g("‖", "=")), theme::fg(theme::AMBER))],
+        (_, _) if run.halted() => vec![Span::styled(format!("{} halted — {}", theme::g("⛔", "X"), run.halt_hint()), theme::fg(theme::AMBER))],
         (_, Some(Status::Failed(m))) | (_, Some(Status::Crashed(m))) => vec![Span::styled(trunc(m, (w as usize).saturating_sub(4)), theme::fg(theme::RED))],
         (_, Some(Status::Retrying(m))) => vec![Span::styled(format!("retrying: {}", trunc(m, (w as usize).saturating_sub(14))), theme::fg(theme::AMBER))],
         (_, Some(Status::Starting)) | (_, None) => vec![Span::styled("starting codex…", theme::faint())],

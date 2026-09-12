@@ -264,6 +264,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     1 => p.name = t,
                     2 => p.base_url = t,
                     3 => p.env_key = t,
+                    4 => p.api_key = if t.is_empty() { None } else { Some(t) },
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -583,7 +584,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
 // ───────────────────────────── models ─────────────────────────────
 
 const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
-const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key"];
+const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key"];
 
 pub fn draw_models(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -647,11 +648,18 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 
-    let pw = [10usize, 14, 42, 18];
+    let pw = [10usize, 14, 34, 16, 14];
     let mut pl = vec![mk_head(PROV_COLS, &pw)];
     pl.push(Line::from(vec![Span::styled(format!(" {:<10} {:<12} {:<40}", "openai", "OpenAI", "(built into Codex — uses your codex login)"), theme::faint())]));
     for (ri, p) in app.registry.providers.iter().enumerate() {
-        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()];
+        let masked = match &p.api_key {
+            Some(k) if !k.trim().is_empty() => {
+                let k = k.trim();
+                if k.len() > 4 { format!("••••{}", &k[k.len() - 4..]) } else { "••••".to_string() }
+            }
+            _ => String::new(),
+        };
+        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), masked];
         let mut spans = vec![];
         for (ci, v) in vals.iter().enumerate() {
             let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
@@ -659,14 +667,20 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
         }
-        let key_ok = !p.env_key.is_empty() && std::env::var(&p.env_key).is_ok();
-        spans.push(Span::styled(if key_ok { format!(" {} key set", theme::g("✓", "ok")) } else { format!(" {} ${} not set", theme::g("✗", "x"), p.env_key) }, if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+        let (key_msg, key_ok) = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            ("key set (env)".to_string(), true)
+        } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+            ("key stored in models.toml".to_string(), true)
+        } else {
+            ("no key".to_string(), false)
+        };
+        spans.push(Span::styled(format!(" {} {key_msg}", if key_ok { theme::g("✓", "ok") } else { theme::g("✗", "x") }), if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
         let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
         spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
         pl.push(Line::from(spans));
     }
     pl.push(Line::from(Span::styled(" base_url = the provider's OpenAI-compatible API root (…/v1): Codex calls …/responses, discovery reads …/models", theme::faint())));
-    pl.push(Line::from(Span::styled(" env_key = the NAME of the environment variable holding the API key (the key itself is never stored) · D here = discover this provider", theme::faint())));
+    pl.push(Line::from(Span::styled(" env_key = name of an env var holding the key · api_key = paste one directly (stored 0600) · either works · D here = discover this provider", theme::faint())));
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
     f.render_widget(Paragraph::new(pl).block(block("providers (OpenAI Responses-compatible)", pcol)), rows[2]);
     footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", "test model"), ("D", "discover models"), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
@@ -721,8 +735,9 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Enter => {
             let (title, val, target) = if ui.providers {
                 let Some(p) = app.registry.providers.get(ui.row) else { return };
-                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()][ui.col.min(3)].clone();
-                (format!("provider · {}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
+                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default()][ui.col.min(4)].clone();
+                let hint = if ui.col == 4 { " (either name an env var or paste a key)" } else { "" };
+                (format!("provider · {}{hint}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
             } else {
                 let Some(m) = app.registry.models.get(ui.row) else { return };
                 let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), m.note.clone()][ui.col].clone();
@@ -734,7 +749,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('n') => {
             if ui.providers {
-                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into() });
+                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), api_key: None, wire_api: "responses".into() });
                 ui.row = app.registry.providers.len() - 1;
             } else {
                 app.registry.models.push(crate::config::ModelEntry { alias: format!("model{}", app.registry.models.len() + 1), model: "model-id".into(), ..Default::default() });
