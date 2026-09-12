@@ -2,6 +2,60 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.3.0
+
+Coordination release: agents ask instead of guessing, halts travel up the chain of command before
+they reach you, a revised plan restarts the phase it changed, and the orchestrator re-reads its
+workers' work on a clock. Driven by a real run's support bundle (`support-bundle.sh`, new).
+
+- **Chain of command.** Every worker, gate and finale agent has `mantra_ask`: a question goes to
+  the orchestrator, who answers with `mantra_prompt` or passes it up with its own `mantra_ask` to
+  the planner, who decides — or, only when the answer changes what is being built, asks you with
+  `mantra_ask_user`. A question to you is a saffron band on the stage, not a halt: the run keeps
+  going and your next message answers it. An agent that stops to wait is shown as *asked a
+  question · waiting for the answer*, is never mistaken for "done", and the rung above it is the
+  one the watchdog expects to act.
+- **Halts escalate to the planner first.** *Gate exhausted* and *attempts exhausted* hand the
+  planner the failing checks, their output and the last gate report, and exactly three ways out:
+  `mantra_revise_plan` (the fix — the run resumes by itself), `mantra_resume_run(note)` (the plan
+  is right; a hint for the stuck agent, and one more attempt), or `mantra_ask_user`. One reminder
+  if it does nothing; then the band is yours. `r` on a task that exhausted its attempts resumes
+  and retries in one go.
+- **A revision restarts what it changed.** A task changed after its worker finished is re-opened
+  (its old worker is cancelled, `mantra_spawn` accepts it again, the workspace keeps the earlier
+  result); a phase already merging or gating goes back to building when tasks were added or
+  changed; a gate that changed simply re-runs its checks. Nothing starts while the run is halted
+  — `mantra_spawn`/`mantra_retry` say so instead of quietly re-running a phase you are sorting
+  out. The identical failing check twice in a row escalates immediately instead of spending the
+  remaining rounds while the gate agent keeps reporting "pass".
+- **Periodic coherence review.** `settings.review_minutes` (default 3, `0` off, in the Studio):
+  while workers build, the idle orchestrator gets each one's activity, files touched and recent
+  log, and is asked to check the parallel work stays coherent with each other and the phase goal
+  — steering only where something is off.
+- **Claude Code backend.** The context gauge follows every API call's own usage (context = input
+  + cache reads + cache writes), so it moves while a turn runs instead of staying at 0 and then
+  showing "211k / 200k" from the turn's summed `result.usage`. A subscription login trusts the
+  window the CLI reports for the account; an `api_key` gateway keeps the configured one. The
+  CLI's once-a-second thinking ticks and tool progress count as activity, so a three-minute
+  `pip install` never reads as an idle agent — and they no longer flood `mantra.log`. Default
+  Claude models are now `opus46 opus48 opus5 sonnet5 fable5 fable51` at **1M** context and
+  `haiku45` at 200k (the `[1m]` aliases are gone; an existing `models.toml` keeps its own
+  `context_window` — set it to `1000000` or delete the file to regenerate).
+- **Keys.** `ctrl+c` interrupts the focused agent's turn (or closes an overlay / clears the input);
+  three presses within two seconds always quit, whatever state the app is in. `esc` only
+  navigates — back to the overview from a zoom, otherwise clear the input — and never interrupts,
+  so the two hints stop colliding in a zoomed Mandala agent.
+- **Protocols and the default pattern.** Planner: keep the tooling later gates need until the last
+  phase (cleanup belongs in the final phase), gate checks must run as-is on this machine. Gate:
+  never report pass while a check fails — a check that cannot pass is a plan problem, say so with
+  `mantra_ask`. Orchestrator: answer questions promptly, pass up what is above your brief, use the
+  review. Worker: ask instead of guessing; end the turn without a STATUS line to wait.
+- `support-bundle.sh`: one command that writes versions, `mantra doctor`, login state, terminal
+  and sandbox facts, settings/models/patterns, the newest runs and the log tail into one file,
+  with anything that looks like a key redacted. README gains *Reporting a problem*.
+- `--demo` gains `MANTRA_MOCK_ASK=1` (a worker asks, the orchestrator answers), and the mock
+  planner handles questions and escalations; 92 unit tests.
+
 ## v0.2.0
 
 - WP1: bumped version to 0.2.0; removed the 7 dead-code warnings (`cargo build` is now clean); crash

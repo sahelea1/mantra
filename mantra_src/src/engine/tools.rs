@@ -23,8 +23,36 @@ fn agent_tools() -> Vec<Value> {
     ]
 }
 
+/// `mantra_ask`: one rung up the chain of command. `up` names who answers.
+fn ask_tool(up: &str) -> Value {
+    tool(
+        "mantra_ask",
+        &format!("Ask the {up} when a decision is not yours to make or you are unsure and it matters (it changes the outcome, the scope, or another agent's work). The answer comes back as a message; if you cannot continue without it, end your turn and wait."),
+        json!({"question": {"type": "string", "description": "what you need decided, with the options you see"}}),
+        &["question"],
+    )
+}
+
+/// The tools every worker gets: just the one it needs to not guess.
+pub fn worker_tools() -> Vec<Value> {
+    vec![ask_tool("orchestrator")]
+}
+
 pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
     let mut v = vec![
+        tool(
+            "mantra_ask_user",
+            "Ask the user. Only for decisions that change what is being built, its scope, or a trade-off only they can make — everything else you decide yourself. The run keeps going; their answer arrives as a [from the user] message.",
+            json!({"question": {"type": "string"}}),
+            &["question"],
+        ),
+        tool(
+            "mantra_resume_run",
+            "Resume a halted run (gate or attempts exhausted) because the plan is right as it is. `note` goes to the agent that was stuck as concrete guidance. To change tasks or gate checks call mantra_revise_plan instead — that resumes the run by itself.",
+            json!({"note": {"type": "string"}}),
+            &[],
+        ),
+        tool("mantra_prompt", "Send a message to an agent — e.g. answer a finale agent's question. For the orchestrator use mantra_brief_orchestrator.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
         tool(
             "mantra_revise_plan",
@@ -80,14 +108,15 @@ pub fn orchestrator_tools() -> Vec<Value> {
         tool("mantra_interrupt", "Interrupt an agent's current turn.", json!({"agent": {"type": "string"}}), &["agent"]),
         tool("mantra_set_effort", "Change an agent's reasoning effort (applies from its next turn).", json!({"agent": {"type": "string"}, "effort": {"type": "string"}}), &["agent", "effort"]),
         tool("mantra_retry", "Respawn a failed/stuck worker with a fresh thread, optionally with a better prompt.", json!({"task_id": {"type": "string"}, "prompt": {"type": "string"}}), &["task_id"]),
-        tool("mantra_wait", "End your turn and wait. Mantra wakes you with events (worker finished/failed/tripwire).", json!({}), &[]),
+        tool("mantra_wait", "End your turn and wait. Mantra wakes you with events (worker finished/failed/tripwire/question).", json!({}), &[]),
+        ask_tool("planner"),
     ];
     v.extend(agent_tools());
     v
 }
 
 pub fn gate_tools(may_spawn: bool, worker_roles: &[String]) -> Vec<Value> {
-    let mut v = vec![gate_report_tool()];
+    let mut v = vec![gate_report_tool(), ask_tool("orchestrator")];
     v.extend(agent_tools());
     if may_spawn {
         v.extend(spawner_tools(worker_roles));
@@ -115,6 +144,15 @@ mantra-role: planner
 - When re-prompted by the user during a run ([mantra:reprompt]): read state with `mantra_status`/`mantra_log`,
   pause agents that would waste work (`mantra_pause_agents`), revise the plan (`mantra_revise_plan`) if needed,
   and tell the orchestrator what changed (`mantra_brief_orchestrator`). Then summarize what you did in 2-4 lines.
+- You are the top of the chain of command. Questions the orchestrator passes up ([mantra:question]) and halts
+  Mantra could not resolve ([mantra:escalation]: gate or attempts exhausted) land with you. Decide yourself
+  whenever the answer keeps the end product and the plan's intent; ask the user (`mantra_ask_user`) only when
+  it changes what is being built, its scope, or is a trade-off only they can make.
+- On an escalation act with exactly one of: `mantra_revise_plan` (fix this phase's tasks or checks — the run
+  resumes by itself), `mantra_resume_run` (the plan is right; a note for the stuck agent), `mantra_ask_user`.
+- Plan hygiene: keep the tooling later gates need (virtualenvs, node_modules, build caches) until the last
+  phase — cleanup tasks belong in the final phase, never in one whose gate still needs them. Gate `checks`
+  must run as-is on this machine; prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping.
 - In the final verification step you may spawn ad-hoc workers (`mantra_spawn_adhoc`), then `mantra_wait`,
   and finish with `mantra_gate_report`.
 "#;
@@ -129,6 +167,11 @@ mantra-role: orchestrator
   and moves to the next phase. You don't need to do any of that.
 - Never prompt a worker whose task is done — its report is final and it won't answer. After spawning,
   call mantra_wait. At most one mantra_prompt per event; silence (mantra_wait) is the normal answer.
+- QUESTION events: a worker or the gate stopped to ask you something. Answer it promptly with mantra_prompt —
+  decide yourself when it stays within the phase and the plan; when it would change the plan, the scope or
+  the product, pass it up to the planner with mantra_ask (you get the answer as a [from the planner] message).
+- [mantra:review]: every few minutes Mantra shows you each worker's recent work. Check the parallel work stays
+  coherent — with each other and with the phase goal — and steer only where something is actually off.
 - [mantra:handoff]: write a handoff note (≤10 lines) for your successor: decisions, risks, anything the next phase must know.
 "#;
 
@@ -137,6 +180,9 @@ mantra-role: worker
 ## Mantra protocol
 - You work in your own isolated copy of the repository. Only change files inside your scope.
 - Don't commit, don't push, don't switch branches — Mantra handles version control.
+- Unsure about a decision that matters (it changes the outcome, the scope, or another agent's work)? Don't
+  guess: call `mantra_ask` — the orchestrator answers, or passes it further up. If you cannot continue without
+  the answer, end your turn without a STATUS line; you'll be woken with the answer.
 - If you are blocked (missing info, impossible task), stop and say so.
 - End your final message with exactly:
 STATUS: done | blocked
@@ -149,6 +195,8 @@ mantra-role: gate
 - You work on the integrated result. You may edit any file needed to make things coherent and green.
 - When done, call `mantra_gate_report` with pass=true/false and a short summary. Then end your turn.
 - Mantra re-runs the gate checks after you report; if they fail you'll get another round.
+- Never report pass while a gate check fails. A check that is wrong, or cannot pass on this machine, is a
+  plan problem: say so with `mantra_ask` (it goes up the chain; the planner can amend the checks) and wait.
 "#;
 
 pub const ARCHITECT_PROMPT: &str = r#"

@@ -167,6 +167,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         match app.run.as_ref().map(|r| &r.stage) {
             None | Some(Stage::Done) | Some(Stage::Failed(_)) => "describe what to build — the planner takes it from here…".to_string(),
             Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan".to_string(),
+            Some(_) if app.run.as_ref().map(|r| r.question.is_some()).unwrap_or(false) => "answer the planner's question…".to_string(),
             Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…".to_string(),
             _ => "re-prompt the planner · @agent to talk to one agent directly".to_string(),
         }
@@ -223,6 +224,15 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         let hint = r.halt_hint();
         let text = format!(" {} halted {} · {} · {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()), h.message, hint);
         let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
+        f.render_widget(Paragraph::new(vec![line]), area);
+        return;
+    }
+    if let Some(q) = &r.question {
+        // The planner is asking the user something: the run keeps going, the band stays until
+        // the next typed message answers it.
+        let text = format!(" {} the planner asks ({}): {} · type your answer below", theme::g("?", "?"), fmt_dur(q.since.elapsed()), q.text);
+        let st = Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
         f.render_widget(Paragraph::new(vec![line]), area);
         return;
@@ -469,6 +479,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                     vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
                 }
                 (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
+                (_, Some(a)) if !a.busy() && run.waiting_for_answer(a.id) => vec![Span::styled("asked a question · waiting for the answer", theme::fg(theme::AMBER))],
                 (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
                 (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
                 _ => vec![],

@@ -349,20 +349,21 @@ pub fn claude_available() -> bool {
     })
 }
 
-/// The six default Claude Code models plus their `[1m]` long-context variants, alias -> model id,
-/// context window and note. (`v02plan.md` WP10.2.)
+/// The default Claude Code models: alias -> model id, context window and note. Every Opus,
+/// Sonnet and Fable model runs with a 1M window on Claude Code (only Haiku is 200k), and
+/// `--autocompact` is derived from this figure; the gauge itself follows the window the CLI
+/// reports for the account (`hub/claude.rs`), so an ineligible plan still reads right.
 const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
-    ("opus46", "claude-opus-4-6", 200_000, ""),
-    ("opus48", "claude-opus-4-8", 200_000, ""),
-    ("opus5", "claude-opus-5", 200_000, ""),
-    ("sonnet5", "claude-sonnet-5", 200_000, ""),
-    ("fable5", "claude-fable-5", 200_000, ""),
-    ("fable51", "claude-fable-5-1", 200_000, ""),
-    ("opus5-1m", "claude-opus-5[1m]", 1_000_000, "1M context; needs an eligible plan"),
-    ("sonnet5-1m", "claude-sonnet-5[1m]", 1_000_000, "1M context; needs an eligible plan"),
+    ("opus46", "claude-opus-4-6", 1_000_000, ""),
+    ("opus48", "claude-opus-4-8", 1_000_000, ""),
+    ("opus5", "claude-opus-5", 1_000_000, ""),
+    ("sonnet5", "claude-sonnet-5", 1_000_000, ""),
+    ("fable5", "claude-fable-5", 1_000_000, ""),
+    ("fable51", "claude-fable-5-1", 1_000_000, ""),
+    ("haiku45", "claude-haiku-4-5-20251001", 200_000, "fast & cheap"),
 ];
 
-/// The six default Claude Code models plus their `[1m]` variants as full `ModelEntry`s for
+/// The default Claude Code models as full `ModelEntry`s for
 /// `provider_id` (`v02plan.md` WP10.2). Used by `Registry::defaults()` (only when `claude` is on
 /// PATH) and by `discover::claude_defaults` (WP10.5, any `ClaudeCode`-kind provider's `D` key), and
 /// injected in memory by `--demo` (WP10.6) regardless of `claude_available()` so
@@ -708,7 +709,7 @@ mod tests {
     fn claude_defaults_only_appear_when_claude_kind_provider_exists() {
         // Registry::defaults() only adds the built-in `claude` provider when the `claude` binary is
         // on PATH (config::claude_available()); assert the two are consistent either way, and that
-        // when present the models/provider shape matches WP10.2 (kind, model ids, [1m] variants).
+        // when present the models/provider shape matches WP10.2 (kind, model ids, 1M windows).
         let r = Registry::defaults();
         let has_claude_provider = r.providers.iter().any(|p| p.kind == ProviderKind::ClaudeCode);
         assert_eq!(has_claude_provider, claude_available());
@@ -718,10 +719,9 @@ mod tests {
             let sonnet = r.get("sonnet5").expect("sonnet5 alias");
             assert_eq!(sonnet.model, "claude-sonnet-5");
             assert_eq!(r.backend_of(sonnet), ProviderKind::ClaudeCode);
-            let sonnet_1m = r.get("sonnet5-1m").expect("sonnet5-1m alias");
-            assert_eq!(sonnet_1m.model, "claude-sonnet-5[1m]");
-            assert_eq!(sonnet_1m.effective_context(), 1_000_000);
-            assert!(sonnet_1m.note.contains("1M context"));
+            assert_eq!(sonnet.effective_context(), 1_000_000, "Opus/Sonnet/Fable default to the 1M window");
+            let haiku = r.get("haiku45").expect("haiku45 alias");
+            assert_eq!(haiku.effective_context(), 200_000, "Haiku keeps 200k");
         }
     }
     #[test]

@@ -19,7 +19,7 @@ const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds"];
+const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -95,6 +95,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
                 "watchdog_seconds" => s.watchdog_seconds.to_string(),
                 "watchdog_escalate_seconds" => s.watchdog_escalate_seconds.to_string(),
+                "review_minutes" => if s.review_minutes == 0 { "off".into() } else { s.review_minutes.to_string() },
                 _ => String::new(),
             }
         }
@@ -192,6 +193,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     s.watchdog_escalate_seconds = (s.watchdog_escalate_seconds as i64 + 30 * d as i64).clamp(WATCHDOG_ESCALATE_MIN as i64, WATCHDOG_SECONDS_MAX as i64) as u64;
                     clamp_watchdog(s);
                 }
+                "review_minutes" => s.review_minutes = (s.review_minutes as i64 + d as i64).clamp(0, 240) as u64,
                 _ => return,
             }
         }
@@ -280,6 +282,8 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     s.watchdog_escalate_seconds = v.clamp(WATCHDOG_ESCALATE_MIN, WATCHDOG_SECONDS_MAX);
                     clamp_watchdog(s);
                 }
+                ("review_minutes", Some(v)) => s.review_minutes = v.min(240),
+                ("review_minutes", None) if text.trim().eq_ignore_ascii_case("off") => s.review_minutes = 0,
                 _ => {}
             }
             app.studio.dirty = true;

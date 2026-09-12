@@ -106,7 +106,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "send"), ("esc", "interrupt"), ("⇧⇥", m), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+o", "mandala"), ("?", "help")]
+        vec![("⏎", "send"), ("ctrl+c", "interrupt"), ("⇧⇥", m), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+o", "mandala"), ("?", "help")]
     };
     footer(f, rows[5], &hints);
 }

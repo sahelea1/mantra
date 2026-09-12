@@ -324,6 +324,14 @@ impl Agent {
                 }
                 out.push(Signal::Activity);
             }
+            // Claude backend liveness tick (`hub/claude.rs`): `last_event` moved above; only the
+            // label, if any, changes here.
+            "mantra/activity" => {
+                if let Some(l) = p.get("activity").and_then(|x| x.as_str()) {
+                    self.activity = l.into();
+                }
+                out.push(Signal::Activity);
+            }
             "item/agentMessage/delta" => {
                 let id = s(p, "itemId");
                 let d = s(p, "delta");

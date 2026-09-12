@@ -303,12 +303,12 @@ mod tests {
     #[test]
     fn claude_defaults_are_new_candidates_with_known_context_and_efforts() {
         let cands = claude_defaults("claude2");
-        assert_eq!(cands.len(), 8, "6 base models + 2 [1m] variants");
+        assert_eq!(cands.len(), 7, "6 1M models + haiku");
         assert!(cands.iter().all(|c| c.provider == "claude2" && c.context_known && !c.efforts.is_empty()));
         let sonnet = cands.iter().find(|c| c.model == "claude-sonnet-5").expect("sonnet5");
-        assert_eq!(sonnet.context, Some(200_000));
-        let sonnet_1m = cands.iter().find(|c| c.model == "claude-sonnet-5[1m]").expect("sonnet5-1m");
-        assert_eq!(sonnet_1m.context, Some(1_000_000));
+        assert_eq!(sonnet.context, Some(1_000_000));
+        let haiku = cands.iter().find(|c| c.model.starts_with("claude-haiku")).expect("haiku45");
+        assert_eq!(haiku.context, Some(200_000));
     }
     #[test]
     fn parses_common_provider_shapes() {

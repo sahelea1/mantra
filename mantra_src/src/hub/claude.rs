@@ -99,7 +99,7 @@ pub(super) async fn run_claude_process(
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     tokio::spawn(read_stderr(stderr, stderr_tail.clone()));
 
-    let mut tr = Translator::new(id, cs.autocompact);
+    let mut tr = Translator::new(id, cs.autocompact, cs.auth != "api_key");
     // MCP bridge state (WP10.4): `None` until a `Cmd::Bridge` hands over a live connection (or after
     // it closes / this process is about to be replaced by a restart). `bridge_rx` is polled in the
     // select loop below only while it's `Some` (`recv_bridge`).
@@ -214,7 +214,9 @@ pub(super) async fn run_claude_process(
             l = line_rx.recv() => {
                 match l {
                     Some(LineIn::Value(v)) => {
-                        crate::mlog!("claude {id}: {}", crate::util::trunc(&v.to_string(), 200));
+                        if !is_heartbeat(&v) {
+                            crate::mlog!("claude {id}: {}", crate::util::trunc(&v.to_string(), 200));
+                        }
                         for e in tr.on_line(&v, is_restart) {
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
@@ -239,6 +241,16 @@ pub(super) async fn run_claude_process(
                 }
             }
         }
+    }
+}
+
+/// The CLI's own progress ticks (`system/thinking_tokens` every second while the model thinks,
+/// `tool_progress` while a tool runs): folded into activity, never worth a log line each.
+fn is_heartbeat(v: &Value) -> bool {
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("tool_progress") => true,
+        Some("system") => v.get("subtype").and_then(|x| x.as_str()) == Some("thinking_tokens"),
+        _ => false,
     }
 }
 
@@ -500,9 +512,26 @@ struct Translator {
     /// *completed* event's own `changes` array is non-empty, so the path must be resent, not just
     /// implied by what `item/started` already told the item.
     open_tools: HashMap<String, ToolOpen>,
-    /// Effective context window, used as `thread/tokenUsage/updated`'s window when a `result` line
-    /// doesn't carry `modelUsage.*.contextWindow` (e.g. the num_turns:0 housekeeping result).
+    /// The context window Mantra configured for this agent (passed as `--autocompact`).
     autocompact: u64,
+    /// Prefer the window the CLI reports (`result.modelUsage.*.contextWindow`) over `autocompact`
+    /// for the gauge. True for a subscription login — the CLI knows what the plan really grants —
+    /// and false for a custom `api_key` gateway, whose real window only the user's config knows.
+    trust_reported_window: bool,
+    /// The window the CLI last reported in a `result` line, if any.
+    reported_window: Option<u64>,
+    /// Running Σ of tokens across every API call of this session (Codex's `total.totalTokens`
+    /// semantics: every request's input + output, cache reads included), fed from each
+    /// `assistant` message's `usage`.
+    total_tokens: u64,
+    /// The last `assistant` message id whose usage was folded into `total_tokens` — the CLI emits
+    /// one `assistant` line per content block of the same message, each repeating the usage.
+    last_usage_msg: Option<String>,
+    /// Context in use after the latest `assistant` message: (input incl. cache, output).
+    last_ctx: (u64, u64),
+    /// `assistant` messages with usage seen in the open turn — when zero, `result.usage` is the
+    /// only signal we have.
+    turn_msgs: u32,
     /// Set on `system/api_retry` with a 401/403 status: the CLI itself retries these ~10 times
     /// before giving up (verified) — Mantra kills the process on the first one instead.
     fatal_auth: Option<String>,
@@ -522,8 +551,53 @@ enum ToolOpen {
 }
 
 impl Translator {
-    fn new(agent: AgentId, autocompact: u64) -> Self {
-        Translator { agent, seen_init: false, turn_open: false, interrupt_pending: false, pending_interrupt_request: None, restart_pending: false, open_tools: HashMap::new(), autocompact, fatal_auth: None }
+    fn new(agent: AgentId, autocompact: u64, trust_reported_window: bool) -> Self {
+        Translator {
+            agent,
+            seen_init: false,
+            turn_open: false,
+            interrupt_pending: false,
+            pending_interrupt_request: None,
+            restart_pending: false,
+            open_tools: HashMap::new(),
+            autocompact,
+            trust_reported_window,
+            reported_window: None,
+            total_tokens: 0,
+            last_usage_msg: None,
+            last_ctx: (0, 0),
+            turn_msgs: 0,
+            fatal_auth: None,
+        }
+    }
+
+    /// The window the gauge and the compaction threshold are measured against.
+    fn window(&self) -> Option<u64> {
+        let configured = Some(self.autocompact).filter(|w| *w > 0);
+        if self.trust_reported_window {
+            self.reported_window.or(configured)
+        } else {
+            configured.or(self.reported_window)
+        }
+    }
+
+    /// Fold an API `usage` object (an `assistant` message's, or `result`'s) into the running
+    /// totals and emit the gauge update. Returns false when the object carried no counts.
+    fn fold_usage(&mut self, usage: Option<&Value>, msg_id: Option<&str>, out: &mut Vec<HubEvent>) -> bool {
+        let g = |k: &str| usage.and_then(|u| u.get(k)).and_then(as_u64).unwrap_or(0);
+        let (input, output) = (g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens"), g("output_tokens"));
+        if input + output == 0 {
+            return false;
+        }
+        let repeat = msg_id.is_some() && msg_id == self.last_usage_msg.as_deref();
+        if !repeat {
+            self.total_tokens += input + output;
+            self.last_usage_msg = msg_id.map(|s| s.to_string());
+        }
+        self.last_ctx = (input, output);
+        self.turn_msgs += 1;
+        out.push(token_usage(self.agent, input, output, Some((self.total_tokens, self.window()))));
+        true
     }
 
     fn on_line(&mut self, v: &Value, is_restart: bool) -> Vec<HubEvent> {
@@ -545,7 +619,9 @@ impl Translator {
                 }
             }
             "result" => self.on_result(v, &mut out),
-            // tool_progress, control_request (from the CLI's own side, unused), commands_changed…
+            // A tool is still running: no state change, but the agent is alive (watchdog/stall).
+            "tool_progress" => out.push(activity(self.agent, None)),
+            // control_request (from the CLI's own side, unused), commands_changed…
             _ => {}
         }
         out
@@ -578,10 +654,18 @@ impl Translator {
                 let pre = meta.and_then(|m| m.get("pre_tokens")).and_then(as_u64).unwrap_or(0);
                 let post = meta.and_then(|m| m.get("post_tokens")).and_then(as_u64).unwrap_or(0);
                 let id = format!("cc-compact-{}", v.get("uuid").and_then(|x| x.as_str()).unwrap_or("0"));
-                out.push(token_usage(self.agent, pre, 0, None));
+                let (total, window) = (self.total_tokens, self.window());
+                out.push(token_usage(self.agent, pre, 0, Some((total, window))));
                 out.push(HubEvent::Notif { agent: self.agent, method: "item/started".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
                 out.push(HubEvent::Notif { agent: self.agent, method: "item/completed".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
-                out.push(token_usage(self.agent, post, 0, None));
+                out.push(token_usage(self.agent, post, 0, Some((total, window))));
+                self.last_ctx = (post, 0);
+            }
+            "thinking_tokens" => {
+                // Emitted about once a second while the model reasons, before any visible
+                // content: the turn is live, and the agent is not idle.
+                self.ensure_turn_open(out);
+                out.push(activity(self.agent, Some("thinking")));
             }
             "api_retry" => {
                 if let Some(status @ (401 | 403)) = v.get("error_status").and_then(|x| x.as_i64()) {
@@ -604,6 +688,14 @@ impl Translator {
     fn on_assistant(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
         let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) else { return };
         let msg_id = v.pointer("/message/id").and_then(|x| x.as_str()).unwrap_or("m");
+        // Every API call's own usage: `input + cache_read + cache_creation` is exactly the
+        // context the model just saw, so the gauge moves while the turn runs instead of
+        // jumping once at `result` (whose `usage` is the *sum* over the turn's calls — never a
+        // context size, and the reason a 200k model used to read "211k / 200k").
+        if v.pointer("/message/usage").is_some() {
+            self.ensure_turn_open(out);
+            self.fold_usage(v.pointer("/message/usage"), Some(msg_id), out);
+        }
         for (i, block) in content.iter().enumerate() {
             match block.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                 "text" => {
@@ -665,21 +757,25 @@ impl Translator {
         // (which would silently swallow every later turn's `turn/started`/`turn/completed`).
         self.ensure_turn_open(out);
         let num_turns = v.get("num_turns").and_then(|x| x.as_i64()).unwrap_or(1);
+        if let Some(w) = v.get("modelUsage").and_then(|m| m.as_object()).and_then(|o| o.values().next()).and_then(|e| e.get("contextWindow")).and_then(as_u64).filter(|w| *w > 0) {
+            self.reported_window = Some(w);
+        }
         if num_turns > 0 {
             // The num_turns:0 housekeeping result (a manual /compact, or an automatic one) carries
             // an all-zero `usage` block — its real token counts already went out via the
             // compact_boundary tokenUsage updates above, so pushing this one would zero the gauge.
-            let usage = v.get("usage");
-            let input = usage.and_then(|u| u.get("input_tokens")).and_then(as_u64).unwrap_or(0);
-            let output = usage.and_then(|u| u.get("output_tokens")).and_then(as_u64).unwrap_or(0);
-            let cache_read = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(as_u64).unwrap_or(0);
-            let cache_creation = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(as_u64).unwrap_or(0);
-            // The window Mantra configured (and passed as `--autocompact`) is what the gauge and the
-            // compaction threshold are about; the API's own `contextWindow` is only a fallback.
-            let reported = v.get("modelUsage").and_then(|m| m.as_object()).and_then(|o| o.values().next()).and_then(|e| e.get("contextWindow")).and_then(as_u64);
-            let window = if self.autocompact > 0 { Some(self.autocompact) } else { reported };
-            out.push(token_usage(self.agent, input + cache_read + cache_creation, output, Some((input + output, window))));
+            if self.turn_msgs > 0 {
+                // The gauge already tracks the last call's context; re-emit it so a window first
+                // learned from this very `result` reaches the agent too.
+                let (input, output) = self.last_ctx;
+                out.push(token_usage(self.agent, input, output, Some((self.total_tokens, self.window()))));
+            } else {
+                // No per-call usage came through (an older CLI, or a turn with no assistant
+                // line): `result.usage` is the best available estimate.
+                self.fold_usage(v.get("usage"), None, out);
+            }
         }
+        self.turn_msgs = 0;
         let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
         let status = if interrupted { "interrupted" } else if is_error { "failed" } else { "completed" };
         let error = if status == "failed" {
@@ -702,6 +798,16 @@ impl Translator {
         self.pending_interrupt_request = None; // any request left unacked when the turn closed is stale
         self.open_tools.clear(); // any tool call left dangling when the turn ended is stale
     }
+}
+
+/// A liveness tick for `Agent`: bumps `last_event` (watchdog, stall tripwire) and optionally
+/// relabels the activity — a Mantra-only method, see `Agent::apply`.
+fn activity(agent: AgentId, label: Option<&str>) -> HubEvent {
+    let params = match label {
+        Some(l) => json!({"activity": l}),
+        None => json!({}),
+    };
+    HubEvent::Notif { agent, method: "mantra/activity".into(), params }
 }
 
 /// Builds a `thread/tokenUsage/updated` params value. `last_out` almost always 0 by construction —
@@ -841,6 +947,78 @@ mod tests {
         assert!(!args2.contains(&"--mcp-config".to_string()), "an empty tool list must not wire up a bridge either");
     }
 
+    /// Drives `Translator` output into an `Agent` and returns it, for gauge assertions.
+    fn feed(tr: &mut Translator, agent: &mut Agent, lines: &[Value]) {
+        for v in lines {
+            for e in tr.on_line(v, false) {
+                if let HubEvent::Notif { method, params, .. } = e {
+                    agent.apply(&method, &params);
+                }
+            }
+        }
+    }
+
+    /// The gauge follows each API call's own usage while the turn runs (context = input +
+    /// cache reads + cache writes), never the turn-summed `result.usage` — which is how a 200k
+    /// model used to read "211k / 200k" at the end of a long turn and 0 in between.
+    #[test]
+    fn context_gauge_tracks_per_call_usage_not_the_turn_sum() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        let call1 = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 50_000, "cache_creation_input_tokens": 4000, "output_tokens": 300}, "content": [{"type": "text", "text": "looking"}]}});
+        // the same message again, as the CLI does per content block — must not double count
+        let call1b = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 50_000, "cache_creation_input_tokens": 4000, "output_tokens": 300}, "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}});
+        feed(&mut tr, &mut agent, &[call1, call1b]);
+        assert!(agent.turn_active, "a usage-bearing assistant line opens the turn");
+        assert_eq!(agent.ctx_used, 55_300, "context = input + cache read + cache creation + output of the latest call");
+        assert_eq!(agent.tokens_total, 55_300, "one message, counted once");
+        assert_eq!(agent.ctx_window, Some(200_000), "the configured window until the CLI reports one");
+
+        let call2 = json!({"type": "assistant", "message": {"id": "m2", "usage": {"input_tokens": 200, "cache_read_input_tokens": 55_000, "cache_creation_input_tokens": 900, "output_tokens": 100}, "content": [{"type": "text", "text": "done"}]}});
+        // result.usage is the Σ over both calls (a subscription CLI also reports the real window)
+        let result = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 1200, "cache_read_input_tokens": 105_000, "cache_creation_input_tokens": 4900, "output_tokens": 400}, "modelUsage": {"claude-sonnet-5": {"contextWindow": 1_000_000}}});
+        feed(&mut tr, &mut agent, &[call2, result]);
+        assert_eq!(agent.ctx_used, 56_200, "the last call's context, not the 111k turn sum");
+        assert_eq!(agent.tokens_total, 55_300 + 56_200);
+        assert_eq!(agent.ctx_window, Some(1_000_000), "subscription auth trusts the window the CLI reports");
+        assert!(!agent.turn_active);
+    }
+
+    /// An `api_key` gateway's real window is whatever the user configured; the CLI's guess is only
+    /// a fallback. And a turn with no per-call usage still gets an estimate from `result.usage`.
+    #[test]
+    fn api_key_auth_keeps_the_configured_window_and_result_usage_is_the_fallback() {
+        let mut tr = Translator::new(1, 262_144, false);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        let result = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 1200, "cache_read_input_tokens": 3000, "output_tokens": 400}, "modelUsage": {"qwen": {"contextWindow": 200_000}}});
+        feed(&mut tr, &mut agent, &[result]);
+        assert_eq!(agent.ctx_used, 4_600);
+        assert_eq!(agent.ctx_window, Some(262_144));
+    }
+
+    /// `system/thinking_tokens` (once a second while the model reasons) and `tool_progress`
+    /// (while a long command runs) prove the agent is alive: they open the turn, label the
+    /// activity and move `last_event` — so the watchdog never mistakes a three-minute `uv pip
+    /// install` for an idle agent.
+    #[test]
+    fn heartbeats_keep_the_agent_alive_and_open_the_turn() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        agent.last_event = std::time::Instant::now() - std::time::Duration::from_secs(500);
+        let think = json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 150, "session_id": "s"});
+        feed(&mut tr, &mut agent, &[think.clone()]);
+        assert!(agent.turn_active);
+        assert_eq!(agent.activity, "thinking");
+        assert!(agent.last_event.elapsed().as_secs() < 5, "a heartbeat is an event");
+        assert!(is_heartbeat(&think) && is_heartbeat(&json!({"type": "tool_progress"})) && !is_heartbeat(&json!({"type": "assistant"})));
+        let bash = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "uv pip install pytest"}}]}});
+        feed(&mut tr, &mut agent, &[bash]);
+        agent.last_event = std::time::Instant::now() - std::time::Duration::from_secs(500);
+        feed(&mut tr, &mut agent, &[json!({"type": "tool_progress", "tool_use_id": "t1", "elapsed_time_seconds": 90})]);
+        assert!(agent.last_event.elapsed().as_secs() < 5);
+        assert!(agent.activity.starts_with("$ uv pip"), "progress ticks keep the command label: {}", agent.activity);
+    }
+
     #[test]
     fn mcp_tool_list_reshapes_codex_style_dynamic_tools_for_mcp() {
         let tools = vec![json!({"type": "function", "name": "mantra_status", "description": "status", "inputSchema": {"type": "object"}})];
@@ -864,7 +1042,7 @@ mod tests {
     #[test]
     fn translates_the_recorded_claude_session_the_way_wp10_3_specifies() {
         let raw = include_str!("../testdata/claude-stream.jsonl");
-        let mut tr = Translator::new(1, 200_000);
+        let mut tr = Translator::new(1, 200_000, false);
         let mut agent = Agent::new(1, "t", "solo", std::path::PathBuf::from("/tmp/ccfix"));
         let mut statuses = vec![];
         let mut ready_count = 0;
@@ -913,7 +1091,7 @@ mod tests {
     /// the CLI's own retries — never as a silent crash with a Debug-formatted status.
     #[test]
     fn provider_auth_error_fails_the_turn_and_kills_the_process() {
-        let mut tr = Translator::new(1, 200_000);
+        let mut tr = Translator::new(1, 200_000, false);
         let assistant = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hi"}]}});
         let _ = tr.on_line(&assistant, false);
         let retry = json!({"type": "system", "subtype": "api_retry", "error_status": 401, "attempt": 1});
@@ -930,14 +1108,14 @@ mod tests {
         let reason = tr.fatal_auth.clone().expect("the process must be killed before the CLI retries");
         assert!(reason.contains("401") && !reason.contains("Some("), "{reason}");
         // a 5xx retry is not fatal
-        let mut tr2 = Translator::new(1, 200_000);
+        let mut tr2 = Translator::new(1, 200_000, false);
         assert!(tr2.on_line(&json!({"type": "system", "subtype": "api_retry", "error_status": 503}), false).is_empty());
         assert!(tr2.fatal_auth.is_none());
     }
 
     #[test]
     fn uncorrelated_control_response_never_arms_a_later_unrelated_turn() {
-        let mut tr = Translator::new(1, 200_000);
+        let mut tr = Translator::new(1, 200_000, false);
 
         // A stray ack arrives with no turn open and nothing pending (the old code armed
         // `interrupt_pending` unconditionally here).
@@ -965,7 +1143,7 @@ mod tests {
     /// came back) must not reach forward and mark a later turn interrupted either.
     #[test]
     fn control_response_after_its_turn_already_closed_does_not_leak_forward() {
-        let mut tr = Translator::new(1, 200_000);
+        let mut tr = Translator::new(1, 200_000, false);
 
         let assistant = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hi"}]}});
         tr.on_line(&assistant, false);
@@ -1000,7 +1178,7 @@ mod tests {
     /// `false` forever and swallowing every later turn's `turn/started`/`turn/completed` too.
     #[test]
     fn a_turn_with_only_thinking_content_still_closes_and_does_not_wedge_later_turns() {
-        let mut tr = Translator::new(1, 200_000);
+        let mut tr = Translator::new(1, 200_000, false);
 
         let thinking_only = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "thinking", "thinking": "hmm"}]}});
         let started = tr.on_line(&thinking_only, false);
