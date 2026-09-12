@@ -282,3 +282,46 @@ mod tests {
         assert_eq!(strip_ansi("plain text"), "plain text");
     }
 }
+
+/// Can Codex's Linux sandbox (bubblewrap) start on this machine? It needs unprivileged user
+/// namespaces; when the kernel or AppArmor forbids them every agent command fails before it
+/// runs (`bwrap: … user namespaces`). Ok on non-Linux. The error text is the fix hint.
+pub fn sandbox_probe() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let hint = "Codex's sandbox needs unprivileged user namespaces. Enable them (`sudo sysctl -w kernel.unprivileged_userns_clone=1`, or on Ubuntu 24.04+ `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), or set sandbox = \"danger-full-access\" in ~/.mantra/settings.toml and on the worker roles (Studio) — workers stay isolated by git worktrees.";
+    let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    if read("/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0") {
+        return Err(format!("kernel.unprivileged_userns_clone = 0 — {hint}"));
+    }
+    if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
+        return Err(format!("kernel.apparmor_restrict_unprivileged_userns = 1 — {hint}"));
+    }
+    // A real attempt beats reading knobs: `unshare -U true` creates a user namespace and exits.
+    if let Ok(mut child) = std::process::Command::new("unshare")
+        .args(["-U", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    if st.success() {
+                        return Ok(());
+                    }
+                    return Err(format!("`unshare -U true` failed (user namespaces are blocked) — {hint}"));
+                }
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                _ => {
+                    let _ = child.kill();
+                    return Ok(()); // undecidable: don't cry wolf
+                }
+            }
+        }
+    }
+    Ok(())
+}

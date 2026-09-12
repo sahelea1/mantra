@@ -476,6 +476,10 @@ fn doctor() {
     }
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
+    match util::sandbox_probe() {
+        Ok(()) => println!("{} sandbox: user namespaces available (Codex's bubblewrap sandbox can run)", ok(true)),
+        Err(e) => println!("{} sandbox: {e}", ok(false)),
+    }
     println!("  terminal: TERM={} COLORTERM={} TERM_PROGRAM={}", std::env::var("TERM").unwrap_or_default(), std::env::var("COLORTERM").unwrap_or_default(), std::env::var("TERM_PROGRAM").unwrap_or_default());
     ui::theme::init(&s);
     println!("  colors: {:?} · glyphs: {}", ui::theme::depth(), if ui::theme::ascii() { "ascii" } else { "unicode" });
