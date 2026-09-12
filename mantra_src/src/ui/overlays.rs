@@ -51,10 +51,16 @@ fn help(f: &mut Frame, area: Rect) {
         k("esc", "interrupt the running turn"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
         Line::default(),
+        h("busy-agent chat (solo, zoom, @name)"),
+        k("⏎", "queue a message behind the current turn (shown as a chip above the input)"),
+        k("ctrl+f", "force-send: deliver the queue + input into the running turn right now"),
+        k("backspace", "on an empty input, pops the last queued message back in to edit"),
+        k("ctrl+x", "on an empty input, discards the whole queue"),
+        Line::default(),
         h("mandala stage"),
         k("tab", "toggle between typing and navigating the canvas"),
-        k("←→↑↓ · alt+←→", "select an agent"),
-        k("⏎", "zoom into the selected agent (esc to come back)"),
+        k("←→↑↓ · alt+←→ · 1-9", "select an agent · jump straight to the nth and zoom in"),
+        k("⏎", "zoom into the selected agent (esc to come back to the overview)"),
         k("space", "pause / resume the whole run"),
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
         k("p · a", "plan · approve plan (during review)"),
@@ -428,13 +434,15 @@ pub fn key(app: &mut App, k: KeyEvent) {
                         r.approve_plan(&mut ctx);
                     }
                     app.run = run;
-                    app.screen = Screen::Stage;
+                    app.land_on_overview();
                     None
                 } else {
                     Some(Overlay::Plan { scroll })
                 }
             }
-            KeyCode::Char('f') => {
+            // Plain 'f' focuses the canvas; ctrl+f is force-send (WP9) and must reach the chat
+            // input instead — it's handled globally in App::on_key, before overlays are dispatched.
+            KeyCode::Char('f') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.canvas_focus = false;
                 app.screen = Screen::Stage;
                 None

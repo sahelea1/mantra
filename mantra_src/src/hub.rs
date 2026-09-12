@@ -418,6 +418,17 @@ fn fire(conn: &Conn, ev: &mpsc::UnboundedSender<HubEvent>, id: AgentId, method: 
 }
 
 #[cfg(test)]
+impl Hub {
+    /// Registers a fake per-agent channel so tests can observe the `Cmd`s `Hub::send` forwards,
+    /// without spawning a real Codex process.
+    pub fn test_register(&mut self, id: AgentId) -> mpsc::UnboundedReceiver<Cmd> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.agents.insert(id, tx);
+        rx
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

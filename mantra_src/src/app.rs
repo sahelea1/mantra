@@ -3,7 +3,7 @@
 use crate::agent::{Agent, Level, Signal, Status};
 use crate::config::{Registry, Settings};
 use crate::engine::pattern::Pattern;
-use crate::engine::run::{Ctx, JobOut, JobTag, Run, SpawnReq, Stage};
+use crate::engine::run::{Ctx, JobOut, JobTag, Run, Send, SpawnReq, Stage};
 use crate::engine::tools;
 use crate::hub::{AgentId, Cmd, Hub, HubEvent, SpawnSpec};
 use crate::ui::input::{Act, Input};
@@ -152,6 +152,8 @@ pub struct App {
     pub probes: HashMap<AgentId, (String, Instant)>,
     pub pulse_scroll: usize,
     pub force_clear: bool,
+    /// Set on every Stage↔Zoom switch; drives a brief header tint so a jump never feels silent.
+    pub flash_screen: Option<Instant>,
 }
 
 /// Options for creating any agent (Solo, run agents, architect, probes).
@@ -230,8 +232,17 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     id
 }
 
-/// Send a prompt: new turn if idle, steer if busy, queue if a turn is starting.
-pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool) {
+/// Send a prompt to an agent. `mode` decides what happens when it's already busy:
+/// - `Auto` (the engine's own steering): new turn if idle, steer immediately if busy, queue if a
+///   turn is only starting (unchanged pre-WP9 behaviour).
+/// - `Queue` (the UI's plain Enter): never steers — a message typed mid-turn is appended to
+///   `Agent.queued` and shown as a chip; it is delivered once the turn ends (or, if it arrived
+///   while the turn was only starting, once `turn/started` drains the queue).
+/// - `Force` (ctrl+f): delivers the queue plus this message into a running turn right away
+///   (`turn/steer`), without interrupting it. Against an agent that's only starting a turn, the
+///   force is deferred the same way `Queue` is — `turn/started` drains it moments later. Against
+///   an idle agent it behaves exactly like `Auto`/Enter.
+pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool, mode: Send) {
     let Some(a) = agents.get_mut(&id) else { return };
     if echo {
         a.push_user(&text);
@@ -242,10 +253,27 @@ pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentI
         a.notice(Level::Warn, "agent is stopped");
         return;
     }
+    if mode == Send::Force && a.turn_active {
+        let mut joined = std::mem::take(&mut a.queued);
+        if !text.trim().is_empty() {
+            joined.push(text);
+        }
+        if !joined.is_empty() {
+            hub.send(id, Cmd::Steer { text: joined.join("\n\n") });
+        }
+        return;
+    }
+    if text.trim().is_empty() {
+        return;
+    }
     if a.awaiting_start {
         a.queued.push(text);
     } else if a.turn_active {
-        hub.send(id, Cmd::Steer { text });
+        if mode == Send::Queue {
+            a.queued.push(text);
+        } else {
+            hub.send(id, Cmd::Steer { text });
+        }
     } else {
         a.awaiting_start = true;
         a.status = Status::Busy;
@@ -288,7 +316,10 @@ impl Ctx for Ctxt<'_> {
         )
     }
     fn prompt(&mut self, a: AgentId, text: String) {
-        prompt_agent(self.hub, self.agents, a, text, true);
+        prompt_agent(self.hub, self.agents, a, text, true, Send::Auto);
+    }
+    fn prompt_mode(&mut self, a: AgentId, text: String, mode: Send) {
+        prompt_agent(self.hub, self.agents, a, text, true, mode);
     }
     fn interrupt(&mut self, a: AgentId) {
         self.hub.send(a, Cmd::Interrupt);
@@ -325,7 +356,7 @@ impl Ctx for Ctxt<'_> {
     fn agent(&self, a: AgentId) -> Option<&Agent> {
         self.agents.get(&a)
     }
-    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + Send>) {
+    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
             let out = f();
@@ -380,6 +411,7 @@ impl App {
             probes: HashMap::new(),
             pulse_scroll: 0,
             force_clear: false,
+            flash_screen: None,
         }
     }
 
@@ -393,6 +425,7 @@ impl App {
             || self.agents.values().any(|a| a.compacting || a.ctx_anim.map(|(_, t)| t.elapsed().as_millis() < 950).unwrap_or(false))
             || self.run.as_ref().map(|r| (r.is_active() && !r.paused && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
             || self.studio.flash.map(|f| f.elapsed() < Duration::from_millis(900)).unwrap_or(false)
+            || self.flash_screen.map(|f| f.elapsed() < Duration::from_millis(450)).unwrap_or(false)
     }
 
     fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
@@ -437,6 +470,24 @@ impl App {
             },
         );
         self.solo = Some(id);
+    }
+
+    /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
+    /// `reduce_motion` is on) so the overview/zoom switch never feels silent.
+    fn set_screen(&mut self, s: Screen) {
+        let jump = matches!((self.screen, s), (Screen::Stage, Screen::Zoom(_)) | (Screen::Zoom(_), Screen::Stage));
+        if jump && crate::ui::theme::motion() {
+            self.flash_screen = Some(Instant::now());
+        }
+        self.screen = s;
+    }
+
+    /// After the plan is approved: land on the animated overview with the orchestrator selected.
+    pub fn land_on_overview(&mut self) {
+        self.set_screen(Screen::Stage);
+        self.canvas_focus = true;
+        let orch = self.run.as_ref().and_then(|r| r.orchestrator);
+        self.sel = self.stage_nodes().iter().position(|a| Some(*a) == orch).unwrap_or(0);
     }
 
     /// The agent the current view is about (Solo agent, zoomed agent, or stage selection).
@@ -583,6 +634,8 @@ impl App {
             run.start(&mut ctx);
         }
         self.run = Some(run);
+        // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
+        // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
         self.screen = Screen::Stage;
         self.sel = 0;
     }
@@ -639,7 +692,7 @@ impl App {
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
         self.models_ui.status.insert(alias.to_string(), "testing…".into());
-        prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true);
+        prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true, Send::Auto);
     }
 
     /// Discover models: Codex's catalog + every custom provider (`only` = one provider id).
@@ -755,7 +808,16 @@ impl App {
             AppEvent::Term(e) => self.on_term(e),
             AppEvent::Hub(h) => self.on_hub(h),
             AppEvent::Job(tag, out) => {
+                // A fresh run's planner is spawned inside this call (once workspace setup
+                // finishes); zoom to it so the user starts in the planner's own view — but only
+                // if they're still on the default overview (haven't navigated away meanwhile).
+                let is_setup = matches!(tag, JobTag::Setup);
                 self.with_run(|r, c| r.on_job(c, tag, out));
+                if is_setup && self.screen == Screen::Stage {
+                    if let Some(p) = self.run.as_ref().and_then(|r| r.planner) {
+                        self.set_screen(Screen::Zoom(p));
+                    }
+                }
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
         }
@@ -763,7 +825,10 @@ impl App {
 
     pub fn tick(&mut self) {
         self.with_run(|r, c| r.tick(c));
-        if self.run.as_ref().map(|r| r.want_review).unwrap_or(false) && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. })) && self.screen == Screen::Stage {
+        if self.run.as_ref().map(|r| r.want_review).unwrap_or(false)
+            && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. }))
+            && matches!(self.screen, Screen::Stage | Screen::Zoom(_) | Screen::Solo)
+        {
             if let Some(r) = self.run.as_mut() {
                 r.want_review = false;
             }
@@ -842,7 +907,7 @@ impl App {
                     }
                     let queued = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
                     if !queued.is_empty() {
-                        prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false);
+                        prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false, Send::Auto);
                     }
                 }
                 for s in signals {
@@ -1172,6 +1237,17 @@ impl App {
             }
             return;
         }
+        // ctrl+f / ctrl+x are unconditional (checked before overlays dispatch) so they reach the
+        // chat input even while the plan-review overlay is open on top of a zoomed agent — see
+        // the `!ctrl` guard on that overlay's own 'f' arm in overlays.rs.
+        if ctrl && k.code == KeyCode::Char('f') {
+            self.force_send();
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('x') {
+            self.discard_queue();
+            return;
+        }
         if k.code == KeyCode::F(1) {
             self.overlays.push(Overlay::Help);
             return;
@@ -1235,6 +1311,15 @@ impl App {
                 return;
             }
         }
+        // Backspace on an empty input pops the last queued message back into the input to edit.
+        if k.code == KeyCode::Backspace && self.input.is_empty() {
+            if let Some(a) = self.focus_agent() {
+                if let Some(text) = self.agents.get_mut(&a).and_then(|ag| ag.queued.pop()) {
+                    self.input.set(&text);
+                    return;
+                }
+            }
+        }
         // slash suggestions navigation
         let sugg = self.suggestions();
         if !sugg.is_empty() {
@@ -1264,7 +1349,7 @@ impl App {
         if k.code == KeyCode::Esc {
             match self.screen {
                 Screen::Zoom(_) if self.input.is_empty() => {
-                    self.screen = Screen::Stage;
+                    self.set_screen(Screen::Stage);
                 }
                 _ => {
                     if let Some(a) = self.focus_agent() {
@@ -1323,7 +1408,7 @@ impl App {
         }
         if k.code == KeyCode::Enter && (self.canvas_focus || self.input.is_empty()) {
             if let Some(a) = nodes.get(self.sel) {
-                self.screen = Screen::Zoom(*a);
+                self.set_screen(Screen::Zoom(*a));
                 self.canvas_focus = false;
             }
             return true;
@@ -1340,6 +1425,7 @@ impl App {
             KeyCode::Char('a') => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
                     self.with_run(|r, c| r.approve_plan(c));
+                    self.land_on_overview();
                 }
             }
             KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
@@ -1387,6 +1473,15 @@ impl App {
                 }
             }
             KeyCode::Esc => {}
+            KeyCode::Char(c @ '1'..='9') => {
+                // 1-9 jump: select the nth node and zoom straight in.
+                let idx = (c as usize) - ('1' as usize);
+                if let Some(a) = nodes.get(idx) {
+                    self.sel = idx;
+                    self.set_screen(Screen::Zoom(*a));
+                    self.canvas_focus = false;
+                }
+            }
             KeyCode::Char(c) if c.is_alphanumeric() => {
                 // start typing
                 self.canvas_focus = false;
@@ -1434,15 +1529,15 @@ impl App {
                     self.hub.send(s, Cmd::Shell { command: cmd.trim().to_string() });
                     return;
                 }
-                prompt_agent(&self.hub, &mut self.agents, s, text, true);
+                prompt_agent(&self.hub, &mut self.agents, s, text, true, Send::Queue);
             }
             Screen::Zoom(a) => {
                 if self.in_run(a) {
                     let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
                     let t = text.clone();
-                    self.with_run(|r, c| r.direct(c, &name, &t));
+                    self.with_run(|r, c| r.direct(c, &name, &t, Send::Queue));
                 } else {
-                    prompt_agent(&self.hub, &mut self.agents, a, text, true);
+                    prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Queue);
                 }
             }
             Screen::Stage => {
@@ -1453,7 +1548,7 @@ impl App {
                 if let Some(rest) = text.strip_prefix('@') {
                     let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
                     let (name, msg) = (name.to_string(), msg.trim().to_string());
-                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg)).unwrap_or(false);
+                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg, Send::Queue)).unwrap_or(false);
                     if !ok {
                         self.toast(format!("no agent named @{name}"), Level::Warn);
                     }
@@ -1462,6 +1557,76 @@ impl App {
                 self.with_run(|r, c| r.user_input(c, &text));
             }
             _ => {}
+        }
+    }
+
+    /// ctrl+f: deliver the focused agent's queued messages plus the current input into its
+    /// running turn right away. Applies to Solo, Zoom and `@name` messages from the stage — the
+    /// same places Enter can queue. Against an idle agent this just behaves like Enter.
+    fn force_send(&mut self) {
+        match self.screen {
+            Screen::Solo => {
+                if let Some(s) = self.solo {
+                    self.force_prompt(s);
+                }
+            }
+            Screen::Zoom(a) => {
+                if self.in_run(a) {
+                    let text = self.input.text().trim_end().to_string();
+                    let empty_queue = self.agents.get(&a).map(|x| x.queued.is_empty()).unwrap_or(true);
+                    if text.trim().is_empty() && empty_queue {
+                        return;
+                    }
+                    if !text.trim().is_empty() {
+                        self.input.take();
+                    }
+                    let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
+                    self.with_run(|r, c| r.direct(c, &name, &text, Send::Force));
+                } else {
+                    self.force_prompt(a);
+                }
+            }
+            Screen::Stage => {
+                let raw = self.input.text();
+                if let Some(rest) = raw.strip_prefix('@') {
+                    let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let (name, msg) = (name.to_string(), msg.trim().to_string());
+                    self.input.take();
+                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg, Send::Force)).unwrap_or(false);
+                    if !ok {
+                        self.toast(format!("no agent named @{name}"), Level::Warn);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn force_prompt(&mut self, id: AgentId) {
+        let text = self.input.text().trim_end().to_string();
+        let empty_queue = self.agents.get(&id).map(|a| a.queued.is_empty()).unwrap_or(true);
+        if text.trim().is_empty() && empty_queue {
+            return; // nothing queued and nothing typed — there's nothing to force
+        }
+        let echo = !text.trim().is_empty();
+        if echo {
+            self.input.take();
+        }
+        prompt_agent(&self.hub, &mut self.agents, id, text, echo, Send::Force);
+    }
+
+    /// ctrl+x on an empty input: discard the focused agent's whole queue.
+    fn discard_queue(&mut self) {
+        if !self.input.is_empty() {
+            return;
+        }
+        if let Some(a) = self.focus_agent() {
+            if let Some(ag) = self.agents.get_mut(&a) {
+                if !ag.queued.is_empty() {
+                    ag.queued.clear();
+                    self.toast("queue cleared", Level::Info);
+                }
+            }
         }
     }
 
@@ -1547,10 +1712,93 @@ impl App {
 
     pub fn studio_architect_send(&mut self, text: String) {
         let a = self.start_architect();
-        prompt_agent(&self.hub, &mut self.agents, a, text, true);
+        prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Auto);
     }
 
     pub fn shutdown(&mut self) {
         self.hub.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
+        let mut agents = BTreeMap::new();
+        let id: AgentId = 1;
+        let mut a = Agent::new(id, "worker", "worker", PathBuf::new());
+        a.status = Status::Busy;
+        a.turn_active = turn_active;
+        a.awaiting_start = awaiting_start;
+        agents.insert(id, a);
+        (agents, id)
+    }
+
+    fn test_hub_with(id: AgentId) -> (Hub, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hub = Hub::new(vec![], ev_tx);
+        let rx = hub.test_register(id);
+        (hub, rx)
+    }
+
+    #[test]
+    fn enter_queues_behind_a_busy_turn_without_steering() {
+        let (mut agents, id) = busy_agent(true, false);
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "use axum instead".into(), true, Send::Queue);
+        assert_eq!(agents[&id].queued.len(), 1);
+        assert!(rx.try_recv().is_err(), "Queue must not steer a busy turn");
+    }
+
+    #[test]
+    fn force_send_joins_the_queue_and_the_new_message_into_one_steer() {
+        let (mut agents, id) = busy_agent(true, false);
+        let (hub, mut rx) = test_hub_with(id);
+        agents.get_mut(&id).unwrap().queued.push("first queued".into());
+        prompt_agent(&hub, &mut agents, id, "and now this".into(), true, Send::Force);
+        assert!(agents[&id].queued.is_empty(), "Force must drain the queue");
+        match rx.try_recv() {
+            Ok(Cmd::Steer { text }) => assert_eq!(text, "first queued\n\nand now this"),
+            other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    #[test]
+    fn force_send_on_a_starting_turn_defers_to_the_queue() {
+        // awaiting_start (turn hasn't produced its first event yet): Force can't steer a turn
+        // that doesn't exist, so it queues — the existing turn/started drain delivers it.
+        let (mut agents, id) = busy_agent(false, true);
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "one more thing".into(), true, Send::Force);
+        assert_eq!(agents[&id].queued, vec!["one more thing".to_string()]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_send_on_an_idle_agent_behaves_like_enter() {
+        let (mut agents, id) = busy_agent(false, false);
+        agents.get_mut(&id).unwrap().status = Status::Idle;
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "go".into(), true, Send::Force);
+        assert!(agents[&id].awaiting_start);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Turn { text }) if text == "go"));
+    }
+
+    #[test]
+    fn backspace_on_empty_input_restores_the_last_queued_message_for_editing() {
+        let mut agent = Agent::new(1, "worker", "worker", PathBuf::new());
+        agent.queued.push("keep this queued".into());
+        agent.queued.push("edit me".into());
+        let mut input = Input::default();
+        // Mirrors App::on_key's Backspace-on-empty-input arm.
+        if input.is_empty() {
+            if let Some(text) = agent.queued.pop() {
+                input.set(&text);
+            }
+        }
+        assert_eq!(input.text(), "edit me");
+        assert_eq!(agent.queued, vec!["keep this queued".to_string()]);
     }
 }
