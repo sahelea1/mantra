@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -280,6 +280,64 @@ pub fn slug(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Where a bare command name resolves on `$PATH`, and whether that file can actually be
+/// executed — so a failed spawn can say *which* file is wrong instead of just "os error 13".
+pub fn which(cmd: &str) -> Option<PathBuf> {
+    which_in(cmd, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// The PATH list is a parameter so tests can synthesize one instead of mutating the process
+/// environment, which is shared by every other test in the binary.
+fn which_in(cmd: &str, path_var: &str) -> Option<PathBuf> {
+    if cmd.is_empty() {
+        return None;
+    }
+    // A name carrying a separator is already a path: execvp(3) doesn't search PATH for it either.
+    if cmd.contains(['/', std::path::MAIN_SEPARATOR]) {
+        let p = PathBuf::from(cmd);
+        return p.symlink_metadata().is_ok().then_some(p);
+    }
+    for dir in std::env::split_paths(path_var) {
+        // An empty PATH entry means the current directory, as the shell reads it.
+        let cand = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir }.join(cmd);
+        // Deliberately *not* filtered down to "regular file with +x": a directory or an
+        // un-executable file shadowing the real binary is exactly the case doctor must report,
+        // and skipping it here would leave the user with a bare errno again.
+        if cand.symlink_metadata().is_ok() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// A one-line, actionable reason a resolved command cannot be executed, or None when it can.
+pub fn exec_problem(path: &Path) -> Option<String> {
+    let p = path.display();
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        // metadata() follows links, so the only way to fail after `which` saw the entry is a
+        // symlink whose target is gone — which execs as a plain "not found" and misleads.
+        Err(_) => return Some(format!("{p} is a broken symlink — reinstall the CLI or repoint the link")),
+    };
+    if md.is_dir() {
+        return Some(format!("{p} is a directory — something else on your PATH shadows the real binary"));
+    }
+    exec_bit_problem(&md, path)
+}
+
+#[cfg(unix)]
+fn exec_bit_problem(md: &std::fs::Metadata, path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    // Which of user/group/other applies depends on who runs it, so only "no exec bit at all" is
+    // reported here; anything subtler (noexec mount, unreadable parent) stays with the raw errno.
+    (md.permissions().mode() & 0o111 == 0).then(|| format!("{p} is not executable — chmod +x {p}", p = path.display()))
+}
+
+#[cfg(not(unix))]
+fn exec_bit_problem(_md: &std::fs::Metadata, _path: &Path) -> Option<String> {
+    None // no exec bit to inspect; executability is decided by the extension there
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +393,75 @@ mod tests {
             assert_eq!(effective_uid_is_root(), want);
         }
     }
+
+    /// A unique scratch directory: no dev-dependency for temp files, and a fixed name would race
+    /// with a parallel test run (cargo runs these threaded).
+    fn scratch(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mantra-which-{tag}-{}-{}-{n}", std::process::id(), unix_secs()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn touch_exec(p: &Path) {
+        std::fs::write(p, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn path_of(dirs: &[&PathBuf]) -> String {
+        std::env::join_paths(dirs.iter().map(|d| d.as_os_str())).unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn which_finds_an_executable_prefers_the_first_path_entry_and_misses_cleanly() {
+        let (first, second) = (scratch("first"), scratch("second"));
+        touch_exec(&first.join("mantraprobe"));
+        touch_exec(&second.join("mantraprobe"));
+        let path = path_of(&[&first, &second]);
+        assert_eq!(which_in("mantraprobe", &path), Some(first.join("mantraprobe")));
+        assert_eq!(which_in("mantraprobe-absent", &path), None);
+        assert_eq!(exec_problem(&first.join("mantraprobe")), None);
+        // A name with a separator is a path, not a PATH lookup: it resolves with no PATH at all.
+        assert_eq!(which_in(&second.join("mantraprobe").display().to_string(), ""), Some(second.join("mantraprobe")));
+        assert_eq!(which_in(&second.join("nothing-here").display().to_string(), ""), None);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn which_returns_a_directory_shadow_instead_of_skipping_it() {
+        // The doctor case: something else on PATH owns the name, so execution fails with EACCES.
+        let (shadow, real) = (scratch("shadow"), scratch("real"));
+        std::fs::create_dir_all(shadow.join("mantraprobe")).unwrap();
+        touch_exec(&real.join("mantraprobe"));
+        let found = which_in("mantraprobe", &path_of(&[&shadow, &real])).expect("the shadowing entry must be reported, not skipped");
+        assert_eq!(found, shadow.join("mantraprobe"));
+        let why = exec_problem(&found).expect("a directory cannot be executed");
+        assert!(why.contains(&found.display().to_string()) && why.contains("is a directory"), "must name the path: {why}");
+        let _ = std::fs::remove_dir_all(&shadow);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_problem_names_the_file_that_lost_its_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("noexec");
+        let f = dir.join("mantraprobe");
+        std::fs::write(&f, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(which_in("mantraprobe", &path_of(&[&dir])), Some(f.clone()));
+        let why = exec_problem(&f).expect("0o644 cannot be executed");
+        let p = f.display().to_string();
+        assert_eq!(why, format!("{p} is not executable — chmod +x {p}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn strip_ansi_handles_osc_and_lone_esc() {
         assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");

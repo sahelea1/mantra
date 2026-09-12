@@ -25,6 +25,25 @@ echo "$out" | grep -qi 'plan review' || { echo "$out"; echo "MISSING: plan revie
 echo "$out" | grep -q 'overview' || { echo "$out"; echo "MISSING: approving the plan should land on the overview"; exit 1; }
 echo "zoom vs overview ok"
 
+# v0.3.1: a hand stop sticks. ctrl+c on the (zoomed) planner must stop it and leave it stopped —
+# no planner nudge, no transient retry, no "continue where you left off" — until the user says so.
+echo "hand stop (ctrl+c) sticks, and a message lifts it…"
+export MANTRA_HOME="$(mktemp -d)"
+out=$(MANTRA_MOCK_SPEED=1 $bin --demo --snapshot "wait:1.2;key:ctrl+c;wait:4;snap:stopped" run "build a todo API with auth" 2>&1)
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC during the hand stop"; exit 1; }
+echo "$out" | grep -q 'stopped by you' || { echo "$out"; echo "MISSING: the card should say the agent was stopped by you"; exit 1; }
+j=$(ls "$MANTRA_HOME"/runs/*/*/journal.jsonl)
+grep -q 'stopped by you' "$j" || { cat "$j"; echo "MISSING: the journal should record the hand stop"; exit 1; }
+grep -q "haven't submitted" "$j" && { cat "$j"; echo "REGRESSION: the planner was nudged back to work after a hand stop"; exit 1; }
+grep -q 'plan v1' "$j" && { cat "$j"; echo "REGRESSION: the run carried on after the user stopped it"; exit 1; }
+# …and talking to it is what starts it again
+export MANTRA_HOME="$(mktemp -d)"
+out=$(MANTRA_MOCK_SPEED=1 $bin --demo --snapshot "wait:1.2;key:ctrl+c;wait:3;type:ok carry on;key:enter;until:plan review@60;snap:resumed" run "build a todo API with auth" 2>&1)
+echo "$out" | grep -q '!! timeout' && { echo "$out"; echo "MISSING: a message to a stopped planner should get it planning again"; exit 1; }
+j=$(ls "$MANTRA_HOME"/runs/*/*/journal.jsonl)
+grep -q 'stopped by you' "$j" && grep -q 'plan v1' "$j" || { cat "$j"; echo "MISSING: stop then resume should both appear in the journal"; exit 1; }
+echo "hand stop ok"
+
 # v0.3 chain of command: a worker stops to ask (MANTRA_MOCK_ASK), the orchestrator answers, the worker finishes.
 echo "chain of command (a worker asks, the orchestrator answers)…"
 export MANTRA_HOME="$(mktemp -d)"

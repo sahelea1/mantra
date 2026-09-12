@@ -287,6 +287,10 @@ pub struct Run {
     /// Set when the watchdog wakes the planner about another agent's idleness (ladder step 3); if
     /// the planner produces no event by the deadline, step 4 halts the run.
     planner_watchdog: Option<(Instant, Instant)>,
+    /// Expected-active agents already reported as silent-but-busy in `watchdog_tick`, so one long
+    /// quiet spell costs the pulse feed exactly one line. An entry is dropped the moment the agent
+    /// speaks again, which is what lets a *later* spell be reported afresh.
+    silent_flagged: HashSet<AgentId>,
 }
 
 impl Run {
@@ -341,6 +345,7 @@ impl Run {
             turn_fail_retried: HashSet::new(),
             last_gate_blocker: None,
             planner_watchdog: None,
+            silent_flagged: HashSet::new(),
         }
     }
 
@@ -788,13 +793,17 @@ Then summarize in 2-4 lines.",
                 s => format!("{s:?}").to_lowercase(),
             };
             let waiting = w.agent.map(|a| self.pending_questions.contains_key(&a)).unwrap_or(false);
+            // The user stopped this one by hand: say so, or the orchestrator reads a live worker
+            // that has simply gone quiet and keeps prompting it.
+            let stopped = w.agent.and_then(|a| ctx.agent(a)).map(|a| a.stopped_by_user).unwrap_or(false);
             s.push_str(&format!(
-                "- {} [{}] {}: {state}, activity: {act}, steps {prog}, tokens {tok}, {el}{}{}\n",
+                "- {} [{}] {}: {state}, activity: {act}, steps {prog}, tokens {tok}, {el}{}{}{}\n",
                 w.task.id,
                 w.task.role,
                 trunc(&w.task.title, 40),
                 if w.paused { " (paused)" } else { "" },
-                if waiting { " (WAITING for an answer to its question)" } else { "" }
+                if waiting { " (WAITING for an answer to its question)" } else { "" },
+                if stopped { " (STOPPED by the user)" } else { "" }
             ));
         }
         if s.is_empty() {
@@ -1521,6 +1530,17 @@ Then summarize in 2-4 lines.",
         if !self.is_active() {
             return;
         }
+        // The user stopped this agent by hand (ctrl+c, or `x`), and that outranks every
+        // self-healing path below — the planner nudge, the next gate round, the worker's report to
+        // the orchestrator, the transient retry — each of which would put it straight back to work
+        // seconds after the stop. The flag clears itself as soon as anyone messages the agent
+        // again, so restarting it is always somebody's decision. `status` here is "interrupted",
+        // or "failed"/"agent restarting" when the kill raced the turn, so the flag — never the
+        // status string — is what decides.
+        if ctx.agent(a).map(|x| x.stopped_by_user).unwrap_or(false) {
+            self.log("■", "amber", format!("{} stopped by you — type to continue, r to respawn", self.name_of(a)));
+            return;
+        }
         // Failed turns: retry blips with backoff (Codex already retried the stream itself);
         // anything else pauses the run instead of burning tokens.
         if status == "failed" {
@@ -1823,7 +1843,10 @@ Then summarize in 2-4 lines.",
             );
             self.save_state();
         }
-        if resumed && was_busy && self.is_active() {
+        // A hand stop outlives the process: the user stopped the work, not the pipe, so a restart
+        // is no reason to tell it to carry on where it left off.
+        let stopped = ctx.agent(a).map(|x| x.stopped_by_user).unwrap_or(false);
+        if resumed && was_busy && self.is_active() && !stopped {
             self.mark_edge(a);
             ctx.prompt(a, "[mantra:resume] Your process restarted mid-task. Continue exactly where you left off.".into());
         }
@@ -1951,12 +1974,31 @@ Then summarize in 2-4 lines.",
         }
         let ws_secs = self.pattern.settings.watchdog_seconds.max(1);
         let es_secs = self.pattern.settings.watchdog_escalate_seconds.max(ws_secs + 1);
+        // The stall tripwire in `tick` only walks `self.workers`, and the ladder below only ever
+        // sees *idle* agents — so a planner (or orchestrator/gate/finale) that is connected and
+        // busy but has emitted nothing for minutes falls through both. That is precisely the state
+        // that reads as a crash from the outside, so it gets a journal line of its own (workers
+        // keep the tripwire, which also wakes the orchestrator — they must not get both).
+        let stall = Duration::from_secs(self.pattern.settings.stall_minutes * 60);
         let mut seen = vec![];
         let mut actions: Vec<(AgentId, Expect, u8, Duration)> = vec![];
         for (a, expect) in self.expected_active() {
             seen.push(a);
             let Some(agent) = ctx.agent(a) else { continue };
-            if agent.busy() {
+            let quiet = agent.last_event.elapsed();
+            if quiet < stall {
+                // It spoke: the spell is over, and the next one is worth reporting again.
+                self.silent_flagged.remove(&a);
+            } else if agent.busy() && !agent.stopped_by_user && self.worker_idx(a).is_none() && self.silent_flagged.insert(a) {
+                // Workers are deliberately left out: `tick`'s stall tripwire already reports them,
+                // and does more with it (the orchestrator is told, so it can steer or respawn).
+                let name = self.name_of(a);
+                self.log("⏳", "amber", format!("{name}: no output for {} — still connected", fmt_dur(quiet)));
+            }
+            // A deliberate stop is not idleness: an agent the user stopped by hand is waiting for
+            // them, so it is never nudged, respawned or escalated on. Its ladder is dropped too —
+            // when the stop is lifted it starts again from the bottom rung.
+            if agent.busy() || agent.stopped_by_user {
                 self.watch.remove(&a);
                 continue;
             }
@@ -1983,6 +2025,7 @@ Then summarize in 2-4 lines.",
             }
         }
         self.watch.retain(|a, _| seen.contains(a));
+        self.silent_flagged.retain(|a| seen.contains(a));
         for (a, expect, stage, idle) in actions {
             self.watchdog_act(ctx, a, expect, stage, idle);
         }
@@ -2753,6 +2796,14 @@ mod halt_tests {
                 ag.awaiting_start = false;
             }
         }
+        /// Back-date `last_event` while the turn stays live: a busy agent that has gone quiet,
+        /// which is the state the ladder ignores and `watchdog_tick` only journals about.
+        fn set_silent_secs(&mut self, a: AgentId, secs: u64) {
+            if let Some(ag) = self.agents.get_mut(&a) {
+                ag.last_event = Instant::now() - Duration::from_secs(secs);
+                ag.turn_active = true;
+            }
+        }
     }
 
     /// A minimal `Worker` for tests that don't need a real workspace/prepare cycle.
@@ -2889,6 +2940,40 @@ mod halt_tests {
         ctx.set_idle_secs(orch, 500); // long idle, but a worker is running — this is legitimate
         run.watchdog_tick(&mut ctx);
         assert!(ctx.prompts.is_empty(), "an orchestrator asleep in mantra_wait while a worker runs must not be nudged: {:?}", ctx.prompts);
+    }
+
+    /// The case the ladder structurally cannot see: a planner that is *busy* — connected, turn
+    /// live — but has emitted nothing for minutes. From the outside that is indistinguishable
+    /// from a crash, so it earns one pulse line and nothing else: no nudge, no respawn, no halt.
+    #[test]
+    fn a_busy_but_silent_agent_is_journalled_once_per_spell() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_busy();
+        ready(&mut ctx, planner);
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        let past_stall = run.pattern.settings.stall_minutes * 60 + 30;
+        let lines = |r: &Run| r.pulse.iter().filter(|p| p.text.contains("no output for")).count();
+
+        ctx.set_silent_secs(planner, past_stall);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(lines(&run), 1, "a long silent planning turn must say so once: {:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        assert!(ctx.prompts.is_empty(), "a working agent is never nudged for being quiet: {:?}", ctx.prompts);
+        assert!(!run.halted(), "quiet is informational — it must never stop the run");
+
+        // Still silent on the next tick: the feed must not fill up with the same observation.
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(lines(&run), 1, "one line per spell, not one per tick");
+
+        // It speaks, then goes quiet again — a second spell, reported afresh.
+        ctx.agents.get_mut(&planner).unwrap().last_event = Instant::now();
+        run.watchdog_tick(&mut ctx);
+        ctx.set_silent_secs(planner, past_stall);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(lines(&run), 2, "a later silent spell is news again");
+        assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+        assert!(!run.halted());
     }
 
     #[test]
@@ -3274,6 +3359,135 @@ mod halt_tests {
         ctx.prompts.clear();
         run.review_tick(&mut ctx);
         assert!(ctx.prompts.is_empty(), "0 turns the review off");
+    }
+
+    // A user's hand stop (ctrl+c / `x`) --------------------------------------------------------
+
+    /// The bug this guards: a planner stopped by hand ends its turn "interrupted" with no plan,
+    /// which used to walk straight into the planner-nudge branch and prompt it again — the user's
+    /// stop undone a second later.
+    #[test]
+    fn hand_stopped_planner_is_not_nudged_back_to_work() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_busy();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        // exactly what `App::interrupt_by_user` leaves behind: the flag set, the turn killed
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = true;
+        ctx.agents.get_mut(&planner).unwrap().turn_active = false;
+
+        run.on_turn_done(&mut ctx, planner, "interrupted", None, None);
+
+        assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("haven't submitted")), "a hand-stopped planner must not be nudged: {:?}", ctx.prompts);
+        assert!(ctx.prompts.is_empty(), "nothing at all may be sent to it: {:?}", ctx.prompts);
+        assert_eq!(run.planner_nudges, 0);
+        assert!(run.is_active(), "the run keeps going — only this agent stopped");
+        assert!(run.pulse.iter().any(|p| p.text.contains("stopped by you")), "the journal says why nothing happened: {:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    }
+
+    /// The other restart path: `Cmd::Interrupt` can race the turn, so the stop can surface as a
+    /// failed turn ("agent restarting") instead of an interrupted one — the flag, not the status
+    /// string, must be what stops the retry ladder.
+    #[test]
+    fn hand_stop_also_swallows_a_racing_transient_failure() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = true;
+
+        run.on_turn_done(&mut ctx, planner, "failed", Some("agent restarting".into()), Some(ErrKind::Transient));
+
+        assert!(ctx.prompts.is_empty(), "no backoff retry for a hand-stopped agent: {:?}", ctx.prompts);
+        assert!(run.continue_queue.is_empty(), "nothing queued to re-prompt it later");
+        assert!(!run.halted());
+    }
+
+    #[test]
+    fn watchdog_leaves_a_hand_stopped_planner_alone() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        ctx.set_idle_secs(planner, 600); // well past watchdog_seconds and both escalations
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = true;
+
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.is_empty(), "a deliberate stop is not idleness: {:?}", ctx.prompts);
+        assert!(!run.halted(), "and it must never escalate into a halt");
+
+        // the user types to it again (`prompt_agent` clears the flag): the ladder starts over
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = false;
+        ctx.set_idle_secs(planner, 100);
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:watchdog]")), "the watchdog resumes its job once the stop is lifted: {:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn hand_stopped_worker_is_not_reported_to_the_orchestrator() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let worker_agent = ctx.add_busy();
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+        ctx.agents.get_mut(&worker_agent).unwrap().stopped_by_user = true;
+        ctx.agents.get_mut(&worker_agent).unwrap().turn_active = false;
+
+        run.on_turn_done(&mut ctx, worker_agent, "interrupted", None, None);
+
+        assert!(ctx.prompts.is_empty(), "the orchestrator must not be told to prompt/retry it: {:?}", ctx.prompts);
+        assert_eq!(run.workers[0].state, WState::Running, "the task is still this worker's — it just stopped");
+        assert!(run.status_text(&ctx).contains("(STOPPED by the user)"), "{}", run.status_text(&ctx));
+    }
+
+    #[test]
+    fn messaging_a_hand_stopped_worker_again_lifts_the_stop() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let worker_agent = ctx.add_busy();
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+        ctx.agents.get_mut(&worker_agent).unwrap().stopped_by_user = true;
+        ctx.agents.get_mut(&worker_agent).unwrap().turn_active = false;
+        run.on_turn_done(&mut ctx, worker_agent, "interrupted", None, None);
+        assert!(ctx.prompts.is_empty());
+
+        // someone messages it again — `app::prompt_agent` clears the flag — and a later interrupted
+        // turn is handled normally again.
+        ctx.agents.get_mut(&worker_agent).unwrap().stopped_by_user = false;
+        run.on_turn_done(&mut ctx, worker_agent, "interrupted", None, None);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("was interrupted")), "normal handling is back: {:?}", ctx.prompts);
+        assert!(!run.status_text(&ctx).contains("STOPPED"));
+    }
+
+    /// A hand-stopped agent whose process happens to restart must not be told to carry on.
+    #[test]
+    fn hand_stop_survives_a_process_restart() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = true;
+
+        run.on_ready(&mut ctx, planner, true, true);
+        assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("[mantra:resume]")), "{:?}", ctx.prompts);
+        assert!(run.agent_meta.contains_key(&planner), "the bookkeeping still happens");
+
+        ctx.agents.get_mut(&planner).unwrap().stopped_by_user = false;
+        run.on_ready(&mut ctx, planner, true, true);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:resume]")), "a plain crash+resume still gets its prompt: {:?}", ctx.prompts);
     }
 
     // WP12.4/L1: EnvironmentBroken -------------------------------------------------------------

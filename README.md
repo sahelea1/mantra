@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.3.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.3.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80)
@@ -69,7 +69,7 @@ The installer verifies a sha256, installs to `~/.local/bin` (override with `MANT
 | [Codex](https://github.com/openai/codex) | `npm i -g @openai/codex` then `codex login` | the default backend |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm i -g @anthropic-ai/claude-code` then `claude` once | optional — for Claude models |
 
-Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing.
+Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
 ---
 
@@ -179,6 +179,21 @@ Every rung is journaled with `⏰`, and the idle agent's card turns amber. Any a
 
 There are guards for the silly failures too: a worker whose task is already done cannot be prompted, an orchestrator that prompts the same stuck worker three times in five minutes gets that worker respawned instead, and nothing can be spawned while the run is halted.
 
+**A stop you make by hand outranks all of it.** `ctrl+c` (or `x`) on an agent marks it *stopped by you*: no nudge, no gate round, no retry, no "continue where you left off" after a process restart, and the watchdog steps over it. It stays stopped until you message it (which is how you restart it) or press `r` to respawn it — the card and `mantra_status` say so, so the orchestrator doesn't mistake it for a worker that merely went quiet.
+
+</details>
+
+<details>
+<summary>Telling "still thinking" from "hung"</summary>
+
+A long reasoning turn used to look exactly like a crashed one. Now it doesn't:
+
+- a Claude agent's thinking label carries its own running count — `thinking · 9.4k`, climbing every second or two;
+- if the stream really does go silent, the status line and the agent's card append an amber `· quiet 1m20s`, counting from the last byte the process sent;
+- a planner, orchestrator or gate agent that is connected but silent past `stall_minutes` gets one journal line (`⏳ … no output for 6m00s — still connected`). Workers already have the stall tripwire, which also wakes the orchestrator.
+
+Nothing here acts on your behalf — it just stops you having to guess.
+
 </details>
 
 <details>
@@ -213,7 +228,7 @@ Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`),
 <details>
 <summary>Claude Code as a backend for any role</summary>
 
-If `claude` is on your `PATH`, Mantra adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. The gauge follows the window Claude Code reports for your account, so a plan without 1M still reads right; an older `models.toml` keeps whatever `context_window` it has — set it to `1000000` (or delete the file to regenerate it). Point any role at a Claude model in the Studio, exactly like a Codex model. The built-in `mantra-default-claude` pattern does it for you: planner and orchestrator on Claude, workers on Claude, gates on Codex.
+If `claude` is on your `PATH`, Mantra adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. Claude Code announces your account's real window a second after each agent starts, and on a subscription login that is what the gauge uses — so it is right from the first turn whatever your plan grants (an `api_key` gateway keeps the window you configured). An older `models.toml` keeps whatever `context_window` it has — set it to `1000000`, or delete the file to regenerate it. Point any role at a Claude model in the Studio, exactly like a Codex model. The built-in `mantra-default-claude` pattern does it for you: planner and orchestrator on Claude, workers on Claude, gates on Codex.
 
 Under the hood each agent is one long-lived `claude -p --input-format stream-json …` process. Mantra translates its event stream into the same shapes the UI already renders, so nothing else in the app knows the difference: steering lands at the next tool boundary, `x` sends a real interrupt, `/compact` compacts the session, and a crashed process restarts with `--resume`.
 
@@ -240,7 +255,7 @@ This is also the way around gateways that reject Codex's `developer` role: same 
 
 <img src="docs/img/models.png" alt="The models registry: aliases, context windows, compaction thresholds, providers" width="960">
 
-`/models` edits everything live (`⏎` edit, `+/-` step, `t` test a model for real, `D` discover, `ctrl+s` save). Add a provider with `n` and fill in four fields:
+`/models` edits everything live (`⏎` edit, `+/-` step, `t` test a model for real, `D` discover, `ctrl+s` save) — and `esc` puts you back on exactly the screen you opened it from, zoom included. Add a provider with `n` and fill in four fields:
 
 | field | meaning |
 |---|---|
@@ -324,7 +339,7 @@ Or describe what you want and let the **architect agent** edit the pattern while
 | `ctrl+d` | diff viewer · `ctrl+e` verbose log |
 | `ctrl+t` | side panel / pulse feed · `ctrl+g` inbox |
 | `ctrl+r` | respawn the focused agent |
-| `ctrl+c` | close an overlay / clear the input / interrupt the focused agent · **three presses quit** |
+| `ctrl+c` | close an overlay / clear the input / **stop** the focused agent (it stays stopped) · three presses quit |
 | `ctrl+l` | redraw · `?` help |
 
 </details>
@@ -402,7 +417,7 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 <details>
 <summary>How this is tested, and what is not covered</summary>
 
-- `cargo build` with zero warnings, 92 unit tests (including the chain of command, escalation, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- `cargo build` with zero warnings, 114 unit tests (including the chain of command, escalation, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
 - Real runs against a live provider with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale, compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
 
@@ -441,6 +456,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.3.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.3.1** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

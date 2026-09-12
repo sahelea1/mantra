@@ -244,8 +244,10 @@ pub(super) async fn run_claude_process(
     }
 }
 
-/// The CLI's own progress ticks (`system/thinking_tokens` every second while the model thinks,
-/// `tool_progress` while a tool runs): folded into activity, never worth a log line each.
+/// The CLI's own progress ticks (`system/thinking_tokens` every second or two while the model
+/// thinks, `tool_progress` while a tool runs): folded into activity, never worth a log line each.
+/// Deliberately not here: `autocompact_state` (once per session) and `rate_limit_event` (once per
+/// turn) — both are rare and both say something about the account worth keeping in `mantra.log`.
 fn is_heartbeat(v: &Value) -> bool {
     match v.get("type").and_then(|x| x.as_str()) {
         Some("tool_progress") => true,
@@ -514,11 +516,14 @@ struct Translator {
     open_tools: HashMap<String, ToolOpen>,
     /// The context window Mantra configured for this agent (passed as `--autocompact`).
     autocompact: u64,
-    /// Prefer the window the CLI reports (`result.modelUsage.*.contextWindow`) over `autocompact`
-    /// for the gauge. True for a subscription login — the CLI knows what the plan really grants —
-    /// and false for a custom `api_key` gateway, whose real window only the user's config knows.
+    /// Prefer the window the CLI reports (`autocompact_state.value.effective_window` at spawn,
+    /// then `result.modelUsage.*.contextWindow`) over `autocompact` for the gauge. True for a
+    /// subscription login — the CLI knows what the plan really grants — and false for a custom
+    /// `api_key` gateway, whose real window only the user's config knows.
     trust_reported_window: bool,
-    /// The window the CLI last reported in a `result` line, if any.
+    /// The window the CLI last reported: `autocompact_state` seconds after spawn, then whatever a
+    /// `result` line says (last writer wins — both are the CLI's own account-aware answer, and the
+    /// later one is the more current).
     reported_window: Option<u64>,
     /// Running Σ of tokens across every API call of this session (Codex's `total.totalTokens`
     /// semantics: every request's input + output, cache reads included), fed from each
@@ -535,6 +540,10 @@ struct Translator {
     /// Set on `system/api_retry` with a 401/403 status: the CLI itself retries these ~10 times
     /// before giving up (verified) — Mantra kills the process on the first one instead.
     fatal_auth: Option<String>,
+    /// A rate-limit warning is already standing (`on_rate_limit`). `rate_limit_event` repeats
+    /// every turn, so without this a single hot window would file one notice per turn; cleared
+    /// again the moment the limits read healthy, so a second episode is still announced.
+    rate_limit_warned: bool,
 }
 
 fn as_u64(v: &Value) -> Option<u64> {
@@ -568,6 +577,7 @@ impl Translator {
             last_ctx: (0, 0),
             turn_msgs: 0,
             fatal_auth: None,
+            rate_limit_warned: false,
         }
     }
 
@@ -621,7 +631,11 @@ impl Translator {
             "result" => self.on_result(v, &mut out),
             // A tool is still running: no state change, but the agent is alive (watchdog/stall).
             "tool_progress" => out.push(activity(self.agent, None)),
-            // control_request (from the CLI's own side, unused), commands_changed…
+            // Both of these are top-level lines, *not* `system` subtypes (verified against Claude
+            // Code 2.1.270), so they dispatch here rather than in `on_system`.
+            "autocompact_state" => self.on_autocompact_state(v, &mut out),
+            "rate_limit_event" => self.on_rate_limit(v, &mut out),
+            // control_request (from the CLI's own side, unused), commands_changed, active_goal…
             _ => {}
         }
         out
@@ -662,10 +676,19 @@ impl Translator {
                 self.last_ctx = (post, 0);
             }
             "thinking_tokens" => {
-                // Emitted about once a second while the model reasons, before any visible
-                // content: the turn is live, and the agent is not idle.
+                // Emitted every second or two while the model reasons, before any visible
+                // content: the turn is live, and the agent is not idle. The tick's own running
+                // `estimated_tokens` goes into the label so the number visibly climbs — a label
+                // frozen at "thinking" for two minutes is indistinguishable from a hung process,
+                // which is exactly what a user reported staring at during a long planning turn.
                 self.ensure_turn_open(out);
-                out.push(activity(self.agent, Some("thinking")));
+                let label = match v.get("estimated_tokens").and_then(as_u64).filter(|t| *t > 0) {
+                    Some(t) => format!("thinking · {}", crate::util::fmt_tokens(t)),
+                    // A tick that carries no count (or the very first, still at 0) must not leave
+                    // a dangling separator behind.
+                    None => "thinking".to_string(),
+                };
+                out.push(activity(self.agent, Some(&label)));
             }
             "api_retry" => {
                 if let Some(status @ (401 | 403)) = v.get("error_status").and_then(|x| x.as_i64()) {
@@ -683,6 +706,68 @@ impl Translator {
             // post_turn_summary, commands_changed: no Agent-visible signal needed.
             _ => {}
         }
+    }
+
+    /// `{"type":"autocompact_state","value":{"effective_window":…,"threshold":…,…}}` — the CLI
+    /// announcing the account's real context window a second or two after spawn, long before the
+    /// first `result` could report `modelUsage.*.contextWindow`. Recording it here is what makes
+    /// the gauge right from the *first* turn instead of showing Mantra's configured guess until a
+    /// turn ends.
+    fn on_autocompact_state(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
+        let Some(w) = v.pointer("/value/effective_window").and_then(as_u64).filter(|w| *w > 0) else { return };
+        // `threshold` is where the CLI itself will auto-compact. Mantra draws its own marker from
+        // the model config (`ModelEntry::effective_compact_percent`), so this one is logged rather
+        // than carried: showing the CLI's real compaction point on the gauge would need a new
+        // `Agent` field, which this change deliberately doesn't add.
+        let threshold = v.pointer("/value/threshold").and_then(as_u64).unwrap_or(0);
+        let before = self.window();
+        // Just a much earlier and better *reported* window — the precedence rule in `window()` is
+        // untouched, so a subscription login takes this over `--autocompact` while an `api_key`
+        // gateway (whose real window only the user's config knows) still keeps the configured one.
+        self.reported_window = Some(w);
+        let (agent, after) = (self.agent, self.window());
+        crate::mlog!("claude {agent}: autocompact_state window={w} threshold={threshold}, gauge uses {}", after.unwrap_or(0));
+        // Never fabricate counts just to carry a window: only re-emit the gauge when this actually
+        // changed what it would show *and* real counts are already there to hang it on.
+        if after != before && self.last_ctx != (0, 0) {
+            let (input, output) = self.last_ctx;
+            out.push(token_usage(agent, input, output, Some((self.total_tokens, after))));
+        }
+    }
+
+    /// `{"type":"rate_limit_event","rate_limit_info":{…}}` — once per turn, so it stays out of
+    /// `is_heartbeat` and gets its own log line. Only a *problem* is worth interrupting the user
+    /// for: a status other than "allowed", or a window already 90% consumed. One warning per
+    /// episode (armed until the limits read healthy again), because the same condition repeats on
+    /// every subsequent turn and a notice per turn would bury the transcript.
+    fn on_rate_limit(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
+        let status = v.pointer("/rate_limit_info/status").and_then(|x| x.as_str()).unwrap_or("allowed");
+        // The most-consumed of the plan's windows (`five_hour`, `seven_day`, …), each 0.0..1.0.
+        let hottest = v
+            .pointer("/rate_limit_info/unifiedWindows")
+            .and_then(|w| w.as_object())
+            .and_then(|o| o.iter().filter_map(|(k, e)| e.get("utilization").and_then(|u| u.as_f64()).map(|u| (k.as_str(), u))).max_by(|a, b| a.1.total_cmp(&b.1)));
+        let (window_name, used) = hottest.unwrap_or(("", 0.0));
+        let blocked = status != "allowed";
+        if !blocked && used < 0.9 {
+            self.rate_limit_warned = false; // healthy again: the next problem is worth saying once more
+            return;
+        }
+        let agent = self.agent;
+        crate::mlog!("claude {agent}: rate limit status={status} {window_name} at {:.0}%", used * 100.0);
+        if std::mem::replace(&mut self.rate_limit_warned, true) {
+            return;
+        }
+        // `turn/completed{status:"failed"}` would be a lie — the turn itself is fine — and
+        // `activity` is a one-second label the next tick overwrites. `warning` is the channel
+        // `Agent::apply` already turns into a `Kind::Notice` item the stage renders, so the user
+        // learns about it before a run dies mid-flight rather than from the failure itself.
+        let msg = if blocked {
+            format!("provider rate limit: status \"{status}\" — turns may start failing until the limit window resets")
+        } else {
+            format!("provider rate limit: the {window_name} window is {:.0}% used", used * 100.0)
+        };
+        out.push(HubEvent::Notif { agent, method: "warning".into(), params: json!({"message": msg}) });
     }
 
     fn on_assistant(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
@@ -1008,7 +1093,7 @@ mod tests {
         let think = json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 150, "session_id": "s"});
         feed(&mut tr, &mut agent, &[think.clone()]);
         assert!(agent.turn_active);
-        assert_eq!(agent.activity, "thinking");
+        assert_eq!(agent.activity, "thinking · 150");
         assert!(agent.last_event.elapsed().as_secs() < 5, "a heartbeat is an event");
         assert!(is_heartbeat(&think) && is_heartbeat(&json!({"type": "tool_progress"})) && !is_heartbeat(&json!({"type": "assistant"})));
         let bash = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "uv pip install pytest"}}]}});
@@ -1017,6 +1102,126 @@ mod tests {
         feed(&mut tr, &mut agent, &[json!({"type": "tool_progress", "tool_use_id": "t1", "elapsed_time_seconds": 90})]);
         assert!(agent.last_event.elapsed().as_secs() < 5);
         assert!(agent.activity.starts_with("$ uv pip"), "progress ticks keep the command label: {}", agent.activity);
+    }
+
+    /// A long planning turn shows the user nothing but the thinking label for minutes at a time,
+    /// so the label itself has to prove life: the tick's own running count goes into it and the
+    /// number climbs with every tick, which a static "thinking" can never do.
+    #[test]
+    fn thinking_ticks_carry_the_climbing_token_count() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        agent.last_event = std::time::Instant::now() - std::time::Duration::from_secs(500);
+        let tick = json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 9450, "estimated_tokens_delta": 100, "session_id": "s"});
+        feed(&mut tr, &mut agent, &[tick]);
+        assert!(agent.turn_active, "a tick means a turn is live, even before any visible content");
+        assert!(agent.activity.contains("thinking"), "still says what it's doing: {}", agent.activity);
+        assert!(agent.activity.contains("9.4k"), "the tick's own count has to show, or the label never changes: {}", agent.activity);
+        assert!(agent.last_event.elapsed().as_secs() < 5, "a tick is an event (watchdog/stall tripwire)");
+    }
+
+    /// The very first ticks of a turn carry no count at all (or a 0): the label stays plain rather
+    /// than trailing a separator with nothing after it.
+    #[test]
+    fn a_thinking_tick_without_a_count_keeps_the_plain_label() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        feed(&mut tr, &mut agent, &[json!({"type": "system", "subtype": "thinking_tokens", "session_id": "s"})]);
+        assert_eq!(agent.activity, "thinking");
+        feed(&mut tr, &mut agent, &[json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 0, "session_id": "s"})]);
+        assert_eq!(agent.activity, "thinking", "a zero count is not worth showing either");
+    }
+
+    /// `autocompact_state` arrives a second or two after spawn — long before the first `result`
+    /// could report `modelUsage.*.contextWindow` — so taking the window from it is what makes the
+    /// gauge right from the very first turn instead of showing Mantra's configured guess. It is a
+    /// *reported* window, so the existing precedence still decides who wins.
+    #[test]
+    fn autocompact_state_gives_the_gauge_the_real_window_before_the_first_result() {
+        let state = json!({"type": "autocompact_state", "value": {"enabled": true, "effective_window": 980_000, "threshold": 784_000, "enforced": true, "source": "model-default"}, "session_id": "s"});
+        let call = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 4000, "output_tokens": 100}, "content": [{"type": "text", "text": "hi"}]}});
+        assert!(!is_heartbeat(&state), "once per session and account-specific: worth its log line");
+
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        feed(&mut tr, &mut agent, &[state.clone()]);
+        assert_eq!(tr.window(), Some(980_000), "a subscription login trusts the window the CLI announced");
+        assert_eq!(agent.ctx_window, None, "no real counts exist yet — none may be invented just to carry the window");
+        feed(&mut tr, &mut agent, &[call.clone()]);
+        assert_eq!(agent.ctx_window, Some(980_000), "the very first turn's gauge already knows the real window");
+        assert_eq!(agent.ctx_used, 5_100);
+
+        // An `api_key` gateway's real window is only ever in the user's config; the CLI's
+        // announcement is a fallback for when there is none.
+        let mut tr2 = Translator::new(1, 262_144, false);
+        let mut agent2 = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        feed(&mut tr2, &mut agent2, &[state.clone(), call.clone()]);
+        assert_eq!(tr2.window(), Some(262_144), "the configured window still wins for api_key auth");
+        assert_eq!(agent2.ctx_window, Some(262_144));
+
+        // Out of order (a line arriving once counts are already flowing): the gauge is corrected
+        // straight away, re-using the counts already on hand rather than making any up.
+        let mut tr3 = Translator::new(1, 200_000, true);
+        let mut agent3 = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        feed(&mut tr3, &mut agent3, &[call, state]);
+        assert_eq!(agent3.ctx_window, Some(980_000));
+        assert_eq!(agent3.ctx_used, 5_100, "the re-emitted gauge must repeat the real counts, not reset them");
+        assert_eq!(agent3.tokens_total, 5_100, "and must not double-count them either");
+    }
+
+    /// The announced window holds for the rest of the session until the CLI reports a newer one of
+    /// its own in a `result` line: both are the CLI's account-aware answer, so `reported_window` is
+    /// last-writer-wins, and on a subscription login the configured guess never takes the gauge back.
+    #[test]
+    fn the_autocompact_window_holds_until_a_result_reports_its_own() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
+        let state = json!({"type": "autocompact_state", "value": {"effective_window": 980_000, "threshold": 784_000}, "session_id": "s"});
+        let call = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 4000, "output_tokens": 100}, "content": [{"type": "text", "text": "hi"}]}});
+        feed(&mut tr, &mut agent, &[state, call]);
+        assert_eq!(agent.ctx_window, Some(980_000));
+
+        // A turn that ends without a window of its own must not quietly fall back to --autocompact.
+        let plain = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 1000, "output_tokens": 100}});
+        feed(&mut tr, &mut agent, &[plain]);
+        assert_eq!(agent.ctx_window, Some(980_000), "a result carrying no modelUsage must not undo the announced window");
+
+        // The CLI naming a window for the model actually used is the newer answer, so it wins.
+        let result = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 2000, "output_tokens": 200}, "modelUsage": {"claude-sonnet-5": {"contextWindow": 1_000_000}}});
+        feed(&mut tr, &mut agent, &[result]);
+        assert_eq!(tr.window(), Some(1_000_000));
+        assert_eq!(agent.ctx_window, Some(1_000_000));
+    }
+
+    /// `rate_limit_event` lands once per turn: silent while the plan's windows are healthy, and
+    /// exactly one warning per episode when they aren't — the user should learn about it before a
+    /// run dies mid-flight, but a notice on every turn would bury the transcript.
+    #[test]
+    fn a_hot_rate_limit_warns_once_and_only_while_it_lasts() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let warnings = |out: &[HubEvent]| -> Vec<String> {
+            out.iter()
+                .filter_map(|e| match e {
+                    HubEvent::Notif { method, params, .. } if method == "warning" => params.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ev = |status: &str, five_hour: f64| json!({"type": "rate_limit_event", "rate_limit_info": {"status": status, "unifiedWindows": {"five_hour": {"utilization": five_hour}, "seven_day": {"utilization": 0.09}}}});
+
+        assert!(tr.on_line(&ev("allowed", 0.03), false).is_empty(), "a healthy window is not news");
+        let hot = tr.on_line(&ev("allowed", 0.94), false);
+        assert_eq!(warnings(&hot).len(), 1, "a nearly-spent window is worth saying once");
+        assert!(warnings(&hot)[0].contains("five_hour") && warnings(&hot)[0].contains("94%"), "{:?}", warnings(&hot));
+        assert!(!hot.iter().any(|e| matches!(e, HubEvent::Notif { method, .. } if method == "turn/completed")), "the turn itself is fine — nothing may fail it");
+        assert!(tr.on_line(&ev("allowed", 0.96), false).is_empty(), "the same episode repeats every turn: say it once");
+
+        // Back under the line, then a real rejection later: that is a new episode, said again.
+        assert!(tr.on_line(&ev("allowed", 0.10), false).is_empty());
+        let blocked = tr.on_line(&ev("rejected", 0.10), false);
+        assert_eq!(warnings(&blocked).len(), 1);
+        assert!(warnings(&blocked)[0].contains("rejected"), "{:?}", warnings(&blocked));
+        assert!(!is_heartbeat(&ev("allowed", 0.03)), "once per turn: cheap enough to log");
     }
 
     #[test]
