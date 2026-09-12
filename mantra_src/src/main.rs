@@ -2,6 +2,7 @@
 
 mod agent;
 mod app;
+mod bridge;
 mod config;
 mod discover;
 mod engine;
@@ -115,6 +116,13 @@ fn main() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         rt.block_on(mock::run());
         return;
+    }
+    // So is the MCP bridge that Claude Code agents use to reach Mantra's tools.
+    if std::env::args().nth(1).as_deref() == Some("mcp-bridge") {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = rt.block_on(bridge::run(args));
+        std::process::exit(code);
     }
     let cli = match parse_args() {
         Ok(Some(c)) => c,
