@@ -354,6 +354,11 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     let chain: Vec<String> = p.flow.finale.iter().map(|s| format!("{} {}", p.role(&s.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default(), s.role)).collect();
     l.push(Line::from(Span::styled(format!("   flow  plan → phases (parallel workers → {} gate) → {}", p.flow.phase_gate, chain.join(" → ")), theme::dim())));
     l.push(Line::from(Span::styled("   /pattern to switch · s or /studio to edit · /models for models & effort", theme::faint())));
+    if !app.unfinished_runs.is_empty() {
+        let n = app.unfinished_runs.len();
+        l.push(Line::default());
+        l.push(Line::from(Span::styled(format!("   {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
+    }
     f.render_widget(Paragraph::new(l), area);
 }
 

@@ -158,6 +158,11 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         key("ctrl+k · alt+↑↓", "switch model · change reasoning effort"),
         key("?", "all keys"),
     ];
+    if !app.unfinished_runs.is_empty() {
+        let n = app.unfinished_runs.len();
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(format!("     {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
+    }
     if app.demo {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("     demo mode — simulated agents, nothing is sent to an API", theme::fg(theme::ROSE))));

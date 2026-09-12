@@ -49,3 +49,14 @@ All notable changes to Mantra are recorded here.
   `backspace` on an empty input restores the last queued message for editing, `ctrl+x` discards
   the whole queue. Applies to Solo, Zoom and `@name` messages from the stage; the engine's own
   prompting (steering workers, waking the orchestrator, etc.) is unaffected.
+- WP11: runs can be listed, resumed and deleted. `state.json` is now a typed snapshot (stage,
+  workspace, workers with their worktrees/branches/reports, agents with their thread ids) rewritten
+  atomically at every transition. `mantra runs` lists every run of every project (id, stage, when,
+  goal); `mantra runs resume <id>` reopens one from any directory at the nearest safe boundary
+  (planner re-attached to its thread, a fresh orchestrator briefed with the phase status, running
+  workers re-attached when their worktree still exists — otherwise re-spawned — merges/checks/gates
+  simply run again, finished runs open read-only for `/land`); `mantra runs delete <id>` removes
+  its worktrees, `mantra/<id>` + `mantra-w/<id>/*` branches and journal after a `y/N` (`--yes`
+  skips it). In the TUI, `/runs` opens the same list for the current project (`⏎` resume, `D`
+  delete), and the welcome screens say `↻ N unfinished runs — /runs`. `--resume-last` reopens the
+  most recent unfinished run (with `--demo`, the last demo run).

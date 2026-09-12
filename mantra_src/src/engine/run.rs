@@ -4,6 +4,7 @@
 //! happens here — never inside an LLM loop. LLM agents are woken only for judgment calls.
 
 use super::git::{self, CheckResult, Workspace};
+use super::state::{AgentState, PhaseHistory, RunState, WorkerState};
 use super::pattern::{Pattern, Role};
 use super::plan::{Phase, Plan, Task};
 use super::tools;
@@ -64,6 +65,11 @@ pub enum Send {
 /// What the engine needs from the app. Keeps the engine free of UI/process details (and testable).
 pub trait Ctx {
     fn spawn(&mut self, req: SpawnReq) -> AgentId;
+    /// Spawn an agent re-attached to a saved thread/session (`mantra runs resume`). The default
+    /// just spawns fresh, which is always a correct (if more expensive) fallback.
+    fn spawn_resumed(&mut self, req: SpawnReq, _thread: String) -> AgentId {
+        self.spawn(req)
+    }
     fn prompt(&mut self, a: AgentId, text: String);
     /// Like `prompt`, but lets a UI-originated message (queued or forced) say how it should
     /// reach an agent that is already busy. Engine call sites always use plain `prompt`.
@@ -78,8 +84,9 @@ pub trait Ctx {
     fn notify(&mut self, text: &str);
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PhaseStep {
+    #[default]
     Orchestrating,
     Merging,
     Checks { round: u32 },
@@ -87,8 +94,9 @@ pub enum PhaseStep {
     Handoff,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
+    #[default]
     Setup,
     Planning,
     Review,
@@ -203,10 +211,14 @@ pub struct Run {
     pub alerts: Vec<String>,
     pub edges: HashMap<AgentId, Instant>,
     pub want_review: bool,
+    /// What `state.json` needs to re-attach agents after a resume: filled in `on_ready` (once the
+    /// thread/session id is known) for every agent of this run.
+    pub agent_meta: HashMap<AgentId, AgentState>,
+    pub started_unix: u64,
     orch_inbox: Vec<String>,
     planner_nudges: u32,
-    handoff_note_done: bool,
-    cleanup_done: bool,
+    pub(super) handoff_note_done: bool,
+    pub(super) cleanup_done: bool,
     continue_queue: Vec<(AgentId, Instant, String)>,
     retry_counts: HashMap<AgentId, u32>,
     paused_agents: Vec<AgentId>,
@@ -246,6 +258,8 @@ impl Run {
             alerts: vec![],
             edges: HashMap::new(),
             want_review: false,
+            agent_meta: HashMap::new(),
+            started_unix: crate::util::unix_secs(),
             orch_inbox: vec![],
             planner_nudges: 0,
             handoff_note_done: false,
@@ -287,16 +301,79 @@ impl Run {
         }
     }
 
-    fn save_state(&self) {
-        let stage = format!("{:?}", self.stage);
-        let st = json!({
-            "id": self.id, "brief": self.brief, "stage": stage, "pattern": self.pattern.name,
-            "plan_version": self.plan_version,
-            "branch": self.ws.as_ref().map(|w| w.branch.clone()),
-            "workers": self.workers.iter().map(|w| json!({"task": w.task.id, "state": format!("{:?}", w.state), "attempt": w.attempt})).collect::<Vec<_>>(),
-        });
-        let _ = std::fs::create_dir_all(&self.dir);
-        let _ = std::fs::write(self.dir.join("state.json"), serde_json::to_string_pretty(&st).unwrap_or_default());
+    /// Persist everything a later `mantra runs resume` needs (see `engine::state`). Cheap: a few
+    /// KB rewritten atomically at every transition.
+    pub(super) fn save_state(&self) {
+        let slot_of = |a: AgentId| -> String {
+            if Some(a) == self.planner {
+                "planner".into()
+            } else if Some(a) == self.orchestrator {
+                "orchestrator".into()
+            } else if Some(a) == self.gate_agent {
+                "gate".into()
+            } else if let Some(w) = self.workers.iter().find(|w| w.agent == Some(a)) {
+                format!("worker:{}#{}", w.task.id, w.attempt)
+            } else if Some(a) == self.finale_agent {
+                "finale".into()
+            } else {
+                String::new()
+            }
+        };
+        let workers = self
+            .workers
+            .iter()
+            .map(|w| {
+                let (state, error) = match &w.state {
+                    WState::Queued => ("queued", String::new()),
+                    WState::Preparing => ("preparing", String::new()),
+                    WState::Running => ("running", String::new()),
+                    WState::Retrying(_) => ("retrying", String::new()),
+                    WState::Done => ("done", String::new()),
+                    WState::Failed(e) => ("failed", e.clone()),
+                    WState::Cancelled => ("cancelled", String::new()),
+                };
+                let mut report = w.report.clone();
+                crate::util::tail_bytes(&mut report, 6000);
+                WorkerState {
+                    task: w.task.id.clone(),
+                    title: w.task.title.clone(),
+                    role: w.task.role.clone(),
+                    state: state.into(),
+                    error,
+                    attempt: w.attempt,
+                    branch: w.branch.clone(),
+                    worktree: w.wt.clone(),
+                    adhoc: w.adhoc,
+                    prompt: w.prompt.clone(),
+                    effort: w.effort.clone(),
+                    report,
+                }
+            })
+            .collect();
+        let live = self.all_agents();
+        let agents = live
+            .iter()
+            .filter_map(|a| self.agent_meta.get(a).map(|m| AgentState { slot: slot_of(*a), ..m.clone() }))
+            .filter(|m| !m.slot.is_empty())
+            .collect();
+        RunState {
+            format: super::state::FORMAT,
+            id: self.id.clone(),
+            project: self.project.clone(),
+            brief: self.brief.clone(),
+            pattern: self.pattern.name.clone(),
+            plan_version: self.plan_version,
+            stage: self.stage.clone(),
+            halted: self.halt.as_ref().map(|h| h.message.clone()),
+            started_unix: self.started_unix,
+            updated_unix: crate::util::unix_secs(),
+            ws: self.ws.clone(),
+            handoff: self.handoff.clone(),
+            workers,
+            agents,
+            history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
+        }
+        .save(&self.dir);
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -341,6 +418,7 @@ impl Run {
         self.alerts.push(message.clone());
         ctx.notify(&format!("Mantra needs you: {message}"));
         self.halt = Some(Halt { reason, agent, message, since: Instant::now() });
+        self.save_state();
     }
 
     /// Un-halt: re-prompt every agent that was interrupted for this, and pick the run back up
@@ -356,6 +434,7 @@ impl Run {
             ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
         }
         self.log("▶", "green", "run resumed");
+        self.save_state();
         if let Stage::Phase { idx, step } = self.stage.clone() {
             match step {
                 PhaseStep::Orchestrating => {
@@ -419,7 +498,7 @@ impl Run {
         self.ws.as_ref().map(|w| w.integ.clone()).unwrap_or_else(|| self.project.clone())
     }
 
-    fn integ_writable(&self) -> Vec<PathBuf> {
+    pub(super) fn integ_writable(&self) -> Vec<PathBuf> {
         self.ws.as_ref().and_then(|w| w.git_common_dir.clone()).into_iter().collect()
     }
 
@@ -434,7 +513,7 @@ impl Run {
         self.tokens_prev + self.all_agents().into_iter().map(ctx_tokens).sum::<u64>()
     }
 
-    fn role(&self, name: &str) -> Role {
+    pub(super) fn role(&self, name: &str) -> Role {
         self.pattern.role(name).cloned().unwrap_or_default()
     }
 
@@ -478,7 +557,7 @@ impl Run {
         self.workers.iter().position(|w| w.agent == Some(a))
     }
 
-    fn mark_edge(&mut self, a: AgentId) {
+    pub(super) fn mark_edge(&mut self, a: AgentId) {
         self.edges.insert(a, Instant::now());
     }
 
@@ -493,7 +572,7 @@ impl Run {
         self.wake_orch(ctx);
     }
 
-    fn wake_orch(&mut self, ctx: &mut dyn Ctx) {
+    pub(super) fn wake_orch(&mut self, ctx: &mut dyn Ctx) {
         let Some(o) = self.orchestrator else { return };
         if self.orch_inbox.is_empty() || self.halted() {
             return;
@@ -507,7 +586,7 @@ impl Run {
         ctx.prompt(o, format!("[mantra:event]\n{}\n\nCurrent status:\n{status}\nDecide what (if anything) to do, then call mantra_wait.", msgs.join("\n")));
     }
 
-    fn status_text(&self, ctx: &dyn Ctx) -> String {
+    pub(super) fn status_text(&self, ctx: &dyn Ctx) -> String {
         let mut s = String::new();
         for w in &self.workers {
             let a = w.agent.and_then(|a| ctx.agent(a));
@@ -544,11 +623,16 @@ impl Run {
         ctx.job(JobTag::Setup, Box::new(move || JobOut::Setup(git::setup(&project, &id, &iso))));
     }
 
-    fn spawn_planner(&mut self, ctx: &mut dyn Ctx) -> AgentId {
+    pub(super) fn spawn_planner(&mut self, ctx: &mut dyn Ctx) -> AgentId {
+        self.spawn_planner_with(ctx, None)
+    }
+
+    /// `resume`: a saved thread/session id to re-attach to (`mantra runs resume`).
+    pub(super) fn spawn_planner_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.planner.clone();
         let role = self.role(&name);
         let wr = self.pattern.worker_roles();
-        let id = ctx.spawn(SpawnReq {
+        let req = SpawnReq {
             name: "planner".into(),
             role_name: name,
             instructions: format!("{}\n{}", role.instructions, tools::PLANNER_PROTOCOL),
@@ -558,12 +642,16 @@ impl Run {
             extra_writable: vec![],
             context_override: None,
             role,
-        });
+        };
+        let id = match resume {
+            Some(t) => ctx.spawn_resumed(req, t),
+            None => ctx.spawn(req),
+        };
         self.planner = Some(id);
         id
     }
 
-    fn planning_prompt(&self) -> String {
+    pub(super) fn planning_prompt(&self) -> String {
         let s = &self.pattern.settings;
         let mut roles = String::new();
         for n in self.pattern.worker_roles() {
@@ -597,7 +685,7 @@ impl Run {
         ctx.prompt(p, format!("[mantra:revise] The user reviewed your plan and says:\n{text}\n\nSubmit the updated plan with mantra_submit_plan."));
     }
 
-    fn start_phase(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+    pub(super) fn start_phase(&mut self, ctx: &mut dyn Ctx, idx: usize) {
         let Some(plan) = self.plan.clone() else { return };
         let Some(phase) = plan.phases.get(idx).cloned() else {
             self.start_finale(ctx, 0);
@@ -619,23 +707,7 @@ impl Run {
                 ctx.compact(o);
                 o
             }
-            _ => {
-                let name = self.pattern.flow.orchestrator.clone();
-                let role = self.role(&name);
-                let id = ctx.spawn(SpawnReq {
-                    name: "orchestrator".into(),
-                    role_name: name,
-                    instructions: format!("{}\n{}\n## Project-specific brief from the planner\n{}", role.instructions, tools::ORCHESTRATOR_PROTOCOL, plan.orchestrator_brief),
-                    cwd: self.workspace_dir(),
-                    tools: tools::orchestrator_tools(),
-                    effort: None,
-                    extra_writable: vec![],
-                    context_override: None,
-                    role,
-                });
-                self.orchestrator = Some(id);
-                id
-            }
+            _ => self.spawn_orchestrator(ctx),
         };
         let handoff = if self.handoff.is_empty() { String::new() } else { format!("Handoff from the previous phase's orchestrator:\n{}\n\n", self.handoff) };
         let phase_json = serde_json::to_string_pretty(&phase).unwrap_or_default();
@@ -654,7 +726,27 @@ impl Run {
         self.save_state();
     }
 
-    fn spawn_task(&mut self, ctx: &mut dyn Ctx, task: Task, prompt: Option<String>, effort: Option<String>) -> String {
+    /// A fresh orchestrator for the current phase (its instructions carry the planner's brief).
+    pub(super) fn spawn_orchestrator(&mut self, ctx: &mut dyn Ctx) -> AgentId {
+        let brief = self.plan.as_ref().map(|p| p.orchestrator_brief.clone()).unwrap_or_default();
+        let name = self.pattern.flow.orchestrator.clone();
+        let role = self.role(&name);
+        let id = ctx.spawn(SpawnReq {
+            name: "orchestrator".into(),
+            role_name: name,
+            instructions: format!("{}\n{}\n## Project-specific brief from the planner\n{}", role.instructions, tools::ORCHESTRATOR_PROTOCOL, brief),
+            cwd: self.workspace_dir(),
+            tools: tools::orchestrator_tools(),
+            effort: None,
+            extra_writable: vec![],
+            context_override: None,
+            role,
+        });
+        self.orchestrator = Some(id);
+        id
+    }
+
+    pub(super) fn spawn_task(&mut self, ctx: &mut dyn Ctx, task: Task, prompt: Option<String>, effort: Option<String>) -> String {
         let running = self.workers.iter().filter(|w| matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))).count();
         let prompt = prompt.filter(|p| !p.trim().is_empty()).unwrap_or_else(|| task.prompt.clone());
         let attempt = self.workers.iter().filter(|w| w.task.id == task.id).map(|w| w.attempt).max().unwrap_or(0) + 1;
@@ -716,7 +808,13 @@ impl Run {
         }
     }
 
-    fn launch_worker(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String) {
+    pub(super) fn launch_worker(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String) {
+        self.launch_worker_with(ctx, wi, dir, branch, None)
+    }
+
+    /// `resume`: re-attach to the worker's saved thread/session instead of starting fresh — its
+    /// worktree still holds its edits, so the prompt tells it to continue rather than restart.
+    pub(super) fn launch_worker_with(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String, resume: Option<String>) {
         let plan_summary = self.plan.as_ref().map(|p| p.summary.clone()).unwrap_or_default();
         let w = &self.workers[wi];
         let role = self.role(&w.task.role);
@@ -729,13 +827,21 @@ impl Run {
             w.task.title,
             if w.task.acceptance.is_empty() { "the task is fully done and verified" } else { &w.task.acceptance }
         );
-        let prompt = format!("{}\n\n(Context — overall project goal: {plan_summary})", w.prompt);
+        let prompt = match &resume {
+            Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
+            None => format!("{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
+        };
         let effort = w.effort.clone().or(w.task.effort.clone());
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
         let context_override = w.context_override;
-        let id = ctx.spawn(SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: vec![], effort, extra_writable: vec![], context_override });
+        let resumed = resume.is_some();
+        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: vec![], effort, extra_writable: vec![], context_override };
+        let id = match resume {
+            Some(t) => ctx.spawn_resumed(req, t),
+            None => ctx.spawn(req),
+        };
         let w = &mut self.workers[wi];
         w.agent = Some(id);
         w.wt = Some(dir);
@@ -745,10 +851,11 @@ impl Run {
         let tid = w.task.id.clone();
         self.mark_edge(id);
         ctx.prompt(id, prompt);
-        self.log(&glyph, "violet", format!("spawned {tid} ({rname})"));
+        self.log(&glyph, "violet", format!("{} {tid} ({rname})", if resumed { "re-attached" } else { "spawned" }));
+        self.save_state();
     }
 
-    fn fill_slots(&mut self, ctx: &mut dyn Ctx) {
+    pub(super) fn fill_slots(&mut self, ctx: &mut dyn Ctx) {
         if self.halted() {
             return;
         }
@@ -763,7 +870,7 @@ impl Run {
         }
     }
 
-    fn check_phase_done(&mut self, ctx: &mut dyn Ctx) {
+    pub(super) fn check_phase_done(&mut self, ctx: &mut dyn Ctx) {
         let Some(idx) = self.phase_idx() else { return };
         if !matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) || self.halted() {
             return;
@@ -902,7 +1009,7 @@ impl Run {
         self.save_state();
     }
 
-    fn maybe_next_phase(&mut self, ctx: &mut dyn Ctx) {
+    pub(super) fn maybe_next_phase(&mut self, ctx: &mut dyn Ctx) {
         let Some(idx) = self.phase_idx() else { return };
         if !matches!(self.stage, Stage::Phase { step: PhaseStep::Handoff, .. }) || !self.handoff_note_done || !self.cleanup_done {
             return;
@@ -924,7 +1031,7 @@ impl Run {
         }
     }
 
-    fn start_finale(&mut self, ctx: &mut dyn Ctx, k: usize) {
+    pub(super) fn start_finale(&mut self, ctx: &mut dyn Ctx, k: usize) {
         self.workers.retain(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Cancelled));
         let steps = self.pattern.flow.finale.clone();
         let Some(step) = steps.get(k).cloned() else {
@@ -994,7 +1101,7 @@ impl Run {
         ctx.job(JobTag::Land, Box::new(move || JobOut::Text(git::land(&ws))));
     }
 
-    fn fail_run(&mut self, ctx: &mut dyn Ctx, why: String) {
+    pub(super) fn fail_run(&mut self, ctx: &mut dyn Ctx, why: String) {
         self.log("✗", "red", format!("run stopped: {why}"));
         self.alerts.push(why.clone());
         ctx.notify(&format!("Mantra: {why}"));
@@ -1356,6 +1463,13 @@ impl Run {
 
     /// Called when an agent's thread is ready. After a crash+resume, continue its unfinished turn.
     pub fn on_ready(&mut self, ctx: &mut dyn Ctx, a: AgentId, resumed: bool, was_busy: bool) {
+        if let Some(ag) = ctx.agent(a) {
+            self.agent_meta.insert(
+                a,
+                AgentState { slot: String::new(), name: ag.name.clone(), role: ag.role.clone(), provider: ag.provider.clone(), model_alias: ag.model_alias.clone(), effort: ag.effort.clone(), thread_id: ag.thread_id.clone(), cwd: ag.cwd.clone() },
+            );
+            self.save_state();
+        }
         if resumed && was_busy && self.is_active() {
             self.mark_edge(a);
             ctx.prompt(a, "[mantra:resume] Your process restarted mid-task. Continue exactly where you left off.".into());

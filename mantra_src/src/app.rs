@@ -51,6 +51,8 @@ pub enum Overlay {
     Edit { title: String, input: Input, target: EditTarget },
     Patterns { sel: usize, list: Vec<String> },
     Discover(DiscoverState),
+    /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
+    Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
 }
 
 /// The model-discovery picker.
@@ -120,6 +122,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/mandala", "open the Mandala stage"),
     ("/run", "start a Mandala run: /run <goal>"),
     ("/pattern", "choose the pattern for new runs"),
+    ("/runs", "this project's runs: resume or delete"),
     ("/plan", "show the run's plan"),
     ("/pause", "pause / resume the run"),
     ("/land", "merge the finished run branch into your branch"),
@@ -159,6 +162,9 @@ pub struct App {
     pub notes: Vec<String>,
     pub pattern_name: String,
     pub branch: String,
+    /// Ids of this project's unfinished runs at startup (welcome-screen notice); kept in sync by
+    /// `/runs` resume/delete.
+    pub unfinished_runs: Vec<String>,
     pub probes: HashMap<AgentId, (String, Instant)>,
     pub pulse_scroll: usize,
     pub force_clear: bool,
@@ -183,6 +189,9 @@ pub struct AgentOpts {
     /// Explicit context-window override (from a halved assumption); `None` uses the model's own
     /// effective context.
     pub context_override: Option<u64>,
+    /// Re-attach to a saved Codex thread / Claude session instead of starting a new one
+    /// (`mantra runs resume`).
+    pub resume_thread: Option<String>,
 }
 
 fn toml_str(s: &str) -> String {
@@ -237,7 +246,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         dynamic_tools: o.tools.clone(),
         config: serde_json::Map::new(),
         extra_args: extra,
-        resume_thread: None,
+        resume_thread: o.resume_thread.clone(),
         envs,
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
@@ -334,6 +343,31 @@ impl Ctx for Ctxt<'_> {
                 tools: r.tools,
                 extra_writable: r.extra_writable,
                 context_override: r.context_override,
+                resume_thread: None,
+            },
+        )
+    }
+    fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
+        let sandbox = if r.role.sandbox.is_empty() { "workspace-write".to_string() } else { r.role.sandbox.clone() };
+        spawn_agent(
+            self.hub,
+            self.agents,
+            self.registry,
+            AgentOpts {
+                name: r.name,
+                role: r.role_name,
+                glyph: r.role.glyph.clone(),
+                color: r.role.color.clone(),
+                model_alias: r.role.model.clone(),
+                effort: r.effort.or(Some(r.role.effort.clone())),
+                cwd: r.cwd,
+                approval: r.role.permission.clone(),
+                sandbox,
+                instructions: r.instructions,
+                tools: r.tools,
+                extra_writable: r.extra_writable,
+                context_override: r.context_override,
+                resume_thread: Some(thread),
             },
         )
     }
@@ -395,6 +429,7 @@ impl App {
         let pattern_name = settings.default_pattern.clone();
         let pattern = Pattern::load(&pattern_name, &project).unwrap_or_else(|_| Pattern::builtin());
         let sel0 = pattern.ordered_roles().first().map(|(n, _)| StudioSel::Role(n.clone())).unwrap_or(StudioSel::Settings);
+        let unfinished_runs: Vec<String> = crate::engine::state::unfinished(&project).into_iter().map(|r| r.id).collect();
         let branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&project)
@@ -431,6 +466,7 @@ impl App {
             notes: vec![],
             pattern_name,
             branch,
+            unfinished_runs,
             probes: HashMap::new(),
             pulse_scroll: 0,
             force_clear: false,
@@ -490,6 +526,7 @@ impl App {
                 tools: vec![],
                 extra_writable: vec![],
                 context_override: None,
+                resume_thread: None,
             },
         );
         self.solo = Some(id);
@@ -700,6 +737,72 @@ impl App {
         self.sel = 0;
     }
 
+    /// `/runs`: this project's runs, newest first. Runs of other projects are only counted — a
+    /// run is resumed from its own project (`mantra runs resume <id>` switches there).
+    pub fn open_runs(&mut self) {
+        let all = crate::engine::state::list_all();
+        let key = crate::engine::state::project_key(&self.project);
+        let (list, other): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| r.project_key == key);
+        self.overlays.push(Overlay::Runs { sel: 0, list, confirm: false, others: other.len() });
+    }
+
+    /// Pick a saved run back up (see `engine::resume`). Refuses while another run is active.
+    pub fn resume_run(&mut self, r: crate::engine::state::RunSummary) {
+        if self.run.as_ref().map(|x| x.is_active()).unwrap_or(false) {
+            self.toast("a run is already active — finish or /pause it first", Level::Warn);
+            return;
+        }
+        let st = match &r.state {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                self.toast(format!("cannot resume {}: {e}", r.id), Level::Error);
+                return;
+            }
+        };
+        // The pattern the run started with (saved copy first: the user may have edited theirs).
+        let pattern = std::fs::read_to_string(r.dir.join("pattern.toml"))
+            .ok()
+            .and_then(|s| Pattern::from_toml(&s).ok())
+            .or_else(|| Pattern::load(&st.pattern, &self.project).ok())
+            .unwrap_or_else(Pattern::builtin);
+        let problems = self.registry.preflight(&pattern);
+        if let Some(p) = problems.first() {
+            self.toast(format!("cannot resume: {p}"), Level::Error);
+            return;
+        }
+        let plan = std::fs::read_to_string(r.dir.join("plan.json")).ok().and_then(|s| serde_json::from_str::<crate::engine::plan::Plan>(&s).ok());
+        let label = crate::engine::state::stage_label(&st.stage);
+        let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
+        {
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            run.resume_boot(&mut ctx, &st);
+        }
+        self.run = Some(run);
+        self.unfinished_runs.retain(|id| *id != r.id);
+        self.screen = Screen::Stage;
+        self.sel = 0;
+        self.toast(format!("resumed {} at {label}", r.id), Level::Ok);
+    }
+
+    /// Delete a saved run (branches, worktrees, journal). The run that is open right now can
+    /// only be deleted once it is finished.
+    pub fn delete_run(&mut self, r: &crate::engine::state::RunSummary) -> bool {
+        if let Some(cur) = &self.run {
+            if cur.id == r.id {
+                if cur.is_active() {
+                    self.toast("this run is open and active — /pause won't do, it has to finish or fail first", Level::Warn);
+                    return false;
+                }
+                self.run = None;
+            }
+        }
+        let log = crate::engine::state::delete(r);
+        crate::mlog!("deleted run {}: {}", r.id, log.join("; "));
+        self.unfinished_runs.retain(|id| *id != r.id);
+        self.toast(format!("deleted {} ({} step{})", r.id, log.len(), if log.len() == 1 { "" } else { "s" }), Level::Ok);
+        true
+    }
+
     fn start_architect(&mut self) -> AgentId {
         if let Some(a) = self.studio.architect {
             return a;
@@ -723,6 +826,7 @@ impl App {
                 tools: tools::architect_tools(),
                 extra_writable: vec![],
                 context_override: None,
+                resume_thread: None,
             },
         );
         self.studio.architect = Some(id);
@@ -762,6 +866,7 @@ impl App {
                 tools: vec![],
                 extra_writable: vec![],
                 context_override: None,
+                resume_thread: None,
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
@@ -1779,6 +1884,7 @@ impl App {
                     self.toast(format!("pattern for new runs: {arg}"), Level::Info);
                 }
             }
+            "/runs" => self.open_runs(),
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));

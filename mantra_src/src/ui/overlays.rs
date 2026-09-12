@@ -24,6 +24,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) {
         Overlay::Edit { title, input, target } => edit(f, area, title, input, target),
         Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
         Overlay::Discover(st) => discover(f, area, st),
+        Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
     }
 }
 
@@ -67,6 +68,7 @@ fn help(f: &mut Frame, area: Rect) {
         k("p · a", "plan · approve plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
+        k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
     ];
     l.push(Line::default());
     l.push(Line::from(Span::styled("  esc to close", theme::faint())));
@@ -334,6 +336,49 @@ fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[String]) {
     f.render_widget(Paragraph::new(l).block(block("patterns", theme::VIOLET)), r);
 }
 
+fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine::state::RunSummary], confirm: bool, others: usize) {
+    use crate::engine::state::fmt_ago;
+    let r = centered(area, 100, (list.len() as u16).max(1) + 5);
+    f.render_widget(Clear, r);
+    let inner_w = r.width.saturating_sub(4) as usize;
+    let brief_w = inner_w.saturating_sub(2 + 22 + 1 + 18 + 1 + 9 + 2).max(8);
+    let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<22} {:<18} {:>9}  {}", "run", "stage", "updated", "goal"), theme::faint()))];
+    if list.is_empty() {
+        l.push(Line::from(Span::styled("   no runs for this project yet — ctrl+o starts one", theme::dim())));
+    }
+    for (i, run) in list.iter().enumerate() {
+        let cur = app.run.as_ref().map(|x| x.id == run.id).unwrap_or(false);
+        let unfinished = run.unfinished();
+        let st = if i == sel { theme::bold(theme::accent()) } else if unfinished { theme::text() } else { theme::muted() };
+        let stage_style = if run.state.is_err() {
+            theme::fg(theme::ROSE)
+        } else if unfinished {
+            theme::fg(theme::AMBER)
+        } else {
+            theme::fg(theme::GREEN)
+        };
+        l.push(Line::from(vec![
+            Span::styled(format!(" {} {:<22}", if i == sel { theme::g("▶", ">") } else { " " }, trunc(&run.id, 22)), st),
+            Span::styled(format!(" {:<18}", trunc(&run.stage_label(), 18)), stage_style),
+            Span::styled(format!(" {:>9}", fmt_ago(run.updated_unix)), theme::faint()),
+            Span::styled(format!("  {}", trunc(&run.brief(), brief_w)), theme::dim()),
+            Span::styled(if cur { "  (open)".to_string() } else { String::new() }, theme::fg(theme::GREEN)),
+        ]));
+    }
+    l.push(Line::default());
+    if confirm {
+        let id = list.get(sel).map(|r| r.id.clone()).unwrap_or_default();
+        l.push(Line::from(Span::styled(format!("  delete {id} — its branches, worktrees and journal? y / n"), theme::bold(theme::fg(theme::ROSE)))));
+    } else {
+        let mut hint = "  ⏎ resume where it stopped · D delete · esc".to_string();
+        if others > 0 {
+            hint.push_str(&format!("   ({others} run{} in other projects: mantra runs)", if others == 1 { "" } else { "s" }));
+        }
+        l.push(Line::from(Span::styled(hint, theme::faint())));
+    }
+    f.render_widget(Paragraph::new(l).block(block("runs", theme::VIOLET)), r);
+}
+
 // ───────────────────────────── keys ─────────────────────────────
 
 pub fn key(app: &mut App, k: KeyEvent) {
@@ -595,6 +640,50 @@ pub fn key(app: &mut App, k: KeyEvent) {
             }
             _ => Some(Overlay::Patterns { sel, list }),
         },
+        Overlay::Runs { mut sel, mut list, confirm, others } => {
+            let n = list.len();
+            if confirm {
+                match k.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(r) = list.get(sel).cloned() {
+                            if app.delete_run(&r) {
+                                list.retain(|x| x.id != r.id);
+                            }
+                        }
+                        sel = sel.min(list.len().saturating_sub(1));
+                        Some(Overlay::Runs { sel, list, confirm: false, others })
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(Overlay::Runs { sel, list, confirm: false, others }),
+                    _ => Some(Overlay::Runs { sel, list, confirm, others }),
+                }
+            } else {
+                match k.code {
+                    KeyCode::Esc => None,
+                    KeyCode::Up => {
+                        sel = sel.saturating_sub(1);
+                        Some(Overlay::Runs { sel, list, confirm, others })
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1).min(n.saturating_sub(1));
+                        Some(Overlay::Runs { sel, list, confirm, others })
+                    }
+                    KeyCode::Enter => {
+                        if let Some(r) = list.get(sel).cloned() {
+                            app.resume_run(r);
+                        }
+                        None
+                    }
+                    KeyCode::Char('D') | KeyCode::Char('d') | KeyCode::Delete => {
+                        if n > 0 {
+                            Some(Overlay::Runs { sel, list, confirm: true, others })
+                        } else {
+                            Some(Overlay::Runs { sel, list, confirm, others })
+                        }
+                    }
+                    _ => Some(Overlay::Runs { sel, list, confirm, others }),
+                }
+            }
+        }
     };
     if let Some(o) = keep {
         app.overlays.push(o);

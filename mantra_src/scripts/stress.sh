@@ -20,4 +20,26 @@ echo "$out" | grep -q 'zoomed' || { echo "$out"; echo "MISSING: run should start
 echo "$out" | grep -qi 'plan review' || { echo "$out"; echo "MISSING: plan review overlay should open while zoomed"; exit 1; }
 echo "$out" | grep -q 'overview' || { echo "$out"; echo "MISSING: approving the plan should land on the overview"; exit 1; }
 echo "zoom vs overview ok"
+
+# WP11: leave a run mid-phase, list it, resume it headlessly to completion, drive the /runs overlay, delete it.
+echo "runs: list / resume / delete…"
+export MANTRA_HOME="$(mktemp -d)"
+out=$($bin --demo --snapshot "wait:0.5;until:plan review@60;key:a;until:spawned p1-config@60;wait:0.3" run "build a todo API with auth" 2>&1)
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC before leaving the run"; exit 1; }
+$bin runs | grep -q 'phase 1' || { $bin runs; echo "MISSING: mantra runs should list the unfinished run at phase 1"; exit 1; }
+proj=$(python3 -c "import json,glob,os;print(json.load(open(glob.glob(os.environ['MANTRA_HOME']+'/runs/*/*/state.json')[0]))['project'])")
+out=$(MANTRA_DEMO_PROJECT="$proj" $bin --demo --snapshot "wait:0.3;snap:welcome;type:/runs;key:enter;sweep:runs-overlay;key:D;snap:confirm;key:n;key:esc" 2>&1)
+echo "$out" | grep -E 'sweep ok|panicked|timeout'
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC in the /runs overlay"; exit 1; }
+echo "$out" | grep -q 'unfinished run' || { echo "$out"; echo "MISSING: welcome screen should mention the unfinished run"; exit 1; }
+echo "$out" | grep -q 'branches, worktrees and journal' || { echo "$out"; echo "MISSING: D should ask before deleting"; exit 1; }
+out=$($bin --demo --resume-last --snapshot "wait:1;snap:resumed;until:run complete@200;snap:done" 2>&1)
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC during resume"; exit 1; }
+echo "$out" | grep -q '!! timeout' && { echo "$out"; echo "TIMEOUT: resumed run did not complete"; exit 1; }
+echo "$out" | grep -q 're-attached\|re-spawned' || { echo "$out"; echo "MISSING: resume should re-attach or re-spawn the phase-1 workers"; exit 1; }
+id=$($bin runs | awk 'NR==2 {print $1}' | sed 's/…$//')
+$bin runs delete "$id" --yes | grep -q '^deleted' || { echo "MISSING: mantra runs delete should remove the run"; exit 1; }
+$bin runs | grep -q 'no runs yet' || { $bin runs; echo "MISSING: the deleted run should be gone"; exit 1; }
+git -C "$proj" branch --list 'mantra*' | grep -q . && { git -C "$proj" branch --list 'mantra*'; echo "MISSING: run branches should be deleted"; exit 1; }
+echo "runs ok"
 echo "all sizes rendered without panics"

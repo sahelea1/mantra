@@ -45,6 +45,9 @@ const HELP: &str = "mantra — one terminal for Codex agents
 USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
   mantra run \"<goal>\" [--pattern NAME]  open straight into a Mandala run
+  mantra runs                            list every run (all projects): id, stage, when, goal
+  mantra runs resume <id>                reopen a run where it stopped (id prefix is enough)
+  mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
   mantra doctor                          check codex, login, terminal, config
   mantra --version
 
@@ -52,6 +55,7 @@ OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
+  --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
 
 FILES
   ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
@@ -68,11 +72,14 @@ struct Cli {
     pattern: Option<String>,
     snapshot: Option<String>,
     size: (u16, u16),
+    /// `mantra runs resume <id>`.
+    resume: Option<String>,
+    resume_last: bool,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36) };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -99,6 +106,21 @@ fn parse_args() -> Result<Option<Cli>> {
                 cli.size = (w.parse()?, h.parse()?);
             }
             "run" => cli.run_goal = Some(next()?),
+            "--resume-last" => cli.resume_last = true,
+            "runs" => match next().ok().as_deref() {
+                None | Some("list") | Some("ls") => {
+                    runs_list();
+                    return Ok(None);
+                }
+                Some("resume") => cli.resume = Some(next()?),
+                Some("delete") | Some("rm") => {
+                    let id = next()?;
+                    let yes = matches!(next().ok().as_deref(), Some("--yes") | Some("-y"));
+                    runs_delete(&id, yes);
+                    return Ok(None);
+                }
+                Some(other) => anyhow::bail!("mantra runs: unknown subcommand {other} (list | resume <id> | delete <id>)"),
+            },
             "doctor" => {
                 doctor();
                 return Ok(None);
@@ -171,7 +193,32 @@ async fn async_main(cli: Cli) -> Result<()> {
         std::thread::sleep(Duration::from_millis(1500));
         demo = true;
     }
-    let project = if demo { demo_project()? } else { cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?) };
+    // A resumed run brings its own project directory (it was saved absolute), so `mantra runs
+    // resume <id>` works from anywhere — and with --demo from the previous demo's temp repo.
+    let resume = match (&cli.resume, cli.resume_last) {
+        (Some(id), _) => Some(engine::state::find(id).map_err(|e| anyhow::anyhow!(e))?),
+        (None, true) => {
+            let pick = engine::state::list_all().into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir() && (!demo || p.to_string_lossy().contains("mantra-demo-"))).unwrap_or(false));
+            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run to resume (mantra runs lists them)"))?)
+        }
+        _ => None,
+    };
+    let project = match &resume {
+        Some(r) => {
+            let p = r.project().ok_or_else(|| anyhow::anyhow!("run {} cannot be resumed: {}", r.id, r.state.as_ref().err().cloned().unwrap_or_default()))?;
+            if !p.is_dir() {
+                anyhow::bail!("run {}: its project directory {} no longer exists (mantra runs delete {} cleans it up)", r.id, p.display(), r.id);
+            }
+            p.canonicalize().unwrap_or(p)
+        }
+        // MANTRA_DEMO_PROJECT reuses an earlier demo repo (stress.sh: the /runs overlay and the
+        // welcome-screen notice need a project that already has runs).
+        None if demo => match std::env::var("MANTRA_DEMO_PROJECT") {
+            Ok(p) if std::path::Path::new(&p).is_dir() => PathBuf::from(p),
+            _ => demo_project()?,
+        },
+        None => cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?),
+    };
     if demo {
         let exe = std::env::current_exe()?;
         settings.codex_command = vec![exe.to_string_lossy().to_string(), "mock-codex".into()];
@@ -197,6 +244,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     app.start_solo();
     if let Some(goal) = &cli.run_goal {
         app.start_run(goal);
+    }
+    if let Some(r) = resume {
+        app.resume_run(r);
     }
     if let Some(script) = cli.snapshot.clone() {
         return snapshot(app, rx, &script, cli.size).await;
@@ -264,6 +314,53 @@ async fn async_main(cli: Cli) -> Result<()> {
         eprintln!("demo project left at {}", app.project.display());
     }
     res
+}
+
+/// `mantra runs`: one line per run, every project, newest first.
+fn runs_list() {
+    let all = engine::state::list_all();
+    if all.is_empty() {
+        println!("no runs yet — `mantra run \"<goal>\"` starts one (or `mantra --demo`)");
+        return;
+    }
+    println!("{:<28} {:<22} {:<18} {:>9}  goal", "run", "project", "stage", "updated");
+    for r in &all {
+        let project = r.project().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| r.project_key.rsplit_once('-').map(|(a, _)| a.to_string()).unwrap_or_else(|| r.project_key.clone()));
+        println!("{:<28} {:<22} {:<18} {:>9}  {}", util::trunc(&r.id, 28), util::trunc(&project, 22), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), util::trunc(&r.brief(), 60));
+    }
+    let n = all.iter().filter(|r| r.unfinished()).count();
+    println!("\n{} run{}, {n} unfinished · mantra runs resume <id> · mantra runs delete <id>", all.len(), if all.len() == 1 { "" } else { "s" });
+}
+
+/// `mantra runs delete <id> [--yes]`: worktrees + branches in the project repo, then the journal.
+fn runs_delete(id: &str, yes: bool) {
+    let r = match engine::state::find(id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mantra: {e}");
+            std::process::exit(2);
+        }
+    };
+    let where_ = r.project().map(|p| p.display().to_string()).unwrap_or_else(|| r.project_key.clone());
+    println!("run {} ({}) — {}\n  {}", r.id, r.stage_label(), where_, util::trunc(&r.brief(), 100));
+    if r.unfinished() {
+        println!("  this run is not finished; its work lives on branch mantra/{} until deleted", r.id);
+    }
+    if !yes {
+        print!("delete it, its worktrees and branches? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("kept.");
+            return;
+        }
+    }
+    for l in engine::state::delete(&r) {
+        println!("  {l}");
+    }
+    println!("deleted {}", r.id);
 }
 
 fn in_tmux() -> bool {

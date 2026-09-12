@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Workspace {
     pub worktree: bool,
     /// The user's repository (or project dir in shared mode).
@@ -176,6 +176,47 @@ pub fn remove_worker(ws: &Workspace, dir: &Path, branch: &str, keep_branch: bool
     if !keep_branch && !branch.is_empty() {
         let _ = git(&ws.repo, &["branch", "-D", branch]);
     }
+}
+
+/// Re-create a run's integration worktree after its directory went missing (a cleaned `/tmp`, a
+/// moved home) — possible as long as the run branch still exists in the repo.
+pub fn reattach(ws: &Workspace) -> Result<(), String> {
+    if !ws.worktree || ws.integ.is_dir() {
+        return Ok(());
+    }
+    let _ = git(&ws.repo, &["worktree", "prune"]);
+    let _ = std::fs::create_dir_all(ws.integ.parent().unwrap_or(&ws.integ));
+    git(&ws.repo, &["worktree", "add", &ws.integ.to_string_lossy(), &ws.branch]).map(|_| ())
+}
+
+/// Remove everything a run left in the repo: its integration and worker worktrees (whatever
+/// `git worktree list` still knows under the run's worktree folder) and the `mantra/<run>` +
+/// `mantra-w/<run>/*` branches. Best effort; returns one line per step so `mantra runs delete`
+/// can show exactly what happened.
+pub fn cleanup_run(repo: &Path, run_id: &str, integ: Option<&Path>) -> Vec<String> {
+    let mut log = vec![];
+    let wt_root = crate::config::worktrees_dir().join(run_id);
+    if let Ok(list) = git(repo, &["worktree", "list", "--porcelain"]) {
+        for line in list.lines() {
+            let Some(p) = line.strip_prefix("worktree ") else { continue };
+            let p = PathBuf::from(p.trim());
+            if p.starts_with(&wt_root) || integ.map(|i| i == p).unwrap_or(false) {
+                match git(repo, &["worktree", "remove", "--force", &p.to_string_lossy()]) {
+                    Ok(_) => log.push(format!("removed worktree {}", p.display())),
+                    Err(e) => log.push(e),
+                }
+            }
+        }
+    }
+    let _ = git(repo, &["worktree", "prune"]);
+    let refs = git(repo, &["for-each-ref", "--format=%(refname:short)", &format!("refs/heads/mantra-w/{run_id}/"), &format!("refs/heads/mantra/{run_id}")]).unwrap_or_default();
+    for b in refs.lines().map(str::trim).filter(|b| !b.is_empty()) {
+        match git(repo, &["branch", "-D", b]) {
+            Ok(_) => log.push(format!("deleted branch {b}")),
+            Err(e) => log.push(e),
+        }
+    }
+    log
 }
 
 pub fn phase_commit(ws: &Workspace, msg: &str) -> Result<bool, String> {
