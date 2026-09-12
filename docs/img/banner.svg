@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 200" width="760" height="200" role="img" aria-label="Mantra">
+<g transform="translate(40,34.0) scale(0.5156)">
+<circle cx="128.0" cy="128.0" r="116" fill="none" stroke="#3ccfb4" stroke-width="2" stroke-opacity=".28" stroke-dasharray="3 9" stroke-linecap="round"/>
+<circle cx="128.00" cy="76.00" r="52" fill="none" stroke="#9682fa" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="173.03" cy="102.00" r="52" fill="none" stroke="#3ccfb4" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="173.03" cy="154.00" r="52" fill="none" stroke="#9682fa" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="128.00" cy="180.00" r="52" fill="none" stroke="#3ccfb4" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="82.97" cy="154.00" r="52" fill="none" stroke="#9682fa" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="82.97" cy="102.00" r="52" fill="none" stroke="#3ccfb4" stroke-width="3" stroke-opacity=".72"/>
+<circle cx="128.0" cy="128.0" r="52" fill="none" stroke="#f2a541" stroke-width="3.5"/>
+<circle cx="128.00" cy="76.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<circle cx="173.03" cy="102.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<circle cx="173.03" cy="154.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<circle cx="128.00" cy="180.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<circle cx="82.97" cy="154.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<circle cx="82.97" cy="102.00" r="4.5" fill="#f2a541" fill-opacity=".92"/>
+<polygon points="128.00,95.00 134.27,121.73 161.00,128.00 134.27,134.27 128.00,161.00 121.73,134.27 95.00,128.00 121.73,121.73" fill="#f2a541"/>
+</g>
+<text x="206" y="94.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="58" font-weight="700" letter-spacing="10" fill="#f2a541">MANTRA</text>
+<text x="209" y="134.0" font-family="ui-sans-serif,system-ui,Segoe UI,Helvetica,Arial,sans-serif" font-size="21" fill="#8a91a0">one terminal for coding agents — alone, or as a team</text>
+</svg>

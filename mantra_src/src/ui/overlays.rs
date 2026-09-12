@@ -75,15 +75,19 @@ fn help(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(l).block(block("keys", theme::SAFFRON)), r);
 }
 
-/// Every provider speaks Codex's wire protocol today; WP10 will branch this on the provider's
-/// `kind` once a `ClaudeCode` backend exists (glyph `✧ claude`).
-fn backend_glyph(_provider: &str) -> &'static str {
-    "◌ codex"
+/// Which runtime a provider's models run through (WP10): `codex app-server` or `claude -p`.
+fn backend_glyph(reg: &crate::config::Registry, provider: &str) -> &'static str {
+    match reg.providers.iter().find(|p| p.id == provider).map(|p| p.kind) {
+        Some(crate::config::ProviderKind::ClaudeCode) => "✧ claude",
+        _ => "◌ codex",
+    }
 }
 
 fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option<crate::hub::AgentId>) {
     let rows = app.registry.models.len() as u16;
-    let r = centered(area, 104, rows + 7);
+    // Wide enough for every column (alias … note … "also via"); `centered` clamps it down on
+    // narrower terminals, where the trailing note/duplicate columns simply get cut.
+    let r = centered(area, 132, rows + 7);
     f.render_widget(Clear, r);
     let cur = target.and_then(|a| app.agents.get(&a));
     let mut l = vec![Line::from(Span::styled(format!("  for: {}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
@@ -92,16 +96,17 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
         let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
         let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
-        let via = format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&m.provider));
+        let via = format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider));
         // Two aliases can point at the same model id through different providers — the provider
         // column above already distinguishes them; call it out too so it isn't missed.
         let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
         let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
         l.push(Line::from(vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
-            Span::styled(format!("{:<10}", m.alias), st),
+            // width + 1: a 10-char alias (sonnet5-1m) must not touch the model id next to it
+            Span::styled(format!("{:<11}", trunc(&m.alias, 10)), st),
             Span::styled(format!("{:<18}", trunc(&m.model, 17)), theme::muted()),
-            Span::styled(format!(" {:<24}", trunc(&via, 23)), theme::dim()),
+            Span::styled(format!(" {:<27}", trunc(&via, 26)), theme::dim()),
             Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
             Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))),
             Span::styled(format!(" {:<12}", ctx), theme::dim()),

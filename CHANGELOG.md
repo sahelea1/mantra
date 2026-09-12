@@ -109,3 +109,12 @@ All notable changes to Mantra are recorded here.
   measured); Mantra probes the Linux sandbox once at startup (`unprivileged_userns_clone`,
   AppArmor, `unshare -U`) and, when it can't work, says so on both welcome screens and in every
   run's pulse, and `mantra run`/`runs resume` ask `y/N` first (`--no-sandbox-check` skips it).
+
+- Docs: the README is rebuilt around real screenshots — every frame is captured from `--demo` by
+  `docs/tools/shoot.py`, which drives the binary inside tmux and paints the captured cells into a
+  PNG — plus a generated mandala logo (`docs/tools/logo.py`), a plain-language explanation and
+  collapsible sections for the depth. Two things the screenshots exposed are fixed with them: the
+  model picker labelled every model `◌ codex` regardless of its provider (it now reads `✧ claude`
+  for Claude Code providers, and the picker uses the full terminal width when there is room), and
+  a 10-character alias ran into the model id beside it. Added the MIT `LICENSE` file the manifest
+  has always pointed at.
