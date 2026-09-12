@@ -140,6 +140,35 @@ efforts = ["low", "medium", "high"]
 ```
 Then in the Studio: select `security` → `model` → `←/→` to `glm`.
 
+## Claude Code agents
+
+Mantra can run any role — planner, orchestrator, workers, gates — on a locally installed `claude` (Claude Code) instead of Codex, with the same everything: status, tokens, stop/resume, crash restart, and the `mantra_*` tools workers and orchestrators use (exposed to Claude as MCP tools, `mcp__mantra__mantra_*`, over a small bridge Mantra spawns automatically — nothing to configure).
+
+**Install.** `npm i -g @anthropic-ai/claude-code`, then either `claude` once to log into your subscription, or use a third-party gateway with an API key (below). When `claude` is on `PATH`, Mantra adds a built-in **`claude`** provider automatically with six models:
+
+| alias | model | | alias | model |
+|---|---|---|---|---|
+| `opus46` | `claude-opus-4-6` | | `sonnet5` | `claude-sonnet-5` |
+| `opus48` | `claude-opus-4-8` | | `fable5` | `claude-fable-5` |
+| `opus5` | `claude-opus-5` | | `fable51` | `claude-fable-5-1` |
+
+plus `opus5-1m` / `sonnet5-1m` (1M context — needs an eligible plan). Point any role at one of these in the Studio (`model` field) exactly like a Codex model.
+
+**Subscription vs. API key.** In `/models` → `tab` to providers, the `claude` row has two extra columns, `kind` and `auth` (cycle either with `+`/`-`):
+
+- `auth = subscription` (the default): no key needed — `claude` uses your OAuth login. The provider row shows "subscription (OAuth login)" instead of a key check.
+- `auth = api_key`: set `base_url` (a third-party Anthropic-compatible gateway, e.g. `https://api.libertai.io` — no trailing `/v1`, unlike Codex's custom providers) and `env_key` (the environment variable holding the key). Press **`D`** on that provider: the six defaults above are always listed (there's no `/models` endpoint for a subscription), plus whatever `GET {base_url}/v1/models` returns — so a third-party model like `qwen3.8-27b` via Claude Code is one keypress away.
+
+Add a second provider of `kind = ClaudeCode` (`n` on the providers table, then cycle `kind`) to mix a subscription and a gateway, or several gateways.
+
+**Which roles.** Any role can use a Claude model — planner and orchestrator are the best fit today (they lean on judgment and tool calls); workers and gates work too. A pattern can mix backends freely: `mantra-default-claude` (a built-in pattern, same shape as `mantra-default`) runs planner/orchestrator on `fable51` and workers on `sonnet5` while gates stay on Codex, to show the mix works.
+
+**Permission and sandbox.** Mantra maps a role's `permission`/`sandbox` (Studio) onto Claude's own flags: `permission = never` → `--dangerously-skip-permissions` (the only mode fully supported today — every Claude agent runs unattended); `sandbox = read-only` restricts to `Read,Glob,Grep,WebFetch`, `workspace-write` adds the agent's own cwd as a writable root, `danger-full-access` adds `/`. Claude agents can't be asked for approval mid-turn the way Codex agents can — a denied action is reported in the turn's `permission_denials` instead, so keep `permission = never` unless you're prepared to read that back.
+
+**Running as root.** `--dangerously-skip-permissions` is refused for uid 0 unless `IS_SANDBOX=1` is set — Mantra sets it on the child automatically when it detects it's running as root, and `mantra doctor` prints a note when it does.
+
+`mantra doctor` also checks `claude --version` (5s timeout — a `claude` stuck waiting on a subscription login in a sandboxed environment must never hang doctor), and per Claude provider: a subscription shows `claude auth status` (when that subcommand exists) or a reminder to log in; an `api_key` provider shows the usual `$VAR set/NOT set`.
+
 ## Context & compaction
 
 Every agent shows how full its context window is (side panel gauge, `ctx %` in the header and on cards). The gauge marks the model's auto-compact threshold (`┊`), turns amber/red as it fills, and Mantra warns you once at 85%.

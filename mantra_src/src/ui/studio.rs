@@ -264,6 +264,8 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     1 => p.name = t,
                     2 => p.base_url = t,
                     3 => p.env_key = t,
+                    4 => p.kind = parse_kind(&t),
+                    5 => p.auth = parse_auth(&t),
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -583,12 +585,44 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
 // ───────────────────────────── models ─────────────────────────────
 
 const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
-const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key"];
+const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "kind", "auth"];
+/// Display strings for `ProviderEntry.kind` (WP10.2) — cycled with +/- on the providers grid the
+/// same way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above). Kept here rather
+/// than a `Display` impl on `ProviderKind` since it's presentation-only.
+const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode"];
+/// Display strings for `ProviderEntry.auth` (WP10.2; irrelevant for `Codex`-kind providers, but
+/// still editable so a provider can be flipped to `ClaudeCode` and given `auth` in one place).
+const PROV_AUTHS: &[&str] = &["subscription", "api_key"];
+
+fn kind_str(k: crate::config::ProviderKind) -> &'static str {
+    match k {
+        crate::config::ProviderKind::Codex => "Codex",
+        crate::config::ProviderKind::ClaudeCode => "ClaudeCode",
+    }
+}
+
+fn parse_kind(t: &str) -> crate::config::ProviderKind {
+    let t = t.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
+    if t == "claudecode" || t == "claude" {
+        crate::config::ProviderKind::ClaudeCode
+    } else {
+        crate::config::ProviderKind::Codex
+    }
+}
+
+fn parse_auth(t: &str) -> String {
+    let t = t.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if t == "api_key" || t == "apikey" || t == "key" {
+        "api_key".into()
+    } else {
+        "subscription".into()
+    }
+}
 
 pub fn draw_models(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let np = app.registry.providers.len() as u16;
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 7), Constraint::Length(1)]).split(area);
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 8), Constraint::Length(1)]).split(area);
     let mut crumbs = vec![Span::styled(format!("  {} models", theme::g("›", ">")), theme::faint())];
     if app.models_ui.dirty {
         crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
@@ -647,11 +681,17 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 
-    let pw = [10usize, 14, 42, 18];
+    let pw = [10usize, 12, 30, 14, 11, 12];
     let mut pl = vec![mk_head(PROV_COLS, &pw)];
-    pl.push(Line::from(vec![Span::styled(format!(" {:<10} {:<12} {:<40}", "openai", "OpenAI", "(built into Codex — uses your codex login)"), theme::faint())]));
+    let openai_vals = ["openai", "OpenAI", "(built into Codex — uses your codex login)", "", "Codex", "—"];
+    let mut ospans = vec![];
+    for (ci, v) in openai_vals.iter().enumerate() {
+        ospans.push(Span::raw(" "));
+        ospans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), theme::faint()));
+    }
+    pl.push(Line::from(ospans));
     for (ri, p) in app.registry.providers.iter().enumerate() {
-        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()];
+        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), kind_str(p.kind).to_string(), p.auth.clone()];
         let mut spans = vec![];
         for (ci, v) in vals.iter().enumerate() {
             let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
@@ -659,16 +699,28 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
         }
-        let key_ok = !p.env_key.is_empty() && std::env::var(&p.env_key).is_ok();
-        spans.push(Span::styled(if key_ok { format!(" {} key set", theme::g("✓", "ok")) } else { format!(" {} ${} not set", theme::g("✗", "x"), p.env_key) }, if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+        // `ClaudeCode` + `subscription` needs no env var at all (OAuth login) — showing a red "key
+        // not set" warning for it would be misleading, so only check when an env var is actually
+        // expected (Codex always; ClaudeCode only under `api_key`).
+        let needs_key = p.kind != crate::config::ProviderKind::ClaudeCode || p.auth == "api_key";
+        spans.push(if !needs_key {
+            Span::styled(format!(" {} subscription (OAuth login)", theme::g("○", "-")), theme::dim())
+        } else {
+            let key_ok = !p.env_key.is_empty() && std::env::var(&p.env_key).is_ok();
+            Span::styled(
+                if key_ok { format!(" {} key set", theme::g("✓", "ok")) } else { format!(" {} ${} not set", theme::g("✗", "x"), p.env_key) },
+                if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) },
+            )
+        });
         let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
         spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
         pl.push(Line::from(spans));
     }
-    pl.push(Line::from(Span::styled(" base_url = the provider's OpenAI-compatible API root (…/v1): Codex calls …/responses, discovery reads …/models", theme::faint())));
+    pl.push(Line::from(Span::styled(" base_url = the provider's API root: Codex reads …/v1/responses + …/v1/models; ClaudeCode uses it as ANTHROPIC_BASE_URL (bare host, no /v1) + …/v1/models for D", theme::faint())));
     pl.push(Line::from(Span::styled(" env_key = the NAME of the environment variable holding the API key (the key itself is never stored) · D here = discover this provider", theme::faint())));
+    pl.push(Line::from(Span::styled(" kind = Codex | ClaudeCode · auth (ClaudeCode only) = subscription | api_key · +/- on either cycles it", theme::faint())));
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
-    f.render_widget(Paragraph::new(pl).block(block("providers (OpenAI Responses-compatible)", pcol)), rows[2]);
+    f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);
     footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", "test model"), ("D", "discover models"), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
 }
 
@@ -697,6 +749,20 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Down => ui.row = (ui.row + 1).min(nrows.saturating_sub(1)),
         KeyCode::Left => ui.col = ui.col.saturating_sub(1),
         KeyCode::Right => ui.col = (ui.col + 1).min(ncols - 1),
+        KeyCode::Char('+') | KeyCode::Char('-') if ui.providers => {
+            // Cycle `kind`/`auth` the same way +/- cycles enumerations on the models grid below,
+            // and the way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above) — the
+            // only in-app way to configure a third-party ClaudeCode provider (§10.2).
+            let d: i32 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
+            if let Some(p) = app.registry.providers.get_mut(ui.row) {
+                match ui.col {
+                    4 => p.kind = parse_kind(&cycle(PROV_KINDS, kind_str(p.kind), d)),
+                    5 => p.auth = cycle(PROV_AUTHS, &p.auth, d),
+                    _ => {}
+                }
+                app.models_ui.dirty = true;
+            }
+        }
         KeyCode::Char('+') | KeyCode::Char('-') if !ui.providers => {
             let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
             if let Some(m) = app.registry.models.get_mut(ui.row) {
@@ -721,7 +787,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Enter => {
             let (title, val, target) = if ui.providers {
                 let Some(p) = app.registry.providers.get(ui.row) else { return };
-                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()][ui.col.min(3)].clone();
+                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), kind_str(p.kind).to_string(), p.auth.clone()][ui.col.min(5)].clone();
                 (format!("provider · {}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
             } else {
                 let Some(m) = app.registry.models.get(ui.row) else { return };
@@ -734,7 +800,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('n') => {
             if ui.providers {
-                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into() });
+                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into(), ..Default::default() });
                 ui.row = app.registry.providers.len() - 1;
             } else {
                 app.registry.models.push(crate::config::ModelEntry { alias: format!("model{}", app.registry.models.len() + 1), model: "model-id".into(), ..Default::default() });

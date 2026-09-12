@@ -13,8 +13,9 @@ This is the plan behind the code: what Mantra is for, how it is built, and why e
 ```
 ┌──────────────────────── mantra (one process, tokio, 2 worker threads) ────────────────────────┐
 │  input thread ──► AppEvent ◄── Hub events ◄── one task per agent ──► codex app-server (child)   │
-│                     │                                                (JSON-RPC over stdio)      │
-│                     ▼                                                                          │
+│                     │                                    │           (JSON-RPC over stdio)      │
+│                     │                                    └────────► claude -p …stream-json      │
+│                     ▼                                                (NDJSON over stdio)        │
 │   App (state, routing, approvals, commands)                                                    │
 │     ├── Agent reducers: protocol notifications → renderable items, tokens, plan, file stats   │
 │     ├── Run = the Conductor (deterministic state machine for Mandala)                          │
@@ -24,7 +25,23 @@ This is the plan behind the code: what Mantra is for, how it is built, and why e
 └────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Source map: `rpc.rs` (JSON-RPC transport), `hub.rs` (process supervision), `agent.rs` (per-agent state + reducer), `engine/` (`pattern`, `plan`, `tools`, `git`, `run` = Conductor), `app.rs` (glue), `ui/` (screens), `mock.rs` (simulated Codex), `config.rs`, `util.rs`.
+Source map: `rpc.rs` (JSON-RPC transport), `hub.rs` (process supervision + the MCP-bridge Unix listener), `hub/claude.rs` (the Claude Code backend: spawn/argv/env, NDJSON→`HubEvent` translator, MCP bridge), `agent.rs` (per-agent state + reducer), `engine/` (`pattern`, `plan`, `tools`, `git`, `run` = Conductor), `app.rs` (glue), `ui/` (screens), `mock.rs` / `mock_claude.rs` (simulated Codex / Claude), `mcp_bridge.rs` (the `mantra mcp-bridge` subcommand `claude` spawns), `config.rs`, `util.rs`.
+
+**The backend seam (WP10).** `hub.rs` dispatches purely on `SpawnSpec.backend: ProviderKind` — `Codex` → the existing `run_process` (JSON-RPC over stdio to `codex app-server`), `ClaudeCode` → `hub::claude::run_claude_process` (NDJSON over stdio to `claude -p --input-format stream-json …`). Both return the same `Exit` and emit the same `HubEvent`s; `hub::claude`'s translator turns Claude's own event shapes into the identical Codex-shaped `item/started`/`item/completed`/`turn/completed`/`thread/tokenUsage/updated` notifications `Agent::apply` already understands, so nothing above the Hub — `App`, `Run`, the UI — has (or needs) a single `if backend == …` branch. This is the "one seam" rule from §0.1: a new backend plugs in *below* the Hub, never beside it.
+
+```
+                       ┌─ Codex ─────────────────────────────┐
+Hub::spawn(spec) ──────┤  run_process: JSON-RPC ↔ codex app-server
+ (backend: ProviderKind)└─ ClaudeCode ─────────────────────────┐
+                          run_claude_process: NDJSON ↔ claude -p …
+                            │                     ▲
+                            ▼ (dynamic tools)      │ (Cmd::Bridge, one per agent)
+                          --mcp-config → mantra mcp-bridge ──► Hub's Unix socket
+                            (spawned by claude,        accept loop hands the connection
+                             MCP over its own stdio)    to *this* agent's own Cmd channel
+```
+
+**The MCP bridge (WP10.4).** Codex gets `mantra_*` tools as native "dynamic tools" over the same JSON-RPC connection it already has; `claude` has no such channel, so Mantra gives it one the way `claude` itself expects: an MCP stdio server. `hub::claude` points every Claude agent's `--mcp-config` at `mantra mcp-bridge --sock <path> --agent <id>` (spawned by `claude`, not by Mantra); that process speaks real MCP to `claude` on one side and a two-line-shaped protocol (`{"list":true}` / `{"call":…,"tool":…,"args":…}` → `{"tools":[…]}` / `{"call":…,"ok":…,"text":…}`) to Mantra's `Hub` on the other, over a Unix socket at `$MANTRA_HOME/run/<pid>.sock`. `Hub`'s accept loop reads each connection's one-line hello and hands it to *that* agent's own command channel as `Cmd::Bridge` — never a shared acceptor a per-agent task can't reach — so `run_claude_process` answers `tools/list` from its own `SpawnSpec.dynamic_tools` (the very same JSON schemas Codex's `dynamicTools` gets) and turns `tools/call` into the same `HubEvent::Request{method:"item/tool/call"}` the Codex path already produces. `App::on_request`/`Run::on_tool_call` need no changes at all; only `Cmd::Respond`/`RespondErr` gained one branch, routing replies whose id starts with `cc-call-` back down to the bridge instead of a JSON-RPC connection.
 
 ## 3. Key decisions
 
@@ -99,6 +116,7 @@ Agents run inside Codex's sandbox (planner/orchestrator read-only; workers works
 - Unit tests (25): effort resolution, registry round-trip, pattern validation (built-in + error cases), plan parsing/validation, protocol reducer (streaming, completion, diffs, compaction turns), error classification and provider-error unwrapping, notice de-duplication, provider model-list parsing (OpenAI, OpenRouter, vLLM, Groq, Gemini, bare lists), discovery add/fill-without-clobbering, effort-less custom models, run-dir placement, markdown wrapping at every width, input layout/cursor, glob matching.
 - `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run (debug build, overflow checks on); plus ASCII/16-colour runs verified to emit zero non-ASCII bytes; plus real tmux 3.4 sessions driven with `send-keys`.
 - `mantra mock-codex`: a protocol-faithful fake app-server with scripted planner/orchestrator/worker/gate/architect behaviours (including a deliberate 502 and an out-of-scope edit), used by `--demo` and by headless end-to-end runs (`--snapshot "until:…;key:…;snap"` renders to a text buffer).
+- `mantra mock-claude` (WP10.6): the same job for the Claude Code backend — a fake `claude -p …stream-json` that, when given `--mcp-config`, spawns the real `mantra mcp-bridge` and talks real MCP to it, so `--demo --pattern mantra-default-claude` exercises the whole WP10.4 bridge chain end to end, not a shortcut around it.
 - Real Codex 0.154.0: process start, thread creation with dynamic tools and `-c` overrides, turn start, API-error paths.
 
 ## 11. Next steps
