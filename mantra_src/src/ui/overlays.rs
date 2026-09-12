@@ -428,7 +428,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                     None
                 }
                 KeyCode::Char('e') => {
-                    app.screen = Screen::Models;
+                    app.enter_screen(Screen::Models);
                     app.models_ui.row = sel;
                     None
                 }

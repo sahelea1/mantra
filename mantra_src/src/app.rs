@@ -142,6 +142,10 @@ pub struct App {
     pub hub: Hub,
     pub agents: BTreeMap<AgentId, Agent>,
     pub screen: Screen,
+    /// The screen `/studio` or `/models` was opened from. Leaving them returns exactly there, so a
+    /// zoom (or Solo while a run is up) survives a trip through the Studio instead of being
+    /// guessed at from whether a run exists.
+    screen_before: Option<Screen>,
     pub overlays: Vec<Overlay>,
     pub input: Input,
     pub solo: Option<AgentId>,
@@ -306,6 +310,10 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
 ///   an idle agent it behaves exactly like `Auto`/Enter.
 pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool, mode: Send) {
     let Some(a) = agents.get_mut(&id) else { return };
+    // Any message — from the user, the orchestrator or the engine — ends a hand stop: talking to
+    // an agent *is* telling it to carry on. Every send funnels through here, so this one line is
+    // the whole lifecycle of the flag.
+    a.stopped_by_user = false;
     if echo {
         a.push_user(&text);
     }
@@ -477,6 +485,7 @@ impl App {
             hub,
             agents: BTreeMap::new(),
             screen: Screen::Solo,
+            screen_before: None,
             overlays: vec![],
             input: Input::default(),
             solo: None,
@@ -578,6 +587,29 @@ impl App {
             self.flash_screen = Some(Instant::now());
         }
         self.screen = s;
+    }
+
+    /// Open Studio/Models remembering the screen underneath them, so `leave_screen` can put the
+    /// user back. A Studio→picker→Models hop must not record Studio as the way back (leaving
+    /// would strand the user on a screen they already left), so only a returnable screen is kept.
+    pub fn enter_screen(&mut self, s: Screen) {
+        if !matches!(self.screen, Screen::Studio | Screen::Models) {
+            self.screen_before = Some(self.screen);
+        }
+        self.set_screen(s);
+    }
+
+    /// Leave Studio/Models for wherever they were opened from. Two cases have nothing to return
+    /// to and keep the old rule (the stage while a run exists, Solo otherwise): nothing was
+    /// recorded (state restored from before this existed), or the remembered zoom is on an agent
+    /// that has since gone, which would draw an empty view with no way to tell why.
+    pub fn leave_screen(&mut self) {
+        let back = self.screen_before.take();
+        let back = back.filter(|s| match s {
+            Screen::Zoom(id) => self.agents.contains_key(id),
+            _ => true,
+        });
+        self.set_screen(back.unwrap_or(if self.run.is_some() { Screen::Stage } else { Screen::Solo }));
     }
 
     /// After the plan is approved: land on the animated overview with the orchestrator selected.
@@ -1673,9 +1705,7 @@ impl App {
             KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
             KeyCode::Char('x') => {
                 if let Some(a) = selected {
-                    if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
-                        self.hub.send(a, Cmd::Interrupt);
-                    }
+                    self.interrupt_by_user(a);
                 }
             }
             KeyCode::Char('r') => {
@@ -1762,7 +1792,7 @@ impl App {
                 self.studio.pattern = p;
             }
         }
-        self.screen = Screen::Studio;
+        self.enter_screen(Screen::Studio);
     }
 
     /// ctrl+c: one press interrupts (or closes an overlay / clears the input), three presses in
@@ -1785,13 +1815,30 @@ impl App {
             return;
         }
         if let Some(a) = self.focus_agent() {
-            if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
-                self.hub.send(a, Cmd::Interrupt);
-                self.toast(format!("interrupting… ({more})"), Level::Warn);
+            if self.interrupt_by_user(a) {
+                self.toast(format!("stopping… it stays stopped ({more})"), Level::Warn);
                 return;
             }
         }
         self.toast(more, Level::Info);
+    }
+
+    /// Interrupt an agent because the user asked for it (ctrl+c, `x`). Unlike an engine-side
+    /// interrupt (a halt, `mantra_interrupt`), this one *sticks*: `Agent::stopped_by_user` tells
+    /// the engine to stand down — no planner nudge, no watchdog, no retry, no resume prompt — until
+    /// someone messages the agent again. Returns whether there was a live turn to stop.
+    fn interrupt_by_user(&mut self, a: AgentId) -> bool {
+        let Some(ag) = self.agents.get_mut(&a) else { return false };
+        if !ag.busy() {
+            return false;
+        }
+        ag.stopped_by_user = true;
+        // A queued message would be delivered the instant the turn ends and start the agent right
+        // back up — the opposite of what the user just pressed.
+        ag.queued.clear();
+        ag.notice(Level::Warn, "stopped by you — type to continue, or r to respawn");
+        self.hub.send(a, Cmd::Interrupt);
+        true
     }
 
     pub fn submit(&mut self, text: String) {
@@ -1993,7 +2040,7 @@ impl App {
                 }
             }
             "/studio" => self.open_studio(),
-            "/models" => self.screen = Screen::Models,
+            "/models" => self.enter_screen(Screen::Models),
             "/inbox" => self.overlays.push(Overlay::Inbox { sel: 0 }),
             "/verbose" => self.verbose = !self.verbose,
             _ => self.toast(format!("unknown command {cmd} — /help"), Level::Warn),
@@ -2076,6 +2123,19 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Cmd::Turn { text }) if text == "go"));
     }
 
+    /// The single choke point that makes a hand stop self-clearing: any message — user,
+    /// orchestrator or engine — means carry on.
+    #[test]
+    fn any_message_lifts_a_hand_stop() {
+        let (mut agents, id) = busy_agent(false, false);
+        agents.get_mut(&id).unwrap().status = Status::Idle;
+        agents.get_mut(&id).unwrap().stopped_by_user = true;
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "carry on".into(), true, Send::Auto);
+        assert!(!agents[&id].stopped_by_user, "talking to a stopped agent is how the user restarts it");
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Turn { text }) if text == "carry on"));
+    }
+
     #[test]
     fn backspace_on_empty_input_restores_the_last_queued_message_for_editing() {
         let mut agent = Agent::new(1, "worker", "worker", PathBuf::new());
@@ -2090,5 +2150,93 @@ mod tests {
         }
         assert_eq!(input.text(), "edit me");
         assert_eq!(agent.queued, vec!["keep this queued".to_string()]);
+    }
+
+    /// A throwaway App on the current directory: screen bookkeeping only reads `screen`, `run`
+    /// and `agents`, so nothing here has to be wired up beyond those.
+    fn screen_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
+    }
+
+    fn a_run() -> Run {
+        Run::new(PathBuf::from("."), Pattern::builtin(), "build a thing".into())
+    }
+
+    /// The reported bug: Solo with a run up used to come back to the stage, because leaving the
+    /// Studio guessed from `run.is_some()` instead of remembering where it was opened from.
+    #[test]
+    fn leaving_the_studio_returns_to_solo_even_while_a_run_exists() {
+        let mut app = screen_app();
+        app.run = Some(a_run());
+        app.screen = Screen::Solo;
+        app.enter_screen(Screen::Studio);
+        assert_eq!(app.screen, Screen::Studio);
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Solo);
+    }
+
+    #[test]
+    fn leaving_the_studio_restores_the_zoom_it_was_opened_from() {
+        let mut app = screen_app();
+        let (agents, id) = busy_agent(false, false);
+        app.agents = agents;
+        app.run = Some(a_run());
+        app.screen = Screen::Zoom(id);
+        app.enter_screen(Screen::Studio);
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Zoom(id));
+    }
+
+    /// The agent can be gone by the time the Studio is closed (respawned, stopped, run torn
+    /// down); restoring that zoom would draw an empty view, so the default rule takes over.
+    #[test]
+    fn a_zoom_on_a_vanished_agent_falls_back_to_the_default_screen() {
+        let mut app = screen_app();
+        let (agents, id) = busy_agent(false, false);
+        app.agents = agents;
+        app.screen = Screen::Zoom(id);
+        app.enter_screen(Screen::Studio);
+        app.agents.clear();
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Solo, "no run: the default is Solo");
+
+        app.run = Some(a_run());
+        app.agents = busy_agent(false, false).0;
+        app.screen = Screen::Zoom(id);
+        app.enter_screen(Screen::Studio);
+        app.agents.clear();
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Stage, "a run is up: the default is the stage");
+    }
+
+    /// Studio → model picker → Models (the picker's `e` key) must not record the Studio as the
+    /// way back, or leaving would land on the screen the user already left.
+    #[test]
+    fn hopping_from_the_studio_to_models_still_returns_to_the_original_screen() {
+        let mut app = screen_app();
+        app.run = Some(a_run());
+        app.screen = Screen::Solo;
+        app.enter_screen(Screen::Studio);
+        app.enter_screen(Screen::Models);
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Solo);
+    }
+
+    /// Nothing recorded (a screen entered before this existed, or restored state): the old
+    /// stage-if-a-run-exists guess is still the fallback.
+    #[test]
+    fn with_nothing_remembered_leaving_keeps_the_old_rule() {
+        let mut app = screen_app();
+        app.screen = Screen::Studio;
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Solo);
+
+        app.run = Some(a_run());
+        app.screen = Screen::Models;
+        app.leave_screen();
+        assert_eq!(app.screen, Screen::Stage);
     }
 }

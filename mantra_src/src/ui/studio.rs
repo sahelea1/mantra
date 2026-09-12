@@ -1,7 +1,7 @@
 //! Pattern Studio (roles, flow, settings + an architect agent) and the Models screen.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, Screen, StudioSel};
+use crate::app::{App, EditTarget, Overlay, StudioSel};
 use crate::config::ProviderEntry;
 use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, KINDS, PERMISSIONS};
 use crate::ui::input::{Act, Input};
@@ -570,7 +570,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
     let fs = fields(app, &entry);
     match k.code {
         KeyCode::Esc => {
-            app.screen = if app.run.is_some() { Screen::Stage } else { Screen::Solo };
+            app.leave_screen();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.studio.focus == 0 {
@@ -835,7 +835,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         return;
     }
     match k.code {
-        KeyCode::Esc => app.screen = if app.run.is_some() { Screen::Stage } else { Screen::Solo },
+        KeyCode::Esc => app.leave_screen(),
         KeyCode::Tab => {
             ui.providers = !ui.providers;
             ui.row = 0;

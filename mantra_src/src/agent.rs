@@ -145,6 +145,11 @@ pub struct Agent {
     pub activity: String,
     pub final_message: Option<String>,
     pub queued: Vec<String>,
+    /// The user interrupted this agent's turn by hand (ctrl+c, or `x` on the stage). A deliberate
+    /// stop: nothing may restart it on its own — no planner nudge, no gate round, no transient
+    /// retry, no "continue where you left off" after a process restart. Cleared the moment any
+    /// message is sent to it again (`app::prompt_agent`), which is the user's way of saying carry on.
+    pub stopped_by_user: bool,
     pub created: Instant,
     pub finished: Option<Instant>,
     pub scroll: usize,
@@ -192,6 +197,7 @@ impl Agent {
             activity: "starting".into(),
             final_message: None,
             queued: vec![],
+            stopped_by_user: false,
             created: Instant::now(),
             finished: None,
             scroll: 0,

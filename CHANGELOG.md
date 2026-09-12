@@ -2,6 +2,42 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.3.1
+
+Four things a real run got wrong, fixed at the root. Driven by a second support bundle.
+
+- **A hand stop sticks.** `ctrl+c` (or `x`) on an agent used to be undone within seconds: the
+  interrupted turn read as "the planner ended without a plan", so Mantra nudged it; that nudge
+  raced the process restart, so the transient-retry ladder sent it again; and a restart re-prompted
+  "continue exactly where you left off". Three self-healing paths, each overriding the user. An
+  agent stopped by hand is now marked as such — no nudge, no gate round, no retry, no resume
+  prompt, and the watchdog leaves it alone — until someone messages it again, which is the one way
+  to start it back up (`r` respawns it instead). The card and `mantra_status` say *stopped by you*,
+  so the orchestrator stops reading it as a worker that merely went quiet.
+- **You can see it is alive.** A Claude agent's thinking tick now carries its own running count, so
+  the label reads `thinking · 9.4k` and visibly climbs instead of sitting at `thinking` for two
+  minutes (captured from a live subscription session: the CLI ticks every 1–2s). When a turn
+  really does go silent, both the status line and the stage card append an amber `· quiet 1m20s`,
+  and a planner/orchestrator/gate agent that is connected but silent past `stall_minutes` gets one
+  journal line (`⏳ … no output for 6m00s — still connected`) — workers keep the existing tripwire,
+  which also wakes the orchestrator.
+- **The context gauge is right from the first turn.** Claude Code announces the account's real
+  window a second after spawn (`autocompact_state`, e.g. 980k), long before any `result` could.
+  Mantra now takes it: a subscription login trusts it over the configured guess, an `api_key`
+  gateway still keeps the window the user configured. A rate limit that is rejected or past 90% of
+  a window raises one warning per episode rather than one per turn.
+- **`mantra doctor` names the file.** `✗ claude: Permission denied (os error 13)` told nobody
+  anything. The probe now resolves the command on `$PATH` itself and says which file is wrong and
+  what to do: *is a directory — something else on your PATH shadows the real binary*, *is not
+  executable — chmod +x …*, *is a broken symlink — reinstall the CLI*, or *`claude` not found on
+  PATH*. `codex` gets the same treatment, and the same 5s timeout it was missing.
+- **The Studio remembers where you were.** Leaving `/studio` or `/models` returned to the stage
+  whenever a run existed, so a zoom — or Solo during a run — was lost every time. It now returns
+  exactly where it was opened from, falling back to the old rule only when there is nothing to
+  return to (or the remembered agent is gone).
+- 114 unit tests (12 new), and `scripts/stress.sh` gains the hand stop end to end: ctrl+c during
+  planning must leave the run stopped and un-nudged, and a typed message must start it again.
+
 ## v0.3.0
 
 Coordination release: agents ask instead of guessing, halts travel up the chain of command before

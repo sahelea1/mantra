@@ -602,21 +602,16 @@ fn doctor() {
     let ok = |b: bool| if b { "✓" } else { "✗" };
     let s = config::Settings::load();
     println!("mantra {} doctor\n", env!("CARGO_PKG_VERSION"));
-    match std::process::Command::new(&s.codex_command[0]).arg("--version").output() {
-        Ok(o) if o.status.success() => println!("{} codex: {}", ok(true), String::from_utf8_lossy(&o.stdout).trim()),
-        _ => println!("{} codex: `{}` not found — npm i -g @openai/codex", ok(false), s.codex_command[0]),
-    }
+    // WP10.5: both CLI probes share one 5s timeout (thread + `recv_timeout`), so a hung binary
+    // (observed in this sandbox for `claude` under `subscription` auth, §0.3) can never hang doctor.
+    let (good, text) = probe_cli(&s.codex_command[0], " — npm i -g @openai/codex");
+    println!("{} codex: {text}", ok(good));
     if let Ok(o) = std::process::Command::new(&s.codex_command[0]).args(["login", "status"]).output() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         println!("{} login: {}", ok(o.status.success()), t.lines().next().unwrap_or("").trim());
     }
-    // WP10.5: `claude --version` with a 5s timeout — run on a thread and `recv_timeout`, so a hung
-    // `claude` binary (observed in this sandbox for `subscription` auth, §0.3) can never hang doctor.
-    match version_with_timeout(&s.claude_command[0], Duration::from_secs(5)) {
-        Some(Ok(v)) => println!("{} claude: {v}", ok(true)),
-        Some(Err(e)) => println!("{} claude: {e}", ok(false)),
-        None => println!("{} claude: `{}` not found (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)", ok(false), s.claude_command[0]),
-    }
+    let (good, text) = probe_cli(&s.claude_command[0], " (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)");
+    println!("{} claude: {text}", ok(good));
     if crate::util::effective_uid_is_root() {
         println!("  IS_SANDBOX note: running as root — Mantra sets IS_SANDBOX=1 for claude agents (--dangerously-skip-permissions is otherwise refused for uid 0)");
     }
@@ -673,20 +668,44 @@ fn doctor() {
     println!("  log: {}", config::log_path().display());
 }
 
+/// The doctor line for one CLI probe (`<cmd0> --version`, 5s cap), as (healthy, text) so the caller
+/// keeps its own ✓/✗ glyph: the version when it runs, the file at fault when it doesn't, and
+/// `not_found_hint` (the install advice, which differs per CLI) only when PATH holds no such name.
+fn probe_cli(cmd0: &str, not_found_hint: &str) -> (bool, String) {
+    match version_with_timeout(cmd0, Duration::from_secs(5)) {
+        Some(Ok(v)) => (true, v),
+        Some(Err(e)) => (false, e),
+        None => (false, format!("`{cmd0}` not found on PATH{not_found_hint}")),
+    }
+}
+
+/// Why a spawn failed, in terms of a file the user can act on — `None` when nothing of that name
+/// is on PATH. A bare "Permission denied (os error 13)" names nothing, yet the cause is always a
+/// specific file: a directory shadowing the binary, or a wrapper script that lost its exec bit.
+fn spawn_failure(cmd0: &str, e: &std::io::Error) -> Option<String> {
+    let path = util::which(cmd0)?;
+    Some(util::exec_problem(&path).unwrap_or_else(|| format!("{}: {e}", path.display())))
+}
+
 /// Runs `<cmd0> --version` on a thread with a hard timeout: `Some(Ok(version))` on success,
 /// `Some(Err(reason))` if it ran but failed or timed out, `None` if the binary isn't even there
 /// (WP10.5 — a `claude` under `subscription` auth can hang indefinitely in some sandboxes, §0.3).
 fn version_with_timeout(cmd0: &str, timeout: Duration) -> Option<Result<String, String>> {
-    let cmd0 = cmd0.to_string();
+    let name = cmd0.to_string();
+    let spawned = name.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(std::process::Command::new(&cmd0).arg("--version").output());
+        let _ = tx.send(std::process::Command::new(&spawned).arg("--version").output());
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(o)) if o.status.success() => Some(Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())),
         Ok(Ok(o)) => Some(Err(format!("--version exited {:?}", o.status.code()))),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Ok(Err(e)) => Some(Err(e.to_string())),
+        // Any spawn error resolves through PATH first: ENOENT can equally mean "the wrapper is
+        // right there but its `#!` interpreter is gone", and EACCES never says which file it is.
+        Ok(Err(e)) => match spawn_failure(&name, &e) {
+            Some(why) => Some(Err(why)),
+            None => (e.kind() != std::io::ErrorKind::NotFound).then(|| Err(e.to_string())),
+        },
         Err(_) => Some(Err(format!("timed out after {}s", timeout.as_secs()))),
     }
 }

@@ -18,6 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::time::Duration;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -206,6 +207,18 @@ pub fn toast_life(text: &str) -> u128 {
     (3000 + text.chars().count() as u128 * 35).min(9000)
 }
 
+/// Below this a gap is just the model thinking between ticks; above it the user starts wondering
+/// whether the process died, which is exactly when the label earns its space.
+const QUIET_AFTER: Duration = Duration::from_secs(20);
+
+/// How long an agent that is *supposed* to be producing has been silent. The CLIs tick while a
+/// model reasons, so a `last_event` that stops moving is the one honest "is it stuck?" signal we
+/// have — shown only past a threshold, so a normal turn never gains noise.
+pub(crate) fn quiet_for(a: &Agent) -> Option<Duration> {
+    let d = a.last_event.elapsed();
+    (a.busy() && d >= QUIET_AFTER).then_some(d)
+}
+
 /// Animated "thinking" status line shown under the log while an agent works.
 pub fn busy_line(a: &Agent) -> Option<Line<'static>> {
     let elapsed = a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default();
@@ -230,6 +243,11 @@ pub fn busy_line(a: &Agent) -> Option<Line<'static>> {
             let mut spans = vec![glyph];
             spans.extend(anim::shimmer(&label, theme::mix_rgb(col, theme::MUTED), theme::TEXT));
             spans.push(Span::styled(format!("  {elapsed} · {} tok · {} · ctrl+c to interrupt", fmt_tokens(a.tokens_total), a.effort), theme::faint()));
+            // Its own span, in amber: the shimmer proves the frame is repainting, not that the
+            // agent is still saying anything. This is the part that warrants a second look.
+            if let Some(q) = quiet_for(a) {
+                spans.push(Span::styled(format!(" · quiet {}", fmt_dur(q)), theme::fg(theme::AMBER)));
+            }
             Some(Line::from(spans))
         }
         _ => None,
@@ -411,4 +429,30 @@ fn draw_toast(f: &mut Frame, app: &App) {
     f.render_widget(Clear, r);
     let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(Style::default().fg(c));
     f.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(c).add_modifier(Modifier::BOLD))).block(blk), r);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn agent() -> Agent {
+        Agent::new(1, "a", "worker", PathBuf::from("."))
+    }
+
+    /// The threshold exists so an ordinary turn never grows a warning, and the `busy()` guard so a
+    /// finished agent — whose `last_event` only gets staler from here — never looks stuck.
+    #[test]
+    fn quiet_for_only_fires_on_a_busy_agent_past_the_threshold() {
+        let mut a = agent();
+        a.last_event = std::time::Instant::now() - Duration::from_secs(3600);
+        assert_eq!(quiet_for(&a), None, "an idle agent is not quiet, however stale");
+
+        a.turn_active = true;
+        a.last_event = std::time::Instant::now() - Duration::from_secs(5);
+        assert_eq!(quiet_for(&a), None, "a ticking turn must stay unannotated");
+
+        a.last_event = std::time::Instant::now() - Duration::from_secs(90);
+        assert!(quiet_for(&a).is_some_and(|d| d.as_secs() >= 90), "a busy agent silent past the threshold reports how long");
+    }
 }

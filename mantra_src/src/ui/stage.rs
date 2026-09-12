@@ -479,8 +479,21 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                     vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
                 }
                 (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
+                (_, Some(a)) if !a.busy() && a.stopped_by_user => vec![Span::styled("stopped by you · r respawn", theme::fg(theme::AMBER))],
                 (_, Some(a)) if !a.busy() && run.waiting_for_answer(a.id) => vec![Span::styled("asked a question · waiting for the answer", theme::fg(theme::AMBER))],
-                (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
+                // The shimmer only proves the frame is repainting; a `last_event` that has stopped
+                // moving is what actually answers "is it stuck?". The suffix takes its columns off
+                // the activity rather than pushing the line past the card's inner width.
+                (_, Some(a)) if a.busy() => match quiet_for(a) {
+                    Some(q) => {
+                        let tail = format!(" · quiet {}", fmt_dur(q));
+                        let room = (iw as usize).saturating_sub(w_of(&tail));
+                        let mut v = anim::shimmer(&trunc(&a.activity, room), theme::mix_rgb(base, theme::MUTED), theme::TEXT);
+                        v.push(Span::styled(tail, theme::fg(theme::AMBER)));
+                        v
+                    }
+                    None => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
+                },
                 (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
                 _ => vec![],
             }
