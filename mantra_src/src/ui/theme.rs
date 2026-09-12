@@ -223,12 +223,6 @@ pub fn effort_bar(effort: &str, efforts: &[String]) -> String {
     format!("{}{}", on.repeat(i), off.repeat(n.saturating_sub(i)))
 }
 
-pub fn gauge(pct: u8, width: usize) -> (String, String) {
-    let filled = ((pct as usize * width) + 50) / 100;
-    let (on, off) = if ascii() { ("=", ".") } else { ("━", "─") };
-    (on.repeat(filled.min(width)), off.repeat(width.saturating_sub(filled)))
-}
-
 /// Average two palette colours (for dimmed/tinted variants).
 pub fn mix_rgb(a: (u8, u8, u8), b: (u8, u8, u8)) -> (u8, u8, u8) {
     (((a.0 as u16 + b.0 as u16) / 2) as u8, ((a.1 as u16 + b.1 as u16) / 2) as u8, ((a.2 as u16 + b.2 as u16) / 2) as u8)

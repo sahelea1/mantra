@@ -3,7 +3,7 @@
 use crate::agent::{Agent, Level, Signal, Status};
 use crate::config::{Registry, Settings};
 use crate::engine::pattern::Pattern;
-use crate::engine::run::{Ctx, JobOut, JobTag, Run, SpawnReq, Stage};
+use crate::engine::run::{Ctx, JobOut, JobTag, Run, Send, SpawnReq, Stage};
 use crate::engine::tools;
 use crate::hub::{AgentId, Cmd, Hub, HubEvent, SpawnSpec};
 use crate::ui::input::{Act, Input};
@@ -51,6 +51,8 @@ pub enum Overlay {
     Edit { title: String, input: Input, target: EditTarget },
     Patterns { sel: usize, list: Vec<String> },
     Discover(DiscoverState),
+    /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
+    Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
 }
 
 /// The model-discovery picker.
@@ -80,9 +82,19 @@ pub struct Approval {
     pub at: Instant,
 }
 
+/// Selection in the Studio's left list, by identity rather than by index into a list that gets
+/// re-sorted on every draw (`ui::studio::entries`/`ordered_roles`) — so changing a role's `kind`
+/// (which moves it in the sort order) never lands the highlight on a different role.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StudioSel {
+    Role(String),
+    Settings,
+    Flow,
+}
+
 pub struct StudioState {
     pub pattern: Pattern,
-    pub sel: usize,
+    pub sel: StudioSel,
     pub field: usize,
     pub focus: u8, // 0 list, 1 fields, 2 architect input
     pub errors: Vec<String>,
@@ -110,8 +122,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/mandala", "open the Mandala stage"),
     ("/run", "start a Mandala run: /run <goal>"),
     ("/pattern", "choose the pattern for new runs"),
+    ("/runs", "this project's runs: resume or delete"),
     ("/plan", "show the run's plan"),
     ("/pause", "pause / resume the run"),
+    ("/respawn", "respawn the focused agent in place (planner/orchestrator/gate/finale/worker)"),
     ("/land", "merge the finished run branch into your branch"),
     ("/studio", "pattern studio (roles, flow, architect agent)"),
     ("/models", "model registry (context, efforts, providers)"),
@@ -149,9 +163,18 @@ pub struct App {
     pub notes: Vec<String>,
     pub pattern_name: String,
     pub branch: String,
+    /// Ids of this project's unfinished runs at startup (welcome-screen notice); kept in sync by
+    /// `/runs` resume/delete.
+    pub unfinished_runs: Vec<String>,
+    /// `util::sandbox_probe` failure at startup (Linux without user namespaces): shown on the
+    /// welcome screens, in the Solo log and in every run's pulse, so nobody burns gate rounds on
+    /// `bwrap` errors (L1).
+    pub sandbox_warning: Option<String>,
     pub probes: HashMap<AgentId, (String, Instant)>,
     pub pulse_scroll: usize,
     pub force_clear: bool,
+    /// Set on every Stage↔Zoom switch; drives a brief header tint so a jump never feels silent.
+    pub flash_screen: Option<Instant>,
 }
 
 /// Options for creating any agent (Solo, run agents, architect, probes).
@@ -168,6 +191,12 @@ pub struct AgentOpts {
     pub instructions: String,
     pub tools: Vec<Value>,
     pub extra_writable: Vec<PathBuf>,
+    /// Explicit context-window override (from a halved assumption); `None` uses the model's own
+    /// effective context.
+    pub context_override: Option<u64>,
+    /// Re-attach to a saved Codex thread / Claude session instead of starting a new one
+    /// (`mantra runs resume`).
+    pub resume_thread: Option<String>,
 }
 
 fn toml_str(s: &str) -> String {
@@ -178,30 +207,58 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     let id = hub.alloc_id();
     let m = reg.resolve(&o.model_alias);
     let effort = m.resolve_effort(o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort));
-    let mut extra = reg.provider_args();
-    if let Some(cw) = m.context_window {
+    let backend = reg.backend_of(&m);
+    // Always tell the backend a context window and compaction limit — an assumed 200k / 85% when
+    // the model doesn't have its own, so auto-compaction never relies on a provider's own defaults
+    // (Codex: `-c model_context_window=…`/`model_auto_compact_token_limit=…`; Claude: `--autocompact`).
+    let cw = o.context_override.unwrap_or_else(|| m.effective_context());
+    let compact_pct = m.effective_compact_percent();
+    let (extra, envs, claude) = if backend == crate::hub::Backend::ClaudeCode {
+        // WP10: no Codex `-c` args at all; auth/base_url/key come from the model's own provider
+        // entry, resolved here (not in `hub::claude`, which stays decoupled from `config::Registry`
+        // — see `SpawnSpec::claude`/`SpawnSpec::envs`).
+        let provider = reg.providers.iter().find(|p| p.id == m.provider);
+        let auth = provider.map(|p| p.auth.clone()).filter(|a| !a.is_empty()).unwrap_or_else(|| "subscription".into());
+        let base_url = provider.map(|p| p.base_url.clone()).unwrap_or_default();
+        let mut envs = vec![];
+        if auth == "api_key" {
+            if let Some(key) = provider.and_then(|p| p.resolve_key()) {
+                envs.push(("ANTHROPIC_API_KEY".to_string(), key));
+            }
+        }
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }))
+    } else {
+        let mut extra = reg.provider_args();
         extra.push("-c".into());
         extra.push(format!("model_context_window={cw}"));
-        if let Some(p) = m.auto_compact_percent {
+        extra.push("-c".into());
+        extra.push(format!("model_auto_compact_token_limit={}", cw * compact_pct.min(99) as u64 / 100));
+        if m.is_custom_provider() {
             extra.push("-c".into());
-            extra.push(format!("model_auto_compact_token_limit={}", cw * p.min(99) as u64 / 100));
+            if m.efforts().is_empty() {
+                // No effort control → don't send any reasoning block (strict gateways reject it).
+                extra.push("model_reasoning_summary=\"none\"".into());
+            } else {
+                // Codex only sends reasoning params to models it doesn't know when told they support them.
+                extra.push("model_supports_reasoning_summaries=true".into());
+            }
         }
-    }
-    if m.is_custom_provider() {
-        extra.push("-c".into());
-        if m.efforts().is_empty() {
-            // No effort control → don't send any reasoning block (strict gateways reject it).
-            extra.push("model_reasoning_summary=\"none\"".into());
-        } else {
-            // Codex only sends reasoning params to models it doesn't know when told they support them.
-            extra.push("model_supports_reasoning_summaries=true".into());
+        if !o.extra_writable.is_empty() {
+            let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
+            extra.push("-c".into());
+            extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
         }
-    }
-    if !o.extra_writable.is_empty() {
-        let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
-        extra.push("-c".into());
-        extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
-    }
+        // Deliver a key stored directly in the provider (not just named by env_key) into the
+        // child's own environment — never on argv, never logged.
+        let envs: Vec<(String, String)> = reg
+            .providers
+            .iter()
+            .find(|p| p.id == m.provider)
+            .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
+            .into_iter()
+            .collect();
+        (extra, envs, None)
+    };
     let spec = SpawnSpec {
         cwd: o.cwd.clone(),
         model: m.model.clone(),
@@ -213,22 +270,37 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         dynamic_tools: o.tools.clone(),
         config: serde_json::Map::new(),
         extra_args: extra,
-        resume_thread: None,
+        resume_thread: o.resume_thread.clone(),
+        backend,
+        envs,
+        claude,
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
     a.glyph = o.glyph;
     a.color = o.color;
     a.model_alias = m.alias.clone();
     a.model = m.model.clone();
+    a.provider = m.provider.clone();
+    a.backend = backend;
     a.effort = effort;
-    a.ctx_window = m.context_window;
+    a.ctx_window = Some(cw);
+    a.approval = o.approval.clone();
     agents.insert(id, a);
     hub.spawn(id, spec);
     id
 }
 
-/// Send a prompt: new turn if idle, steer if busy, queue if a turn is starting.
-pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool) {
+/// Send a prompt to an agent. `mode` decides what happens when it's already busy:
+/// - `Auto` (the engine's own steering): new turn if idle, steer immediately if busy, queue if a
+///   turn is only starting (unchanged pre-WP9 behaviour).
+/// - `Queue` (the UI's plain Enter): never steers — a message typed mid-turn is appended to
+///   `Agent.queued` and shown as a chip; it is delivered once the turn ends (or, if it arrived
+///   while the turn was only starting, once `turn/started` drains the queue).
+/// - `Force` (ctrl+f): delivers the queue plus this message into a running turn right away
+///   (`turn/steer`), without interrupting it. Against an agent that's only starting a turn, the
+///   force is deferred the same way `Queue` is — `turn/started` drains it moments later. Against
+///   an idle agent it behaves exactly like `Auto`/Enter.
+pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool, mode: Send) {
     let Some(a) = agents.get_mut(&id) else { return };
     if echo {
         a.push_user(&text);
@@ -239,10 +311,27 @@ pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentI
         a.notice(Level::Warn, "agent is stopped");
         return;
     }
+    if mode == Send::Force && a.turn_active {
+        let mut joined = std::mem::take(&mut a.queued);
+        if !text.trim().is_empty() {
+            joined.push(text);
+        }
+        if !joined.is_empty() {
+            hub.send(id, Cmd::Steer { text: joined.join("\n\n") });
+        }
+        return;
+    }
+    if text.trim().is_empty() {
+        return;
+    }
     if a.awaiting_start {
         a.queued.push(text);
     } else if a.turn_active {
-        hub.send(id, Cmd::Steer { text });
+        if mode == Send::Queue {
+            a.queued.push(text);
+        } else {
+            hub.send(id, Cmd::Steer { text });
+        }
     } else {
         a.awaiting_start = true;
         a.status = Status::Busy;
@@ -275,16 +364,45 @@ impl Ctx for Ctxt<'_> {
                 model_alias: r.role.model.clone(),
                 effort: r.effort.or(Some(r.role.effort.clone())),
                 cwd: r.cwd,
-                approval: "never".into(),
+                approval: r.role.permission.clone(),
                 sandbox,
                 instructions: r.instructions,
                 tools: r.tools,
                 extra_writable: r.extra_writable,
+                context_override: r.context_override,
+                resume_thread: None,
+            },
+        )
+    }
+    fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
+        let sandbox = if r.role.sandbox.is_empty() { "workspace-write".to_string() } else { r.role.sandbox.clone() };
+        spawn_agent(
+            self.hub,
+            self.agents,
+            self.registry,
+            AgentOpts {
+                name: r.name,
+                role: r.role_name,
+                glyph: r.role.glyph.clone(),
+                color: r.role.color.clone(),
+                model_alias: r.role.model.clone(),
+                effort: r.effort.or(Some(r.role.effort.clone())),
+                cwd: r.cwd,
+                approval: r.role.permission.clone(),
+                sandbox,
+                instructions: r.instructions,
+                tools: r.tools,
+                extra_writable: r.extra_writable,
+                context_override: r.context_override,
+                resume_thread: Some(thread),
             },
         )
     }
     fn prompt(&mut self, a: AgentId, text: String) {
-        prompt_agent(self.hub, self.agents, a, text, true);
+        prompt_agent(self.hub, self.agents, a, text, true, Send::Auto);
+    }
+    fn prompt_mode(&mut self, a: AgentId, text: String, mode: Send) {
+        prompt_agent(self.hub, self.agents, a, text, true, mode);
     }
     fn interrupt(&mut self, a: AgentId) {
         self.hub.send(a, Cmd::Interrupt);
@@ -321,7 +439,7 @@ impl Ctx for Ctxt<'_> {
     fn agent(&self, a: AgentId) -> Option<&Agent> {
         self.agents.get(&a)
     }
-    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + Send>) {
+    fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
             let out = f();
@@ -337,6 +455,8 @@ impl App {
     pub fn new(settings: Settings, registry: Registry, project: PathBuf, hub: Hub, tx: UnboundedSender<AppEvent>, demo: bool) -> App {
         let pattern_name = settings.default_pattern.clone();
         let pattern = Pattern::load(&pattern_name, &project).unwrap_or_else(|_| Pattern::builtin());
+        let sel0 = pattern.ordered_roles().first().map(|(n, _)| StudioSel::Role(n.clone())).unwrap_or(StudioSel::Settings);
+        let unfinished_runs: Vec<String> = crate::engine::state::unfinished(&project).into_iter().map(|r| r.id).collect();
         let branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&project)
@@ -367,15 +487,18 @@ impl App {
             ctrl_c: None,
             tx,
             demo,
-            studio: StudioState { pattern, sel: 0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
+            studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
             models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false },
             suggest: 0,
             notes: vec![],
             pattern_name,
             branch,
+            unfinished_runs,
+            sandbox_warning: None,
             probes: HashMap::new(),
             pulse_scroll: 0,
             force_clear: false,
+            flash_screen: None,
         }
     }
 
@@ -387,8 +510,9 @@ impl App {
         self.agents.values().any(|a| a.busy() || matches!(a.status, Status::Starting | Status::Retrying(_)))
             || self.toast.as_ref().map(|t| t.1.elapsed().as_millis() < crate::ui::toast_life(&t.0) + 100).unwrap_or(false)
             || self.agents.values().any(|a| a.compacting || a.ctx_anim.map(|(_, t)| t.elapsed().as_millis() < 950).unwrap_or(false))
-            || self.run.as_ref().map(|r| (r.is_active() && !r.paused && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
+            || self.run.as_ref().map(|r| (r.is_active() && !r.halted() && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
             || self.studio.flash.map(|f| f.elapsed() < Duration::from_millis(900)).unwrap_or(false)
+            || self.flash_screen.map(|f| f.elapsed() < Duration::from_millis(450)).unwrap_or(false)
     }
 
     fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
@@ -429,9 +553,34 @@ impl App {
                 instructions: String::new(),
                 tools: vec![],
                 extra_writable: vec![],
+                context_override: None,
+                resume_thread: None,
             },
         );
         self.solo = Some(id);
+        if let Some(why) = self.registry.alias_problem(&self.settings.default_model) {
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.notice(Level::Warn, &why);
+            }
+        }
+    }
+
+    /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
+    /// `reduce_motion` is on) so the overview/zoom switch never feels silent.
+    fn set_screen(&mut self, s: Screen) {
+        let jump = matches!((self.screen, s), (Screen::Stage, Screen::Zoom(_)) | (Screen::Zoom(_), Screen::Stage));
+        if jump && crate::ui::theme::motion() {
+            self.flash_screen = Some(Instant::now());
+        }
+        self.screen = s;
+    }
+
+    /// After the plan is approved: land on the animated overview with the orchestrator selected.
+    pub fn land_on_overview(&mut self) {
+        self.set_screen(Screen::Stage);
+        self.canvas_focus = true;
+        let orch = self.run.as_ref().and_then(|r| r.orchestrator);
+        self.sel = self.stage_nodes().iter().position(|a| Some(*a) == orch).unwrap_or(0);
     }
 
     /// The agent the current view is about (Solo agent, zoomed agent, or stage selection).
@@ -515,6 +664,26 @@ impl App {
         }
     }
 
+    /// After switching a run agent's model (e.g. from the halt-band `m` picker), persist the
+    /// choice into this run's own pattern copy so a later spawn of that role picks it up, and —
+    /// if the run was halted — resume it so the newly-configured agent gets going again.
+    pub fn model_switched_for_run_agent(&mut self, a: AgentId) {
+        if !self.run.as_ref().map(|r| r.all_agents().contains(&a)).unwrap_or(false) {
+            return;
+        }
+        let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
+        if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
+            if let Some(role_name) = run.role_name_of(a) {
+                if let Some(r) = run.pattern.roles.get_mut(&role_name) {
+                    r.model = alias;
+                }
+            }
+        }
+        if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
+            self.with_run(|r, c| r.resume(c));
+        }
+    }
+
     /// Compact an agent's context now, or right after its current turn.
     pub fn compact_agent(&mut self, a: AgentId) {
         let Some(ag) = self.agents.get_mut(&a) else { return };
@@ -529,6 +698,20 @@ impl App {
             ag.compacting = true;
             ag.activity = "compacting context".into();
             self.hub.send(a, Cmd::Compact);
+        }
+    }
+
+    /// WP7.4: respawn a run agent in place (stage `r` on a non-crashed node, `ctrl+r` anywhere,
+    /// `/respawn`). A no-op with a toast for an agent that isn't part of the active run.
+    pub fn respawn_agent(&mut self, a: AgentId) {
+        if !self.in_run(a) {
+            self.toast("that agent isn't part of the active run", Level::Info);
+            return;
+        }
+        match self.with_run(|r, c| r.respawn(c, a, None)) {
+            Some(Ok(())) => self.toast("respawned", Level::Info),
+            Some(Err(msg)) => self.toast(msg, Level::Warn),
+            None => {}
         }
     }
 
@@ -554,7 +737,7 @@ impl App {
                     Stage::Done => "done".to_string(),
                     Stage::Failed(_) => "stopped".to_string(),
                 };
-                format!("{} mantra — {st}{}", if r.paused { "‖" } else { "◉" }, if busy > 0 { format!(" · {busy} active") } else { String::new() })
+                format!("{} mantra — {st}{}", if r.halted() { "⛔" } else { "◉" }, if busy > 0 { format!(" · {busy} active") } else { String::new() })
             }
             _ => format!("✦ mantra — {}{}", self.project.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), if busy > 0 { " · working" } else { "" }),
         }
@@ -572,14 +755,104 @@ impl App {
                 return;
             }
         };
+        let problems = self.registry.preflight(&pattern);
+        if !problems.is_empty() {
+            // L3: fail before spending a single turn, naming the role, provider and variable.
+            // Shown where the user is looking: as a toast, and in the Solo log if one exists.
+            if let Some(a) = self.solo.and_then(|s| self.agents.get_mut(&s)) {
+                for p in &problems {
+                    a.notice(Level::Warn, &format!("cannot start the run — {p}"));
+                }
+            }
+            self.toast(format!("cannot start: {}", problems[0]), Level::Error);
+            return;
+        }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
         }
+        if let Some(w) = &self.sandbox_warning {
+            run.log("⚠", "amber", format!("sandbox: {}", crate::util::trunc(w, 140)));
+        }
         self.run = Some(run);
+        // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
+        // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
         self.screen = Screen::Stage;
         self.sel = 0;
+    }
+
+    /// Record a failed sandbox probe (done once at startup, never in demo mode). The welcome
+    /// screens show it while they're up; every run's pulse repeats it (`start_run`) so it is on
+    /// screen exactly where a `bwrap` failure would otherwise be puzzling.
+    pub fn set_sandbox_warning(&mut self, why: String) {
+        self.sandbox_warning = Some(why);
+    }
+
+    /// `/runs`: this project's runs, newest first. Runs of other projects are only counted — a
+    /// run is resumed from its own project (`mantra runs resume <id>` switches there).
+    pub fn open_runs(&mut self) {
+        let all = crate::engine::state::list_all();
+        let key = crate::engine::state::project_key(&self.project);
+        let (list, other): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| r.project_key == key);
+        self.overlays.push(Overlay::Runs { sel: 0, list, confirm: false, others: other.len() });
+    }
+
+    /// Pick a saved run back up (see `engine::resume`). Refuses while another run is active.
+    pub fn resume_run(&mut self, r: crate::engine::state::RunSummary) {
+        if self.run.as_ref().map(|x| x.is_active()).unwrap_or(false) {
+            self.toast("a run is already active — finish or /pause it first", Level::Warn);
+            return;
+        }
+        let st = match &r.state {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                self.toast(format!("cannot resume {}: {e}", r.id), Level::Error);
+                return;
+            }
+        };
+        // The pattern the run started with (saved copy first: the user may have edited theirs).
+        let pattern = std::fs::read_to_string(r.dir.join("pattern.toml"))
+            .ok()
+            .and_then(|s| Pattern::from_toml(&s).ok())
+            .or_else(|| Pattern::load(&st.pattern, &self.project).ok())
+            .unwrap_or_else(Pattern::builtin);
+        let problems = self.registry.preflight(&pattern);
+        if let Some(p) = problems.first() {
+            self.toast(format!("cannot resume: {p}"), Level::Error);
+            return;
+        }
+        let plan = std::fs::read_to_string(r.dir.join("plan.json")).ok().and_then(|s| serde_json::from_str::<crate::engine::plan::Plan>(&s).ok());
+        let label = crate::engine::state::stage_label(&st.stage);
+        let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
+        {
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            run.resume_boot(&mut ctx, &st);
+        }
+        self.run = Some(run);
+        self.unfinished_runs.retain(|id| *id != r.id);
+        self.screen = Screen::Stage;
+        self.sel = 0;
+        self.toast(format!("resumed {} at {label}", r.id), Level::Ok);
+    }
+
+    /// Delete a saved run (branches, worktrees, journal). The run that is open right now can
+    /// only be deleted once it is finished.
+    pub fn delete_run(&mut self, r: &crate::engine::state::RunSummary) -> bool {
+        if let Some(cur) = &self.run {
+            if cur.id == r.id {
+                if cur.is_active() {
+                    self.toast("this run is open and active — /pause won't do, it has to finish or fail first", Level::Warn);
+                    return false;
+                }
+                self.run = None;
+            }
+        }
+        let log = crate::engine::state::delete(r);
+        crate::mlog!("deleted run {}: {}", r.id, log.join("; "));
+        self.unfinished_runs.retain(|id| *id != r.id);
+        self.toast(format!("deleted {} ({} step{})", r.id, log.len(), if log.len() == 1 { "" } else { "s" }), Level::Ok);
+        true
     }
 
     fn start_architect(&mut self) -> AgentId {
@@ -604,13 +877,25 @@ impl App {
                 instructions: tools::ARCHITECT_PROMPT.into(),
                 tools: tools::architect_tools(),
                 extra_writable: vec![],
+                context_override: None,
+                resume_thread: None,
             },
         );
         self.studio.architect = Some(id);
         id
     }
 
+    /// The `/models` `t` live test. Dispatched per backend so a provider that can't actually run a
+    /// role (F4: a model rejecting Codex's `developer` role) fails here, before a real run — not the
+    /// job the user is running it for.
     pub fn probe_model(&mut self, alias: &str) {
+        // Every provider today speaks Codex's wire protocol (`kind = ClaudeCode` and its own test
+        // path — `--append-system-prompt` — arrive with WP10). Keep the dispatch explicit so that
+        // arm can be added here without touching the caller.
+        self.probe_model_codex(alias);
+    }
+
+    fn probe_model_codex(&mut self, alias: &str) {
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -625,14 +910,20 @@ impl App {
                 cwd: self.project.clone(),
                 approval: "never".into(),
                 sandbox: "read-only".into(),
-                instructions: String::new(),
+                // Non-empty developer instructions become Codex's `developerInstructions`
+                // (`thread/start`) — the same channel a real run's phase/task briefs use, and the
+                // one some providers (F4) reject with an HTTP 400. Sending it here means the test
+                // catches that before the model is picked for a role.
+                instructions: "You are a compatibility probe. Developer-role messages like this one must be accepted.".into(),
                 tools: vec![],
                 extra_writable: vec![],
+                context_override: None,
+                resume_thread: None,
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
         self.models_ui.status.insert(alias.to_string(), "testing…".into());
-        prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true);
+        prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true, Send::Auto);
     }
 
     /// Discover models: Codex's catalog + every custom provider (`only` = one provider id).
@@ -642,8 +933,16 @@ impl App {
             sources.push("codex".into());
         }
         let provs: Vec<crate::config::ProviderEntry> = self.registry.providers.iter().filter(|p| !p.id.is_empty() && p.id != "openai" && only.as_ref().map(|o| *o == p.id).unwrap_or(true)).cloned().collect();
-        sources.extend(provs.iter().map(|p| p.id.clone()));
+        // ClaudeCode providers have no `/models` endpoint for a subscription; the six defaults
+        // (§10.2) are always known locally and answer instantly, with no loading spinner needed. A
+        // `base_url` (a third-party gateway) additionally gets queried live, exactly like a Codex
+        // custom provider (§10.5).
+        let net_provs: Vec<crate::config::ProviderEntry> = provs.iter().filter(|p| p.kind != crate::config::ProviderKind::ClaudeCode || !p.base_url.trim().is_empty()).cloned().collect();
+        sources.extend(net_provs.iter().map(|p| p.id.clone()));
         self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, errors: vec![], sel: 0, filter: Input::default() }));
+        for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
+            self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+        }
         if only.is_none() {
             let cmd = self.hub.codex_cmd.clone();
             let args = self.registry.provider_args();
@@ -651,7 +950,7 @@ impl App {
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let r = async {
-                    let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd).map_err(|e| e.to_string())?;
+                    let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd, &[]).map_err(|e| e.to_string())?;
                     crate::rpc::handshake(&conn).await.map_err(|e| e.to_string())?;
                     let v = conn.request_timeout("model/list", json!({"limit": 100}), Duration::from_secs(20)).await.map_err(|e| e.message)?;
                     let _ = child.kill().await;
@@ -661,10 +960,10 @@ impl App {
                 let _ = tx.send(AppEvent::Discovered { source: "codex".into(), result: r });
             });
         }
-        for p in provs {
+        for p in net_provs {
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
-                let r = crate::discover::list_models(&p.base_url, &p.env_key).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
+                let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref()).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
                 let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
             });
         }
@@ -718,6 +1017,9 @@ impl App {
         let _ = self.settings.save();
         if let Some(s) = self.solo {
             self.hub.send(s, Cmd::SetApproval(mode.to_string()));
+            if let Some(a) = self.agents.get_mut(&s) {
+                a.approval = mode.to_string();
+            }
         }
         let label = match mode {
             "never" => "never ask",
@@ -748,7 +1050,16 @@ impl App {
             AppEvent::Term(e) => self.on_term(e),
             AppEvent::Hub(h) => self.on_hub(h),
             AppEvent::Job(tag, out) => {
+                // A fresh run's planner is spawned inside this call (once workspace setup
+                // finishes); zoom to it so the user starts in the planner's own view — but only
+                // if they're still on the default overview (haven't navigated away meanwhile).
+                let is_setup = matches!(tag, JobTag::Setup);
                 self.with_run(|r, c| r.on_job(c, tag, out));
+                if is_setup && self.screen == Screen::Stage {
+                    if let Some(p) = self.run.as_ref().and_then(|r| r.planner) {
+                        self.set_screen(Screen::Zoom(p));
+                    }
+                }
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
         }
@@ -756,7 +1067,10 @@ impl App {
 
     pub fn tick(&mut self) {
         self.with_run(|r, c| r.tick(c));
-        if self.run.as_ref().map(|r| r.want_review).unwrap_or(false) && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. })) && self.screen == Screen::Stage {
+        if self.run.as_ref().map(|r| r.want_review).unwrap_or(false)
+            && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. }))
+            && matches!(self.screen, Screen::Stage | Screen::Zoom(_) | Screen::Solo)
+        {
             if let Some(r) = self.run.as_mut() {
                 r.want_review = false;
             }
@@ -835,7 +1149,7 @@ impl App {
                     }
                     let queued = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
                     if !queued.is_empty() {
-                        prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false);
+                        prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false, Send::Auto);
                     }
                 }
                 for s in signals {
@@ -847,6 +1161,11 @@ impl App {
                             }
                         }
                         Signal::Activity => {}
+                        Signal::EnvironmentBroken(msg) => {
+                            if self.in_run(agent) {
+                                self.with_run(|r, c| r.on_environment_broken(c, agent, msg));
+                            }
+                        }
                     }
                 }
             }
@@ -881,13 +1200,14 @@ impl App {
                 if let Some(a) = self.agents.get_mut(&agent) {
                     a.status = if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
                     a.activity = if restarting { "restarting".into() } else { "crashed".into() };
-                    a.notice(Level::Error, format!("codex process {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                    let what = if a.backend == crate::config::ProviderKind::ClaudeCode { "claude process" } else { "codex process" };
+                    a.notice(Level::Error, format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
                 }
                 if self.in_run(agent) {
                     self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));
                 }
                 if Some(agent) == self.solo && !restarting {
-                    self.toast("Solo agent is down — check `codex` is installed & logged in (see log), /new to retry", Level::Error);
+                    self.toast("Solo agent is down — check the CLI is installed & logged in / the provider key (see log), /new to retry", Level::Error);
                 }
             }
             HubEvent::Exited { agent } => {
@@ -895,6 +1215,11 @@ impl App {
                     a.status = Status::Stopped;
                     a.turn_active = false;
                 }
+            }
+            HubEvent::BridgeConn { agent, stream } => {
+                // Routing by agent id is `Hub::send`'s job already (WP10.4) — a bridge connection
+                // for an agent that's since exited is just dropped, same as any other stale `Cmd`.
+                self.hub.send(agent, Cmd::Bridge(stream));
             }
         }
     }
@@ -968,9 +1293,11 @@ impl App {
                     self.notes.push(format!("Mantra: {name} needs approval"));
                 }
                 self.approvals.push(Approval { agent, id, method: method.to_string(), title, detail, params, at: Instant::now() });
-                if self.settings.approval_mode == "never" {
-                    // Codex fixes a turn's policy when the turn starts, so a turn begun under another
-                    // mode (or a run agent) can still ask — honour "never ask" here.
+                // Codex fixes a turn's policy when the turn starts, so a turn begun under another
+                // mode can still ask — honour the *agent's own* approval policy here (not the
+                // global Solo mode), so a Mandala role set to "never" auto-resolves even while
+                // Solo's mode is something else, and vice versa.
+                if self.agents.get(&agent).map(|a| a.approval == "never").unwrap_or(false) {
                     self.auto_approve_pending();
                     self.toast = self.toast.take().filter(|t| !t.0.contains("needs approval"));
                     self.notes.retain(|n| !n.contains("needs approval"));
@@ -1165,6 +1492,24 @@ impl App {
             }
             return;
         }
+        // ctrl+f / ctrl+x are unconditional (checked before overlays dispatch) so they reach the
+        // chat input even while the plan-review overlay is open on top of a zoomed agent — see
+        // the `!ctrl` guard on that overlay's own 'f' arm in overlays.rs.
+        if ctrl && k.code == KeyCode::Char('f') {
+            self.force_send();
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('x') {
+            self.discard_queue();
+            return;
+        }
+        // WP7.4: respawn the focused run agent in place, from anywhere (not just the stage nav 'r').
+        if ctrl && k.code == KeyCode::Char('r') && self.overlays.is_empty() {
+            if let Some(a) = self.focus_agent() {
+                self.respawn_agent(a);
+            }
+            return;
+        }
         if k.code == KeyCode::F(1) {
             self.overlays.push(Overlay::Help);
             return;
@@ -1228,6 +1573,15 @@ impl App {
                 return;
             }
         }
+        // Backspace on an empty input pops the last queued message back into the input to edit.
+        if k.code == KeyCode::Backspace && self.input.is_empty() {
+            if let Some(a) = self.focus_agent() {
+                if let Some(text) = self.agents.get_mut(&a).and_then(|ag| ag.queued.pop()) {
+                    self.input.set(&text);
+                    return;
+                }
+            }
+        }
         // slash suggestions navigation
         let sugg = self.suggestions();
         if !sugg.is_empty() {
@@ -1257,7 +1611,7 @@ impl App {
         if k.code == KeyCode::Esc {
             match self.screen {
                 Screen::Zoom(_) if self.input.is_empty() => {
-                    self.screen = Screen::Stage;
+                    self.set_screen(Screen::Stage);
                 }
                 _ => {
                     if let Some(a) = self.focus_agent() {
@@ -1316,7 +1670,7 @@ impl App {
         }
         if k.code == KeyCode::Enter && (self.canvas_focus || self.input.is_empty()) {
             if let Some(a) = nodes.get(self.sel) {
-                self.screen = Screen::Zoom(*a);
+                self.set_screen(Screen::Zoom(*a));
                 self.canvas_focus = false;
             }
             return true;
@@ -1333,12 +1687,15 @@ impl App {
             KeyCode::Char('a') => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
                     self.with_run(|r, c| r.approve_plan(c));
+                    self.land_on_overview();
                 }
             }
             KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
             KeyCode::Char('x') => {
                 if let Some(a) = selected {
-                    self.hub.send(a, Cmd::Interrupt);
+                    if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
+                        self.hub.send(a, Cmd::Interrupt);
+                    }
                 }
             }
             KeyCode::Char('r') => {
@@ -1346,8 +1703,11 @@ impl App {
                     let crashed = self.agents.get(&a).map(|x| matches!(x.status, Status::Crashed(_))).unwrap_or(false);
                     if crashed {
                         self.hub.send(a, Cmd::Restart);
-                    } else if let Some(msg) = self.with_run(|r, c| r.retry_worker(c, a, None)) {
-                        self.toast(msg, Level::Info);
+                    } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
+                        match res {
+                            Ok(()) => self.toast("respawned", Level::Info),
+                            Err(msg) => self.toast(msg, Level::Warn),
+                        }
                     }
                 }
             }
@@ -1371,6 +1731,15 @@ impl App {
                     self.compact_agent(a);
                 }
             }
+            KeyCode::Char('m') => {
+                // On a halted run this is the fix for `ProviderRejected`: pick a different model
+                // for the affected agent (WP6.6). Works on any selected agent, halted or not.
+                if let Some(a) = selected {
+                    let cur = self.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
+                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
+                    self.overlays.push(Overlay::ModelPicker { sel, target: Some(a) });
+                }
+            }
             KeyCode::Char('s') => self.open_studio(),
             KeyCode::Char('?') => self.overlays.push(Overlay::Help),
             KeyCode::Char('/') | KeyCode::Char('@') => {
@@ -1380,6 +1749,15 @@ impl App {
                 }
             }
             KeyCode::Esc => {}
+            KeyCode::Char(c @ '1'..='9') => {
+                // 1-9 jump: select the nth node and zoom straight in.
+                let idx = (c as usize) - ('1' as usize);
+                if let Some(a) = nodes.get(idx) {
+                    self.sel = idx;
+                    self.set_screen(Screen::Zoom(*a));
+                    self.canvas_focus = false;
+                }
+            }
             KeyCode::Char(c) if c.is_alphanumeric() => {
                 // start typing
                 self.canvas_focus = false;
@@ -1427,15 +1805,15 @@ impl App {
                     self.hub.send(s, Cmd::Shell { command: cmd.trim().to_string() });
                     return;
                 }
-                prompt_agent(&self.hub, &mut self.agents, s, text, true);
+                prompt_agent(&self.hub, &mut self.agents, s, text, true, Send::Queue);
             }
             Screen::Zoom(a) => {
                 if self.in_run(a) {
                     let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
                     let t = text.clone();
-                    self.with_run(|r, c| r.direct(c, &name, &t));
+                    self.with_run(|r, c| r.direct(c, &name, &t, Send::Queue));
                 } else {
-                    prompt_agent(&self.hub, &mut self.agents, a, text, true);
+                    prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Queue);
                 }
             }
             Screen::Stage => {
@@ -1446,7 +1824,7 @@ impl App {
                 if let Some(rest) = text.strip_prefix('@') {
                     let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
                     let (name, msg) = (name.to_string(), msg.trim().to_string());
-                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg)).unwrap_or(false);
+                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg, Send::Queue)).unwrap_or(false);
                     if !ok {
                         self.toast(format!("no agent named @{name}"), Level::Warn);
                     }
@@ -1455,6 +1833,76 @@ impl App {
                 self.with_run(|r, c| r.user_input(c, &text));
             }
             _ => {}
+        }
+    }
+
+    /// ctrl+f: deliver the focused agent's queued messages plus the current input into its
+    /// running turn right away. Applies to Solo, Zoom and `@name` messages from the stage — the
+    /// same places Enter can queue. Against an idle agent this just behaves like Enter.
+    fn force_send(&mut self) {
+        match self.screen {
+            Screen::Solo => {
+                if let Some(s) = self.solo {
+                    self.force_prompt(s);
+                }
+            }
+            Screen::Zoom(a) => {
+                if self.in_run(a) {
+                    let text = self.input.text().trim_end().to_string();
+                    let empty_queue = self.agents.get(&a).map(|x| x.queued.is_empty()).unwrap_or(true);
+                    if text.trim().is_empty() && empty_queue {
+                        return;
+                    }
+                    if !text.trim().is_empty() {
+                        self.input.take();
+                    }
+                    let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
+                    self.with_run(|r, c| r.direct(c, &name, &text, Send::Force));
+                } else {
+                    self.force_prompt(a);
+                }
+            }
+            Screen::Stage => {
+                let raw = self.input.text();
+                if let Some(rest) = raw.strip_prefix('@') {
+                    let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let (name, msg) = (name.to_string(), msg.trim().to_string());
+                    self.input.take();
+                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg, Send::Force)).unwrap_or(false);
+                    if !ok {
+                        self.toast(format!("no agent named @{name}"), Level::Warn);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn force_prompt(&mut self, id: AgentId) {
+        let text = self.input.text().trim_end().to_string();
+        let empty_queue = self.agents.get(&id).map(|a| a.queued.is_empty()).unwrap_or(true);
+        if text.trim().is_empty() && empty_queue {
+            return; // nothing queued and nothing typed — there's nothing to force
+        }
+        let echo = !text.trim().is_empty();
+        if echo {
+            self.input.take();
+        }
+        prompt_agent(&self.hub, &mut self.agents, id, text, echo, Send::Force);
+    }
+
+    /// ctrl+x on an empty input: discard the focused agent's whole queue.
+    fn discard_queue(&mut self) {
+        if !self.input.is_empty() {
+            return;
+        }
+        if let Some(a) = self.focus_agent() {
+            if let Some(ag) = self.agents.get_mut(&a) {
+                if !ag.queued.is_empty() {
+                    ag.queued.clear();
+                    self.toast("queue cleared", Level::Info);
+                }
+            }
         }
     }
 
@@ -1519,10 +1967,15 @@ impl App {
                     self.toast(format!("pattern for new runs: {arg}"), Level::Info);
                 }
             }
+            "/runs" => self.open_runs(),
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
+            "/respawn" => match target {
+                Some(a) => self.respawn_agent(a),
+                None => self.toast("no agent focused", Level::Info),
+            },
             "/land" => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Done).unwrap_or(false) {
                     self.with_run(|r, c| r.land(c));
@@ -1540,10 +1993,93 @@ impl App {
 
     pub fn studio_architect_send(&mut self, text: String) {
         let a = self.start_architect();
-        prompt_agent(&self.hub, &mut self.agents, a, text, true);
+        prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Auto);
     }
 
     pub fn shutdown(&mut self) {
         self.hub.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
+        let mut agents = BTreeMap::new();
+        let id: AgentId = 1;
+        let mut a = Agent::new(id, "worker", "worker", PathBuf::new());
+        a.status = Status::Busy;
+        a.turn_active = turn_active;
+        a.awaiting_start = awaiting_start;
+        agents.insert(id, a);
+        (agents, id)
+    }
+
+    fn test_hub_with(id: AgentId) -> (Hub, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hub = Hub::new(vec![], vec![], ev_tx, false);
+        let rx = hub.test_register(id);
+        (hub, rx)
+    }
+
+    #[test]
+    fn enter_queues_behind_a_busy_turn_without_steering() {
+        let (mut agents, id) = busy_agent(true, false);
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "use axum instead".into(), true, Send::Queue);
+        assert_eq!(agents[&id].queued.len(), 1);
+        assert!(rx.try_recv().is_err(), "Queue must not steer a busy turn");
+    }
+
+    #[test]
+    fn force_send_joins_the_queue_and_the_new_message_into_one_steer() {
+        let (mut agents, id) = busy_agent(true, false);
+        let (hub, mut rx) = test_hub_with(id);
+        agents.get_mut(&id).unwrap().queued.push("first queued".into());
+        prompt_agent(&hub, &mut agents, id, "and now this".into(), true, Send::Force);
+        assert!(agents[&id].queued.is_empty(), "Force must drain the queue");
+        match rx.try_recv() {
+            Ok(Cmd::Steer { text }) => assert_eq!(text, "first queued\n\nand now this"),
+            other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    #[test]
+    fn force_send_on_a_starting_turn_defers_to_the_queue() {
+        // awaiting_start (turn hasn't produced its first event yet): Force can't steer a turn
+        // that doesn't exist, so it queues — the existing turn/started drain delivers it.
+        let (mut agents, id) = busy_agent(false, true);
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "one more thing".into(), true, Send::Force);
+        assert_eq!(agents[&id].queued, vec!["one more thing".to_string()]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_send_on_an_idle_agent_behaves_like_enter() {
+        let (mut agents, id) = busy_agent(false, false);
+        agents.get_mut(&id).unwrap().status = Status::Idle;
+        let (hub, mut rx) = test_hub_with(id);
+        prompt_agent(&hub, &mut agents, id, "go".into(), true, Send::Force);
+        assert!(agents[&id].awaiting_start);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Turn { text }) if text == "go"));
+    }
+
+    #[test]
+    fn backspace_on_empty_input_restores_the_last_queued_message_for_editing() {
+        let mut agent = Agent::new(1, "worker", "worker", PathBuf::new());
+        agent.queued.push("keep this queued".into());
+        agent.queued.push("edit me".into());
+        let mut input = Input::default();
+        // Mirrors App::on_key's Backspace-on-empty-input arm.
+        if input.is_empty() {
+            if let Some(text) = agent.queued.pop() {
+                input.set(&text);
+            }
+        }
+        assert_eq!(input.text(), "edit me");
+        assert_eq!(agent.queued, vec!["keep this queued".to_string()]);
     }
 }

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build)",
+      "Bash(cargo build *)",
+      "Bash(cargo test)",
+      "Bash(cargo test *)",
+      "Bash(./scripts/stress.sh)",
+      "Workflow",
+      "Agent"
+    ]
+  }
+}

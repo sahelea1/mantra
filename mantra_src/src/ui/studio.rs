@@ -1,17 +1,25 @@
 //! Pattern Studio (roles, flow, settings + an architect agent) and the Models screen.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, Screen};
+use crate::app::{App, EditTarget, Overlay, Screen, StudioSel};
 use crate::config::ProviderEntry;
-use crate::engine::pattern::{FinaleStep, Role, COLORS, KINDS};
+use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, KINDS, PERMISSIONS};
 use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 
 const GLYPHS: &[&str] = &["✦", "◉", "◇", "◆", "◎", "▲", "■", "●", "★", "◈", "▣", "⬡", "♦", "▼"];
+/// Sane upper bound (24h) for `watchdog_seconds`/`watchdog_escalate_seconds`: keeps
+/// `es_secs.saturating_mul(2)` in `Run::watchdog_tick` well clear of `u64::MAX` and rules out a
+/// typo (or a pasted huge number) leaving the watchdog effectively disabled.
+const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
+/// Floors for `watchdog_seconds`/`watchdog_escalate_seconds`, shared by the nudge (+/-) and
+/// free-text edit paths so the two don't disagree on what's a valid value.
+const WATCHDOG_SECONDS_MIN: u64 = 15;
+const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
+const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -19,6 +27,36 @@ fn entries(app: &App) -> Vec<String> {
     v.push("⚙ settings".into());
     v.push("⇢ flow".into());
     v
+}
+
+fn sel_for_entry(e: &str) -> StudioSel {
+    match e {
+        "⚙ settings" => StudioSel::Settings,
+        "⇢ flow" => StudioSel::Flow,
+        name => StudioSel::Role(name.to_string()),
+    }
+}
+
+/// `app.studio.sel`'s position in the current (re-sorted) list — for drawing and for ↑/↓, which
+/// step by index but must land back on an identity so a later re-sort can't move the highlight.
+fn sel_index(app: &App) -> usize {
+    let es = entries(app);
+    let i = match &app.studio.sel {
+        StudioSel::Settings => es.iter().position(|e| e == "⚙ settings"),
+        StudioSel::Flow => es.iter().position(|e| e == "⇢ flow"),
+        StudioSel::Role(name) => es.iter().position(|e| e == name),
+    };
+    i.unwrap_or(0).min(es.len().saturating_sub(1))
+}
+
+/// Select the `i`th entry of the current list by identity.
+fn select_by_index(app: &mut App, i: usize) {
+    let es = entries(app);
+    if es.is_empty() {
+        return;
+    }
+    let i = i.min(es.len() - 1);
+    app.studio.sel = sel_for_entry(&es[i]);
 }
 
 fn flow_fields(app: &App) -> Vec<String> {
@@ -55,6 +93,8 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "gate_max_rounds" => s.gate_max_rounds.to_string(),
                 "check_timeout_secs" => s.check_timeout_secs.to_string(),
                 "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
+                "watchdog_seconds" => s.watchdog_seconds.to_string(),
+                "watchdog_escalate_seconds" => s.watchdog_escalate_seconds.to_string(),
                 _ => String::new(),
             }
         }
@@ -85,9 +125,17 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "kind" => r.kind.clone(),
                 "glyph" => r.glyph.clone(),
                 "color" => r.color.clone(),
-                "model" => r.model.clone(),
+                "model" => {
+                    let m = app.registry.resolve(&r.model);
+                    if r.model.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} · {} · via {}", r.model, m.model, app.registry.provider_name(&m.provider))
+                    }
+                }
                 "effort" => r.effort.clone(),
                 "sandbox" => r.sandbox.clone(),
+                "permission" => r.permission.clone(),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
                 "description" => r.description.clone(),
                 "instructions" => r.instructions.clone(),
@@ -104,6 +152,17 @@ fn cycle<T: AsRef<str>>(list: &[T], cur: &str, d: i32) -> String {
     }
     let i = list.iter().position(|x| x.as_ref() == cur).map(|i| i as i32).unwrap_or(-1);
     list[((i + d).rem_euclid(n)) as usize].as_ref().to_string()
+}
+
+/// Enforces the floors and the `escalate > seconds` invariant that `Pattern::validate` requires
+/// (`engine/pattern.rs`), so neither the nudge (+/-) nor the free-text edit path can leave the
+/// two watchdog fields in a combination validate() would only reject later at save time.
+fn clamp_watchdog(s: &mut PatternSettings) {
+    s.watchdog_seconds = s.watchdog_seconds.clamp(WATCHDOG_SECONDS_MIN, WATCHDOG_SECONDS_MAX);
+    s.watchdog_escalate_seconds = s.watchdog_escalate_seconds.clamp(WATCHDOG_ESCALATE_MIN, WATCHDOG_SECONDS_MAX);
+    if s.watchdog_escalate_seconds <= s.watchdog_seconds {
+        s.watchdog_escalate_seconds = (s.watchdog_seconds + 1).min(WATCHDOG_SECONDS_MAX);
+    }
 }
 
 /// ←/→ on a field: cycle enumerations / step numbers / toggle booleans.
@@ -125,6 +184,14 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 "gate_max_rounds" => s.gate_max_rounds = (s.gate_max_rounds as i32 + d).max(1) as u32,
                 "check_timeout_secs" => s.check_timeout_secs = (s.check_timeout_secs as i64 + 60 * d as i64).max(60) as u64,
                 "max_tasks_per_phase" => step_u(&mut s.max_tasks_per_phase, 1),
+                "watchdog_seconds" => {
+                    s.watchdog_seconds = (s.watchdog_seconds as i64 + 15 * d as i64).clamp(WATCHDOG_SECONDS_MIN as i64, WATCHDOG_SECONDS_MAX as i64) as u64;
+                    clamp_watchdog(s);
+                }
+                "watchdog_escalate_seconds" => {
+                    s.watchdog_escalate_seconds = (s.watchdog_escalate_seconds as i64 + 30 * d as i64).clamp(WATCHDOG_ESCALATE_MIN as i64, WATCHDOG_SECONDS_MAX as i64) as u64;
+                    clamp_watchdog(s);
+                }
                 _ => return,
             }
         }
@@ -166,6 +233,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     r.effort = cycle(&effs, &r.effort, d);
                 }
                 "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
+                "permission" => r.permission = cycle(PERMISSIONS, &r.permission, d),
                 "max_tokens" => {
                     let cur = r.max_tokens.unwrap_or(0) as i64;
                     let next = cur + d as i64 * 250_000;
@@ -204,6 +272,14 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 ("gate_max_rounds", Some(v)) => s.gate_max_rounds = v.max(1) as u32,
                 ("check_timeout_secs", Some(v)) => s.check_timeout_secs = v.max(10),
                 ("max_tasks_per_phase", Some(v)) => s.max_tasks_per_phase = v.max(1) as usize,
+                ("watchdog_seconds", Some(v)) => {
+                    s.watchdog_seconds = v.clamp(WATCHDOG_SECONDS_MIN, WATCHDOG_SECONDS_MAX);
+                    clamp_watchdog(s);
+                }
+                ("watchdog_escalate_seconds", Some(v)) => {
+                    s.watchdog_escalate_seconds = v.clamp(WATCHDOG_ESCALATE_MIN, WATCHDOG_SECONDS_MAX);
+                    clamp_watchdog(s);
+                }
                 _ => {}
             }
             app.studio.dirty = true;
@@ -226,8 +302,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
             }
             app.studio.pattern.roles.insert(name.clone(), Role { description: "new role".into(), ..Default::default() });
             app.studio.dirty = true;
-            let es = entries(app);
-            app.studio.sel = es.iter().position(|e| *e == name).unwrap_or(0);
+            app.studio.sel = StudioSel::Role(name);
             app.studio.focus = 1;
         }
         EditTarget::NewPattern => {
@@ -264,6 +339,9 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     1 => p.name = t,
                     2 => p.base_url = t,
                     3 => p.env_key = t,
+                    4 => p.api_key = if t.is_empty() { None } else { Some(t) },
+                    5 => p.kind = parse_kind(&t),
+                    6 => p.auth = parse_auth(&t),
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -307,7 +385,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
     };
     let es = entries(app);
-    let sel = app.studio.sel.min(es.len() - 1);
+    let sel = sel_index(app);
     let flash = anim::fade(app.studio.flash, 900);
     // list
     let mut l = vec![];
@@ -360,6 +438,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         };
         let arrows = if is { format!(" {}", theme::g("◂ ▸", "< >")) } else { String::new() };
         fl.push(Line::from(vec![Span::styled(format!(" {}{:<20}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
+    }
+    if app.studio.focus == 1 && fs.get(fsel).map(|s| s.as_str()) == Some("permission") {
+        fl.push(Line::from(Span::styled(" off = the agent never asks (default for Mandala). Turn on only for roles you want to approve by hand; requests land in the inbox (ctrl+g).", theme::faint())));
     }
     fl.push(Line::default());
     fl.push(Line::from(Span::styled(" ←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())));
@@ -481,7 +562,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         return;
     }
     let es = entries(app);
-    let entry = es[app.studio.sel.min(es.len() - 1)].clone();
+    let entry = es[sel_index(app)].clone();
     let fs = fields(app, &entry);
     match k.code {
         KeyCode::Esc => {
@@ -489,7 +570,8 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.studio.focus == 0 {
-                app.studio.sel = app.studio.sel.saturating_sub(1);
+                let i = sel_index(app);
+                select_by_index(app, i.saturating_sub(1));
                 app.studio.field = 0;
             } else {
                 app.studio.field = app.studio.field.saturating_sub(1);
@@ -497,7 +579,8 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if app.studio.focus == 0 {
-                app.studio.sel = (app.studio.sel + 1).min(es.len() - 1);
+                let i = sel_index(app);
+                select_by_index(app, (i + 1).min(es.len() - 1));
                 app.studio.field = 0;
             } else {
                 app.studio.field = (app.studio.field + 1).min(fs.len().saturating_sub(1));
@@ -537,7 +620,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 }
                 "⇢ flow" => return nudge(app, &entry, &fname, 1),
                 role => {
-                    if ["kind", "color", "sandbox", "effort", "model"].contains(&fname.as_str()) {
+                    if ["kind", "color", "sandbox", "permission", "effort", "model"].contains(&fname.as_str()) {
                         return nudge(app, &entry, &fname, 1);
                     }
                     EditTarget::RoleField(role.to_string(), fname.clone())
@@ -570,9 +653,10 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 if used {
                     app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
                 } else {
+                    let i = sel_index(app);
                     app.studio.pattern.roles.remove(&entry);
                     app.studio.dirty = true;
-                    app.studio.sel = app.studio.sel.saturating_sub(1);
+                    select_by_index(app, i.saturating_sub(1));
                 }
             }
         }
@@ -583,31 +667,67 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
 // ───────────────────────────── models ─────────────────────────────
 
 const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
-const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key"];
+const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth"];
+/// Display strings for `ProviderEntry.kind` (WP10.2) — cycled with +/- on the providers grid the
+/// same way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above). Kept here rather
+/// than a `Display` impl on `ProviderKind` since it's presentation-only.
+const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode"];
+/// Display strings for `ProviderEntry.auth` (WP10.2; irrelevant for `Codex`-kind providers, but
+/// still editable so a provider can be flipped to `ClaudeCode` and given `auth` in one place).
+const PROV_AUTHS: &[&str] = &["subscription", "api_key"];
+
+fn kind_str(k: crate::config::ProviderKind) -> &'static str {
+    match k {
+        crate::config::ProviderKind::Codex => "Codex",
+        crate::config::ProviderKind::ClaudeCode => "ClaudeCode",
+    }
+}
+
+fn parse_kind(t: &str) -> crate::config::ProviderKind {
+    let t = t.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
+    if t == "claudecode" || t == "claude" {
+        crate::config::ProviderKind::ClaudeCode
+    } else {
+        crate::config::ProviderKind::Codex
+    }
+}
+
+fn parse_auth(t: &str) -> String {
+    let t = t.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if t == "api_key" || t == "apikey" || t == "key" {
+        "api_key".into()
+    } else {
+        "subscription".into()
+    }
+}
 
 pub fn draw_models(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let np = app.registry.providers.len() as u16;
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 7), Constraint::Length(1)]).split(area);
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 8), Constraint::Length(1)]).split(area);
     let mut crumbs = vec![Span::styled(format!("  {} models", theme::g("›", ">")), theme::faint())];
     if app.models_ui.dirty {
         crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
     }
     header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
-    let widths = [10usize, 9, 18, 9, 8, 8, 30, 30];
+    let widths = [10usize, 9, 18, 14, 14, 8, 30, 30];
     let mk_head = |cols: &[&str], ws: &[usize]| Line::from(cols.iter().zip(ws).map(|(c, w)| Span::styled(format!(" {:<w$}", c, w = *w), theme::bold(theme::muted()))).collect::<Vec<_>>());
     let mut l = vec![mk_head(MODEL_COLS, &widths)];
+    // Whole-thousands tokens print as "200k" (no decimal); anything else falls back to fmt_tokens.
+    let short_tokens = |n: u64| if n > 0 && n % 1000 == 0 { format!("{}k", n / 1000) } else { fmt_tokens(n) };
     for (ri, m) in app.registry.models.iter().enumerate() {
         let status = app.models_ui.status.get(&m.alias).cloned().unwrap_or_else(|| m.note.clone());
         let vals = [
             m.alias.clone(),
             m.provider.clone(),
             m.model.clone(),
-            m.context_window.map(fmt_tokens).unwrap_or_else(|| "default".into()),
-            match (m.auto_compact_percent, m.context_window) {
-                (Some(p), Some(_)) => format!("{p}%"),
-                (Some(p), None) => format!("{p}% {}", theme::g("⚠", "!")),
-                _ => "codex".into(),
+            match m.context_window {
+                Some(cw) => short_tokens(cw),
+                None => format!("{} (assumed)", short_tokens(m.effective_context())),
+            },
+            match m.auto_compact_percent {
+                Some(p) => format!("{p}%"),
+                None => format!("{}% (default)", m.effective_compact_percent()),
             },
             if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
             if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
@@ -616,8 +736,11 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         let mut spans = vec![];
         for (ci, v) in vals.iter().enumerate() {
             let is = !app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
+            let derived = (ci == 3 && m.context_window.is_none()) || (ci == 4 && m.auto_compact_percent.is_none());
             let st = if is {
                 Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if derived {
+                theme::dim()
             } else if ci == 5 {
                 theme::fg(effort_color(v))
             } else if ci == 7 && v.starts_with("ok") {
@@ -635,16 +758,29 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         l.push(Line::from(spans));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled(" context + compact % are passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
-    l.push(Line::from(Span::styled(" compact \"codex\" = Codex's own default · a % needs a context size to take effect (⚠) · +/- steps values", theme::faint())));
+    l.push(Line::from(Span::styled(" context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
+    l.push(Line::from(Span::styled(" dim \"(assumed)\" / \"(default)\" = not set here, using Mantra's built-in 200k / 85% · +/- steps values", theme::faint())));
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 
-    let pw = [10usize, 14, 42, 18];
+    let pw = [10usize, 12, 26, 14, 10, 11, 12];
     let mut pl = vec![mk_head(PROV_COLS, &pw)];
-    pl.push(Line::from(vec![Span::styled(format!(" {:<10} {:<12} {:<40}", "openai", "OpenAI", "(built into Codex — uses your codex login)"), theme::faint())]));
+    let openai_vals = ["openai", "OpenAI", "(built into Codex — uses your codex login)", "", "Codex", "—"];
+    let mut ospans = vec![];
+    for (ci, v) in openai_vals.iter().enumerate() {
+        ospans.push(Span::raw(" "));
+        ospans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), theme::faint()));
+    }
+    pl.push(Line::from(ospans));
     for (ri, p) in app.registry.providers.iter().enumerate() {
-        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()];
+        let masked = match &p.api_key {
+            Some(k) if !k.trim().is_empty() => {
+                let k = k.trim();
+                if k.len() > 4 { format!("••••{}", &k[k.len() - 4..]) } else { "••••".to_string() }
+            }
+            _ => String::new(),
+        };
+        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), masked, kind_str(p.kind).to_string(), p.auth.clone()];
         let mut spans = vec![];
         for (ci, v) in vals.iter().enumerate() {
             let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
@@ -652,16 +788,31 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
         }
-        let key_ok = !p.env_key.is_empty() && std::env::var(&p.env_key).is_ok();
-        spans.push(Span::styled(if key_ok { format!(" {} key set", theme::g("✓", "ok")) } else { format!(" {} ${} not set", theme::g("✗", "x"), p.env_key) }, if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+        // `ClaudeCode` + `subscription` needs no key at all (OAuth login) — a red "no key" for it
+        // would be misleading, so only check when a key is actually expected (Codex always;
+        // ClaudeCode only under `api_key`).
+        let needs_key = p.kind != crate::config::ProviderKind::ClaudeCode || p.auth == "api_key";
+        if !needs_key {
+            spans.push(Span::styled(format!(" {} subscription (OAuth login)", theme::g("○", "-")), theme::dim()));
+        } else {
+            let (key_msg, key_ok) = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                ("key set (env)".to_string(), true)
+            } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                ("key stored in models.toml".to_string(), true)
+            } else {
+                ("no key".to_string(), false)
+            };
+            spans.push(Span::styled(format!(" {} {key_msg}", if key_ok { theme::g("✓", "ok") } else { theme::g("✗", "x") }), if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+        }
         let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
         spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
         pl.push(Line::from(spans));
     }
-    pl.push(Line::from(Span::styled(" base_url = the provider's OpenAI-compatible API root (…/v1): Codex calls …/responses, discovery reads …/models", theme::faint())));
-    pl.push(Line::from(Span::styled(" env_key = the NAME of the environment variable holding the API key (the key itself is never stored) · D here = discover this provider", theme::faint())));
+    pl.push(Line::from(Span::styled(" base_url = the provider's API root: Codex reads …/v1/responses + …/v1/models; ClaudeCode uses it as ANTHROPIC_BASE_URL (bare host, no /v1) + …/v1/models for D", theme::faint())));
+    pl.push(Line::from(Span::styled(" env_key = name of an env var holding the key · api_key = paste one directly (stored 0600) · either works · D here = discover this provider", theme::faint())));
+    pl.push(Line::from(Span::styled(" kind = Codex | ClaudeCode · auth (ClaudeCode only) = subscription | api_key · +/- on either cycles it", theme::faint())));
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
-    f.render_widget(Paragraph::new(pl).block(block("providers (OpenAI Responses-compatible)", pcol)), rows[2]);
+    f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);
     footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", "test model"), ("D", "discover models"), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
 }
 
@@ -690,6 +841,20 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Down => ui.row = (ui.row + 1).min(nrows.saturating_sub(1)),
         KeyCode::Left => ui.col = ui.col.saturating_sub(1),
         KeyCode::Right => ui.col = (ui.col + 1).min(ncols - 1),
+        KeyCode::Char('+') | KeyCode::Char('-') if ui.providers => {
+            // Cycle `kind`/`auth` the same way +/- cycles enumerations on the models grid below,
+            // and the way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above) — the
+            // only in-app way to configure a third-party ClaudeCode provider (§10.2).
+            let d: i32 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
+            if let Some(p) = app.registry.providers.get_mut(ui.row) {
+                match ui.col {
+                    4 => p.kind = parse_kind(&cycle(PROV_KINDS, kind_str(p.kind), d)),
+                    5 => p.auth = cycle(PROV_AUTHS, &p.auth, d),
+                    _ => {}
+                }
+                app.models_ui.dirty = true;
+            }
+        }
         KeyCode::Char('+') | KeyCode::Char('-') if !ui.providers => {
             let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
             if let Some(m) = app.registry.models.get_mut(ui.row) {
@@ -714,8 +879,9 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Enter => {
             let (title, val, target) = if ui.providers {
                 let Some(p) = app.registry.providers.get(ui.row) else { return };
-                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone()][ui.col.min(3)].clone();
-                (format!("provider · {}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
+                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default(), kind_str(p.kind).to_string(), p.auth.clone()][ui.col.min(6)].clone();
+                let hint = if ui.col == 4 { " (either name an env var or paste a key)" } else { "" };
+                (format!("provider · {}{hint}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
             } else {
                 let Some(m) = app.registry.models.get(ui.row) else { return };
                 let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), m.note.clone()][ui.col].clone();
@@ -727,7 +893,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('n') => {
             if ui.providers {
-                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into() });
+                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into(), ..Default::default() });
                 ui.row = app.registry.providers.len() - 1;
             } else {
                 app.registry.models.push(crate::config::ModelEntry { alias: format!("model{}", app.registry.models.len() + 1), model: "model-id".into(), ..Default::default() });
@@ -763,5 +929,27 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review fix: `nudge()` and `apply_edit()` used to enforce different floors (15/30 vs 5/10)
+    /// and neither checked `escalate > watchdog_seconds`, so a value `Pattern::validate` would
+    /// reject was only caught at save time. `clamp_watchdog` is the single place both paths now
+    /// go through.
+    #[test]
+    fn clamp_watchdog_enforces_floor_and_escalate_gt_seconds() {
+        let mut s = PatternSettings { watchdog_seconds: 1, watchdog_escalate_seconds: 1, ..Default::default() };
+        clamp_watchdog(&mut s);
+        assert_eq!(s.watchdog_seconds, WATCHDOG_SECONDS_MIN);
+        assert!(s.watchdog_escalate_seconds > s.watchdog_seconds);
+
+        // Both individually within their own floors, but the combination validate() forbids.
+        let mut s = PatternSettings { watchdog_seconds: 90, watchdog_escalate_seconds: 30, ..Default::default() };
+        clamp_watchdog(&mut s);
+        assert!(s.watchdog_escalate_seconds > s.watchdog_seconds, "escalate must never end up <= seconds");
     }
 }

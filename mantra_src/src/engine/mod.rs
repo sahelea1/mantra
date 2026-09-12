@@ -2,5 +2,7 @@
 pub mod git;
 pub mod pattern;
 pub mod plan;
+pub mod resume;
 pub mod run;
+pub mod state;
 pub mod tools;

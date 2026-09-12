@@ -506,16 +506,24 @@ async fn solo(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn mock_plan(first: bool) -> Value {
+/// Shared with `mock_claude.rs` (WP10.6): the same demo plan, so a phase spawned by a Claude-backed
+/// planner looks identical to one spawned by a Codex-backed planner.
+pub(crate) fn mock_plan(first: bool) -> Value {
     let t = |id: &str, title: &str, role: &str, scope: &str, prompt: &str| json!({"id": id, "title": title, "role": role, "scope": [scope], "prompt": prompt, "acceptance": "builds, tests pass"});
+    let mut p1_tasks = vec![
+        t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
+        t("p1-config", "Config loader", "worker-small", if first { "src/models/**" } else { "src/config/**" }, "Add a typed configuration loader with defaults and env overrides."),
+    ];
+    // WP6 test scenario: a task whose model the provider rejects outright (ProviderRejected halt).
+    if std::env::var("MANTRA_MOCK_BADMODEL").is_ok() {
+        p1_tasks.push(t("p1-badmodel", "Feature flags", "worker-small", "src/flags/**", "Add a simple feature-flag lookup."));
+    }
     json!({"plan": {
         "title": "Build the requested feature set",
         "summary": "Three phases: shared foundations first, then the features in parallel, then integration and docs.",
         "orchestrator_brief": "Workers are independent inside a phase. Watch p2-auth closely (security-sensitive).",
         "phases": [
-            {"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": [
-                t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
-                t("p1-config", "Config loader", "worker-small", if first { "src/models/**" } else { "src/config/**" }, "Add a typed configuration loader with defaults and env overrides.")],
+            {"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": p1_tasks,
              "gate": {"checks": ["test -d src", "echo gate-ok"], "focus": "consistent naming", "criteria": "models and config compile together"}},
             {"id": "p2", "name": "Features", "goal": "The main features, in parallel", "tasks": [
                 t("p2-api", "HTTP API", "worker-big", "src/api/**", "Implement the REST handlers for the domain models with validation."),
@@ -572,6 +580,13 @@ async fn planner(e: &Em, text: &str) -> Outcome {
 }
 
 async fn orchestrator(e: &Em, text: &str) -> Outcome {
+    // WP7.2 demo: the watchdog nudged this (real, running) agent directly — acknowledge it and go
+    // back to `mantra_wait`; there is nothing else queued to react to.
+    if text.contains("[mantra:watchdog]") {
+        step!(e.think("**Watchdog nudge**\n\nNothing new since my last check — logging and waiting again.").await);
+        let _ = e.tool("mantra_wait", json!({})).await;
+        return Outcome::Done;
+    }
     if text.contains("[mantra:phase]") {
         let json_block = text.split("```json").nth(1).and_then(|s| s.split("```").next()).unwrap_or("{}");
         let phase: Value = serde_json::from_str(json_block).unwrap_or(json!({}));
@@ -603,7 +618,8 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn task_info(dev: &str) -> (String, String, Vec<String>) {
+/// Shared with `mock_claude.rs` (WP10.6).
+pub(crate) fn task_info(dev: &str) -> (String, String, Vec<String>) {
     let line = dev.lines().find(|l| l.starts_with("## Your task:")).unwrap_or("## Your task: task — work");
     let rest = line.trim_start_matches("## Your task:").trim();
     let mut parts = rest.splitn(2, " — ");
@@ -619,6 +635,22 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     let h: u64 = id.bytes().map(|b| b as u64).sum();
     let steps = [("Read the relevant code", "inProgress"), ("Implement", "pending"), ("Verify", "pending")];
     e.plan(&steps);
+    // WP7.2/7.6 demo (`MANTRA_MOCK_LAZY_ORCH=1`): this worker's process vanishes mid-task on its
+    // very first turn without reporting anything useful — the turn ends `interrupted`, which
+    // `Run::on_worker_done` does not advance out of `WState::Running` (that's the F3 rule: an
+    // interrupted-but-still-Running worker is "idle"). The mock orchestrator's default reaction to
+    // an "… was interrupted …" event is just a log line and `mantra_wait` (no `mantra_prompt`/
+    // `mantra_retry`), so nothing re-prompts this worker's own agent — it is the watchdog's
+    // `Expect::Working` nudge (`Run::watchdog_tick`), not any orchestrator-side self-heal, that
+    // eventually wakes it back up. This is the one place in the default demo pattern where the
+    // engine's other self-healing paths (the orchestrator's own "forgot to spawn" safety net,
+    // `wake_orch`, `check_phase_done`, …) don't already paper over the gap, so it is what
+    // `stress.sh` uses to exercise the watchdog end to end through a real running mock agent.
+    if id == "p1-config" && e.turns() == 1 && std::env::var("MANTRA_MOCK_LAZY_ORCH").is_ok() {
+        step!(e.think(&format!("**{title}**\n\nReading the surrounding code to match existing conventions.")).await);
+        step!(e.sleep(200).await);
+        return Outcome::Interrupted;
+    }
     if text.contains("[mantra:retry]") || text.contains("[mantra:resume]") {
         step!(e.think("**Resuming**\n\nPicking up where the previous attempt stopped.").await);
     } else if !text.contains("[from") {
@@ -644,6 +676,12 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     if id.ends_with("-auth") && e.turns() == 1 {
         step!(e.sleep(500).await);
         return Outcome::Failed(json!({"responseStreamDisconnected": {"httpStatusCode": 502}}), "stream disconnected before completion".into());
+    }
+    // Demo (WP6, MANTRA_MOCK_BADMODEL=1): the provider rejects this model/role outright — a
+    // deterministic 400 that must halt with ProviderRejected, never retry.
+    if id.ends_with("-badmodel") && e.turns() == 1 {
+        step!(e.sleep(300).await);
+        return Outcome::Failed(json!("badRequest"), "Unexpected message role: developer".into());
     }
     step!(e.sleep(300 + (h % 7) * 250).await);
     step!(e.write(&format!("{dir}/{}_test.rs", id.replace('-', "_")), &format!("#[test]\nfn {}_works() {{ assert!(true); }}\n", id.replace('-', "_"))).await);
@@ -689,7 +727,8 @@ async fn architect(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
-fn camel(s: &str) -> String {
+/// Shared with `mock_claude.rs` (WP10.6).
+pub(crate) fn camel(s: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|p| !p.is_empty()).map(|p| {
         let mut c = p.chars();
         c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()

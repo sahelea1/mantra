@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,12 +34,16 @@ impl std::fmt::Display for RpcError {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<std::result::Result<Value, RpcError>>>>>;
+/// Last few stderr lines, ANSI-stripped, kept around so a crash reason (even one raised before the
+/// process has actually exited, e.g. a `thread/start` RPC failure) can show *something* useful.
+type TailBuf = Arc<Mutex<VecDeque<String>>>;
 
 #[derive(Clone)]
 pub struct Conn {
     out: mpsc::UnboundedSender<String>,
     pending: Pending,
     next: Arc<AtomicI64>,
+    stderr_tail: TailBuf,
 }
 
 impl Conn {
@@ -85,15 +89,24 @@ impl Conn {
     pub fn respond_err(&self, id: Value, code: i64, message: &str) {
         let _ = self.out.send(json!({ "id": id, "error": { "code": code, "message": message } }).to_string());
     }
+
+    /// The last few stderr lines seen so far, newline-joined. Usable even before the process exits
+    /// (e.g. to explain a `thread/start` RPC failure while the process is still alive).
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
+    }
 }
 
-/// Spawn `cmd` and wire up reader/writer tasks.
-pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path) -> Result<(Conn, mpsc::UnboundedReceiver<Incoming>, Child)> {
+/// Spawn `cmd` and wire up reader/writer tasks. `envs` are set on the child in addition to the
+/// inherited environment (used to deliver an API key that lives only in `models.toml`, never on
+/// argv) — never logged.
+pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs: &[(String, String)]) -> Result<(Conn, mpsc::UnboundedReceiver<Incoming>, Child)> {
     let (prog, args) = cmd.split_first().ok_or_else(|| anyhow!("empty codex command"))?;
     let mut c = Command::new(prog);
     c.args(args)
         .args(extra_args)
         .current_dir(cwd)
+        .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,7 +119,8 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path) -> Re
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let stderr_tail: TailBuf = Arc::new(Mutex::new(VecDeque::new()));
+    const TAIL_LINES: usize = 5;
 
     // writer
     tokio::spawn(async move {
@@ -119,18 +133,46 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path) -> Re
         }
     });
 
-    // stderr → tail buffer + log
+    // stderr → tail buffer (ANSI-stripped, last N lines) + log (raw, for on-disk debugging)
     {
         let tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            // Codex can emit the same diagnostic thousands of times per turn (`OutputTextDelta
+            // without active item`); collapse repeats and drop known noise so the log stays useful.
+            let mut last: Option<String> = None;
+            let mut repeats: u32 = 0;
+            let mut dropped: u32 = 0;
             while let Ok(Some(l)) = lines.next_line().await {
-                crate::mlog!("[codex stderr] {}", crate::util::trunc(&l, 400));
-                if let Ok(mut t) = tail.lock() {
-                    t.push_str(&l);
-                    t.push('\n');
-                    crate::util::tail_bytes(&mut t, 2000);
+                let clean = crate::util::strip_ansi(&l);
+                if is_stderr_noise(&clean) {
+                    dropped += 1;
+                    continue;
                 }
+                if last.as_deref() == Some(clean.as_str()) {
+                    repeats += 1;
+                    continue;
+                }
+                if repeats > 0 {
+                    crate::mlog!("[codex stderr] … previous line repeated {repeats}×");
+                    repeats = 0;
+                }
+                crate::mlog!("[codex stderr] {}", crate::util::trunc(&clean, 400));
+                last = Some(clean.clone());
+                if !clean.trim().is_empty() {
+                    if let Ok(mut t) = tail.lock() {
+                        t.push_back(clean);
+                        while t.len() > TAIL_LINES {
+                            t.pop_front();
+                        }
+                    }
+                }
+            }
+            if repeats > 0 {
+                crate::mlog!("[codex stderr] … previous line repeated {repeats}×");
+            }
+            if dropped > 0 {
+                crate::mlog!("[codex stderr] {dropped} known-noise line(s) dropped");
             }
         });
     }
@@ -166,12 +208,12 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path) -> Re
                     let _ = tx.send(Err(RpcError { code: -1, message: "codex process exited".into() }));
                 }
             }
-            let t = tail.lock().map(|t| t.clone()).unwrap_or_default();
+            let t = tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
             let _ = in_tx.send(Incoming::Closed { stderr_tail: t });
         });
     }
 
-    Ok((Conn { out: out_tx, pending, next: Arc::new(AtomicI64::new(1)) }, in_rx, child))
+    Ok((Conn { out: out_tx, pending, next: Arc::new(AtomicI64::new(1)), stderr_tail }, in_rx, child))
 }
 
 fn route(v: Value, pending: &Pending, in_tx: &mpsc::UnboundedSender<Incoming>) {
@@ -225,4 +267,25 @@ pub async fn handshake(conn: &Conn) -> std::result::Result<Value, RpcError> {
         .await?;
     conn.notify("initialized", json!({}));
     Ok(r)
+}
+
+/// Codex diagnostics that carry no information for Mantra users and repeat in bulk.
+fn is_stderr_noise(line: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "OutputTextDelta without active item",
+        "unsupported call: multi_agent_v1",
+        "cannot update goal because this thread has no goal",
+        "resources/read failed for `codex_apps`",
+    ];
+    NOISE.iter().any(|n| line.contains(n))
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    #[test]
+    fn noise_filter() {
+        assert!(super::is_stderr_noise("2026-09-11T21:35:40Z ERROR codex_core::util: OutputTextDelta without active item"));
+        assert!(super::is_stderr_noise("ERROR codex_core::tools::router: error=unsupported call: multi_agent_v1"));
+        assert!(!super::is_stderr_noise("ERROR codex_app_server: Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces."));
+    }
 }

@@ -30,23 +30,20 @@ const CTX_KEYS: &[&str] = &[
 const NESTED: &[&str] = &["top_provider", "limits", "limit", "capabilities", "metadata", "meta", "info", "architecture"];
 const NOT_CHAT: &[&str] = &["embed", "whisper", "tts", "dall-e", "moderation", "rerank", "transcri", "speech", "audio", "image-gen", "text-to-image"];
 
-pub fn list_models(base_url: &str, env_key: &str) -> Result<Vec<Found>, String> {
+/// `key` is the already-resolved API key (from `ProviderEntry::resolve_key`), if any — this
+/// function no longer looks at the environment itself, so a key pasted into `api_key` works too.
+pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<Found>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("set the provider's base URL first".into());
     }
-    let key = if env_key.trim().is_empty() {
-        None
-    } else {
-        Some(std::env::var(env_key.trim()).map_err(|_| format!("${} is not set in the environment Mantra was started from", env_key.trim()))?)
-    };
     let mut urls = vec![format!("{base}/models")];
     if !base.ends_with("/v1") {
         urls.push(format!("{base}/v1/models"));
     }
     let mut last = String::new();
     for url in urls {
-        match curl_get(&url, key.as_deref()) {
+        match curl_get(&url, key) {
             Ok((200..=299, body)) => {
                 return parse_models(&body).ok_or_else(|| format!("{url} answered, but not with a model list: {}", crate::util::trunc(body.trim(), 120)));
             }
@@ -126,7 +123,10 @@ pub fn parse_models(body: &str) -> Option<Vec<Found>> {
             continue;
         }
         if !out.iter().any(|f| f.id == id) {
-            out.push(Found { context: context_of(item), reasoning: reasoning_of(item), id });
+            // LibertAI/OpenRouter-style catalogues often say nothing about reasoning but name
+            // the thinking variant in the id (`glm-5.3-thinking`): those accept an effort.
+            let reasoning = reasoning_of(item).or_else(|| lower.contains("thinking").then_some(true));
+            out.push(Found { context: context_of(item), reasoning, id });
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -174,6 +174,21 @@ pub struct Candidate {
 
 fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
+}
+
+/// The six built-in Claude Code models (`config::claude_default_model_entries`) as discovery
+/// candidates: there is no `/models` endpoint for a subscription, so these are always "found"
+/// locally for any `ClaudeCode`-kind provider — the built-in `claude` provider (already
+/// pre-populated by `Registry::defaults()`, so these come back `Configured`), or a second,
+/// third-party-gateway provider a user adds by hand (`v02plan.md` §10.2, §10.5).
+pub fn claude_defaults(provider_id: &str) -> Vec<Candidate> {
+    crate::config::claude_default_model_entries(provider_id)
+        .into_iter()
+        .map(|m| {
+            let efforts = m.efforts();
+            Candidate { provider: provider_id.to_string(), model: m.model, context: m.context_window, context_known: true, efforts, default_effort: m.default_effort, note: m.note, state: CState::New, selected: false }
+        })
+        .collect()
 }
 
 /// A model found on a custom provider.
@@ -286,6 +301,16 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 mod tests {
     use super::*;
     #[test]
+    fn claude_defaults_are_new_candidates_with_known_context_and_efforts() {
+        let cands = claude_defaults("claude2");
+        assert_eq!(cands.len(), 8, "6 base models + 2 [1m] variants");
+        assert!(cands.iter().all(|c| c.provider == "claude2" && c.context_known && !c.efforts.is_empty()));
+        let sonnet = cands.iter().find(|c| c.model == "claude-sonnet-5").expect("sonnet5");
+        assert_eq!(sonnet.context, Some(200_000));
+        let sonnet_1m = cands.iter().find(|c| c.model == "claude-sonnet-5[1m]").expect("sonnet5-1m");
+        assert_eq!(sonnet_1m.context, Some(1_000_000));
+    }
+    #[test]
     fn parses_common_provider_shapes() {
         let openai = r#"{"object":"list","data":[{"id":"glm-4.6","object":"model"},{"id":"text-embedding-3-small"},{"id":"glm-4.5-air"}]}"#;
         let m = parse_models(openai).unwrap();
@@ -314,6 +339,10 @@ mod tests {
         assert_eq!(get("z-ai/glm-5.2").reasoning, Some(true));
         assert_eq!(get("meta/llama-4").reasoning, Some(false));
         assert_eq!(get("plain").reasoning, None);
+        let lib = r#"{"data":[{"id":"glm-5.3-thinking","object":"model"},{"id":"glm-5.3","object":"model"}]}"#;
+        let m = parse_models(lib).unwrap();
+        assert_eq!(m.iter().find(|f| f.id == "glm-5.3-thinking").unwrap().reasoning, Some(true), "a -thinking id is reasoning-capable");
+        assert_eq!(m.iter().find(|f| f.id == "glm-5.3").unwrap().reasoning, None);
         let c = from_provider("zai", &get("z-ai/glm-5.2"));
         assert_eq!((c.context, c.context_known, c.efforts.len()), (Some(202752), true, 3));
         let c = from_provider("zai", &get("plain"));

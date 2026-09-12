@@ -130,10 +130,6 @@ impl Plan {
         }
     }
 
-    pub fn task(&self, id: &str) -> Option<(usize, &Task)> {
-        self.phases.iter().enumerate().find_map(|(i, p)| p.tasks.iter().find(|t| t.id == id).map(|t| (i, t)))
-    }
-
     pub fn to_markdown(&self) -> String {
         let mut s = format!("# {}\n\n{}\n\n", self.title, self.summary);
         for (i, ph) in self.phases.iter().enumerate() {

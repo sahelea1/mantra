@@ -166,6 +166,12 @@ pub fn model_chip(a: &Agent, app: &App) -> Vec<Span<'static>> {
         v.push(Span::raw(" "));
         v.push(Span::styled(theme::effort_bar(&a.effort, &efforts), theme::fg(effort_color(&a.effort))));
     }
+    // Only worth naming the provider once there's more than one to confuse it with (the built-in
+    // "openai" is implicit and never shown on its own).
+    if !app.registry.providers.is_empty() {
+        v.push(Span::styled(" · via ", theme::faint()));
+        v.push(Span::styled(app.registry.provider_name(&m.provider), theme::dim()));
+    }
     if let Some(p) = a.ctx_percent() {
         let col = if p >= 85 { theme::RED } else if p >= 65 { theme::AMBER } else { theme::MUTED };
         v.push(Span::styled(" · ", theme::faint()));
@@ -192,17 +198,6 @@ pub fn effort_color(e: &str) -> (u8, u8, u8) {
         "max" => theme::SAFFRON,
         "ultra" => theme::ROSE,
         _ => theme::TEXT,
-    }
-}
-
-pub fn status_color(a: &Agent) -> (u8, u8, u8) {
-    match &a.status {
-        Status::Busy => theme::named(&a.color),
-        Status::Waiting | Status::Retrying(_) => theme::AMBER,
-        Status::Failed(_) | Status::Crashed(_) => theme::RED,
-        Status::Stopped => theme::GRAY,
-        Status::Starting => theme::MUTED,
-        Status::Idle => theme::GREEN,
     }
 }
 
@@ -271,6 +266,54 @@ pub fn draw_input(f: &mut Frame, area: Rect, app: &App, placeholder: &str, color
     f.render_widget(Paragraph::new(lines), inner);
     if focused {
         f.set_cursor_position((inner.x + 2 + cc as u16, inner.y + (cr - start) as u16));
+    }
+}
+
+/// Height (0 or 1) of the queued-message chip row for the given agent — 0 collapses the row
+/// entirely when nothing is queued.
+pub fn queue_chip_height(app: &App, id: Option<crate::hub::AgentId>) -> u16 {
+    if id.and_then(|a| app.agents.get(&a)).map(|a| !a.queued.is_empty()).unwrap_or(false) {
+        1
+    } else {
+        0
+    }
+}
+
+/// "⏳ queued 2 · "…" · ctrl+f send now · backspace on empty input to edit" — shown directly
+/// above the input box while the given agent (the focused agent in Solo/Zoom, the selected node
+/// on the stage) has messages waiting behind its current turn.
+pub fn draw_queue_chip(f: &mut Frame, area: Rect, app: &App, id: Option<crate::hub::AgentId>) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(a) = id.and_then(|a| app.agents.get(&a)) else { return };
+    if a.queued.is_empty() {
+        return;
+    }
+    let n = a.queued.len();
+    let preview = a.queued.last().map(|s| trunc(&s.replace('\n', " "), 40)).unwrap_or_default();
+    let line = Line::from(vec![
+        Span::styled(format!(" {} queued {n}", theme::g("⏳", "...")), theme::bold(theme::fg(theme::AMBER))),
+        Span::styled(format!(" · \"{preview}\""), theme::dim()),
+        Span::styled("  ctrl+f send now · backspace on empty input to edit", theme::faint()),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// A brief tint across the header right after switching between the overview and a zoomed
+/// agent, so the jump never feels silent. Never armed when `reduce_motion` is set (see
+/// `App::set_screen`), so this naturally does nothing in that case.
+pub fn draw_screen_flash(f: &mut Frame, area: Rect, app: &App, color: (u8, u8, u8)) {
+    let k = anim::fade(app.flash_screen, 400);
+    if k <= 0.0 {
+        return;
+    }
+    let bg = theme::mix(theme::FAINT, color, k);
+    let buf = f.buffer_mut();
+    for x in area.x..area.x + area.width {
+        if let Some(cell) = buf.cell_mut((x, area.y)) {
+            cell.set_bg(bg);
+        }
     }
 }
 

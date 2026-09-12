@@ -137,12 +137,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Small terminals (tmux splits!) lose the peek strip first, then the rail's second line.
     let peek_h = if has_run && !app.stage_nodes().is_empty() && area.height >= 26 { 4 } else { 0 };
     let rail_h = if !has_run { 0 } else if area.height >= 20 { 2 } else { 1 };
+    let sel_agent = app.stage_nodes().get(app.sel).copied();
+    let chip_h = super::queue_chip_height(app, sel_agent);
     let in_h = input_height(app, area.width).min(area.height.saturating_sub(8).max(3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(rail_h), Constraint::Min(4), Constraint::Length(peek_h), Constraint::Length(in_h), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Length(rail_h), Constraint::Min(4), Constraint::Length(peek_h), Constraint::Length(chip_h), Constraint::Length(in_h), Constraint::Length(1)])
         .split(area);
     draw_header(f, rows[0], app);
+    super::draw_screen_flash(f, rows[0], app, theme::MUTED);
     draw_rail(f, rows[1], app);
     let show_pulse = app.pulse_panel && has_run && rows[2].width >= 110;
     let body = if show_pulse {
@@ -157,29 +160,35 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if peek_h > 0 {
         draw_peek(f, rows[3], app);
     }
-    let placeholder = match app.run.as_ref().map(|r| &r.stage) {
-        None | Some(Stage::Done) | Some(Stage::Failed(_)) => "describe what to build — the planner takes it from here…",
-        Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan",
-        Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…",
-        _ => "re-prompt the planner · @agent to talk to one agent directly",
+    super::draw_queue_chip(f, rows[4], app, sel_agent);
+    let placeholder = if app.canvas_focus {
+        "navigating — ←→↑↓ select · ⏎ zoom · 1-9 jump · tab to type".to_string()
+    } else {
+        match app.run.as_ref().map(|r| &r.stage) {
+            None | Some(Stage::Done) | Some(Stage::Failed(_)) => "describe what to build — the planner takes it from here…".to_string(),
+            Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan".to_string(),
+            Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…".to_string(),
+            _ => "re-prompt the planner · @agent to talk to one agent directly".to_string(),
+        }
     };
-    draw_input(f, rows[4], app, placeholder, theme::VIOLET, !app.canvas_focus);
-    draw_suggestions(f, rows[4], app);
+    draw_input(f, rows[5], app, &placeholder, theme::VIOLET, !app.canvas_focus);
+    draw_suggestions(f, rows[5], app);
     let hints: Vec<(&str, &str)> = if app.canvas_focus {
-        vec![("←→", "select"), ("⏎", "zoom"), ("space", "pause"), ("r", "retry"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
+        vec![("←→", "select"), ("1-9", "jump"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
     } else {
         let mode: &'static str = match app.settings.approval_mode.as_str() {
             "never" => "approvals: never ask",
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "send"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("alt+←→", "select"), ("⏎ empty", "zoom"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
+        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("alt+←→", "select"), ("⏎ empty", "zoom"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
     };
-    footer(f, rows[5], &hints);
+    footer(f, rows[6], &hints);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut crumbs = vec![Span::styled("  mandala", theme::bold(theme::fg(theme::VIOLET)))];
+    crumbs.push(Span::styled(format!("  {} overview", theme::g("›", ">")), theme::faint()));
     let mut right = vec![];
     if let Some(b) = app.inbox_badge() {
         right.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
@@ -189,15 +198,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             crumbs.push(Span::styled(format!("  {}", trunc(&r.id, if area.width < 110 { 18 } else { 30 })), theme::dim()));
             crumbs.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
             if app.demo {
-                crumbs.insert(1, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
+                crumbs.insert(2, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
             let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-            if r.paused {
-                right.push(Span::styled(format!(" {} PAUSED ", theme::g("‖", "||")), Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED)));
-                right.push(Span::raw("  "));
-            }
-            right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.started.elapsed())), theme::muted()));
+            // The halt band (drawn in the rail, just under this header) already says why and
+            // what to do — no separate badge needed here.
+            right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
         }
@@ -212,6 +219,14 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     let Some(r) = &app.run else {
         return;
     };
+    if let Some(h) = &r.halt {
+        let hint = r.halt_hint();
+        let text = format!(" {} halted {} · {} · {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()), h.message, hint);
+        let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
+        f.render_widget(Paragraph::new(vec![line]), area);
+        return;
+    }
     let names: Vec<String> = r.plan.as_ref().map(|p| p.phases.iter().map(|x| x.name.clone()).collect()).unwrap_or_default();
     // state per rail item: 0 pending, 1 active, 2 done
     let mut items: Vec<(String, u8)> = vec![];
@@ -339,6 +354,17 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     let chain: Vec<String> = p.flow.finale.iter().map(|s| format!("{} {}", p.role(&s.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default(), s.role)).collect();
     l.push(Line::from(Span::styled(format!("   flow  plan → phases (parallel workers → {} gate) → {}", p.flow.phase_gate, chain.join(" → ")), theme::dim())));
     l.push(Line::from(Span::styled("   /pattern to switch · s or /studio to edit · /models for models & effort", theme::faint())));
+    if !app.unfinished_runs.is_empty() {
+        let n = app.unfinished_runs.len();
+        l.push(Line::default());
+        l.push(Line::from(Span::styled(format!("   {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
+    }
+    if let Some(w) = &app.sandbox_warning {
+        l.push(Line::default());
+        let width = area.width.saturating_sub(16) as usize;
+        l.push(Line::from(Span::styled(format!("   {} sandbox: {}", theme::g("⚠", "!"), trunc(w, width.max(20))), theme::fg(theme::AMBER))));
+        l.push(Line::from(Span::styled("     workers' commands would fail under Codex's sandbox — mantra doctor shows the fix", theme::faint())));
+    }
     f.render_widget(Paragraph::new(l), area);
 }
 
@@ -366,7 +392,14 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let role: Option<&Role> = run.pattern.role(&t.role);
     let base = role.map(|r| theme::named(&r.color)).unwrap_or(theme::TEAL);
     let v = vstate(w, a);
-    let (mut st, dotted) = card_border(base, v, a);
+    let (mut st, mut dotted) = card_border(base, v, a);
+    // WP7.6: the watchdog escalation ladder has fired on this agent — override the border amber
+    // dotted regardless of its ordinary visual state, and (below) its activity line.
+    let watchdog = a.and_then(|ag| run.watchdog_idle(ag.id));
+    if watchdog.is_some() {
+        st = theme::fg(theme::AMBER);
+        dotted = true;
+    }
     if selected {
         st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
     }
@@ -411,31 +444,35 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     }
     // line 2: activity
     if h >= 4 {
-        let line: Vec<Span> = match (v, a) {
-            (V::NotStarted, _) => vec![Span::styled(trunc(&t.title, iw as usize), theme::faint())],
-            (V::Queued, _) => vec![Span::styled("waiting for a free slot", theme::faint())],
-            (V::Done, _) => {
-                let s = w.map(|w| w.report.lines().find(|l| l.to_lowercase().starts_with("summary:")).map(|l| l[8..].trim().to_string()).unwrap_or_else(|| t.title.clone())).unwrap_or_default();
-                vec![Span::styled(trunc(&s, iw as usize), theme::dim())]
+        let line: Vec<Span> = if let Some(idle) = watchdog {
+            vec![Span::styled(format!("idle {}m · watchdog", (idle.as_secs() / 60).max(1)), theme::fg(theme::AMBER))]
+        } else {
+            match (v, a) {
+                (V::NotStarted, _) => vec![Span::styled(trunc(&t.title, iw as usize), theme::faint())],
+                (V::Queued, _) => vec![Span::styled("waiting for a free slot", theme::faint())],
+                (V::Done, _) => {
+                    let s = w.map(|w| w.report.lines().find(|l| l.to_lowercase().starts_with("summary:")).map(|l| l[8..].trim().to_string()).unwrap_or_else(|| t.title.clone())).unwrap_or_default();
+                    vec![Span::styled(trunc(&s, iw as usize), theme::dim())]
+                }
+                (V::Failed, _) => {
+                    let m = match w.map(|w| &w.state) {
+                        Some(WState::Failed(m)) => m.clone(),
+                        _ => a.map(|a| a.activity.clone()).unwrap_or_default(),
+                    };
+                    vec![Span::styled(trunc(&m, iw as usize), theme::fg(theme::RED))]
+                }
+                (V::Retrying, _) => {
+                    let t = match w.map(|w| &w.state) {
+                        Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
+                        _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
+                    };
+                    vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
+                }
+                (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
+                (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
+                (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
+                _ => vec![],
             }
-            (V::Failed, _) => {
-                let m = match w.map(|w| &w.state) {
-                    Some(WState::Failed(m)) => m.clone(),
-                    _ => a.map(|a| a.activity.clone()).unwrap_or_default(),
-                };
-                vec![Span::styled(trunc(&m, iw as usize), theme::fg(theme::RED))]
-            }
-            (V::Retrying, _) => {
-                let t = match w.map(|w| &w.state) {
-                    Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
-                    _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
-                };
-                vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
-            }
-            (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
-            (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
-            (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
-            _ => vec![],
         };
         cv.spans(x, y + 2, &line, iw);
     }
@@ -462,7 +499,8 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let _ = app;
 }
 
-fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
+#[allow(clippy::too_many_arguments)]
+fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
     let v = match a {
         None => V::NotStarted,
         Some(a) => match &a.status {
@@ -478,10 +516,19 @@ fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, 
     if v == V::Queued {
         st = theme::fg(theme::mix_rgb(color, theme::FAINT));
     }
+    // WP7.6: watched-idle agent (planner/orchestrator/gate/finale) — amber dotted border + an
+    // "idle Nm · watchdog" label overriding the ordinary line2 content, same treatment as
+    // `worker_card`.
+    let watchdog = a.and_then(|ag| run.watchdog_idle(ag.id));
+    let mut dotted = a.is_none();
+    if watchdog.is_some() {
+        st = theme::fg(theme::AMBER);
+        dotted = true;
+    }
     if selected {
         st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
     }
-    cv.boxed(r, st, selected, a.is_none());
+    cv.boxed(r, st, selected, dotted && !selected);
     let (x, y, iw) = (r.x as i32 + 2, r.y as i32, r.width as i32 - 4);
     let mut title = vec![Span::raw(" "), Span::styled(format!("{} ", theme::role_glyph(glyph)), theme::bold(theme::fg(color))), Span::styled(name.to_string(), theme::bold(theme::text()))];
     if let Some(a) = a {
@@ -502,6 +549,10 @@ fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, 
         }
     }
     if r.height >= 4 {
+        let line2 = match watchdog {
+            Some(idle) => vec![Span::styled(format!("idle {}m · watchdog", (idle.as_secs() / 60).max(1)), theme::fg(theme::AMBER))],
+            None => line2,
+        };
         cv.spans(x, y + 2, &line2, iw);
     }
 }
@@ -516,14 +567,14 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     let r = Rect { x: (area.x as i32 + (area.width as i32 - w) / 2) as u16, y: area.y + 1, width: w as u16, height: h as u16 };
     let line2 = match (run.stage == Stage::Review, a.map(|a| &a.status)) {
         (true, _) => vec![Span::styled(format!("{} plan ready · p to review · tab → a to approve · or type feedback", theme::g("☰", "=")), theme::bold(theme::accent()))],
-        (_, _) if run.paused => vec![Span::styled(format!("{} paused — see the alert (ctrl+g), fix it, then space to resume", theme::g("‖", "=")), theme::fg(theme::AMBER))],
+        (_, _) if run.halted() => vec![Span::styled(format!("{} halted — {}", theme::g("⛔", "X"), run.halt_hint()), theme::fg(theme::AMBER))],
         (_, Some(Status::Failed(m))) | (_, Some(Status::Crashed(m))) => vec![Span::styled(trunc(m, (w as usize).saturating_sub(4)), theme::fg(theme::RED))],
         (_, Some(Status::Retrying(m))) => vec![Span::styled(format!("retrying: {}", trunc(m, (w as usize).saturating_sub(14))), theme::fg(theme::AMBER))],
         (_, Some(Status::Starting)) | (_, None) => vec![Span::styled("starting codex…", theme::faint())],
         _ => vec![Span::styled("exploring the repo & designing phases…", theme::faint())],
     };
     let sel = nodes.first().copied() == run.planner && app.sel == 0;
-    agent_card(cv, r, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
+    agent_card(cv, r, run, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
     if let Some(a) = a {
         let lines = a.tail_lines((h as usize).saturating_sub(5));
         for (i, l) in lines.iter().enumerate() {
@@ -602,13 +653,13 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let last = oa.and_then(|a| a.tail_lines(1).pop()).unwrap_or_default();
         vec![Span::styled(trunc(&last, (orch_w as usize).saturating_sub(4)), theme::faint())]
     };
-    agent_card(cv, orch, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
+    agent_card(cv, orch, run, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
     if show_planner {
         let pr = Rect { x: (x0 + 1) as u16, y: y0 as u16, width: 26, height: 3 };
         let pa = run.planner.and_then(|p| app.agents.get(&p));
         let pcol = role_col(run, &run.pattern.flow.planner);
         let pglyph = run.pattern.role(&run.pattern.flow.planner).map(|r| r.glyph.clone()).unwrap_or_else(|| "✦".into());
-        agent_card(cv, pr, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
+        agent_card(cv, pr, run, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
         // planner → orchestrator edge when briefing
         let ey = y0 + 1;
         let (ex1, ex2) = (x0 + 27, orch.x as i32 - 1);
@@ -772,7 +823,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         let round = if let PhaseStep::Gate { round } = step { format!("round {round} · ") } else { String::new() };
         let mut l = vec![Span::styled(round, theme::fg(col))];
         l.extend(line2);
-        agent_card(cv, r, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
+        agent_card(cv, r, run, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
     }
 }
 
@@ -788,7 +839,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
         let r = Rect { x: x as u16, y: y as u16, width: w as u16, height: 3 };
         if i == idx {
             let a = run.finale_agent.and_then(|a| app.agents.get(&a));
-            agent_card(cv, Rect { height: 4, ..r }, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
+            agent_card(cv, Rect { height: 4, ..r }, run, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
             y += 4;
         } else {
             let (st, mark) = if i < idx { (theme::fg(theme::mix_rgb(theme::GREEN, theme::FAINT)), theme::g("✓", "v")) } else { (theme::faint(), theme::g("○", "o")) };
@@ -833,7 +884,7 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
             y += 2;
         }
         _ => {
-            let title = format!("{} run complete in {}", theme::g("✦", "*"), fmt_dur(run.history.last().map(|h| h.ended.duration_since(run.started)).unwrap_or_else(|| run.started.elapsed())));
+            let title = format!("{} run complete in {}", theme::g("✦", "*"), fmt_dur(run.elapsed()));
             let fresh = run.pulse.back().map(|p| p.at.elapsed().as_millis() < 3000).unwrap_or(false);
             if fresh {
                 cv.spans(x, y, &anim::shimmer(&title, theme::SAFFRON, theme::TEXT), area.width as i32 - 6);

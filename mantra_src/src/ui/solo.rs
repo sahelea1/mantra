@@ -11,81 +11,94 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let id = zoom.or(app.solo);
     let approval = app.approval_for(id);
     let ap_h = approval.map(|i| approval_height(&app.approvals[i])).unwrap_or(0);
+    let chip_h = super::queue_chip_height(app, id);
     let in_h = input_height(app, area.width).min(area.height.saturating_sub(8).max(3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(ap_h), Constraint::Length(in_h), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(ap_h), Constraint::Length(chip_h), Constraint::Length(in_h), Constraint::Length(1)])
         .split(area);
 
-    // header
-    let (crumbs, right) = match id.and_then(|a| app.agents.get(&a)) {
-        Some(a) => {
-            let mut c = vec![];
-            if zoom.is_some() {
-                c.push(Span::styled(format!(" {} mandala {} ", theme::g("›", ">"), theme::g("›", ">")), theme::faint()));
-                c.push(Span::styled(format!("{} {}", theme::role_glyph(&a.glyph), a.name), theme::bold(theme::fg(theme::named(&a.color)))));
-                c.push(Span::styled(format!("  {}", a.role), theme::dim()));
-            } else {
-                c.push(Span::styled("  solo  ", theme::muted()));
-                c.push(Span::styled(home_rel(&app.project), theme::dim()));
-                if !app.branch.is_empty() {
-                    c.push(Span::styled(format!("  {} {}", theme::g("⎇", "@"), app.branch), theme::faint()));
-                }
-                if app.demo {
-                    c.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
-                }
+    // header — zoomed gets a solid role-coloured band (unmistakably "inside one agent"); Solo
+    // keeps its plain brand+breadcrumb header.
+    match (zoom, id.and_then(|a| app.agents.get(&a))) {
+        (Some(_), Some(a)) => {
+            zoomed_header(f, rows[0], a);
+            super::draw_screen_flash(f, rows[0], app, theme::named(&a.color));
+        }
+        (Some(_), None) => header(f, rows[0], vec![Span::styled(format!(" {} mandala {} zoomed", theme::g("›", ">"), theme::g("›", ">")), theme::faint())], vec![]),
+        (None, Some(a)) => {
+            let mut c = vec![Span::styled("  solo  ", theme::muted())];
+            c.push(Span::styled(home_rel(&app.project), theme::dim()));
+            if !app.branch.is_empty() {
+                c.push(Span::styled(format!("  {} {}", theme::g("⎇", "@"), app.branch), theme::faint()));
+            }
+            if app.demo {
+                c.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let mut r = vec![];
             if let Some(b) = app.inbox_badge().filter(|_| app.approval_for(id).is_none()) {
                 r.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
             }
             r.extend(model_chip(a, app));
-            (c, r)
+            header(f, rows[0], c, r);
         }
-        None => (vec![Span::styled("  solo", theme::muted())], vec![]),
-    };
-    header(f, rows[0], crumbs, right);
+        (None, None) => header(f, rows[0], vec![Span::styled("  solo", theme::muted())], vec![]),
+    }
 
-    // body: log | side panel
+    // body: spine (zoomed only) | log | side panel
+    let spine_w: u16 = if zoom.is_some() { 1 } else { 0 };
     let has_activity = id.and_then(|a| app.agents.get(&a)).map(|a| !a.items.is_empty()).unwrap_or(false);
     let show_side = app.side_panel && rows[1].width >= 100 && (has_activity || zoom.is_some());
     let body = if show_side {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Min(40), Constraint::Length(36)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(spine_w), Constraint::Min(40), Constraint::Length(36)]).split(rows[1])
     } else {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Min(40)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(spine_w), Constraint::Min(40)]).split(rows[1])
     };
+    if let Some(a) = id.and_then(|a| app.agents.get(&a)) {
+        if zoom.is_some() && body[0].width > 0 {
+            let col = theme::c(theme::named(&a.color));
+            let buf = f.buffer_mut();
+            for y in body[0].y..body[0].y + body[0].height {
+                if let Some(cell) = buf.cell_mut((body[0].x, y)) {
+                    cell.set_symbol(theme::g("▎", "|"));
+                    cell.set_fg(col);
+                }
+            }
+        }
+    }
     let verbose = app.verbose;
     let empty = id.and_then(|a| app.agents.get(&a)).map(|a| a.items.is_empty()).unwrap_or(true);
     if empty && zoom.is_none() {
-        welcome(f, body[0], app);
+        welcome(f, body[1], app);
     } else if let Some(a) = id.and_then(|a| app.agents.get_mut(&a)) {
         let footer: Vec<Line<'static>> = busy_line(a).into_iter().collect();
-        convo::draw(f, body[0], a, verbose, footer);
+        convo::draw(f, body[1], a, verbose, footer);
     }
     if show_side {
-        side_panel(f, body[1], app, id);
+        side_panel(f, body[2], app, id);
     }
     if let Some(i) = approval {
         let name = app.agents.get(&app.approvals[i].agent).map(|a| a.name.clone()).unwrap_or_default();
         draw_approval(f, rows[2], &app.approvals[i], &name);
     }
+    super::draw_queue_chip(f, rows[3], app, id);
 
     // input
     let busy = id.and_then(|a| app.agents.get(&a)).map(|a| a.busy()).unwrap_or(false);
-    let placeholder = match zoom {
-        Some(_) if busy => "steer this agent (it sees your message mid-turn)…",
-        Some(_) => "message this agent…",
-        None if busy => "type to steer the running turn…",
-        None => "ask anything · / commands · ! shell · ctrl+o mandala",
+    let placeholder = match (zoom, id.and_then(|a| app.agents.get(&a))) {
+        (Some(_), Some(a)) if busy => format!("message {} {} …  (⏎ queue · ctrl+f send now · esc overview)", theme::role_glyph(&a.glyph), a.role),
+        (Some(_), _) => "message this agent…  (esc back to overview)".to_string(),
+        (None, _) if busy => "type to steer the running turn…".to_string(),
+        (None, _) => "ask anything · / commands · ! shell · ctrl+o mandala".to_string(),
     };
     let color = id.and_then(|a| app.agents.get(&a)).map(|a| theme::named(&a.color)).unwrap_or(theme::SAFFRON);
     let focused = approval.map(|i| app.approvals[i].method == "item/tool/requestUserInput").unwrap_or(true);
-    draw_input(f, rows[3], app, placeholder, color, focused);
-    draw_suggestions(f, rows[3], app);
+    draw_input(f, rows[4], app, &placeholder, color, focused);
+    draw_suggestions(f, rows[4], app);
 
     // footer
     let hints: Vec<(&str, &str)> = if zoom.is_some() {
-        vec![("esc", "back to stage"), ("⏎", "send"), ("ctrl+c", "interrupt"), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+e", "verbose")]
+        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("ctrl+c", "interrupt"), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("esc", "▸ overview")]
     } else {
         let mode = app.settings.approval_mode.clone();
         let m: &'static str = match mode.as_str() {
@@ -95,7 +108,29 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
         };
         vec![("⏎", "send"), ("esc", "interrupt"), ("⇧⇥", m), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+o", "mandala"), ("?", "help")]
     };
-    footer(f, rows[4], &hints);
+    footer(f, rows[5], &hints);
+}
+
+/// Zoomed-in header: a solid band tinted with the agent's role colour so the two views — overview
+/// and zoom — are never mistaken for each other, even mid-scroll.
+fn zoomed_header(f: &mut Frame, area: Rect, a: &Agent) {
+    let base = theme::named(&a.color);
+    let band = Style::default().bg(theme::mix(theme::FAINT, base, 0.25));
+    let text_st = band.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
+    let dim_st = band.fg(theme::c(theme::MUTED));
+    let mut left = format!(" {} {}", theme::role_glyph(&a.glyph), a.name);
+    if !a.model_alias.is_empty() {
+        left.push_str(&format!(" · {}", a.model_alias));
+    }
+    if !a.effort.is_empty() {
+        left.push_str(&format!(" · {}", a.effort));
+    }
+    let right = "zoomed · esc back to overview ";
+    let gap = (area.width as usize).saturating_sub(w_of(&left) + w_of(right)).max(2);
+    let line = Line::from(vec![Span::styled(left, text_st), Span::styled(" ".repeat(gap), dim_st), Span::styled(right, dim_st)]);
+    // `.style(band)` fills the whole row's background first, so the tint stays solid even where
+    // no span reaches (a narrow terminal, or the trailing cell after `right`).
+    f.render_widget(Paragraph::new(line).style(band), area);
 }
 
 fn welcome(f: &mut Frame, area: Rect, app: &App) {
@@ -123,6 +158,17 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         key("ctrl+k · alt+↑↓", "switch model · change reasoning effort"),
         key("?", "all keys"),
     ];
+    if !app.unfinished_runs.is_empty() {
+        let n = app.unfinished_runs.len();
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(format!("     {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
+    }
+    if let Some(w) = &app.sandbox_warning {
+        lines.push(Line::default());
+        let width = area.width.saturating_sub(18) as usize;
+        lines.push(Line::from(Span::styled(format!("     {} sandbox: {}", theme::g("⚠", "!"), trunc(w, width.max(20))), theme::fg(theme::AMBER))));
+        lines.push(Line::from(Span::styled("       (mantra doctor shows the full fix)", theme::faint())));
+    }
     if app.demo {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("     demo mode — simulated agents, nothing is sent to an API", theme::fg(theme::ROSE))));

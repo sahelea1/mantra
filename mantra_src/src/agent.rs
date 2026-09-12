@@ -76,7 +76,9 @@ pub enum ErrKind {
     ContextFull,
     UsageLimit,
     Auth,
-    BadRequest,
+    /// Deterministic provider/model incompatibility (HTTP 400/422, "unexpected message role", …).
+    /// Never retried — the same request will fail again.
+    ProviderRejected,
     Other,
 }
 
@@ -93,6 +95,9 @@ pub enum Signal {
     TurnDone { status: String, error: Option<String>, kind: Option<ErrKind> },
     FilesChanged(Vec<String>),
     Activity,
+    /// A finished `commandExecution` item's output names `bwrap`/user namespaces (WP12.4/L1): the
+    /// sandbox itself cannot run commands on this host. Carries the offending output, truncated.
+    EnvironmentBroken(String),
 }
 
 pub struct Agent {
@@ -103,8 +108,17 @@ pub struct Agent {
     pub color: String,
     pub model_alias: String,
     pub model: String,
+    /// Provider id this agent's model runs on (set at spawn) — used to name the provider in
+    /// halt messages (e.g. `ProviderRejected`).
+    pub provider: String,
+    /// Which runtime this agent's process is (Codex app-server or Claude Code) — for wording only;
+    /// every protocol-level difference is handled in `hub`.
+    pub backend: crate::config::ProviderKind,
     pub effort: String,
     pub cwd: PathBuf,
+    /// Codex approval policy this agent was spawned with ("never" | "on-request" | "untrusted").
+    /// Drives auto-approval independently of the global Solo mode (`Settings.approval_mode`).
+    pub approval: String,
     pub thread_id: Option<String>,
     pub status: Status,
     pub items: Vec<Item>,
@@ -133,7 +147,6 @@ pub struct Agent {
     pub queued: Vec<String>,
     pub created: Instant,
     pub finished: Option<Instant>,
-    pub flash: Option<Instant>,
     pub scroll: usize,
     pub follow: bool,
     pub retry_note: Option<String>,
@@ -151,8 +164,11 @@ impl Agent {
             color: "text".into(),
             model_alias: String::new(),
             model: String::new(),
+            provider: String::new(),
+            backend: crate::config::ProviderKind::Codex,
             effort: "medium".into(),
             cwd,
+            approval: "never".into(),
             thread_id: None,
             status: Status::Starting,
             items: vec![],
@@ -178,7 +194,6 @@ impl Agent {
             queued: vec![],
             created: Instant::now(),
             finished: None,
-            flash: None,
             scroll: 0,
             follow: true,
             retry_note: None,
@@ -554,6 +569,7 @@ impl Agent {
                 let agg = item.get("aggregatedOutput").and_then(|x| x.as_str()).map(|x| x.to_string());
                 let short = crate::util::trunc(cmd.lines().next().unwrap_or(""), 60);
                 let it = self.get_or_insert(&id, Kind::Command { cmd: cmd.clone(), output: String::new(), exit: None, status: status.clone(), dur_ms: None });
+                let mut out_for_probe = String::new();
                 if let Kind::Command { cmd: c, output, exit: e, status: st, dur_ms } = &mut it.kind {
                     if !cmd.is_empty() {
                         *c = cmd;
@@ -567,11 +583,19 @@ impl Agent {
                     *e = exit.or(*e);
                     *st = status;
                     *dur_ms = dur.or(*dur_ms);
+                    out_for_probe = output.clone();
                 }
                 it.done = done;
                 it.touch();
                 if !done {
                     self.activity = format!("$ {short}");
+                } else {
+                    // WP12.4/L1: a bubblewrap/user-namespace failure means every agent's shell
+                    // commands are dead on this host — surface it once as a run-level signal.
+                    let hay = out_for_probe.to_lowercase();
+                    if hay.contains("bwrap") || hay.contains("user namespaces") {
+                        signal = Some(Signal::EnvironmentBroken(crate::util::trunc(&out_for_probe, 300)));
+                    }
                 }
             }
             "fileChange" => {
@@ -781,7 +805,7 @@ pub fn classify(info: &Value) -> ErrKind {
         "contextWindowExceeded" => ErrKind::ContextFull,
         "usageLimitExceeded" | "sessionBudgetExceeded" => ErrKind::UsageLimit,
         "unauthorized" => ErrKind::Auth,
-        "badRequest" => ErrKind::BadRequest,
+        "badRequest" => ErrKind::ProviderRejected,
         _ => ErrKind::Other,
     }
 }
@@ -811,6 +835,8 @@ pub fn refine(k: ErrKind, msg: &str) -> ErrKind {
         ErrKind::Auth
     } else if m.contains("429") || m.contains("502") || m.contains("503") || m.contains("timed out") || m.contains("disconnected") {
         ErrKind::Transient
+    } else if m.contains("400") || m.contains("422") || m.contains("unexpected message role") || m.contains("unsupported") || m.contains("invalid_request_error") {
+        ErrKind::ProviderRejected
     } else {
         k
     }
@@ -910,6 +936,8 @@ mod tests {
         assert_eq!(refine(ErrKind::Other, "stream disconnected before completion"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Transient, "403"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Other, "something odd"), ErrKind::Other);
+        assert_eq!(refine(ErrKind::Other, "Unexpected message role."), ErrKind::ProviderRejected);
+        assert_eq!(refine(ErrKind::Other, "unexpected status 422: invalid_request_error"), ErrKind::ProviderRejected);
     }
 
     #[test]
@@ -950,6 +978,9 @@ mod tests {
         assert_eq!(classify(&json!("serverOverloaded")), ErrKind::Transient);
         assert_eq!(classify(&json!({"responseStreamDisconnected": {"httpStatusCode": 502}})), ErrKind::Transient);
         assert_eq!(classify(&json!("unauthorized")), ErrKind::Auth);
+        assert_eq!(classify(&json!("contextWindowExceeded")), ErrKind::ContextFull);
+        assert_eq!(classify(&json!({"contextWindowExceeded": {}})), ErrKind::ContextFull);
+        assert_eq!(classify(&json!("badRequest")), ErrKind::ProviderRejected);
     }
 
     #[test]

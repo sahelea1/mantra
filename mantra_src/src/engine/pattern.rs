@@ -20,6 +20,9 @@ pub struct Role {
     pub effort: String,
     /// read-only | workspace-write
     pub sandbox: String,
+    /// Codex approval policy for agents of this role: "never" (default — never asks; requests
+    /// land in the inbox only if a tool forces the question), "on-request", or "untrusted".
+    pub permission: String,
     pub description: String,
     pub instructions: String,
     /// Tripwire when an agent of this role uses more tokens than this.
@@ -35,12 +38,16 @@ impl Default for Role {
             model: "sol".into(),
             effort: "medium".into(),
             sandbox: "workspace-write".into(),
+            permission: "never".into(),
             description: String::new(),
             instructions: String::new(),
             max_tokens: None,
         }
     }
 }
+
+/// Values `Role.permission` may take.
+pub const PERMISSIONS: &[&str] = &["never", "on-request", "untrusted"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -57,6 +64,11 @@ pub struct PatternSettings {
     pub gate_max_rounds: u32,
     pub check_timeout_secs: u64,
     pub max_tasks_per_phase: usize,
+    /// Watchdog (WP7.2): seconds an expected-active agent may sit idle before the first nudge.
+    pub watchdog_seconds: u64,
+    /// Watchdog: seconds of continued idleness before the next escalation step (respawn the
+    /// orchestrator / wake the orchestrator / wake the planner); the step after that is 2× this.
+    pub watchdog_escalate_seconds: u64,
 }
 
 impl Default for PatternSettings {
@@ -71,6 +83,8 @@ impl Default for PatternSettings {
             gate_max_rounds: 3,
             check_timeout_secs: 900,
             max_tasks_per_phase: 8,
+            watchdog_seconds: 90,
+            watchdog_escalate_seconds: 240,
         }
     }
 }
@@ -127,6 +141,25 @@ impl Pattern {
         toml::from_str(DEFAULT_PATTERN).expect("built-in pattern must parse")
     }
 
+    /// The default pattern with planner/orchestrator moved to a Claude Code model (`fable51`) and
+    /// workers to another (`sonnet5`) — gate roles are left on their Codex models, so this exercises
+    /// a genuinely mixed-backend run (`v02plan.md` §10.6). Built by editing `builtin()` in memory
+    /// rather than a second embedded TOML, so the two patterns can never silently drift apart on
+    /// anything but the models.
+    pub fn builtin_claude() -> Pattern {
+        let mut p = Pattern::builtin();
+        p.name = "mantra-default-claude".into();
+        p.description = format!("{} — planner/orchestrator on Claude Code (fable51), workers on Claude Code (sonnet5)", p.description);
+        for role in p.roles.values_mut() {
+            match role.kind.as_str() {
+                "planner" | "orchestrator" => role.model = "fable51".into(),
+                "worker" => role.model = "sonnet5".into(),
+                _ => {}
+            }
+        }
+        p
+    }
+
     pub fn from_toml(s: &str) -> Result<Pattern> {
         let p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
         p.validate().map_err(|errs| anyhow!(errs.join("; ")))?;
@@ -171,6 +204,9 @@ impl Pattern {
             if r.model.trim().is_empty() {
                 errs.push(format!("role '{n}': model is empty"));
             }
+            if !PERMISSIONS.contains(&r.permission.as_str()) {
+                errs.push(format!("role '{n}': permission must be one of {} (got '{}')", PERMISSIONS.join(", "), r.permission));
+            }
         }
         let need = |role: &str, kind: &str, what: &str, errs: &mut Vec<String>| match self.roles.get(role) {
             None => errs.push(format!("flow.{what} = '{role}' is not a defined role")),
@@ -193,6 +229,9 @@ impl Pattern {
         }
         if self.settings.max_parallel == 0 {
             errs.push("settings.max_parallel must be ≥ 1".into());
+        }
+        if self.settings.watchdog_escalate_seconds <= self.settings.watchdog_seconds {
+            errs.push("settings.watchdog_escalate_seconds must be greater than watchdog_seconds".into());
         }
         if errs.is_empty() {
             Ok(())
@@ -223,11 +262,14 @@ impl Pattern {
         if crate::util::slug(name) == "mantra-default" {
             return Ok(Pattern::builtin());
         }
+        if crate::util::slug(name) == "mantra-default-claude" {
+            return Ok(Pattern::builtin_claude());
+        }
         Err(anyhow!("pattern '{name}' not found"))
     }
 
     pub fn list(project: &Path) -> Vec<String> {
-        let mut v = vec!["mantra-default".to_string()];
+        let mut v = vec!["mantra-default".to_string(), "mantra-default-claude".to_string()];
         for dir in [project.join(".mantra").join("patterns"), crate::config::patterns_dir()] {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
@@ -260,6 +302,8 @@ stall_minutes = 6
 gate_max_rounds = 3
 check_timeout_secs = 900
 max_tasks_per_phase = 8
+watchdog_seconds = 90
+watchdog_escalate_seconds = 240
 
 [roles.planner]
 kind = "planner"
@@ -383,5 +427,47 @@ mod tests {
         let mut p = Pattern::builtin();
         p.flow.phase_gate = "nope".into();
         assert!(p.validate().is_err());
+    }
+    #[test]
+    fn watchdog_settings_default_for_old_patterns() {
+        // An old pattern TOML saved before WP7 has no watchdog_* keys at all — it must still load,
+        // with the built-in defaults filled in by serde (the `#[serde(default)]` on the struct).
+        let old = DEFAULT_PATTERN.replace("watchdog_seconds = 90\nwatchdog_escalate_seconds = 240\n", "");
+        assert!(!old.contains("watchdog_seconds"), "the fixture must actually be missing the field");
+        let p = Pattern::from_toml(&old).unwrap();
+        assert_eq!(p.settings.watchdog_seconds, 90);
+        assert_eq!(p.settings.watchdog_escalate_seconds, 240);
+    }
+
+    #[test]
+    fn permission_defaults_off_and_validates() {
+        let p = Pattern::builtin();
+        for (n, r) in &p.roles {
+            assert_eq!(r.permission, "never", "role '{n}' should default to permission = never");
+        }
+        let mut bad = Pattern::builtin();
+        let name = bad.worker_roles()[0].clone();
+        bad.roles.get_mut(&name).unwrap().permission = "sometimes".into();
+        let errs = bad.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("permission") && e.contains("sometimes")), "{errs:?}");
+    }
+
+    #[test]
+    fn builtin_claude_is_valid_and_moves_only_planner_orchestrator_worker_models() {
+        let p = Pattern::builtin_claude();
+        assert!(p.validate().is_ok(), "{:?}", p.validate());
+        assert_eq!(p.name, "mantra-default-claude");
+        for (name, role) in &p.roles {
+            match role.kind.as_str() {
+                "planner" | "orchestrator" => assert_eq!(role.model, "fable51", "role '{name}'"),
+                "worker" => assert_eq!(role.model, "sonnet5", "role '{name}'"),
+                "gate" => assert_ne!(role.model, "fable51", "gate role '{name}' must keep its Codex model — only planner/orchestrator/worker move"),
+                _ => {}
+            }
+        }
+        // Loadable by name (`Pattern::load`), the same way "mantra-default" always is.
+        let loaded = Pattern::load("mantra-default-claude", Path::new("/nonexistent")).unwrap();
+        assert_eq!(loaded, p);
+        assert!(Pattern::list(Path::new("/nonexistent")).contains(&"mantra-default-claude".to_string()));
     }
 }

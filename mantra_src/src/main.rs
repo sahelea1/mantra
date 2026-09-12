@@ -6,7 +6,9 @@ mod config;
 mod discover;
 mod engine;
 mod hub;
+mod mcp_bridge;
 mod mock;
+mod mock_claude;
 mod rpc;
 mod ui;
 mod util;
@@ -44,6 +46,9 @@ const HELP: &str = "mantra — one terminal for Codex agents
 USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
   mantra run \"<goal>\" [--pattern NAME]  open straight into a Mandala run
+  mantra runs                            list every run (all projects): id, stage, when, goal
+  mantra runs resume <id>                reopen a run where it stopped (id prefix is enough)
+  mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
   mantra doctor                          check codex, login, terminal, config
   mantra --version
 
@@ -51,6 +56,8 @@ OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
+  --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
+  --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
 
 FILES
   ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
@@ -67,11 +74,15 @@ struct Cli {
     pattern: Option<String>,
     snapshot: Option<String>,
     size: (u16, u16),
+    /// `mantra runs resume <id>`.
+    resume: Option<String>,
+    resume_last: bool,
+    no_sandbox_check: bool,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36) };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -98,6 +109,22 @@ fn parse_args() -> Result<Option<Cli>> {
                 cli.size = (w.parse()?, h.parse()?);
             }
             "run" => cli.run_goal = Some(next()?),
+            "--resume-last" => cli.resume_last = true,
+            "--no-sandbox-check" => cli.no_sandbox_check = true,
+            "runs" => match next().ok().as_deref() {
+                None | Some("list") | Some("ls") => {
+                    runs_list();
+                    return Ok(None);
+                }
+                Some("resume") => cli.resume = Some(next()?),
+                Some("delete") | Some("rm") => {
+                    let id = next()?;
+                    let yes = matches!(next().ok().as_deref(), Some("--yes") | Some("-y"));
+                    runs_delete(&id, yes);
+                    return Ok(None);
+                }
+                Some(other) => anyhow::bail!("mantra runs: unknown subcommand {other} (list | resume <id> | delete <id>)"),
+            },
             "doctor" => {
                 doctor();
                 return Ok(None);
@@ -110,11 +137,24 @@ fn parse_args() -> Result<Option<Cli>> {
 }
 
 fn main() {
-    // The mock server is a separate mode of the same binary.
-    if std::env::args().nth(1).as_deref() == Some("mock-codex") {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        rt.block_on(mock::run());
-        return;
+    // The mock servers and the MCP bridge (WP10.4/10.6) are separate modes of the same binary.
+    match std::env::args().nth(1).as_deref() {
+        Some("mock-codex") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mock::run());
+            return;
+        }
+        Some("mock-claude") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mock_claude::run());
+            return;
+        }
+        Some("mcp-bridge") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mcp_bridge::run());
+            return;
+        }
+        _ => {}
     }
     let cli = match parse_args() {
         Ok(Some(c)) => c,
@@ -156,17 +196,65 @@ fn demo_project() -> Result<PathBuf> {
 
 async fn async_main(cli: Cli) -> Result<()> {
     let mut settings = config::Settings::load();
-    let registry = config::Registry::load();
+    let mut registry = config::Registry::load();
     let mut demo = cli.demo;
     if !demo && !codex_available(&settings.codex_command) {
         eprintln!("mantra: `{}` not found — starting in DEMO mode (simulated agents).\n        Install Codex with `npm i -g @openai/codex`, then `codex login`.", settings.codex_command.join(" "));
         std::thread::sleep(Duration::from_millis(1500));
         demo = true;
     }
-    let project = if demo { demo_project()? } else { cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?) };
+    // A resumed run brings its own project directory (it was saved absolute), so `mantra runs
+    // resume <id>` works from anywhere — and with --demo from the previous demo's temp repo.
+    let resume = match (&cli.resume, cli.resume_last) {
+        (Some(id), _) => Some(engine::state::find(id).map_err(|e| anyhow::anyhow!(e))?),
+        (None, true) => {
+            let pick = engine::state::list_all().into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir() && (!demo || p.to_string_lossy().contains("mantra-demo-"))).unwrap_or(false));
+            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run to resume (mantra runs lists them)"))?)
+        }
+        _ => None,
+    };
+    let project = match &resume {
+        Some(r) => {
+            let p = r.project().ok_or_else(|| anyhow::anyhow!("run {} cannot be resumed: {}", r.id, r.state.as_ref().err().cloned().unwrap_or_default()))?;
+            if !p.is_dir() {
+                anyhow::bail!("run {}: its project directory {} no longer exists (mantra runs delete {} cleans it up)", r.id, p.display(), r.id);
+            }
+            p.canonicalize().unwrap_or(p)
+        }
+        // MANTRA_DEMO_PROJECT reuses an earlier demo repo (stress.sh: the /runs overlay and the
+        // welcome-screen notice need a project that already has runs).
+        None if demo => match std::env::var("MANTRA_DEMO_PROJECT") {
+            Ok(p) if std::path::Path::new(&p).is_dir() => PathBuf::from(p),
+            _ => demo_project()?,
+        },
+        None => cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?),
+    };
     if demo {
         let exe = std::env::current_exe()?;
         settings.codex_command = vec![exe.to_string_lossy().to_string(), "mock-codex".into()];
+        // WP10.6: mirror the Codex override above for the Claude Code backend. Injected in memory
+        // (never saved) regardless of `config::claude_available()`, so `--demo --pattern
+        // mantra-default-claude` needs no real `claude` install: the demo's whole point is zero
+        // external dependencies.
+        settings.claude_command = vec![exe.to_string_lossy().to_string(), "mock-claude".into()];
+        if !registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode) {
+            registry.providers.push(config::ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+            registry.models.extend(config::claude_default_model_entries("claude"));
+        }
+    }
+    // L1: on a Linux box where unprivileged user namespaces are off, every worker command dies
+    // in bubblewrap. Say so once, up front — and don't start a run on it without a nod.
+    // (MANTRA_SANDBOX_WARNING=<text> forces the notice — stress.sh renders it in demo mode.)
+    let sandbox_warning = std::env::var("MANTRA_SANDBOX_WARNING").ok().filter(|w| !w.is_empty()).or_else(|| if demo || cli.snapshot.is_some() { None } else { util::sandbox_probe().err() });
+    if let (Some(w), true, false) = (&sandbox_warning, cli.run_goal.is_some() || cli.resume.is_some() || cli.resume_last, cli.no_sandbox_check) {
+        eprintln!("mantra: sandbox check failed — {w}\n");
+        eprint!("start anyway? workers' commands will fail unless the roles use sandbox = \"danger-full-access\" [y/N] ");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("not started. (mantra --no-sandbox-check skips this question)");
+            return Ok(());
+        }
     }
     ui::theme::init(&settings);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -181,14 +269,23 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
         });
     }
-    let hub = hub::Hub::new(settings.codex_command.clone(), hub_tx);
+    // The MCP-bridge socket (WP10.4) is only worth opening when a Claude Code agent could actually
+    // run — real or (in `--demo`) mocked.
+    let enable_bridge = registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode);
+    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), hub_tx, enable_bridge);
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
     if let Some(p) = cli.pattern {
         app.pattern_name = p;
     }
     app.start_solo();
+    if let Some(w) = sandbox_warning {
+        app.set_sandbox_warning(w);
+    }
     if let Some(goal) = &cli.run_goal {
         app.start_run(goal);
+    }
+    if let Some(r) = resume {
+        app.resume_run(r);
     }
     if let Some(script) = cli.snapshot.clone() {
         return snapshot(app, rx, &script, cli.size).await;
@@ -256,6 +353,53 @@ async fn async_main(cli: Cli) -> Result<()> {
         eprintln!("demo project left at {}", app.project.display());
     }
     res
+}
+
+/// `mantra runs`: one line per run, every project, newest first.
+fn runs_list() {
+    let all = engine::state::list_all();
+    if all.is_empty() {
+        println!("no runs yet — `mantra run \"<goal>\"` starts one (or `mantra --demo`)");
+        return;
+    }
+    println!("{:<28} {:<22} {:<18} {:>9}  goal", "run", "project", "stage", "updated");
+    for r in &all {
+        let project = r.project().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| r.project_key.rsplit_once('-').map(|(a, _)| a.to_string()).unwrap_or_else(|| r.project_key.clone()));
+        println!("{:<28} {:<22} {:<18} {:>9}  {}", util::trunc(&r.id, 28), util::trunc(&project, 22), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), util::trunc(&r.brief(), 60));
+    }
+    let n = all.iter().filter(|r| r.unfinished()).count();
+    println!("\n{} run{}, {n} unfinished · mantra runs resume <id> · mantra runs delete <id>", all.len(), if all.len() == 1 { "" } else { "s" });
+}
+
+/// `mantra runs delete <id> [--yes]`: worktrees + branches in the project repo, then the journal.
+fn runs_delete(id: &str, yes: bool) {
+    let r = match engine::state::find(id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mantra: {e}");
+            std::process::exit(2);
+        }
+    };
+    let where_ = r.project().map(|p| p.display().to_string()).unwrap_or_else(|| r.project_key.clone());
+    println!("run {} ({}) — {}\n  {}", r.id, r.stage_label(), where_, util::trunc(&r.brief(), 100));
+    if r.unfinished() {
+        println!("  this run is not finished; its work lives on branch mantra/{} until deleted", r.id);
+    }
+    if !yes {
+        print!("delete it, its worktrees and branches? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("kept.");
+            return;
+        }
+    }
+    for l in engine::state::delete(&r) {
+        println!("  {l}");
+    }
+    println!("deleted {}", r.id);
 }
 
 fn in_tmux() -> bool {
@@ -466,8 +610,22 @@ fn doctor() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         println!("{} login: {}", ok(o.status.success()), t.lines().next().unwrap_or("").trim());
     }
+    // WP10.5: `claude --version` with a 5s timeout — run on a thread and `recv_timeout`, so a hung
+    // `claude` binary (observed in this sandbox for `subscription` auth, §0.3) can never hang doctor.
+    match version_with_timeout(&s.claude_command[0], Duration::from_secs(5)) {
+        Some(Ok(v)) => println!("{} claude: {v}", ok(true)),
+        Some(Err(e)) => println!("{} claude: {e}", ok(false)),
+        None => println!("{} claude: `{}` not found (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)", ok(false), s.claude_command[0]),
+    }
+    if crate::util::effective_uid_is_root() {
+        println!("  IS_SANDBOX note: running as root — Mantra sets IS_SANDBOX=1 for claude agents (--dangerously-skip-permissions is otherwise refused for uid 0)");
+    }
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
+    match util::sandbox_probe() {
+        Ok(()) => println!("{} sandbox: user namespaces available (Codex's bubblewrap sandbox can run)", ok(true)),
+        Err(e) => println!("{} sandbox: {e}", ok(false)),
+    }
     println!("  terminal: TERM={} COLORTERM={} TERM_PROGRAM={}", std::env::var("TERM").unwrap_or_default(), std::env::var("COLORTERM").unwrap_or_default(), std::env::var("TERM_PROGRAM").unwrap_or_default());
     ui::theme::init(&s);
     println!("  colors: {:?} · glyphs: {}", ui::theme::depth(), if ui::theme::ascii() { "ascii" } else { "unicode" });
@@ -488,8 +646,64 @@ fn doctor() {
     let r = config::Registry::load();
     println!("  models: {}", r.models.iter().map(|m| format!("{}={}", m.alias, m.model)).collect::<Vec<_>>().join(", "));
     for p in &r.providers {
-        let set = std::env::var(&p.env_key).is_ok();
-        println!("{} provider {}: ${} {}", ok(set), p.id, p.env_key, if set { "set" } else { "NOT set" });
+        let key_src = |p: &config::ProviderEntry| -> String {
+            if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                format!("${} set", p.env_key)
+            } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                "key stored in models.toml".to_string()
+            } else if p.env_key.trim().is_empty() {
+                "no key".to_string()
+            } else {
+                format!("${} NOT set", p.env_key)
+            }
+        };
+        if p.kind == config::ProviderKind::ClaudeCode {
+            if p.auth == "api_key" {
+                println!("{} provider {} (Claude Code, api_key): {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
+            } else {
+                match claude_auth_status(&s.claude_command[0]) {
+                    Some(line) => println!("{} provider {} (Claude Code, subscription): {line}", ok(true), p.id),
+                    None => println!("  provider {} (Claude Code, subscription): OAuth login — no `claude auth status` to check; run `claude` once and log in", p.id),
+                }
+            }
+        } else {
+            println!("{} provider {}: {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
+        }
     }
     println!("  log: {}", config::log_path().display());
+}
+
+/// Runs `<cmd0> --version` on a thread with a hard timeout: `Some(Ok(version))` on success,
+/// `Some(Err(reason))` if it ran but failed or timed out, `None` if the binary isn't even there
+/// (WP10.5 — a `claude` under `subscription` auth can hang indefinitely in some sandboxes, §0.3).
+fn version_with_timeout(cmd0: &str, timeout: Duration) -> Option<Result<String, String>> {
+    let cmd0 = cmd0.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new(&cmd0).arg("--version").output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(o)) if o.status.success() => Some(Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())),
+        Ok(Ok(o)) => Some(Err(format!("--version exited {:?}", o.status.code()))),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(e)) => Some(Err(e.to_string())),
+        Err(_) => Some(Err(format!("timed out after {}s", timeout.as_secs()))),
+    }
+}
+
+/// `claude auth status`, if the subcommand exists and says anything (§10.5: "if that subcommand
+/// exists else skip"). Real Claude Code answers JSON (`{"loggedIn":…,"authMethod":…,…}`) — pull
+/// out the two fields that matter rather than dumping raw `{`; fall back to the first line for
+/// whatever a future/older CLI shape prints instead.
+fn claude_auth_status(cmd0: &str) -> Option<String> {
+    let o = std::process::Command::new(cmd0).args(["auth", "status"]).output().ok()?;
+    let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t.trim()) {
+        if let Some(logged_in) = v.get("loggedIn").and_then(|b| b.as_bool()) {
+            let method = v.get("authMethod").and_then(|m| m.as_str()).unwrap_or("");
+            return Some(if logged_in { format!("logged in ({method})") } else { "not logged in".into() });
+        }
+    }
+    let first = t.lines().next().unwrap_or("").trim().to_string();
+    (!first.is_empty()).then_some(first)
 }

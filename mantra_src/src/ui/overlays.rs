@@ -24,6 +24,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) {
         Overlay::Edit { title, input, target } => edit(f, area, title, input, target),
         Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
         Overlay::Discover(st) => discover(f, area, st),
+        Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
     }
 }
 
@@ -51,24 +52,38 @@ fn help(f: &mut Frame, area: Rect) {
         k("esc", "interrupt the running turn"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
         Line::default(),
+        h("busy-agent chat (solo, zoom, @name)"),
+        k("⏎", "queue a message behind the current turn (shown as a chip above the input)"),
+        k("ctrl+f", "force-send: deliver the queue + input into the running turn right now"),
+        k("backspace", "on an empty input, pops the last queued message back in to edit"),
+        k("ctrl+x", "on an empty input, discards the whole queue"),
+        Line::default(),
         h("mandala stage"),
         k("tab", "toggle between typing and navigating the canvas"),
-        k("←→↑↓ · alt+←→", "select an agent"),
-        k("⏎", "zoom into the selected agent (esc to come back)"),
+        k("←→↑↓ · alt+←→ · 1-9", "select an agent · jump straight to the nth and zoom in"),
+        k("⏎", "zoom into the selected agent (esc to come back to the overview)"),
         k("space", "pause / resume the whole run"),
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
+        k("m", "switch model for the selected agent (fixes a halted ProviderRejected)"),
         k("p · a", "plan · approve plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
+        k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
     ];
     l.push(Line::default());
     l.push(Line::from(Span::styled("  esc to close", theme::faint())));
     f.render_widget(Paragraph::new(l).block(block("keys", theme::SAFFRON)), r);
 }
 
+/// Every provider speaks Codex's wire protocol today; WP10 will branch this on the provider's
+/// `kind` once a `ClaudeCode` backend exists (glyph `✧ claude`).
+fn backend_glyph(_provider: &str) -> &'static str {
+    "◌ codex"
+}
+
 fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option<crate::hub::AgentId>) {
     let rows = app.registry.models.len() as u16;
-    let r = centered(area, 92, rows + 7);
+    let r = centered(area, 104, rows + 7);
     f.render_widget(Clear, r);
     let cur = target.and_then(|a| app.agents.get(&a));
     let mut l = vec![Line::from(Span::styled(format!("  for: {}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
@@ -77,19 +92,25 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
         let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
         let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
+        let via = format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&m.provider));
+        // Two aliases can point at the same model id through different providers — the provider
+        // column above already distinguishes them; call it out too so it isn't missed.
+        let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
+        let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
         l.push(Line::from(vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
             Span::styled(format!("{:<10}", m.alias), st),
             Span::styled(format!("{:<18}", trunc(&m.model, 17)), theme::muted()),
-            Span::styled(format!("{:<9}", trunc(&m.provider, 8)), theme::dim()),
+            Span::styled(format!(" {:<24}", trunc(&via, 23)), theme::dim()),
             Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
             Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))),
             Span::styled(format!(" {:<12}", ctx), theme::dim()),
-            Span::styled(if is_cur { format!(" {} current", theme::g("●", "*")) } else { format!(" {}", trunc(&m.note, 22)) }, if is_cur { theme::fg(theme::GREEN) } else { theme::faint() }),
+            Span::styled(if is_cur { format!(" {} current", theme::g("●", "*")) } else { format!(" {}", trunc(&m.note, 18)) }, if is_cur { theme::fg(theme::GREEN) } else { theme::faint() }),
+            Span::styled(trunc(&dup, 26), theme::faint()),
         ]));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled("  ↑↓ model · ←→ effort (current model) · ⏎ switch · e edit models · esc", theme::faint())));
+    l.push(Line::from(Span::styled("  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc", theme::faint())));
     f.render_widget(Paragraph::new(l).block(block("model & effort", theme::SAFFRON)), r);
 }
 
@@ -315,6 +336,49 @@ fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[String]) {
     f.render_widget(Paragraph::new(l).block(block("patterns", theme::VIOLET)), r);
 }
 
+fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine::state::RunSummary], confirm: bool, others: usize) {
+    use crate::engine::state::fmt_ago;
+    let r = centered(area, 100, (list.len() as u16).max(1) + 5);
+    f.render_widget(Clear, r);
+    let inner_w = r.width.saturating_sub(4) as usize;
+    let brief_w = inner_w.saturating_sub(2 + 22 + 1 + 18 + 1 + 9 + 2).max(8);
+    let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<22} {:<18} {:>9}  {}", "run", "stage", "updated", "goal"), theme::faint()))];
+    if list.is_empty() {
+        l.push(Line::from(Span::styled("   no runs for this project yet — ctrl+o starts one", theme::dim())));
+    }
+    for (i, run) in list.iter().enumerate() {
+        let cur = app.run.as_ref().map(|x| x.id == run.id).unwrap_or(false);
+        let unfinished = run.unfinished();
+        let st = if i == sel { theme::bold(theme::accent()) } else if unfinished { theme::text() } else { theme::muted() };
+        let stage_style = if run.state.is_err() {
+            theme::fg(theme::ROSE)
+        } else if unfinished {
+            theme::fg(theme::AMBER)
+        } else {
+            theme::fg(theme::GREEN)
+        };
+        l.push(Line::from(vec![
+            Span::styled(format!(" {} {:<22}", if i == sel { theme::g("▶", ">") } else { " " }, trunc(&run.id, 22)), st),
+            Span::styled(format!(" {:<18}", trunc(&run.stage_label(), 18)), stage_style),
+            Span::styled(format!(" {:>9}", fmt_ago(run.updated_unix)), theme::faint()),
+            Span::styled(format!("  {}", trunc(&run.brief(), brief_w)), theme::dim()),
+            Span::styled(if cur { "  (open)".to_string() } else { String::new() }, theme::fg(theme::GREEN)),
+        ]));
+    }
+    l.push(Line::default());
+    if confirm {
+        let id = list.get(sel).map(|r| r.id.clone()).unwrap_or_default();
+        l.push(Line::from(Span::styled(format!("  delete {id} — its branches, worktrees and journal? y / n"), theme::bold(theme::fg(theme::ROSE)))));
+    } else {
+        let mut hint = "  ⏎ resume where it stopped · D delete · esc".to_string();
+        if others > 0 {
+            hint.push_str(&format!("   ({others} run{} in other projects: mantra runs)", if others == 1 { "" } else { "s" }));
+        }
+        l.push(Line::from(Span::styled(hint, theme::faint())));
+    }
+    f.render_widget(Paragraph::new(l).block(block("runs", theme::VIOLET)), r);
+}
+
 // ───────────────────────────── keys ─────────────────────────────
 
 pub fn key(app: &mut App, k: KeyEvent) {
@@ -347,7 +411,10 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 KeyCode::Enter => {
                     let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
                     match target {
-                        Some(a) => app.set_model(a, &alias),
+                        Some(a) => {
+                            app.set_model(a, &alias);
+                            app.model_switched_for_run_agent(a);
+                        }
                         None => {
                             app.settings.default_model = alias;
                             let _ = app.settings.save();
@@ -358,6 +425,29 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 KeyCode::Char('e') => {
                     app.screen = Screen::Models;
                     app.models_ui.row = sel;
+                    None
+                }
+                KeyCode::Char('+') | KeyCode::Char('-') => {
+                    const STEPS: &[u64] = &[16_000, 32_000, 64_000, 128_000, 200_000, 262_000, 272_000, 400_000, 524_000, 1_000_000];
+                    let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
+                    if let Some(m) = app.registry.models.get_mut(sel) {
+                        let cur = m.context_window.unwrap_or(0);
+                        let i = STEPS.iter().position(|x| *x >= cur).unwrap_or(STEPS.len() - 1) as i64;
+                        let j = (i + d).clamp(0, STEPS.len() as i64 - 1) as usize;
+                        m.context_window = Some(STEPS[j]);
+                        let _ = app.registry.save();
+                        app.toast("context window changed — applies to new agents", crate::agent::Level::Info);
+                    }
+                    Some(Overlay::ModelPicker { sel, target })
+                }
+                KeyCode::Char('c') => {
+                    if let Some(m) = app.registry.models.get(sel) {
+                        let mut input = crate::ui::input::Input::default();
+                        input.set(&m.context_window.map(|c| c.to_string()).unwrap_or_default());
+                        let title = format!("{} · context (accepts 400k / 1m)", m.alias);
+                        app.overlays.push(Overlay::ModelPicker { sel, target });
+                        app.overlays.push(Overlay::Edit { title, input, target: EditTarget::ModelCell(sel, 3) });
+                    }
                     None
                 }
                 _ => Some(Overlay::ModelPicker { sel, target }),
@@ -428,13 +518,15 @@ pub fn key(app: &mut App, k: KeyEvent) {
                         r.approve_plan(&mut ctx);
                     }
                     app.run = run;
-                    app.screen = Screen::Stage;
+                    app.land_on_overview();
                     None
                 } else {
                     Some(Overlay::Plan { scroll })
                 }
             }
-            KeyCode::Char('f') => {
+            // Plain 'f' focuses the canvas; ctrl+f is force-send (WP9) and must reach the chat
+            // input instead — it's handled globally in App::on_key, before overlays are dispatched.
+            KeyCode::Char('f') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.canvas_focus = false;
                 app.screen = Screen::Stage;
                 None
@@ -548,6 +640,50 @@ pub fn key(app: &mut App, k: KeyEvent) {
             }
             _ => Some(Overlay::Patterns { sel, list }),
         },
+        Overlay::Runs { mut sel, mut list, confirm, others } => {
+            let n = list.len();
+            if confirm {
+                match k.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(r) = list.get(sel).cloned() {
+                            if app.delete_run(&r) {
+                                list.retain(|x| x.id != r.id);
+                            }
+                        }
+                        sel = sel.min(list.len().saturating_sub(1));
+                        Some(Overlay::Runs { sel, list, confirm: false, others })
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(Overlay::Runs { sel, list, confirm: false, others }),
+                    _ => Some(Overlay::Runs { sel, list, confirm, others }),
+                }
+            } else {
+                match k.code {
+                    KeyCode::Esc => None,
+                    KeyCode::Up => {
+                        sel = sel.saturating_sub(1);
+                        Some(Overlay::Runs { sel, list, confirm, others })
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1).min(n.saturating_sub(1));
+                        Some(Overlay::Runs { sel, list, confirm, others })
+                    }
+                    KeyCode::Enter => {
+                        if let Some(r) = list.get(sel).cloned() {
+                            app.resume_run(r);
+                        }
+                        None
+                    }
+                    KeyCode::Char('D') | KeyCode::Char('d') | KeyCode::Delete => {
+                        if n > 0 {
+                            Some(Overlay::Runs { sel, list, confirm: true, others })
+                        } else {
+                            Some(Overlay::Runs { sel, list, confirm, others })
+                        }
+                    }
+                    _ => Some(Overlay::Runs { sel, list, confirm, others }),
+                }
+            }
+        }
     };
     if let Some(o) = keep {
         app.overlays.push(o);
