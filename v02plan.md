@@ -66,7 +66,7 @@ Models and context windows (from the provider's page; `/v1/models` does not repo
 | `qwen3.5-122b-a10b` | 262,144 | **rejects the `developer` role that Codex sends → HTTP 400 "Unexpected message role."** Do not use under Codex. Fine under Claude Code. |
 | `deepseek-v4-flash` | 200,000 | ok |
 | `glm-5.3-flash` | 524,288 | ok |
-| `hermes-3-8b-tee` | 16,000 | too small; good for testing context-full handling |
+| `hermes-3-8b-tee` | 16,000 | too small, and it never completed a Codex turn in testing — to test compaction pin `qwen3.8-27b` to `context_window = 16000` instead (verified: compacts at ~12k) |
 
 A ready-made test home was used in this session and should be re-created by `scripts/live-env.sh` (WP13):
 
