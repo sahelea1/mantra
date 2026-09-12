@@ -2,6 +2,7 @@
 
 mod agent;
 mod app;
+mod bridge;
 mod config;
 mod discover;
 mod engine;
@@ -115,6 +116,13 @@ fn main() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         rt.block_on(mock::run());
         return;
+    }
+    // So is the MCP bridge that Claude Code agents use to reach Mantra's tools.
+    if std::env::args().nth(1).as_deref() == Some("mcp-bridge") {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = rt.block_on(bridge::run(args));
+        std::process::exit(code);
     }
     let cli = match parse_args() {
         Ok(Some(c)) => c,
@@ -468,6 +476,10 @@ fn doctor() {
     }
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
+    match util::sandbox_probe() {
+        Ok(()) => println!("{} sandbox: user namespaces available (Codex's bubblewrap sandbox can run)", ok(true)),
+        Err(e) => println!("{} sandbox: {e}", ok(false)),
+    }
     println!("  terminal: TERM={} COLORTERM={} TERM_PROGRAM={}", std::env::var("TERM").unwrap_or_default(), std::env::var("COLORTERM").unwrap_or_default(), std::env::var("TERM_PROGRAM").unwrap_or_default());
     ui::theme::init(&s);
     println!("  colors: {:?} · glyphs: {}", ui::theme::depth(), if ui::theme::ascii() { "ascii" } else { "unicode" });

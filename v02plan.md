@@ -645,8 +645,11 @@ unchanged) or `run_claude_process`. Both return the same `Exit` and emit the sam
 
 #### 10.4 Dynamic tools via `mantra mcp-bridge`
 
-- New subcommand intercepted like `mock-codex` (`main.rs:112-118`): `mantra mcp-bridge --sock <path> --agent
-  <id>`. It speaks MCP over its stdio (`initialize` → capabilities `{tools:{}}`, `tools/list`, `tools/call`;
+- **DONE (src/bridge.rs, verified against the real CLI):** subcommand `mantra mcp-bridge --sock <path> --agent
+  <id>`, intercepted like `mock-codex` (`main.rs`). Wire protocol: every request carries a `call` id —
+  `{"agent","call","list":true}` → `{"call","tools":[…]}` and `{"agent","call","tool","args"}` →
+  `{"call","ok","text"}`; the first line after connecting is `{"agent","hello":true}`. What remains is the
+  Mantra side below. It speaks MCP over its stdio (`initialize` → capabilities `{tools:{}}`, `tools/list`, `tools/call`;
   answer `ping`; ignore notifications) and forwards every `tools/call` over a Unix socket to the running
   Mantra process as one JSON line `{"agent":<id>,"call":"<n>","tool":"mantra_submit_plan","args":{…}}`,
   then blocks until the line `{"call":"<n>","ok":true|false,"text":"…"}` comes back and returns it as

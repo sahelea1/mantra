@@ -138,9 +138,27 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs:
         let tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            // Codex can emit the same diagnostic thousands of times per turn (`OutputTextDelta
+            // without active item`); collapse repeats and drop known noise so the log stays useful.
+            let mut last: Option<String> = None;
+            let mut repeats: u32 = 0;
+            let mut dropped: u32 = 0;
             while let Ok(Some(l)) = lines.next_line().await {
-                crate::mlog!("[codex stderr] {}", crate::util::trunc(&l, 400));
                 let clean = crate::util::strip_ansi(&l);
+                if is_stderr_noise(&clean) {
+                    dropped += 1;
+                    continue;
+                }
+                if last.as_deref() == Some(clean.as_str()) {
+                    repeats += 1;
+                    continue;
+                }
+                if repeats > 0 {
+                    crate::mlog!("[codex stderr] … previous line repeated {repeats}×");
+                    repeats = 0;
+                }
+                crate::mlog!("[codex stderr] {}", crate::util::trunc(&clean, 400));
+                last = Some(clean.clone());
                 if !clean.trim().is_empty() {
                     if let Ok(mut t) = tail.lock() {
                         t.push_back(clean);
@@ -149,6 +167,12 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs:
                         }
                     }
                 }
+            }
+            if repeats > 0 {
+                crate::mlog!("[codex stderr] … previous line repeated {repeats}×");
+            }
+            if dropped > 0 {
+                crate::mlog!("[codex stderr] {dropped} known-noise line(s) dropped");
             }
         });
     }
@@ -243,4 +267,25 @@ pub async fn handshake(conn: &Conn) -> std::result::Result<Value, RpcError> {
         .await?;
     conn.notify("initialized", json!({}));
     Ok(r)
+}
+
+/// Codex diagnostics that carry no information for Mantra users and repeat in bulk.
+fn is_stderr_noise(line: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "OutputTextDelta without active item",
+        "unsupported call: multi_agent_v1",
+        "cannot update goal because this thread has no goal",
+        "resources/read failed for `codex_apps`",
+    ];
+    NOISE.iter().any(|n| line.contains(n))
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    #[test]
+    fn noise_filter() {
+        assert!(super::is_stderr_noise("2026-09-11T21:35:40Z ERROR codex_core::util: OutputTextDelta without active item"));
+        assert!(super::is_stderr_noise("ERROR codex_core::tools::router: error=unsupported call: multi_agent_v1"));
+        assert!(!super::is_stderr_noise("ERROR codex_app_server: Codex's Linux sandbox uses bubblewrap and needs access to create user namespaces."));
+    }
 }
