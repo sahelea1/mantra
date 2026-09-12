@@ -420,6 +420,38 @@ impl Registry {
         })
     }
 
+    /// Why an alias cannot run right now: unknown alias, unknown provider, or a custom provider
+    /// with no usable key (neither the `env_key` variable nor a stored `api_key`). `None` = fine.
+    pub fn alias_problem(&self, alias: &str) -> Option<String> {
+        let Some(m) = self.get(alias) else {
+            return Some(format!("model alias '{alias}' is not in /models"));
+        };
+        if !m.is_custom_provider() {
+            return None; // Codex's own account: `codex login` is checked by doctor, not here
+        }
+        let Some(p) = self.providers.iter().find(|p| p.id == m.provider) else {
+            return Some(format!("{alias} uses provider '{}' which is not in /models", m.provider));
+        };
+        if p.resolve_key().is_none() {
+            let var = p.env_var_name();
+            return Some(format!("{alias} via {} — ${var} is not set and no api_key is stored (/models to fix)", self.provider_name(&p.id)));
+        }
+        None
+    }
+
+    /// Preflight every role of a pattern before a run starts: one message per role whose model
+    /// cannot run (L3 in v02plan.md — the orchestrator's provider used to fail only after the plan
+    /// was approved). Empty = go.
+    pub fn preflight(&self, pattern: &crate::engine::pattern::Pattern) -> Vec<String> {
+        let mut out = vec![];
+        for (name, role) in pattern.ordered_roles() {
+            if let Some(why) = self.alias_problem(&role.model) {
+                out.push(format!("{name}: {why}"));
+            }
+        }
+        out
+    }
+
     /// `-c key=value` arguments that register custom providers with a Codex process.
     pub fn provider_args(&self) -> Vec<String> {
         let mut args = vec![];
@@ -533,6 +565,24 @@ mod tests {
         r.providers.push(ProviderEntry { id: "nameless".into(), ..Default::default() });
         assert_eq!(r.provider_name("nameless"), "nameless");
         assert_eq!(r.provider_name("unconfigured"), "unconfigured");
+    }
+    #[test]
+    fn preflight_names_missing_keys_per_role() {
+        let mut r = Registry::defaults();
+        assert!(r.preflight(&crate::engine::pattern::Pattern::builtin()).is_empty(), "built-in models run on Codex's account");
+        r.providers.push(ProviderEntry { id: "zai".into(), name: "Z.ai".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
+        r.models.push(ModelEntry { alias: "glm".into(), provider: "zai".into(), model: "glm-5.2".into(), ..Default::default() });
+        let mut p = crate::engine::pattern::Pattern::builtin();
+        let sec = p.roles.keys().find(|k| k.contains("security")).cloned().expect("built-in has a security role");
+        p.roles.get_mut(&sec).unwrap().model = "glm".into();
+        let msgs = r.preflight(&p);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].starts_with(&format!("{sec}: glm via Z.ai")) && msgs[0].contains("MANTRA_TEST_NO_SUCH_VAR"), "{msgs:?}");
+        assert!(msgs[0].contains("/models"));
+        // a stored key satisfies it
+        r.providers[0].api_key = Some("k".into());
+        assert!(r.preflight(&p).is_empty());
+        assert!(r.alias_problem("nope").unwrap().contains("not in /models"));
     }
     #[test]
     fn provider_key_resolution_and_no_leak_on_argv() {

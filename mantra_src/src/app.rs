@@ -493,6 +493,11 @@ impl App {
             },
         );
         self.solo = Some(id);
+        if let Some(why) = self.registry.alias_problem(&self.settings.default_model) {
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.notice(Level::Warn, &why);
+            }
+        }
     }
 
     /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
@@ -671,6 +676,18 @@ impl App {
                 return;
             }
         };
+        let problems = self.registry.preflight(&pattern);
+        if !problems.is_empty() {
+            // L3: fail before spending a single turn, naming the role, provider and variable.
+            // Shown where the user is looking: as a toast, and in the Solo log if one exists.
+            if let Some(a) = self.solo.and_then(|s| self.agents.get_mut(&s)) {
+                for p in &problems {
+                    a.notice(Level::Warn, &format!("cannot start the run — {p}"));
+                }
+            }
+            self.toast(format!("cannot start: {}", problems[0]), Level::Error);
+            return;
+        }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
