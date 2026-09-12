@@ -30,6 +30,21 @@ Mantra is a single ~3.5 MB Rust binary. It drives the official `codex app-server
 **Requirements:** [Codex CLI](https://github.com/openai/codex) (`npm i -g @openai/codex`, then `codex login`), `git`, and a Rust toolchain ≥ 1.80 to build.
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
+# no curl? use wget:
+wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
+```
+
+Downloads and verifies (sha256) a prebuilt binary for Linux (x86_64/aarch64) or macOS
+(arm64/x86_64) from the latest release if one matches; otherwise builds from source
+(installing a minimal `rustup` toolchain first if `cargo` is missing). Installs to
+`~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that to your `PATH` if it isn't
+already there, and finishes by running `mantra doctor`. Safe to re-run to upgrade; never
+uses `sudo`.
+
+Or, from a source tarball or clone:
+
+```bash
 tar xzf mantra-src.tar.gz && cd mantra
 cargo build --release              # ~3 min
 cp target/release/mantra ~/.local/bin/    # or: cargo install --path .
