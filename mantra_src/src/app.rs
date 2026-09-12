@@ -125,6 +125,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/runs", "this project's runs: resume or delete"),
     ("/plan", "show the run's plan"),
     ("/pause", "pause / resume the run"),
+    ("/respawn", "respawn the focused agent in place (planner/orchestrator/gate/finale/worker)"),
     ("/land", "merge the finished run branch into your branch"),
     ("/studio", "pattern studio (roles, flow, architect agent)"),
     ("/models", "model registry (context, efforts, providers)"),
@@ -678,6 +679,20 @@ impl App {
         }
     }
 
+    /// WP7.4: respawn a run agent in place (stage `r` on a non-crashed node, `ctrl+r` anywhere,
+    /// `/respawn`). A no-op with a toast for an agent that isn't part of the active run.
+    pub fn respawn_agent(&mut self, a: AgentId) {
+        if !self.in_run(a) {
+            self.toast("that agent isn't part of the active run", Level::Info);
+            return;
+        }
+        match self.with_run(|r, c| r.respawn(c, a, None)) {
+            Some(Ok(())) => self.toast("respawned", Level::Info),
+            Some(Err(msg)) => self.toast(msg, Level::Warn),
+            None => {}
+        }
+    }
+
     /// "⚑ 2" when approvals are waiting anywhere.
     pub fn inbox_badge(&self) -> Option<String> {
         let n = self.approvals.len();
@@ -1116,6 +1131,11 @@ impl App {
                             }
                         }
                         Signal::Activity => {}
+                        Signal::EnvironmentBroken(msg) => {
+                            if self.in_run(agent) {
+                                self.with_run(|r, c| r.on_environment_broken(c, agent, msg));
+                            }
+                        }
                     }
                 }
             }
@@ -1447,6 +1467,13 @@ impl App {
             self.discard_queue();
             return;
         }
+        // WP7.4: respawn the focused run agent in place, from anywhere (not just the stage nav 'r').
+        if ctrl && k.code == KeyCode::Char('r') && self.overlays.is_empty() {
+            if let Some(a) = self.focus_agent() {
+                self.respawn_agent(a);
+            }
+            return;
+        }
         if k.code == KeyCode::F(1) {
             self.overlays.push(Overlay::Help);
             return;
@@ -1638,8 +1665,11 @@ impl App {
                     let crashed = self.agents.get(&a).map(|x| matches!(x.status, Status::Crashed(_))).unwrap_or(false);
                     if crashed {
                         self.hub.send(a, Cmd::Restart);
-                    } else if let Some(msg) = self.with_run(|r, c| r.retry_worker(c, a, None)) {
-                        self.toast(msg, Level::Info);
+                    } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
+                        match res {
+                            Ok(()) => self.toast("respawned", Level::Info),
+                            Err(msg) => self.toast(msg, Level::Warn),
+                        }
                     }
                 }
             }
@@ -1904,6 +1934,10 @@ impl App {
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
+            "/respawn" => match target {
+                Some(a) => self.respawn_agent(a),
+                None => self.toast("no agent focused", Level::Info),
+            },
             "/land" => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Done).unwrap_or(false) {
                     self.with_run(|r, c| r.land(c));

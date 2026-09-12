@@ -392,7 +392,14 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let role: Option<&Role> = run.pattern.role(&t.role);
     let base = role.map(|r| theme::named(&r.color)).unwrap_or(theme::TEAL);
     let v = vstate(w, a);
-    let (mut st, dotted) = card_border(base, v, a);
+    let (mut st, mut dotted) = card_border(base, v, a);
+    // WP7.6: the watchdog escalation ladder has fired on this agent — override the border amber
+    // dotted regardless of its ordinary visual state, and (below) its activity line.
+    let watchdog = a.and_then(|ag| run.watchdog_idle(ag.id));
+    if watchdog.is_some() {
+        st = theme::fg(theme::AMBER);
+        dotted = true;
+    }
     if selected {
         st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
     }
@@ -437,31 +444,35 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     }
     // line 2: activity
     if h >= 4 {
-        let line: Vec<Span> = match (v, a) {
-            (V::NotStarted, _) => vec![Span::styled(trunc(&t.title, iw as usize), theme::faint())],
-            (V::Queued, _) => vec![Span::styled("waiting for a free slot", theme::faint())],
-            (V::Done, _) => {
-                let s = w.map(|w| w.report.lines().find(|l| l.to_lowercase().starts_with("summary:")).map(|l| l[8..].trim().to_string()).unwrap_or_else(|| t.title.clone())).unwrap_or_default();
-                vec![Span::styled(trunc(&s, iw as usize), theme::dim())]
+        let line: Vec<Span> = if let Some(idle) = watchdog {
+            vec![Span::styled(format!("idle {}m · watchdog", (idle.as_secs() / 60).max(1)), theme::fg(theme::AMBER))]
+        } else {
+            match (v, a) {
+                (V::NotStarted, _) => vec![Span::styled(trunc(&t.title, iw as usize), theme::faint())],
+                (V::Queued, _) => vec![Span::styled("waiting for a free slot", theme::faint())],
+                (V::Done, _) => {
+                    let s = w.map(|w| w.report.lines().find(|l| l.to_lowercase().starts_with("summary:")).map(|l| l[8..].trim().to_string()).unwrap_or_else(|| t.title.clone())).unwrap_or_default();
+                    vec![Span::styled(trunc(&s, iw as usize), theme::dim())]
+                }
+                (V::Failed, _) => {
+                    let m = match w.map(|w| &w.state) {
+                        Some(WState::Failed(m)) => m.clone(),
+                        _ => a.map(|a| a.activity.clone()).unwrap_or_default(),
+                    };
+                    vec![Span::styled(trunc(&m, iw as usize), theme::fg(theme::RED))]
+                }
+                (V::Retrying, _) => {
+                    let t = match w.map(|w| &w.state) {
+                        Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
+                        _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
+                    };
+                    vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
+                }
+                (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
+                (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
+                (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
+                _ => vec![],
             }
-            (V::Failed, _) => {
-                let m = match w.map(|w| &w.state) {
-                    Some(WState::Failed(m)) => m.clone(),
-                    _ => a.map(|a| a.activity.clone()).unwrap_or_default(),
-                };
-                vec![Span::styled(trunc(&m, iw as usize), theme::fg(theme::RED))]
-            }
-            (V::Retrying, _) => {
-                let t = match w.map(|w| &w.state) {
-                    Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
-                    _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
-                };
-                vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
-            }
-            (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
-            (_, Some(a)) if a.busy() => anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(base, theme::MUTED), theme::TEXT),
-            (_, Some(a)) => vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())],
-            _ => vec![],
         };
         cv.spans(x, y + 2, &line, iw);
     }
@@ -488,7 +499,8 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let _ = app;
 }
 
-fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
+#[allow(clippy::too_many_arguments)]
+fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
     let v = match a {
         None => V::NotStarted,
         Some(a) => match &a.status {
@@ -504,10 +516,19 @@ fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, 
     if v == V::Queued {
         st = theme::fg(theme::mix_rgb(color, theme::FAINT));
     }
+    // WP7.6: watched-idle agent (planner/orchestrator/gate/finale) — amber dotted border + an
+    // "idle Nm · watchdog" label overriding the ordinary line2 content, same treatment as
+    // `worker_card`.
+    let watchdog = a.and_then(|ag| run.watchdog_idle(ag.id));
+    let mut dotted = a.is_none();
+    if watchdog.is_some() {
+        st = theme::fg(theme::AMBER);
+        dotted = true;
+    }
     if selected {
         st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
     }
-    cv.boxed(r, st, selected, a.is_none());
+    cv.boxed(r, st, selected, dotted && !selected);
     let (x, y, iw) = (r.x as i32 + 2, r.y as i32, r.width as i32 - 4);
     let mut title = vec![Span::raw(" "), Span::styled(format!("{} ", theme::role_glyph(glyph)), theme::bold(theme::fg(color))), Span::styled(name.to_string(), theme::bold(theme::text()))];
     if let Some(a) = a {
@@ -528,6 +549,10 @@ fn agent_card(cv: &mut Cv, r: Rect, a: Option<&Agent>, name: &str, glyph: &str, 
         }
     }
     if r.height >= 4 {
+        let line2 = match watchdog {
+            Some(idle) => vec![Span::styled(format!("idle {}m · watchdog", (idle.as_secs() / 60).max(1)), theme::fg(theme::AMBER))],
+            None => line2,
+        };
         cv.spans(x, y + 2, &line2, iw);
     }
 }
@@ -549,7 +574,7 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         _ => vec![Span::styled("exploring the repo & designing phases…", theme::faint())],
     };
     let sel = nodes.first().copied() == run.planner && app.sel == 0;
-    agent_card(cv, r, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
+    agent_card(cv, r, run, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
     if let Some(a) = a {
         let lines = a.tail_lines((h as usize).saturating_sub(5));
         for (i, l) in lines.iter().enumerate() {
@@ -628,13 +653,13 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let last = oa.and_then(|a| a.tail_lines(1).pop()).unwrap_or_default();
         vec![Span::styled(trunc(&last, (orch_w as usize).saturating_sub(4)), theme::faint())]
     };
-    agent_card(cv, orch, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
+    agent_card(cv, orch, run, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
     if show_planner {
         let pr = Rect { x: (x0 + 1) as u16, y: y0 as u16, width: 26, height: 3 };
         let pa = run.planner.and_then(|p| app.agents.get(&p));
         let pcol = role_col(run, &run.pattern.flow.planner);
         let pglyph = run.pattern.role(&run.pattern.flow.planner).map(|r| r.glyph.clone()).unwrap_or_else(|| "✦".into());
-        agent_card(cv, pr, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
+        agent_card(cv, pr, run, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
         // planner → orchestrator edge when briefing
         let ey = y0 + 1;
         let (ex1, ex2) = (x0 + 27, orch.x as i32 - 1);
@@ -798,7 +823,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         let round = if let PhaseStep::Gate { round } = step { format!("round {round} · ") } else { String::new() };
         let mut l = vec![Span::styled(round, theme::fg(col))];
         l.extend(line2);
-        agent_card(cv, r, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
+        agent_card(cv, r, run, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
     }
 }
 
@@ -814,7 +839,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
         let r = Rect { x: x as u16, y: y as u16, width: w as u16, height: 3 };
         if i == idx {
             let a = run.finale_agent.and_then(|a| app.agents.get(&a));
-            agent_card(cv, Rect { height: 4, ..r }, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
+            agent_card(cv, Rect { height: 4, ..r }, run, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
             y += 4;
         } else {
             let (st, mark) = if i < idx { (theme::fg(theme::mix_rgb(theme::GREEN, theme::FAINT)), theme::g("✓", "v")) } else { (theme::faint(), theme::g("○", "o")) };

@@ -12,6 +12,8 @@ echo "mandala…"
 $bin --demo --snapshot "wait:0.5;sweep:planning;until:plan review@60;sweep:review;key:a;until:Foundations@60;sweep:phase1;until:Features@90;wait:1;sweep:phase2;key:right;key:enter;sweep:zoom;key:esc;key:space;sweep:paused;key:space;until:finale 2/3@150;sweep:finale;until:run complete@150;sweep:done" run "build a todo API with auth" | grep -E 'sweep ok|panicked|timeout'
 echo "halt band (WP6: ProviderRejected)…"
 MANTRA_MOCK_BADMODEL=1 $bin --demo --snapshot "wait:0.5;until:plan review@60;key:a;until:halted@60;sweep:halt-band;snap:halt-band" run "trigger a bad model" | grep -E 'sweep ok|panicked|timeout|halted'
+echo "watchdog (WP7.2/WP7.6: idle-agent nudge, real wall-clock wait ~watchdog_seconds)…"
+MANTRA_MOCK_LAZY_ORCH=1 $bin --demo --snapshot "wait:0.5;until:plan review@60;key:a;until:Foundations@60;wait:1;until:watchdog@150;sweep:watchdog;snap:watchdog" run "build a todo API with auth" | grep -E 'sweep ok|panicked|timeout|watchdog'
 echo "zoom vs overview (WP8)…"
 out=$($bin --demo --snapshot "until:zoomed@10;snap:start-zoomed;until:plan review@60;snap:review-in-zoom;key:a;wait:0.3;until:overview@10;snap:overview-after-approve" run "build a tiny CLI" 2>&1)
 echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC during zoom-vs-overview snapshot"; exit 1; }

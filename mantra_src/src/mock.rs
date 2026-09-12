@@ -578,6 +578,13 @@ async fn planner(e: &Em, text: &str) -> Outcome {
 }
 
 async fn orchestrator(e: &Em, text: &str) -> Outcome {
+    // WP7.2 demo: the watchdog nudged this (real, running) agent directly — acknowledge it and go
+    // back to `mantra_wait`; there is nothing else queued to react to.
+    if text.contains("[mantra:watchdog]") {
+        step!(e.think("**Watchdog nudge**\n\nNothing new since my last check — logging and waiting again.").await);
+        let _ = e.tool("mantra_wait", json!({})).await;
+        return Outcome::Done;
+    }
     if text.contains("[mantra:phase]") {
         let json_block = text.split("```json").nth(1).and_then(|s| s.split("```").next()).unwrap_or("{}");
         let phase: Value = serde_json::from_str(json_block).unwrap_or(json!({}));
@@ -625,6 +632,22 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     let h: u64 = id.bytes().map(|b| b as u64).sum();
     let steps = [("Read the relevant code", "inProgress"), ("Implement", "pending"), ("Verify", "pending")];
     e.plan(&steps);
+    // WP7.2/7.6 demo (`MANTRA_MOCK_LAZY_ORCH=1`): this worker's process vanishes mid-task on its
+    // very first turn without reporting anything useful — the turn ends `interrupted`, which
+    // `Run::on_worker_done` does not advance out of `WState::Running` (that's the F3 rule: an
+    // interrupted-but-still-Running worker is "idle"). The mock orchestrator's default reaction to
+    // an "… was interrupted …" event is just a log line and `mantra_wait` (no `mantra_prompt`/
+    // `mantra_retry`), so nothing re-prompts this worker's own agent — it is the watchdog's
+    // `Expect::Working` nudge (`Run::watchdog_tick`), not any orchestrator-side self-heal, that
+    // eventually wakes it back up. This is the one place in the default demo pattern where the
+    // engine's other self-healing paths (the orchestrator's own "forgot to spawn" safety net,
+    // `wake_orch`, `check_phase_done`, …) don't already paper over the gap, so it is what
+    // `stress.sh` uses to exercise the watchdog end to end through a real running mock agent.
+    if id == "p1-config" && e.turns() == 1 && std::env::var("MANTRA_MOCK_LAZY_ORCH").is_ok() {
+        step!(e.think(&format!("**{title}**\n\nReading the surrounding code to match existing conventions.")).await);
+        step!(e.sleep(200).await);
+        return Outcome::Interrupted;
+    }
     if text.contains("[mantra:retry]") || text.contains("[mantra:resume]") {
         step!(e.think("**Resuming**\n\nPicking up where the previous attempt stopped.").await);
     } else if !text.contains("[from") {

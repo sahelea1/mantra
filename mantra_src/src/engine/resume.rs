@@ -222,6 +222,7 @@ impl Run {
                     stall_flagged: false,
                     budget_flagged: false,
                     context_override: None,
+                    idle_prompts: vec![],
                 }
             })
             .collect();

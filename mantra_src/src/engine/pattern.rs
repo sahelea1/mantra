@@ -64,6 +64,11 @@ pub struct PatternSettings {
     pub gate_max_rounds: u32,
     pub check_timeout_secs: u64,
     pub max_tasks_per_phase: usize,
+    /// Watchdog (WP7.2): seconds an expected-active agent may sit idle before the first nudge.
+    pub watchdog_seconds: u64,
+    /// Watchdog: seconds of continued idleness before the next escalation step (respawn the
+    /// orchestrator / wake the orchestrator / wake the planner); the step after that is 2× this.
+    pub watchdog_escalate_seconds: u64,
 }
 
 impl Default for PatternSettings {
@@ -78,6 +83,8 @@ impl Default for PatternSettings {
             gate_max_rounds: 3,
             check_timeout_secs: 900,
             max_tasks_per_phase: 8,
+            watchdog_seconds: 90,
+            watchdog_escalate_seconds: 240,
         }
     }
 }
@@ -204,6 +211,9 @@ impl Pattern {
         if self.settings.max_parallel == 0 {
             errs.push("settings.max_parallel must be ≥ 1".into());
         }
+        if self.settings.watchdog_escalate_seconds <= self.settings.watchdog_seconds {
+            errs.push("settings.watchdog_escalate_seconds must be greater than watchdog_seconds".into());
+        }
         if errs.is_empty() {
             Ok(())
         } else {
@@ -270,6 +280,8 @@ stall_minutes = 6
 gate_max_rounds = 3
 check_timeout_secs = 900
 max_tasks_per_phase = 8
+watchdog_seconds = 90
+watchdog_escalate_seconds = 240
 
 [roles.planner]
 kind = "planner"
@@ -394,6 +406,17 @@ mod tests {
         p.flow.phase_gate = "nope".into();
         assert!(p.validate().is_err());
     }
+    #[test]
+    fn watchdog_settings_default_for_old_patterns() {
+        // An old pattern TOML saved before WP7 has no watchdog_* keys at all — it must still load,
+        // with the built-in defaults filled in by serde (the `#[serde(default)]` on the struct).
+        let old = DEFAULT_PATTERN.replace("watchdog_seconds = 90\nwatchdog_escalate_seconds = 240\n", "");
+        assert!(!old.contains("watchdog_seconds"), "the fixture must actually be missing the field");
+        let p = Pattern::from_toml(&old).unwrap();
+        assert_eq!(p.settings.watchdog_seconds, 90);
+        assert_eq!(p.settings.watchdog_escalate_seconds, 240);
+    }
+
     #[test]
     fn permission_defaults_off_and_validates() {
         let p = Pattern::builtin();

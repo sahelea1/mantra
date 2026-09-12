@@ -37,6 +37,25 @@ All notable changes to Mantra are recorded here.
   (HTTP 400/422, "unexpected message role", …) is never retried and halts immediately, naming the
   role, model alias and provider. `m` on a selected stage agent opens the model picker to fix a
   `ProviderRejected` halt and resumes the run once a new model is picked.
+- WP7: a watchdog now makes sure every agent that should be working is working. `Run::expected_active`
+  says who must be busy right now and why (planning, orchestrating, working a task, gating, a finale
+  step); an idle agent gets an escalation ladder — nudge it (`watchdog_seconds`, default 90s), then
+  respawn the orchestrator or wake it about another idle agent (`watchdog_escalate_seconds`, default
+  240s), then wake the planner (2×), then halt (`AgentTurnFailed`) if the planner itself doesn't
+  respond — journaled with `⏰`. `Run::respawn` can now restart any run agent in place (planner,
+  orchestrator, phase gate, finale step, or a worker), reachable from the stage `r` key (not just
+  crashed processes), `ctrl+r` anywhere, and `/respawn`. A planner/orchestrator/gate/finale turn that
+  fails past its retry cap gets one free respawn before the run halts. Tool guards refuse
+  `mantra_prompt`/`mantra_interrupt`/`mantra_retry`/`mantra_set_effort` on a worker whose task is
+  already `Done` once the phase has moved past orchestrating ("wait for the handoff"), and the
+  orchestrator prompting the same stuck idle worker three times in five minutes respawns it instead
+  of relaying a fourth message into the void (the F3 loop from real runs). Also from the v0.1 field
+  reports: a `commandExecution` whose output names `bwrap`/user namespaces now halts the run
+  immediately with `HaltReason::Environment` and the sandbox fix hint instead of burning gate rounds
+  or retries (L1); two consecutive gate reports blocked on the same thing halt with `GateExhausted`
+  right away instead of spending the remaining rounds (L4). The Studio's settings panel exposes the
+  new `watchdog_seconds`/`watchdog_escalate_seconds` pattern settings (old saved patterns still load
+  — they default to 90/240 via serde).
 - WP8: zoom vs overview are now unmistakable — a zoomed agent gets a solid role-coloured header
   band and a coloured spine down the log; a run starts zoomed into the planner (once it's spawned);
   the plan-review overlay now opens over any screen (Solo, Zoom or Stage), not just the overview;
