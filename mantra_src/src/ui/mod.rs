@@ -166,6 +166,12 @@ pub fn model_chip(a: &Agent, app: &App) -> Vec<Span<'static>> {
         v.push(Span::raw(" "));
         v.push(Span::styled(theme::effort_bar(&a.effort, &efforts), theme::fg(effort_color(&a.effort))));
     }
+    // Only worth naming the provider once there's more than one to confuse it with (the built-in
+    // "openai" is implicit and never shown on its own).
+    if !app.registry.providers.is_empty() {
+        v.push(Span::styled(" · via ", theme::faint()));
+        v.push(Span::styled(app.registry.provider_name(&m.provider), theme::dim()));
+    }
     if let Some(p) = a.ctx_percent() {
         let col = if p >= 85 { theme::RED } else if p >= 65 { theme::AMBER } else { theme::MUTED };
         v.push(Span::styled(" · ", theme::faint()));

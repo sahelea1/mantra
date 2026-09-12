@@ -356,6 +356,17 @@ impl Registry {
         atomic_write(&Self::path(), &format!("{REGISTRY_HEADER}{body}"))
     }
 
+    /// Display name for a provider id, for pickers and fields that show "via <name>": the built-in
+    /// `openai` (Codex's own account, no `[[provider]]` entry) is always "OpenAI (Codex)"; a
+    /// configured provider shows its `name` (falling back to the id if that's blank); an unknown id
+    /// falls back to itself.
+    pub fn provider_name(&self, id: &str) -> String {
+        if id.is_empty() || id == "openai" {
+            return "OpenAI (Codex)".into();
+        }
+        self.providers.iter().find(|p| p.id == id).map(|p| if p.name.trim().is_empty() { p.id.clone() } else { p.name.clone() }).unwrap_or_else(|| id.to_string())
+    }
+
     pub fn get(&self, alias: &str) -> Option<&ModelEntry> {
         self.models
             .iter()
@@ -454,6 +465,17 @@ mod tests {
         let sol = r.get("sol").unwrap();
         assert_eq!(sol.effective_context(), 272_000);
         assert_eq!(sol.effective_compact_percent(), 85);
+    }
+    #[test]
+    fn provider_display_names() {
+        let mut r = Registry::defaults();
+        assert_eq!(r.provider_name("openai"), "OpenAI (Codex)");
+        assert_eq!(r.provider_name(""), "OpenAI (Codex)");
+        r.providers.push(ProviderEntry { id: "zai".into(), name: "Z.ai".into(), ..Default::default() });
+        assert_eq!(r.provider_name("zai"), "Z.ai");
+        r.providers.push(ProviderEntry { id: "nameless".into(), ..Default::default() });
+        assert_eq!(r.provider_name("nameless"), "nameless");
+        assert_eq!(r.provider_name("unconfigured"), "unconfigured");
     }
     #[test]
     fn registry_roundtrip() {

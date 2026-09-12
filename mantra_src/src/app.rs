@@ -80,9 +80,19 @@ pub struct Approval {
     pub at: Instant,
 }
 
+/// Selection in the Studio's left list, by identity rather than by index into a list that gets
+/// re-sorted on every draw (`ui::studio::entries`/`ordered_roles`) — so changing a role's `kind`
+/// (which moves it in the sort order) never lands the highlight on a different role.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StudioSel {
+    Role(String),
+    Settings,
+    Flow,
+}
+
 pub struct StudioState {
     pub pattern: Pattern,
-    pub sel: usize,
+    pub sel: StudioSel,
     pub field: usize,
     pub focus: u8, // 0 list, 1 fields, 2 architect input
     pub errors: Vec<String>,
@@ -225,6 +235,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.model = m.model.clone();
     a.effort = effort;
     a.ctx_window = Some(cw);
+    a.approval = o.approval.clone();
     agents.insert(id, a);
     hub.spawn(id, spec);
     id
@@ -278,7 +289,7 @@ impl Ctx for Ctxt<'_> {
                 model_alias: r.role.model.clone(),
                 effort: r.effort.or(Some(r.role.effort.clone())),
                 cwd: r.cwd,
-                approval: "never".into(),
+                approval: r.role.permission.clone(),
                 sandbox,
                 instructions: r.instructions,
                 tools: r.tools,
@@ -341,6 +352,7 @@ impl App {
     pub fn new(settings: Settings, registry: Registry, project: PathBuf, hub: Hub, tx: UnboundedSender<AppEvent>, demo: bool) -> App {
         let pattern_name = settings.default_pattern.clone();
         let pattern = Pattern::load(&pattern_name, &project).unwrap_or_else(|_| Pattern::builtin());
+        let sel0 = pattern.ordered_roles().first().map(|(n, _)| StudioSel::Role(n.clone())).unwrap_or(StudioSel::Settings);
         let branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&project)
@@ -371,7 +383,7 @@ impl App {
             ctrl_c: None,
             tx,
             demo,
-            studio: StudioState { pattern, sel: 0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
+            studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
             models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false },
             suggest: 0,
             notes: vec![],
@@ -616,7 +628,17 @@ impl App {
         id
     }
 
+    /// The `/models` `t` live test. Dispatched per backend so a provider that can't actually run a
+    /// role (F4: a model rejecting Codex's `developer` role) fails here, before a real run — not the
+    /// job the user is running it for.
     pub fn probe_model(&mut self, alias: &str) {
+        // Every provider today speaks Codex's wire protocol (`kind = ClaudeCode` and its own test
+        // path — `--append-system-prompt` — arrive with WP10). Keep the dispatch explicit so that
+        // arm can be added here without touching the caller.
+        self.probe_model_codex(alias);
+    }
+
+    fn probe_model_codex(&mut self, alias: &str) {
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -631,7 +653,11 @@ impl App {
                 cwd: self.project.clone(),
                 approval: "never".into(),
                 sandbox: "read-only".into(),
-                instructions: String::new(),
+                // Non-empty developer instructions become Codex's `developerInstructions`
+                // (`thread/start`) — the same channel a real run's phase/task briefs use, and the
+                // one some providers (F4) reject with an HTTP 400. Sending it here means the test
+                // catches that before the model is picked for a role.
+                instructions: "You are a compatibility probe. Developer-role messages like this one must be accepted.".into(),
                 tools: vec![],
                 extra_writable: vec![],
                 context_override: None,
@@ -725,6 +751,9 @@ impl App {
         let _ = self.settings.save();
         if let Some(s) = self.solo {
             self.hub.send(s, Cmd::SetApproval(mode.to_string()));
+            if let Some(a) = self.agents.get_mut(&s) {
+                a.approval = mode.to_string();
+            }
         }
         let label = match mode {
             "never" => "never ask",
@@ -975,9 +1004,11 @@ impl App {
                     self.notes.push(format!("Mantra: {name} needs approval"));
                 }
                 self.approvals.push(Approval { agent, id, method: method.to_string(), title, detail, params, at: Instant::now() });
-                if self.settings.approval_mode == "never" {
-                    // Codex fixes a turn's policy when the turn starts, so a turn begun under another
-                    // mode (or a run agent) can still ask — honour "never ask" here.
+                // Codex fixes a turn's policy when the turn starts, so a turn begun under another
+                // mode can still ask — honour the *agent's own* approval policy here (not the
+                // global Solo mode), so a Mandala role set to "never" auto-resolves even while
+                // Solo's mode is something else, and vice versa.
+                if self.agents.get(&agent).map(|a| a.approval == "never").unwrap_or(false) {
                     self.auto_approve_pending();
                     self.toast = self.toast.take().filter(|t| !t.0.contains("needs approval"));
                     self.notes.retain(|n| !n.contains("needs approval"));

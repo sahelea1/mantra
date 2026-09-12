@@ -66,9 +66,15 @@ fn help(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(l).block(block("keys", theme::SAFFRON)), r);
 }
 
+/// Every provider speaks Codex's wire protocol today; WP10 will branch this on the provider's
+/// `kind` once a `ClaudeCode` backend exists (glyph `✧ claude`).
+fn backend_glyph(_provider: &str) -> &'static str {
+    "◌ codex"
+}
+
 fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option<crate::hub::AgentId>) {
     let rows = app.registry.models.len() as u16;
-    let r = centered(area, 92, rows + 7);
+    let r = centered(area, 104, rows + 7);
     f.render_widget(Clear, r);
     let cur = target.and_then(|a| app.agents.get(&a));
     let mut l = vec![Line::from(Span::styled(format!("  for: {}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
@@ -77,19 +83,25 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
         let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
         let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
+        let via = format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&m.provider));
+        // Two aliases can point at the same model id through different providers — the provider
+        // column above already distinguishes them; call it out too so it isn't missed.
+        let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
+        let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
         l.push(Line::from(vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
             Span::styled(format!("{:<10}", m.alias), st),
             Span::styled(format!("{:<18}", trunc(&m.model, 17)), theme::muted()),
-            Span::styled(format!("{:<9}", trunc(&m.provider, 8)), theme::dim()),
+            Span::styled(format!(" {:<24}", trunc(&via, 23)), theme::dim()),
             Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
             Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))),
             Span::styled(format!(" {:<12}", ctx), theme::dim()),
-            Span::styled(if is_cur { format!(" {} current", theme::g("●", "*")) } else { format!(" {}", trunc(&m.note, 22)) }, if is_cur { theme::fg(theme::GREEN) } else { theme::faint() }),
+            Span::styled(if is_cur { format!(" {} current", theme::g("●", "*")) } else { format!(" {}", trunc(&m.note, 18)) }, if is_cur { theme::fg(theme::GREEN) } else { theme::faint() }),
+            Span::styled(trunc(&dup, 26), theme::faint()),
         ]));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled("  ↑↓ model · ←→ effort (current model) · ⏎ switch · e edit models · esc", theme::faint())));
+    l.push(Line::from(Span::styled("  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc", theme::faint())));
     f.render_widget(Paragraph::new(l).block(block("model & effort", theme::SAFFRON)), r);
 }
 
@@ -358,6 +370,29 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 KeyCode::Char('e') => {
                     app.screen = Screen::Models;
                     app.models_ui.row = sel;
+                    None
+                }
+                KeyCode::Char('+') | KeyCode::Char('-') => {
+                    const STEPS: &[u64] = &[16_000, 32_000, 64_000, 128_000, 200_000, 262_000, 272_000, 400_000, 524_000, 1_000_000];
+                    let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
+                    if let Some(m) = app.registry.models.get_mut(sel) {
+                        let cur = m.context_window.unwrap_or(0);
+                        let i = STEPS.iter().position(|x| *x >= cur).unwrap_or(STEPS.len() - 1) as i64;
+                        let j = (i + d).clamp(0, STEPS.len() as i64 - 1) as usize;
+                        m.context_window = Some(STEPS[j]);
+                        let _ = app.registry.save();
+                        app.toast("context window changed — applies to new agents", crate::agent::Level::Info);
+                    }
+                    Some(Overlay::ModelPicker { sel, target })
+                }
+                KeyCode::Char('c') => {
+                    if let Some(m) = app.registry.models.get(sel) {
+                        let mut input = crate::ui::input::Input::default();
+                        input.set(&m.context_window.map(|c| c.to_string()).unwrap_or_default());
+                        let title = format!("{} · context (accepts 400k / 1m)", m.alias);
+                        app.overlays.push(Overlay::ModelPicker { sel, target });
+                        app.overlays.push(Overlay::Edit { title, input, target: EditTarget::ModelCell(sel, 3) });
+                    }
                     None
                 }
                 _ => Some(Overlay::ModelPicker { sel, target }),

@@ -20,6 +20,9 @@ pub struct Role {
     pub effort: String,
     /// read-only | workspace-write
     pub sandbox: String,
+    /// Codex approval policy for agents of this role: "never" (default — never asks; requests
+    /// land in the inbox only if a tool forces the question), "on-request", or "untrusted".
+    pub permission: String,
     pub description: String,
     pub instructions: String,
     /// Tripwire when an agent of this role uses more tokens than this.
@@ -35,12 +38,16 @@ impl Default for Role {
             model: "sol".into(),
             effort: "medium".into(),
             sandbox: "workspace-write".into(),
+            permission: "never".into(),
             description: String::new(),
             instructions: String::new(),
             max_tokens: None,
         }
     }
 }
+
+/// Values `Role.permission` may take.
+pub const PERMISSIONS: &[&str] = &["never", "on-request", "untrusted"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -170,6 +177,9 @@ impl Pattern {
             }
             if r.model.trim().is_empty() {
                 errs.push(format!("role '{n}': model is empty"));
+            }
+            if !PERMISSIONS.contains(&r.permission.as_str()) {
+                errs.push(format!("role '{n}': permission must be one of {} (got '{}')", PERMISSIONS.join(", "), r.permission));
             }
         }
         let need = |role: &str, kind: &str, what: &str, errs: &mut Vec<String>| match self.roles.get(role) {
@@ -383,5 +393,17 @@ mod tests {
         let mut p = Pattern::builtin();
         p.flow.phase_gate = "nope".into();
         assert!(p.validate().is_err());
+    }
+    #[test]
+    fn permission_defaults_off_and_validates() {
+        let p = Pattern::builtin();
+        for (n, r) in &p.roles {
+            assert_eq!(r.permission, "never", "role '{n}' should default to permission = never");
+        }
+        let mut bad = Pattern::builtin();
+        let name = bad.worker_roles()[0].clone();
+        bad.roles.get_mut(&name).unwrap().permission = "sometimes".into();
+        let errs = bad.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("permission") && e.contains("sometimes")), "{errs:?}");
     }
 }

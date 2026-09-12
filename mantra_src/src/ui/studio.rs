@@ -1,16 +1,16 @@
 //! Pattern Studio (roles, flow, settings + an architect agent) and the Models screen.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, Screen};
+use crate::app::{App, EditTarget, Overlay, Screen, StudioSel};
 use crate::config::ProviderEntry;
-use crate::engine::pattern::{FinaleStep, Role, COLORS, KINDS};
+use crate::engine::pattern::{FinaleStep, Role, COLORS, KINDS, PERMISSIONS};
 use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 
 const GLYPHS: &[&str] = &["✦", "◉", "◇", "◆", "◎", "▲", "■", "●", "★", "◈", "▣", "⬡", "♦", "▼"];
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "max_tokens", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
 const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase"];
 
 /// Entries in the left list: roles…, settings, flow
@@ -19,6 +19,36 @@ fn entries(app: &App) -> Vec<String> {
     v.push("⚙ settings".into());
     v.push("⇢ flow".into());
     v
+}
+
+fn sel_for_entry(e: &str) -> StudioSel {
+    match e {
+        "⚙ settings" => StudioSel::Settings,
+        "⇢ flow" => StudioSel::Flow,
+        name => StudioSel::Role(name.to_string()),
+    }
+}
+
+/// `app.studio.sel`'s position in the current (re-sorted) list — for drawing and for ↑/↓, which
+/// step by index but must land back on an identity so a later re-sort can't move the highlight.
+fn sel_index(app: &App) -> usize {
+    let es = entries(app);
+    let i = match &app.studio.sel {
+        StudioSel::Settings => es.iter().position(|e| e == "⚙ settings"),
+        StudioSel::Flow => es.iter().position(|e| e == "⇢ flow"),
+        StudioSel::Role(name) => es.iter().position(|e| e == name),
+    };
+    i.unwrap_or(0).min(es.len().saturating_sub(1))
+}
+
+/// Select the `i`th entry of the current list by identity.
+fn select_by_index(app: &mut App, i: usize) {
+    let es = entries(app);
+    if es.is_empty() {
+        return;
+    }
+    let i = i.min(es.len() - 1);
+    app.studio.sel = sel_for_entry(&es[i]);
 }
 
 fn flow_fields(app: &App) -> Vec<String> {
@@ -85,9 +115,17 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "kind" => r.kind.clone(),
                 "glyph" => r.glyph.clone(),
                 "color" => r.color.clone(),
-                "model" => r.model.clone(),
+                "model" => {
+                    let m = app.registry.resolve(&r.model);
+                    if r.model.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} · {} · via {}", r.model, m.model, app.registry.provider_name(&m.provider))
+                    }
+                }
                 "effort" => r.effort.clone(),
                 "sandbox" => r.sandbox.clone(),
+                "permission" => r.permission.clone(),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
                 "description" => r.description.clone(),
                 "instructions" => r.instructions.clone(),
@@ -166,6 +204,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     r.effort = cycle(&effs, &r.effort, d);
                 }
                 "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
+                "permission" => r.permission = cycle(PERMISSIONS, &r.permission, d),
                 "max_tokens" => {
                     let cur = r.max_tokens.unwrap_or(0) as i64;
                     let next = cur + d as i64 * 250_000;
@@ -226,8 +265,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
             }
             app.studio.pattern.roles.insert(name.clone(), Role { description: "new role".into(), ..Default::default() });
             app.studio.dirty = true;
-            let es = entries(app);
-            app.studio.sel = es.iter().position(|e| *e == name).unwrap_or(0);
+            app.studio.sel = StudioSel::Role(name);
             app.studio.focus = 1;
         }
         EditTarget::NewPattern => {
@@ -307,7 +345,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
     };
     let es = entries(app);
-    let sel = app.studio.sel.min(es.len() - 1);
+    let sel = sel_index(app);
     let flash = anim::fade(app.studio.flash, 900);
     // list
     let mut l = vec![];
@@ -360,6 +398,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         };
         let arrows = if is { format!(" {}", theme::g("◂ ▸", "< >")) } else { String::new() };
         fl.push(Line::from(vec![Span::styled(format!(" {}{:<20}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
+    }
+    if app.studio.focus == 1 && fs.get(fsel).map(|s| s.as_str()) == Some("permission") {
+        fl.push(Line::from(Span::styled(" off = the agent never asks (default for Mandala). Turn on only for roles you want to approve by hand; requests land in the inbox (ctrl+g).", theme::faint())));
     }
     fl.push(Line::default());
     fl.push(Line::from(Span::styled(" ←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())));
@@ -481,7 +522,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         return;
     }
     let es = entries(app);
-    let entry = es[app.studio.sel.min(es.len() - 1)].clone();
+    let entry = es[sel_index(app)].clone();
     let fs = fields(app, &entry);
     match k.code {
         KeyCode::Esc => {
@@ -489,7 +530,8 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.studio.focus == 0 {
-                app.studio.sel = app.studio.sel.saturating_sub(1);
+                let i = sel_index(app);
+                select_by_index(app, i.saturating_sub(1));
                 app.studio.field = 0;
             } else {
                 app.studio.field = app.studio.field.saturating_sub(1);
@@ -497,7 +539,8 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if app.studio.focus == 0 {
-                app.studio.sel = (app.studio.sel + 1).min(es.len() - 1);
+                let i = sel_index(app);
+                select_by_index(app, (i + 1).min(es.len() - 1));
                 app.studio.field = 0;
             } else {
                 app.studio.field = (app.studio.field + 1).min(fs.len().saturating_sub(1));
@@ -537,7 +580,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 }
                 "⇢ flow" => return nudge(app, &entry, &fname, 1),
                 role => {
-                    if ["kind", "color", "sandbox", "effort", "model"].contains(&fname.as_str()) {
+                    if ["kind", "color", "sandbox", "permission", "effort", "model"].contains(&fname.as_str()) {
                         return nudge(app, &entry, &fname, 1);
                     }
                     EditTarget::RoleField(role.to_string(), fname.clone())
@@ -570,9 +613,10 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 if used {
                     app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
                 } else {
+                    let i = sel_index(app);
                     app.studio.pattern.roles.remove(&entry);
                     app.studio.dirty = true;
-                    app.studio.sel = app.studio.sel.saturating_sub(1);
+                    select_by_index(app, i.saturating_sub(1));
                 }
             }
         }

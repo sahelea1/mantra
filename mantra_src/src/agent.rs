@@ -105,6 +105,9 @@ pub struct Agent {
     pub model: String,
     pub effort: String,
     pub cwd: PathBuf,
+    /// Codex approval policy this agent was spawned with ("never" | "on-request" | "untrusted").
+    /// Drives auto-approval independently of the global Solo mode (`Settings.approval_mode`).
+    pub approval: String,
     pub thread_id: Option<String>,
     pub status: Status,
     pub items: Vec<Item>,
@@ -152,6 +155,7 @@ impl Agent {
             model: String::new(),
             effort: "medium".into(),
             cwd,
+            approval: "never".into(),
             thread_id: None,
             status: Status::Starting,
             items: vec![],
