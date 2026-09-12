@@ -26,6 +26,9 @@ pub struct SpawnSpec {
     pub config: serde_json::Map<String, Value>,
     pub extra_args: Vec<String>,
     pub resume_thread: Option<String>,
+    /// Extra environment variables for the child process (e.g. an API key pasted into
+    /// `models.toml` rather than left in an env var) — never placed on argv.
+    pub envs: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -211,7 +214,7 @@ async fn run_process(
     approval: &mut String,
     is_restart: bool,
 ) -> Exit {
-    let (conn, mut inc, mut child) = match rpc::spawn(codex_cmd, &spec.extra_args, &spec.cwd) {
+    let (conn, mut inc, mut child) = match rpc::spawn(codex_cmd, &spec.extra_args, &spec.cwd, &spec.envs) {
         Ok(x) => x,
         Err(e) => return Exit::Crashed(e.to_string()),
     };

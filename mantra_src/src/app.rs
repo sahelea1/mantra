@@ -215,6 +215,15 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         extra.push("-c".into());
         extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
     }
+    // Deliver a key stored directly in the provider (not just named by env_key) into the child's
+    // own environment — never on argv, never logged.
+    let envs: Vec<(String, String)> = reg
+        .providers
+        .iter()
+        .find(|p| p.id == m.provider)
+        .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
+        .into_iter()
+        .collect();
     let spec = SpawnSpec {
         cwd: o.cwd.clone(),
         model: m.model.clone(),
@@ -227,12 +236,14 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         config: serde_json::Map::new(),
         extra_args: extra,
         resume_thread: None,
+        envs,
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
     a.glyph = o.glyph;
     a.color = o.color;
     a.model_alias = m.alias.clone();
     a.model = m.model.clone();
+    a.provider = m.provider.clone();
     a.effort = effort;
     a.ctx_window = Some(cw);
     a.approval = o.approval.clone();
@@ -403,7 +414,7 @@ impl App {
         self.agents.values().any(|a| a.busy() || matches!(a.status, Status::Starting | Status::Retrying(_)))
             || self.toast.as_ref().map(|t| t.1.elapsed().as_millis() < crate::ui::toast_life(&t.0) + 100).unwrap_or(false)
             || self.agents.values().any(|a| a.compacting || a.ctx_anim.map(|(_, t)| t.elapsed().as_millis() < 950).unwrap_or(false))
-            || self.run.as_ref().map(|r| (r.is_active() && !r.paused && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
+            || self.run.as_ref().map(|r| (r.is_active() && !r.halted() && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
             || self.studio.flash.map(|f| f.elapsed() < Duration::from_millis(900)).unwrap_or(false)
     }
 
@@ -532,6 +543,26 @@ impl App {
         }
     }
 
+    /// After switching a run agent's model (e.g. from the halt-band `m` picker), persist the
+    /// choice into this run's own pattern copy so a later spawn of that role picks it up, and —
+    /// if the run was halted — resume it so the newly-configured agent gets going again.
+    pub fn model_switched_for_run_agent(&mut self, a: AgentId) {
+        if !self.run.as_ref().map(|r| r.all_agents().contains(&a)).unwrap_or(false) {
+            return;
+        }
+        let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
+        if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
+            if let Some(role_name) = run.role_name_of(a) {
+                if let Some(r) = run.pattern.roles.get_mut(&role_name) {
+                    r.model = alias;
+                }
+            }
+        }
+        if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
+            self.with_run(|r, c| r.resume(c));
+        }
+    }
+
     /// Compact an agent's context now, or right after its current turn.
     pub fn compact_agent(&mut self, a: AgentId) {
         let Some(ag) = self.agents.get_mut(&a) else { return };
@@ -571,7 +602,7 @@ impl App {
                     Stage::Done => "done".to_string(),
                     Stage::Failed(_) => "stopped".to_string(),
                 };
-                format!("{} mantra — {st}{}", if r.paused { "‖" } else { "◉" }, if busy > 0 { format!(" · {busy} active") } else { String::new() })
+                format!("{} mantra — {st}{}", if r.halted() { "⛔" } else { "◉" }, if busy > 0 { format!(" · {busy} active") } else { String::new() })
             }
             _ => format!("✦ mantra — {}{}", self.project.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), if busy > 0 { " · working" } else { "" }),
         }
@@ -684,7 +715,7 @@ impl App {
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let r = async {
-                    let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd).map_err(|e| e.to_string())?;
+                    let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd, &[]).map_err(|e| e.to_string())?;
                     crate::rpc::handshake(&conn).await.map_err(|e| e.to_string())?;
                     let v = conn.request_timeout("model/list", json!({"limit": 100}), Duration::from_secs(20)).await.map_err(|e| e.message)?;
                     let _ = child.kill().await;
@@ -697,7 +728,7 @@ impl App {
         for p in provs {
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
-                let r = crate::discover::list_models(&p.base_url, &p.env_key).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
+                let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref()).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
                 let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
             });
         }
@@ -1407,6 +1438,15 @@ impl App {
             KeyCode::Char('c') => {
                 if let Some(a) = selected {
                     self.compact_agent(a);
+                }
+            }
+            KeyCode::Char('m') => {
+                // On a halted run this is the fix for `ProviderRejected`: pick a different model
+                // for the affected agent (WP6.6). Works on any selected agent, halted or not.
+                if let Some(a) = selected {
+                    let cur = self.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
+                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
+                    self.overlays.push(Overlay::ModelPicker { sel, target: Some(a) });
                 }
             }
             KeyCode::Char('s') => self.open_studio(),

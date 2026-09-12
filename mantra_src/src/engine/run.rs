@@ -124,6 +124,34 @@ pub struct Pulse {
     pub text: String,
 }
 
+/// Why a run stopped making progress on its own and needs a person.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HaltReason {
+    /// The user pressed `space`.
+    User,
+    Auth,
+    UsageLimit,
+    /// A deterministic provider/model incompatibility (HTTP 400/422, "unexpected message role", …)
+    /// — retrying cannot help; the role's model must change.
+    ProviderRejected,
+    /// The host environment itself can't run agents (e.g. no sandbox support). The actual probe
+    /// is WP12; this reason and its hint exist now so `halt()` has somewhere to route it.
+    #[allow(dead_code)]
+    Environment,
+    GateExhausted,
+    AttemptsExhausted,
+    AgentTurnFailed,
+}
+
+/// A run-level halt: `Run.halt.is_some()` replaces the old bare `paused` flag with a reason, the
+/// agent it's about (if any) and a message — so the UI can show *why* and *what to do*.
+pub struct Halt {
+    pub reason: HaltReason,
+    pub agent: Option<AgentId>,
+    pub message: String,
+    pub since: Instant,
+}
+
 pub struct PhaseRecord {
     pub name: String,
     pub workers: Vec<(String, String, String, bool)>, // task id, title, glyph, ok
@@ -138,7 +166,8 @@ pub struct Run {
     pub pattern: Pattern,
     pub brief: String,
     pub stage: Stage,
-    pub paused: bool,
+    /// `Some` while the run is halted (see `HaltReason`); `None` while running normally.
+    pub halt: Option<Halt>,
     pub plan: Option<Plan>,
     pub plan_version: u32,
     pub planner: Option<AgentId>,
@@ -181,7 +210,7 @@ impl Run {
             pattern,
             brief,
             stage: Stage::Setup,
-            paused: false,
+            halt: None,
             plan: None,
             plan_version: 0,
             planner: None,
@@ -270,6 +299,106 @@ impl Run {
         !matches!(self.stage, Stage::Done | Stage::Failed(_))
     }
 
+    pub fn halted(&self) -> bool {
+        self.halt.is_some()
+    }
+
+    /// Halt the run: interrupt whatever is busy, remember why, journal and alert. Every failure
+    /// the run cannot handle by itself goes through here instead of a bare pause flag.
+    fn halt(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String) {
+        for a in self.all_agents() {
+            if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
+                ctx.interrupt(a);
+                if !self.paused_agents.contains(&a) {
+                    self.paused_agents.push(a);
+                }
+            }
+        }
+        // The agent this halt is about may already be idle (its turn just failed) — still queue
+        // it for a "continue where you left off" prompt once the run resumes.
+        if let Some(a) = agent {
+            if !self.paused_agents.contains(&a) {
+                self.paused_agents.push(a);
+            }
+        }
+        self.log("⛔", "red", format!("halted: {message}"));
+        self.alerts.push(message.clone());
+        ctx.notify(&format!("Mantra needs you: {message}"));
+        self.halt = Some(Halt { reason, agent, message, since: Instant::now() });
+    }
+
+    /// Un-halt: re-prompt every agent that was interrupted for this, and pick the run back up
+    /// wherever it left off. Used by `toggle_pause`'s resume path and by `m` (switch model) on a
+    /// `ProviderRejected` halt.
+    pub fn resume(&mut self, ctx: &mut dyn Ctx) {
+        if self.halt.is_none() {
+            return;
+        }
+        self.halt = None;
+        self.alerts.clear();
+        for a in std::mem::take(&mut self.paused_agents) {
+            ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
+        }
+        self.log("▶", "green", "run resumed");
+        if let Stage::Phase { idx, step } = self.stage.clone() {
+            match step {
+                PhaseStep::Orchestrating => {
+                    self.fill_slots(ctx);
+                    self.check_phase_done(ctx);
+                }
+                PhaseStep::Gate { .. } | PhaseStep::Checks { .. } => self.run_checks(ctx, idx, 1),
+                _ => {}
+            }
+        }
+        self.wake_orch(ctx);
+    }
+
+    /// Short "what to do" text for the halted state, shown in the stage header band and the alert.
+    pub fn halt_hint(&self) -> String {
+        let Some(h) = &self.halt else { return String::new() };
+        match h.reason {
+            HaltReason::User => "space resume".into(),
+            HaltReason::Auth | HaltReason::UsageLimit => "fix credentials or quota, then space".into(),
+            HaltReason::ProviderRejected => {
+                let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
+                format!("m switch model for {who} · r retry")
+            }
+            HaltReason::Environment => "fix the environment (see the message above), then r retry".into(),
+            HaltReason::GateExhausted => "type feedback for the planner, or space to retry the gate".into(),
+            HaltReason::AttemptsExhausted => {
+                let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the task".into());
+                format!("r retry {who} · type feedback for the planner")
+            }
+            HaltReason::AgentTurnFailed => {
+                let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
+                format!("r respawn {who} · space retries the turn")
+            }
+        }
+    }
+
+    /// The pattern role name behind an agent (not `name_of`'s task id / flow-slot label) — used to
+    /// persist a model switch back into this run's pattern copy.
+    pub fn role_name_of(&self, a: AgentId) -> Option<String> {
+        if Some(a) == self.planner {
+            return Some(self.pattern.flow.planner.clone());
+        }
+        if Some(a) == self.orchestrator {
+            return Some(self.pattern.flow.orchestrator.clone());
+        }
+        if Some(a) == self.gate_agent {
+            return Some(self.pattern.flow.phase_gate.clone());
+        }
+        if let Some(w) = self.workers.iter().find(|w| w.agent == Some(a)) {
+            return Some(w.task.role.clone());
+        }
+        if Some(a) == self.finale_agent {
+            if let Stage::Finale { idx } = self.stage {
+                return self.pattern.flow.finale.get(idx).map(|s| s.role.clone());
+            }
+        }
+        None
+    }
+
     pub fn workspace_dir(&self) -> PathBuf {
         self.ws.as_ref().map(|w| w.integ.clone()).unwrap_or_else(|| self.project.clone())
     }
@@ -350,7 +479,7 @@ impl Run {
 
     fn wake_orch(&mut self, ctx: &mut dyn Ctx) {
         let Some(o) = self.orchestrator else { return };
-        if self.orch_inbox.is_empty() || self.paused {
+        if self.orch_inbox.is_empty() || self.halted() {
             return;
         }
         let Some(a) = ctx.agent(o) else { return };
@@ -515,10 +644,9 @@ impl Run {
         let attempt = self.workers.iter().filter(|w| w.task.id == task.id).map(|w| w.attempt).max().unwrap_or(0) + 1;
         let cap = self.max_attempts();
         if attempt > cap {
-            let msg = format!("{} has used all {cap} attempts — not respawning. The run is paused: fix the cause, then re-prompt (or tell the planner to drop/rewrite the task).", task.id);
-            if !self.paused {
-                self.alert(ctx, msg.clone());
-                self.toggle_pause(ctx);
+            let msg = format!("{} has used all {cap} attempts — not respawning.", task.id);
+            if !self.halted() {
+                self.halt(ctx, HaltReason::AttemptsExhausted, None, msg.clone());
             }
             return format!("REFUSED: {msg}");
         }
@@ -605,7 +733,7 @@ impl Run {
     }
 
     fn fill_slots(&mut self, ctx: &mut dyn Ctx) {
-        if self.paused {
+        if self.halted() {
             return;
         }
         let running = self.workers.iter().filter(|w| matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))).count();
@@ -621,7 +749,7 @@ impl Run {
 
     fn check_phase_done(&mut self, ctx: &mut dyn Ctx) {
         let Some(idx) = self.phase_idx() else { return };
-        if !matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) || self.paused {
+        if !matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) || self.halted() {
             return;
         }
         let Some(phase) = self.current_phase().cloned() else { return };
@@ -935,8 +1063,8 @@ impl Run {
                         ctx.prompt(g, format!("[mantra:gate-round {}] Gate checks still fail after your fixes:\n{s}\n\nFix them, then call mantra_gate_report again.", round + 1));
                     }
                 } else {
-                    self.paused = true;
-                    self.alert(ctx, format!("phase {} gate still failing after {} rounds — fix manually or re-prompt, then press space to resume", phase + 1, round));
+                    let gate = self.gate_agent;
+                    self.halt(ctx, HaltReason::GateExhausted, gate, format!("phase {} gate still failing after {} rounds", phase + 1, round));
                 }
             }
             (JobTag::Cleanup { phase }, JobOut::Text(r)) => {
@@ -1003,18 +1131,29 @@ impl Run {
                     return;
                 }
             }
-            let hard = matches!(kind, Some(ErrKind::Auth) | Some(ErrKind::UsageLimit));
-            if hard || self.worker_idx(a).is_none() {
+            // ProviderRejected is deterministic (bad model/role for this provider) — never retried,
+            // and halts immediately even for a worker (unlike other worker errors, which are
+            // reported to the orchestrator below).
+            let reason = match kind {
+                Some(ErrKind::Auth) => Some(HaltReason::Auth),
+                Some(ErrKind::UsageLimit) => Some(HaltReason::UsageLimit),
+                Some(ErrKind::ProviderRejected) => Some(HaltReason::ProviderRejected),
+                _ if self.worker_idx(a).is_none() => Some(HaltReason::AgentTurnFailed),
+                _ => None,
+            };
+            if let Some(reason) = reason {
                 let n = self.name_of(a);
-                if !self.paused {
-                    self.toggle_pause(ctx);
-                }
-                if !self.paused_agents.contains(&a) {
-                    self.paused_agents.push(a);
+                let detail = if reason == HaltReason::ProviderRejected {
+                    let (alias, provider) = ctx.agent(a).map(|ag| (ag.model_alias.clone(), ag.provider.clone())).unwrap_or_default();
+                    let role = self.role_name_of(a).unwrap_or_default();
+                    format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120))
+                } else {
+                    format!("{n}: {}", trunc(&msg, 120))
+                };
+                if !self.halted() {
+                    self.halt(ctx, reason, Some(a), detail);
                 }
                 self.retry_counts.remove(&a);
-                let hint = if hard { "fix credentials / limits / network" } else { "check the error" };
-                self.alert(ctx, format!("{n}: {} — run paused ({hint}, then press space to resume)", trunc(&msg, 120)));
                 return;
             }
             // worker with a non-retryable error or out of retries: falls through → reported to the orchestrator
@@ -1053,7 +1192,7 @@ impl Run {
             }
             // Safety net: tasks the orchestrator forgot to spawn are started automatically.
             if let Some(phase) = self.current_phase().cloned() {
-                if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) && !self.paused {
+                if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) && !self.halted() {
                     for t in phase.tasks {
                         if !self.workers.iter().any(|w| w.task.id == t.id) {
                             self.log("◉", "violet", format!("auto-spawning {} (orchestrator skipped it)", t.id));
@@ -1083,8 +1222,7 @@ impl Run {
                             self.mark_edge(a);
                             ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
                         } else {
-                            self.paused = true;
-                            self.alert(ctx, format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)));
+                            self.halt(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)));
                         }
                     }
                 }
@@ -1214,7 +1352,7 @@ impl Run {
             return;
         }
         self.last_tick = Instant::now();
-        if !self.is_active() || self.paused {
+        if !self.is_active() || self.halted() {
             return;
         }
         let now = Instant::now();
@@ -1255,34 +1393,24 @@ impl Run {
         self.wake_orch(ctx);
     }
 
+    /// `space`: the user's own pause/resume, distinct from a failure halt only by `HaltReason`
+    /// and by staying quiet (no alert, no desktop notification) — resuming works the same for
+    /// every reason, via `resume()`.
     pub fn toggle_pause(&mut self, ctx: &mut dyn Ctx) {
-        self.paused = !self.paused;
-        if self.paused {
-            for a in self.all_agents() {
-                if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
-                    ctx.interrupt(a);
+        if self.halted() {
+            self.resume(ctx);
+            return;
+        }
+        for a in self.all_agents() {
+            if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
+                ctx.interrupt(a);
+                if !self.paused_agents.contains(&a) {
                     self.paused_agents.push(a);
                 }
             }
-            self.log("‖", "amber", "run paused");
-        } else {
-            self.alerts.clear();
-            for a in std::mem::take(&mut self.paused_agents) {
-                ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
-            }
-            self.log("▶", "green", "run resumed");
-            if let Stage::Phase { idx, step } = self.stage.clone() {
-                match step {
-                    PhaseStep::Orchestrating => {
-                        self.fill_slots(ctx);
-                        self.check_phase_done(ctx);
-                    }
-                    PhaseStep::Gate { .. } | PhaseStep::Checks { .. } => self.run_checks(ctx, idx, 1),
-                    _ => {}
-                }
-            }
-            self.wake_orch(ctx);
         }
+        self.log("‖", "amber", "run paused");
+        self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), since: Instant::now() });
     }
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
@@ -1583,4 +1711,90 @@ fn parse_gate_from_text(t: Option<&str>) -> Option<(bool, String)> {
         return Some((false, trunc(t, 200)));
     }
     None
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use crate::agent::Agent;
+    use std::collections::HashMap;
+
+    /// A minimal fake `Ctx` for unit-testing `Run`'s halt/resume behaviour without a real hub.
+    struct TestCtx {
+        agents: HashMap<AgentId, Agent>,
+        next: AgentId,
+        interrupted: Vec<AgentId>,
+        prompts: Vec<(AgentId, String)>,
+    }
+    impl TestCtx {
+        fn new() -> TestCtx {
+            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![] }
+        }
+        /// Register a fake agent that looks busy (a live turn in progress).
+        fn add_busy(&mut self) -> AgentId {
+            let id = self.next;
+            self.next += 1;
+            let mut a = Agent::new(id, "a", "worker", PathBuf::from("."));
+            a.turn_active = true;
+            self.agents.insert(id, a);
+            id
+        }
+    }
+    impl Ctx for TestCtx {
+        fn spawn(&mut self, _r: SpawnReq) -> AgentId {
+            let id = self.next;
+            self.next += 1;
+            self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
+            id
+        }
+        fn prompt(&mut self, a: AgentId, text: String) {
+            self.prompts.push((a, text));
+        }
+        fn interrupt(&mut self, a: AgentId) {
+            self.interrupted.push(a);
+            if let Some(ag) = self.agents.get_mut(&a) {
+                ag.turn_active = false;
+            }
+        }
+        fn compact(&mut self, _a: AgentId) {}
+        fn stop(&mut self, _a: AgentId, _archive: bool) {}
+        fn tool_result(&mut self, _a: AgentId, _req: Value, _text: String, _ok: bool) {}
+        fn set_effort(&mut self, _a: AgentId, effort: &str) -> String {
+            effort.to_string()
+        }
+        fn agent(&self, a: AgentId) -> Option<&Agent> {
+            self.agents.get(&a)
+        }
+        fn job(&mut self, _tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + Send>) {}
+        fn notify(&mut self, _text: &str) {}
+    }
+
+    #[test]
+    fn halt_interrupts_busy_agents_and_resume_reprompts_them() {
+        let mut ctx = TestCtx::new();
+        let busy = ctx.add_busy();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.orchestrator = Some(busy); // must be a run agent to be found & interrupted
+        run.halt(&mut ctx, HaltReason::ProviderRejected, Some(busy), "qa (sol via zai): Unexpected message role.".into());
+        assert!(run.halted());
+        assert!(ctx.interrupted.contains(&busy), "the busy agent must be interrupted");
+        assert!(run.alerts.iter().any(|a| a.contains("Unexpected message role")));
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::ProviderRejected);
+
+        run.resume(&mut ctx);
+        assert!(!run.halted());
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == busy && t.contains("[mantra:resume]")), "resume must re-prompt the halted agent");
+    }
+
+    #[test]
+    fn user_pause_is_quiet_but_still_a_halt() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.toggle_pause(&mut ctx);
+        assert!(run.halted());
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::User);
+        assert!(run.alerts.is_empty(), "a manual pause is not an alert");
+        run.toggle_pause(&mut ctx);
+        assert!(!run.halted(), "space toggles a manual pause back off");
+    }
 }

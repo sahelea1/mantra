@@ -508,14 +508,20 @@ async fn solo(e: &Em, text: &str) -> Outcome {
 
 fn mock_plan(first: bool) -> Value {
     let t = |id: &str, title: &str, role: &str, scope: &str, prompt: &str| json!({"id": id, "title": title, "role": role, "scope": [scope], "prompt": prompt, "acceptance": "builds, tests pass"});
+    let mut p1_tasks = vec![
+        t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
+        t("p1-config", "Config loader", "worker-small", if first { "src/models/**" } else { "src/config/**" }, "Add a typed configuration loader with defaults and env overrides."),
+    ];
+    // WP6 test scenario: a task whose model the provider rejects outright (ProviderRejected halt).
+    if std::env::var("MANTRA_MOCK_BADMODEL").is_ok() {
+        p1_tasks.push(t("p1-badmodel", "Feature flags", "worker-small", "src/flags/**", "Add a simple feature-flag lookup."));
+    }
     json!({"plan": {
         "title": "Build the requested feature set",
         "summary": "Three phases: shared foundations first, then the features in parallel, then integration and docs.",
         "orchestrator_brief": "Workers are independent inside a phase. Watch p2-auth closely (security-sensitive).",
         "phases": [
-            {"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": [
-                t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
-                t("p1-config", "Config loader", "worker-small", if first { "src/models/**" } else { "src/config/**" }, "Add a typed configuration loader with defaults and env overrides.")],
+            {"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": p1_tasks,
              "gate": {"checks": ["test -d src", "echo gate-ok"], "focus": "consistent naming", "criteria": "models and config compile together"}},
             {"id": "p2", "name": "Features", "goal": "The main features, in parallel", "tasks": [
                 t("p2-api", "HTTP API", "worker-big", "src/api/**", "Implement the REST handlers for the domain models with validation."),
@@ -644,6 +650,12 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     if id.ends_with("-auth") && e.turns() == 1 {
         step!(e.sleep(500).await);
         return Outcome::Failed(json!({"responseStreamDisconnected": {"httpStatusCode": 502}}), "stream disconnected before completion".into());
+    }
+    // Demo (WP6, MANTRA_MOCK_BADMODEL=1): the provider rejects this model/role outright — a
+    // deterministic 400 that must halt with ProviderRejected, never retry.
+    if id.ends_with("-badmodel") && e.turns() == 1 {
+        step!(e.sleep(300).await);
+        return Outcome::Failed(json!("badRequest"), "Unexpected message role: developer".into());
     }
     step!(e.sleep(300 + (h % 7) * 250).await);
     step!(e.write(&format!("{dir}/{}_test.rs", id.replace('-', "_")), &format!("#[test]\nfn {}_works() {{ assert!(true); }}\n", id.replace('-', "_"))).await);

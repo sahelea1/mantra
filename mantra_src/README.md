@@ -112,7 +112,8 @@ Effort is set **per model** (default), **per role** (pattern), and **per agent a
 | `id` | short name you'll see next to its models (e.g. `zai`) |
 | `name` | display name |
 | `base_url` | the provider's OpenAI-compatible API root, usually ending in `/v1`. Codex calls `…/responses` (Codex requires the OpenAI **Responses** API); discovery reads `…/models` |
-| `env_key` | the **name** of the environment variable that holds the API key (e.g. `ZAI_API_KEY`). The key itself is never stored; `✓ key set` shows when it's present |
+| `env_key` | the **name** of the environment variable that holds the API key (e.g. `ZAI_API_KEY`). Nothing is stored; `✓ key set (env)` shows when it's present |
+| `api_key` | *(optional, alongside `env_key`)* paste the key directly instead — it's written to `models.toml` (chmod `0600` on Unix), never to argv or logs; shown masked (`••••1234`). Set either field, not both |
 
 Then press **`D`** on that provider (or `D` on the models table to discover everything, including Codex's own catalog). Mantra fetches `GET {base_url}/models` with your key and opens a picker (type to filter, `space` select, `tab` all/none, `⏎` add & save):
 

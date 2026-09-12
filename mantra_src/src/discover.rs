@@ -30,23 +30,20 @@ const CTX_KEYS: &[&str] = &[
 const NESTED: &[&str] = &["top_provider", "limits", "limit", "capabilities", "metadata", "meta", "info", "architecture"];
 const NOT_CHAT: &[&str] = &["embed", "whisper", "tts", "dall-e", "moderation", "rerank", "transcri", "speech", "audio", "image-gen", "text-to-image"];
 
-pub fn list_models(base_url: &str, env_key: &str) -> Result<Vec<Found>, String> {
+/// `key` is the already-resolved API key (from `ProviderEntry::resolve_key`), if any — this
+/// function no longer looks at the environment itself, so a key pasted into `api_key` works too.
+pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<Found>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("set the provider's base URL first".into());
     }
-    let key = if env_key.trim().is_empty() {
-        None
-    } else {
-        Some(std::env::var(env_key.trim()).map_err(|_| format!("${} is not set in the environment Mantra was started from", env_key.trim()))?)
-    };
     let mut urls = vec![format!("{base}/models")];
     if !base.ends_with("/v1") {
         urls.push(format!("{base}/v1/models"));
     }
     let mut last = String::new();
     for url in urls {
-        match curl_get(&url, key.as_deref()) {
+        match curl_get(&url, key) {
             Ok((200..=299, body)) => {
                 return parse_models(&body).ok_or_else(|| format!("{url} answered, but not with a model list: {}", crate::util::trunc(body.trim(), 120)));
             }

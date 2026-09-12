@@ -76,7 +76,9 @@ pub enum ErrKind {
     ContextFull,
     UsageLimit,
     Auth,
-    BadRequest,
+    /// Deterministic provider/model incompatibility (HTTP 400/422, "unexpected message role", …).
+    /// Never retried — the same request will fail again.
+    ProviderRejected,
     Other,
 }
 
@@ -103,6 +105,9 @@ pub struct Agent {
     pub color: String,
     pub model_alias: String,
     pub model: String,
+    /// Provider id this agent's model runs on (set at spawn) — used to name the provider in
+    /// halt messages (e.g. `ProviderRejected`).
+    pub provider: String,
     pub effort: String,
     pub cwd: PathBuf,
     /// Codex approval policy this agent was spawned with ("never" | "on-request" | "untrusted").
@@ -153,6 +158,7 @@ impl Agent {
             color: "text".into(),
             model_alias: String::new(),
             model: String::new(),
+            provider: String::new(),
             effort: "medium".into(),
             cwd,
             approval: "never".into(),
@@ -783,7 +789,7 @@ pub fn classify(info: &Value) -> ErrKind {
         "contextWindowExceeded" => ErrKind::ContextFull,
         "usageLimitExceeded" | "sessionBudgetExceeded" => ErrKind::UsageLimit,
         "unauthorized" => ErrKind::Auth,
-        "badRequest" => ErrKind::BadRequest,
+        "badRequest" => ErrKind::ProviderRejected,
         _ => ErrKind::Other,
     }
 }
@@ -813,6 +819,8 @@ pub fn refine(k: ErrKind, msg: &str) -> ErrKind {
         ErrKind::Auth
     } else if m.contains("429") || m.contains("502") || m.contains("503") || m.contains("timed out") || m.contains("disconnected") {
         ErrKind::Transient
+    } else if m.contains("400") || m.contains("422") || m.contains("unexpected message role") || m.contains("unsupported") || m.contains("invalid_request_error") {
+        ErrKind::ProviderRejected
     } else {
         k
     }
@@ -912,6 +920,8 @@ mod tests {
         assert_eq!(refine(ErrKind::Other, "stream disconnected before completion"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Transient, "403"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Other, "something odd"), ErrKind::Other);
+        assert_eq!(refine(ErrKind::Other, "Unexpected message role."), ErrKind::ProviderRejected);
+        assert_eq!(refine(ErrKind::Other, "unexpected status 422: invalid_request_error"), ErrKind::ProviderRejected);
     }
 
     #[test]
@@ -954,6 +964,7 @@ mod tests {
         assert_eq!(classify(&json!("unauthorized")), ErrKind::Auth);
         assert_eq!(classify(&json!("contextWindowExceeded")), ErrKind::ContextFull);
         assert_eq!(classify(&json!({"contextWindowExceeded": {}})), ErrKind::ContextFull);
+        assert_eq!(classify(&json!("badRequest")), ErrKind::ProviderRejected);
     }
 
     #[test]
