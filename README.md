@@ -389,6 +389,19 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 </details>
 
 <details>
+<summary>Reporting a problem</summary>
+
+One command collects everything useful into a single text file — versions, `mantra doctor`, login state (subscription or key, never the credentials), terminal and sandbox facts, your settings and models, the newest runs (plan, journal, phase outputs, merge logs) and the tail of `mantra.log`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/support-bundle.sh | sh > mantra-bundle.txt
+```
+
+Anything that looks like an API key is redacted before it is written, and nothing leaves your machine — skim the file, then attach it to an issue together with what you did and what you expected. `BUNDLE_RUNS=5` includes more runs, `BUNDLE_LOG=5000` more log lines, and `MANTRA_BIN=/path/to/mantra` points it at a binary that is not on your `PATH`.
+
+</details>
+
+<details>
 <summary>Regenerating the screenshots and the logo</summary>
 
 ```bash
