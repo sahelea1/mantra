@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.2.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.3.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80)
@@ -125,9 +125,9 @@ Press `ctrl+o`, describe the goal, and this happens:
 
 <img src="docs/img/plan-review.png" alt="The plan review overlay: phases, tasks, scopes, acceptance criteria and gate checks" width="920">
 
-**2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled or edited outside its scope — and decides what to do about it.
+**2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together.
 
-**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. Two identical failures in a row stop the run instead of burning every round.
+**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. A check that keeps failing identically, or a gate that runs out of rounds, goes to the planner to fix — the plan, the checks, or a hint — before it ever stops for you.
 
 **4. The finale**: heavy QA → a security sweep → the planner verifying its own plan, able to spawn ad-hoc fixers.
 
@@ -159,8 +159,8 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 | auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
 | provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
 | environment | a command died in the sandbox (`bwrap`, user namespaces) | fix the machine — `mantra doctor` prints the sysctl |
-| gate exhausted | QA kept failing, or repeated the same blocker | feedback for the planner, or retry the gate |
-| attempts exhausted | a task used every attempt | `r` retries it |
+| gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the planner has already been handed it (see below); `space` retries, or type feedback |
+| attempts exhausted | a task used every attempt | the planner has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | `r` respawns it |
 
 </details>
@@ -177,7 +177,26 @@ A long run should never quietly stop. Mantra knows who *should* be working at an
 
 Every rung is journaled with `⏰`, and the idle agent's card turns amber. Any agent can also be respawned by hand with `r` (or `ctrl+r`, or `/respawn`) — planner, orchestrator, gate, finale step or worker, each restarted with a prompt carrying the current state.
 
-There are guards for the silly failures too: a worker whose task is already done cannot be prompted, and an orchestrator that prompts the same stuck worker three times in five minutes gets that worker respawned instead.
+There are guards for the silly failures too: a worker whose task is already done cannot be prompted, an orchestrator that prompts the same stuck worker three times in five minutes gets that worker respawned instead, and nothing can be spawned while the run is halted.
+
+</details>
+
+<details>
+<summary>The chain of command: ask, don't guess</summary>
+
+Decisions travel **up**, never sideways, and only reach you when they have to:
+
+| who | asks | how | answers with |
+|---|---|---|---|
+| worker, gate, finale agent | the orchestrator | `mantra_ask` | the orchestrator's `mantra_prompt` |
+| orchestrator | the planner | `mantra_ask` | the planner's `mantra_brief_orchestrator` |
+| planner | **you** | `mantra_ask_user` | your next message on the stage |
+
+An agent that stops to wait is shown as *asked a question · waiting for the answer* — never mistaken for "done" — and the rung above it becomes the one the watchdog expects to act. The planner is told to decide by itself whenever the answer keeps the end product and the plan's intent, and to ask you only when it changes what is being built, its scope, or is a trade-off only you can make. A question to you is a saffron band, not a halt: the run keeps going meanwhile.
+
+The same chain carries halts. *Gate exhausted* and *attempts exhausted* go to the planner first, with the failing checks and their output, and it has exactly three moves: `mantra_revise_plan` (the run resumes by itself — a task changed after it was done is re-opened, a phase already gating goes back to building, a changed gate just re-runs its checks), `mantra_resume_run` with a hint for the stuck agent, or `mantra_ask_user`. If it does nothing, one reminder; then the band is yours.
+
+`settings.review_minutes` (default 3, `0` off) sets how often the orchestrator gets a digest of every running worker — activity, files touched, recent log — to check that the parallel work stays coherent with each other and with the phase goal.
 
 </details>
 
@@ -194,7 +213,7 @@ Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`),
 <details>
 <summary>Claude Code as a backend for any role</summary>
 
-If `claude` is on your `PATH`, Mantra adds a `claude` provider with six models — `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` — plus `opus5-1m` and `sonnet5-1m` for the long-context variants. Point any role at one in the Studio, exactly like a Codex model. The built-in `mantra-default-claude` pattern does it for you: planner and orchestrator on Claude, workers on Claude, gates on Codex.
+If `claude` is on your `PATH`, Mantra adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. The gauge follows the window Claude Code reports for your account, so a plan without 1M still reads right; an older `models.toml` keeps whatever `context_window` it has — set it to `1000000` (or delete the file to regenerate it). Point any role at a Claude model in the Studio, exactly like a Codex model. The built-in `mantra-default-claude` pattern does it for you: planner and orchestrator on Claude, workers on Claude, gates on Codex.
 
 Under the hood each agent is one long-lived `claude -p --input-format stream-json …` process. Mantra translates its event stream into the same shapes the UI already renders, so nothing else in the app knows the difference: steering lands at the next tool boundary, `x` sends a real interrupt, `/compact` compacts the session, and a crashed process restarts with `--resume`.
 
@@ -305,7 +324,8 @@ Or describe what you want and let the **architect agent** edit the pattern while
 | `ctrl+d` | diff viewer · `ctrl+e` verbose log |
 | `ctrl+t` | side panel / pulse feed · `ctrl+g` inbox |
 | `ctrl+r` | respawn the focused agent |
-| `ctrl+l` | redraw · `ctrl+c` clear → interrupt → quit · `?` help |
+| `ctrl+c` | close an overlay / clear the input / interrupt the focused agent · **three presses quit** |
+| `ctrl+l` | redraw · `?` help |
 
 </details>
 
@@ -316,12 +336,12 @@ Or describe what you want and let the **architect agent** edit the pattern while
 |---|---|
 | `tab` | switch between typing and navigating |
 | `←→↑↓` | select an agent · `1`–`9` jump to the *n*th and zoom |
-| `⏎` | zoom in · `esc` back to the overview |
+| `⏎` | zoom in · `esc` back to the overview (esc never interrupts) |
 | `space` | pause / resume the run |
 | `r` | respawn the selected agent · `m` switch its model |
 | `x` | interrupt · `c` compact · `+/-` effort |
 | `p` | plan · `a` approve · `d` diff · `s` studio |
-| `@name …` | message one agent; plain text re-prompts the planner |
+| `@name …` | message one agent; plain text re-prompts the planner — or answers its open question |
 
 </details>
 
@@ -382,9 +402,22 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 <details>
 <summary>How this is tested, and what is not covered</summary>
 
-- `cargo build` with zero warnings, 82 unit tests, and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- `cargo build` with zero warnings, 92 unit tests (including the chain of command, escalation, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
 - Real runs against a live provider with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale, compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
+
+</details>
+
+<details>
+<summary>Reporting a problem</summary>
+
+One command collects everything useful into a single text file — versions, `mantra doctor`, login state (subscription or key, never the credentials), terminal and sandbox facts, your settings and models, the newest runs (plan, journal, phase outputs, merge logs) and the tail of `mantra.log`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/support-bundle.sh | sh > mantra-bundle.txt
+```
+
+Anything that looks like an API key is redacted before it is written, and nothing leaves your machine — skim the file, then attach it to an issue together with what you did and what you expected. `BUNDLE_RUNS=5` includes more runs, `BUNDLE_LOG=5000` more log lines, and `MANTRA_BIN=/path/to/mantra` points it at a binary that is not on your `PATH`.
 
 </details>
 
@@ -408,6 +441,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.2.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.3.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

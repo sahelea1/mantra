@@ -43,13 +43,13 @@ fn help(f: &mut Frame, area: Rect) {
         k("ctrl+g", "inbox: approvals & alerts from all agents"),
         k("ctrl+t · F2", "toggle side panel / pulse feed"),
         k("ctrl+l", "redraw the screen"),
-        k("ctrl+c", "clear input → interrupt → quit (twice)"),
+        k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
         k("pgup / pgdn", "scroll (mouse wheel too)"),
         k("/", "commands (tab completes) · ! runs a shell command"),
         Line::default(),
         h("solo"),
         k("⏎ / alt+⏎", "send / newline (or end a line with \\)"),
-        k("esc", "interrupt the running turn"),
+        k("esc", "clear the input (never interrupts)"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
         Line::default(),
         h("busy-agent chat (solo, zoom, @name)"),
@@ -103,7 +103,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
         l.push(Line::from(vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
-            // width + 1: a 10-char alias (sonnet5-1m) must not touch the model id next to it
+            // width + 1: a 10-char alias must not touch the model id next to it
             Span::styled(format!("{:<11}", trunc(&m.alias, 10)), st),
             Span::styled(format!("{:<18}", trunc(&m.model, 17)), theme::muted()),
             Span::styled(format!(" {:<27}", trunc(&via, 26)), theme::dim()),

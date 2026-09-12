@@ -154,7 +154,11 @@ pub struct App {
     pub side_panel: bool,
     pub pulse_panel: bool,
     pub quit: bool,
+    /// When ctrl+c was last pressed and how many times in a row (within 2s of each other):
+    /// the first press does the contextual thing (close an overlay, clear the input, interrupt
+    /// the focused agent's turn), the third always quits.
     ctrl_c: Option<Instant>,
+    ctrl_c_count: u8,
     pub tx: UnboundedSender<AppEvent>,
     pub demo: bool,
     pub studio: StudioState,
@@ -485,6 +489,7 @@ impl App {
             pulse_panel: true,
             quit: false,
             ctrl_c: None,
+            ctrl_c_count: 0,
             tx,
             demo,
             studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
@@ -933,8 +938,8 @@ impl App {
             sources.push("codex".into());
         }
         let provs: Vec<crate::config::ProviderEntry> = self.registry.providers.iter().filter(|p| !p.id.is_empty() && p.id != "openai" && only.as_ref().map(|o| *o == p.id).unwrap_or(true)).cloned().collect();
-        // ClaudeCode providers have no `/models` endpoint for a subscription; the six defaults
-        // (§10.2) are always known locally and answer instantly, with no loading spinner needed. A
+        // ClaudeCode providers have no `/models` endpoint for a subscription; the built-in defaults
+        // (config::CLAUDE_MODELS) are always known locally and answer instantly, with no loading spinner needed. A
         // `base_url` (a third-party gateway) additionally gets queried live, exactly like a Codex
         // custom provider (§10.5).
         let net_provs: Vec<crate::config::ProviderEntry> = provs.iter().filter(|p| p.kind != crate::config::ProviderKind::ClaudeCode || !p.base_url.trim().is_empty()).cloned().collect();
@@ -1427,27 +1432,7 @@ impl App {
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         // Global keys
         if ctrl && k.code == KeyCode::Char('c') {
-            if !self.overlays.is_empty() {
-                self.overlays.pop();
-                return;
-            }
-            if !self.input.is_empty() {
-                self.input.clear();
-                return;
-            }
-            if let Some(a) = self.focus_agent() {
-                if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
-                    self.hub.send(a, Cmd::Interrupt);
-                    self.toast("interrupting…", Level::Warn);
-                    return;
-                }
-            }
-            if self.ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) {
-                self.quit = true;
-            } else {
-                self.ctrl_c = Some(Instant::now());
-                self.toast("press ctrl+c again to quit", Level::Info);
-            }
+            self.ctrl_c_press();
             return;
         }
         if ctrl && k.code == KeyCode::Char('o') {
@@ -1608,19 +1593,14 @@ impl App {
                 _ => {}
             }
         }
+        // esc only navigates: back to the overview from a zoom, otherwise clear the input.
+        // Interrupting is ctrl+c's job (it used to be both, and the two hints collided).
         if k.code == KeyCode::Esc {
             match self.screen {
                 Screen::Zoom(_) if self.input.is_empty() => {
                     self.set_screen(Screen::Stage);
                 }
                 _ => {
-                    if let Some(a) = self.focus_agent() {
-                        if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) && self.input.is_empty() {
-                            self.hub.send(a, Cmd::Interrupt);
-                            self.toast("interrupting…", Level::Warn);
-                            return;
-                        }
-                    }
                     self.input.clear();
                     if self.screen == Screen::Stage {
                         self.canvas_focus = true;
@@ -1783,6 +1763,35 @@ impl App {
             }
         }
         self.screen = Screen::Studio;
+    }
+
+    /// ctrl+c: one press interrupts (or closes an overlay / clears the input), three presses in
+    /// a row quit — whatever state the app is in, so there is always a way out.
+    fn ctrl_c_press(&mut self) {
+        let again = self.ctrl_c.map(|t| t.elapsed() < Duration::from_secs(2)).unwrap_or(false);
+        self.ctrl_c_count = if again { self.ctrl_c_count.saturating_add(1) } else { 1 };
+        self.ctrl_c = Some(Instant::now());
+        if self.ctrl_c_count >= 3 {
+            self.quit = true;
+            return;
+        }
+        let more = if self.ctrl_c_count == 1 { "ctrl+c ×2 more quits" } else { "ctrl+c once more quits" };
+        if !self.overlays.is_empty() {
+            self.overlays.pop();
+            return;
+        }
+        if !self.input.is_empty() {
+            self.input.clear();
+            return;
+        }
+        if let Some(a) = self.focus_agent() {
+            if self.agents.get(&a).map(|x| x.busy()).unwrap_or(false) {
+                self.hub.send(a, Cmd::Interrupt);
+                self.toast(format!("interrupting… ({more})"), Level::Warn);
+                return;
+            }
+        }
+        self.toast(more, Level::Info);
     }
 
     pub fn submit(&mut self, text: String) {

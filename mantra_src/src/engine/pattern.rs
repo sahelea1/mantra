@@ -69,6 +69,9 @@ pub struct PatternSettings {
     /// Watchdog: seconds of continued idleness before the next escalation step (respawn the
     /// orchestrator / wake the orchestrator / wake the planner); the step after that is 2× this.
     pub watchdog_escalate_seconds: u64,
+    /// How often (minutes) the orchestrator is shown every running worker's recent work and asked
+    /// to check the parallel work stays coherent. 0 turns the periodic review off.
+    pub review_minutes: u64,
 }
 
 impl Default for PatternSettings {
@@ -85,6 +88,7 @@ impl Default for PatternSettings {
             max_tasks_per_phase: 8,
             watchdog_seconds: 90,
             watchdog_escalate_seconds: 240,
+            review_minutes: 3,
         }
     }
 }
@@ -304,6 +308,7 @@ check_timeout_secs = 900
 max_tasks_per_phase = 8
 watchdog_seconds = 90
 watchdog_escalate_seconds = 240
+review_minutes = 3             # the orchestrator re-reads every worker's recent work this often (0 = off)
 
 [roles.planner]
 kind = "planner"
@@ -322,6 +327,9 @@ touch disjoint files (declare each task's `scope` as path globs). Anything seque
 Pick the right worker role per task: small, well-bounded changes → worker-small; broad or tricky work → worker-big.
 Every phase ends with a gate: list shell `checks` that must pass (build, tests, lint) and what QA should focus on.
 Write prompts for workers that are self-contained: they only see their own prompt, not the whole plan.
+Keep the tooling later gates need (virtualenvs, node_modules, build caches) in place until the last phase:
+hygiene and cleanup belong in the final phase, never in a phase whose gate still needs them. Gate `checks`
+must run as-is on this machine — prefer what already exists over bootstrapping tools.
 Also write `orchestrator_brief`: how the orchestrator should supervise this particular project.
 """
 
@@ -337,9 +345,10 @@ instructions = """
 You are the Orchestrator. You never edit code yourself; you run workers through Mantra tools.
 Mantra handles the bookkeeping (saving outputs, retrying API errors, merging, gates). You handle judgment:
 spawn the phase's tasks (you may sharpen their prompts), and when Mantra wakes you with an event
-(worker finished, failed, went out of scope, stalled), decide what to do: accept, steer the worker
-with mantra_prompt, or respawn it with a better prompt via mantra_retry. Keep turns short:
-act, then call mantra_wait. Don't poll in loops — Mantra wakes you.
+(worker finished, failed, went out of scope, stalled, asked a question), decide what to do: answer,
+accept, steer the worker with mantra_prompt, or respawn it with a better prompt via mantra_retry.
+Decisions above your brief go up to the planner (mantra_ask). Keep turns short: act, then call
+mantra_wait. Don't poll in loops — Mantra wakes you.
 """
 
 [roles.worker-small]

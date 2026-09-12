@@ -25,6 +25,19 @@ echo "$out" | grep -qi 'plan review' || { echo "$out"; echo "MISSING: plan revie
 echo "$out" | grep -q 'overview' || { echo "$out"; echo "MISSING: approving the plan should land on the overview"; exit 1; }
 echo "zoom vs overview ok"
 
+# v0.3 chain of command: a worker stops to ask (MANTRA_MOCK_ASK), the orchestrator answers, the worker finishes.
+echo "chain of command (a worker asks, the orchestrator answers)…"
+export MANTRA_HOME="$(mktemp -d)"
+out=$(MANTRA_MOCK_ASK=1 $bin --demo --snapshot "wait:0.5;until:plan review@60;key:a;until:run complete@200;snap:done" run "build a todo API with auth" 2>&1)
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC in the ask scenario"; exit 1; }
+echo "$out" | grep -q '!! timeout' && { echo "$out"; echo "TIMEOUT: the run with a question did not complete"; exit 1; }
+j=$(ls "$MANTRA_HOME"/runs/*/*/journal.jsonl)
+grep -q 'p2-api asks the orchestrator' "$j" || { cat "$j"; echo "MISSING: the worker should ask the orchestrator"; exit 1; }
+grep -q 'p2-api waits for an answer' "$j" || { cat "$j"; echo "MISSING: an asking worker waits instead of finishing"; exit 1; }
+grep -q 'orchestrator → p2-api (answer)' "$j" || { cat "$j"; echo "MISSING: the orchestrator should answer"; exit 1; }
+grep -q 'p2-api done' "$j" || { cat "$j"; echo "MISSING: the answered worker should finish"; exit 1; }
+echo "chain of command ok"
+
 # WP11: leave a run mid-phase, list it, resume it headlessly to completion, drive the /runs overlay, delete it.
 echo "runs: list / resume / delete…"
 export MANTRA_HOME="$(mktemp -d)"

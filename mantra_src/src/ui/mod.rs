@@ -229,7 +229,7 @@ pub fn busy_line(a: &Agent) -> Option<Line<'static>> {
             };
             let mut spans = vec![glyph];
             spans.extend(anim::shimmer(&label, theme::mix_rgb(col, theme::MUTED), theme::TEXT));
-            spans.push(Span::styled(format!("  {elapsed} · {} tok · {} · esc to interrupt", fmt_tokens(a.tokens_total), a.effort), theme::faint()));
+            spans.push(Span::styled(format!("  {elapsed} · {} tok · {} · ctrl+c to interrupt", fmt_tokens(a.tokens_total), a.effort), theme::faint()));
             Some(Line::from(spans))
         }
         _ => None,

@@ -562,6 +562,18 @@ async fn planner(e: &Em, text: &str) -> Outcome {
         step!(e.say("Handled the re-prompt: no plan change needed, the orchestrator has been briefed to steer the running workers.").await);
         return Outcome::Done;
     }
+    if text.contains("[mantra:question]") {
+        step!(e.think("**A question from the orchestrator**\n\nThis stays within the plan's intent — I can decide it myself rather than bother the user.").await);
+        let _ = e.tool("mantra_brief_orchestrator", json!({"message": "Decision: opaque tokens, stored hashed; keep the API surface as planned."})).await;
+        step!(e.say("Answered the orchestrator: opaque tokens, hashed at rest. No plan change.").await);
+        return Outcome::Done;
+    }
+    if text.contains("[mantra:escalation]") {
+        step!(e.think("**Escalation**\n\nThe plan is right; the gate just needs a concrete hint.").await);
+        let _ = e.tool("mantra_resume_run", json!({"note": "Run the checks exactly as listed; the venv already exists — do not recreate it."})).await;
+        step!(e.say("Resumed the run with a note for the gate.").await);
+        return Outcome::Done;
+    }
     if text.contains("[mantra:finale]") {
         step!(e.think("**Final verification**\n\nComparing the plan against what was built. Running the app and the checks.").await);
         step!(e.command("cargo run -- --help", "demo 0.1.0\nUSAGE: demo [OPTIONS]", 0).await);
@@ -601,6 +613,18 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
     }
     if text.contains("[mantra:handoff]") {
         step!(e.say("Handoff: phase complete. Interfaces are in place; keep naming consistent with `models::*`. No open risks.").await);
+        return Outcome::Done;
+    }
+    if let Some(rest) = text.split("QUESTION from ").nth(1) {
+        let who = rest.split(':').next().unwrap_or("").trim().to_string();
+        step!(e.think(&format!("**{who} asked a question**\n\nIt stays within the phase — I can answer it myself.")).await);
+        let _ = e.tool("mantra_prompt", json!({"agent": who, "message": "Use cursor-based pagination with an opaque `next` token; page size 50."})).await;
+        let _ = e.tool("mantra_wait", json!({})).await;
+        return Outcome::Done;
+    }
+    if text.contains("[mantra:review]") {
+        step!(e.think("**Coherence review**\n\nComparing the workers' recent edits with each other and the phase goal: disjoint files, consistent naming. Nothing to correct.").await);
+        let _ = e.tool("mantra_wait", json!({})).await;
         return Outcome::Done;
     }
     if text.contains("TRIPWIRE") {
@@ -651,11 +675,26 @@ async fn worker(e: &Em, text: &str) -> Outcome {
         step!(e.sleep(200).await);
         return Outcome::Interrupted;
     }
+    // Demo (MANTRA_MOCK_ASK=1): the API worker stops to ask the orchestrator a design question
+    // instead of guessing — its turn ends without a STATUS line, Mantra keeps it "running"
+    // (waiting), and the orchestrator's answer arrives as a `[from the orchestrator]` message.
+    if id.ends_with("-api") && e.turns() == 1 && std::env::var("MANTRA_MOCK_ASK").is_ok() {
+        step!(e.think(&format!("**{title}**\n\nThe spec doesn't say how list endpoints paginate — that shapes every handler, so I'll ask rather than guess.")).await);
+        let _ = e.tool("mantra_ask", json!({"question": "Offset/limit or cursor pagination for the list endpoints? The spec is silent and it changes every handler's signature."})).await;
+        step!(e.say("Waiting for the orchestrator's decision on pagination before writing the handlers.").await);
+        return Outcome::Done;
+    }
     if text.contains("[mantra:retry]") || text.contains("[mantra:resume]") {
         step!(e.think("**Resuming**\n\nPicking up where the previous attempt stopped.").await);
     } else if !text.contains("[from") {
         step!(e.think(&format!("**{title}**\n\nReading the surrounding code to match existing conventions.")).await);
         step!(e.command(&format!("rg -n \"struct|fn\" {dir} || true"), "src/lib.rs:3:pub fn greet(name: &str) -> String {", 0).await);
+    }
+    if text.contains("(answering your question)") {
+        step!(e.think("**Answer received**\n\nCursor pagination it is — writing the handlers accordingly.").await);
+        step!(e.write(&format!("{dir}/{}.rs", id.replace('-', "_")), &format!("//! {title}\n\npub struct Page {{ pub next: Option<String> }}\n")).await);
+        step!(e.say(&format!("Implemented **{title}** with cursor pagination as decided.\n\nSTATUS: done\nSUMMARY: {title} — list endpoints paginate by opaque cursor (page size 50); handlers and tests in {dir}/.")).await);
+        return Outcome::Done;
     }
     if text.contains("[from") {
         e.absorb_steer().await;
