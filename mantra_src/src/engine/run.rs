@@ -229,7 +229,6 @@ pub struct Run {
     pub conflicts: Vec<String>,
     pub gate_report: Option<(bool, String)>,
     pub pulse: VecDeque<Pulse>,
-    pub started: Instant,
     pub phase_started: Instant,
     pub ws: Option<Workspace>,
     pub handoff: String,
@@ -288,7 +287,6 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             pulse: VecDeque::new(),
-            started: Instant::now(),
             phase_started: Instant::now(),
             ws: None,
             handoff: String::new(),
@@ -427,6 +425,12 @@ impl Run {
     pub fn current_phase(&self) -> Option<&Phase> {
         let i = self.phase_idx()?;
         self.plan.as_ref()?.phases.get(i)
+    }
+
+    /// Wall-clock time since the run was first started — survives a resume (unlike `started`,
+    /// which is this process's `Instant`).
+    pub fn elapsed(&self) -> Duration {
+        Duration::from_secs(crate::util::unix_secs().saturating_sub(self.started_unix))
     }
 
     pub fn is_active(&self) -> bool {
@@ -1233,7 +1237,7 @@ impl Run {
             ctx.stop(a, false);
         }
         let branch = self.ws.as_ref().filter(|w| w.worktree).map(|w| format!(" — branch {} is ready; /land merges it into {}", w.branch, w.base_branch)).unwrap_or_default();
-        self.log("✦", "saffron", format!("run complete in {}{branch}", fmt_dur(self.started.elapsed())));
+        self.log("✦", "saffron", format!("run complete in {}{branch}", fmt_dur(self.elapsed())));
         ctx.notify(&format!("Mantra: run complete{branch}"));
         self.save_state();
     }

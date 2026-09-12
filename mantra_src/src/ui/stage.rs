@@ -204,7 +204,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
             // The halt band (drawn in the rail, just under this header) already says why and
             // what to do — no separate badge needed here.
-            right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.started.elapsed())), theme::muted()));
+            right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
         }
@@ -884,7 +884,7 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
             y += 2;
         }
         _ => {
-            let title = format!("{} run complete in {}", theme::g("✦", "*"), fmt_dur(run.history.last().map(|h| h.ended.duration_since(run.started)).unwrap_or_else(|| run.started.elapsed())));
+            let title = format!("{} run complete in {}", theme::g("✦", "*"), fmt_dur(run.elapsed()));
             let fresh = run.pulse.back().map(|p| p.at.elapsed().as_millis() < 3000).unwrap_or(false);
             if fresh {
                 cv.spans(x, y, &anim::shimmer(&title, theme::SAFFRON, theme::TEXT), area.width as i32 - 6);
