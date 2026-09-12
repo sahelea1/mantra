@@ -60,3 +60,11 @@ All notable changes to Mantra are recorded here.
   skips it). In the TUI, `/runs` opens the same list for the current project (`⏎` resume, `D`
   delete), and the welcome screens say `↻ N unfinished runs — /runs`. `--resume-last` reopens the
   most recent unfinished run (with `--demo`, the last demo run).
+- WP12 (real-run robustness): a `ProviderRejected` halt caused by a rejected `developer` message
+  now says so and points at running that model through Claude Code (`kind = claude-code`);
+  discovery marks `*-thinking` model ids as reasoning-capable when the catalogue says nothing
+  (LibertAI/OpenRouter shapes); the orchestrator protocol tells it never to prompt a finished
+  worker and to answer events with at most one `mantra_prompt` (3 wasted prompts per phase were
+  measured); Mantra probes the Linux sandbox once at startup (`unprivileged_userns_clone`,
+  AppArmor, `unshare -U`) and, when it can't work, says so on both welcome screens and in every
+  run's pulse, and `mantra run`/`runs resume` ask `y/N` first (`--no-sandbox-check` skips it).

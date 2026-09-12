@@ -456,7 +456,11 @@ impl Run {
             HaltReason::Auth | HaltReason::UsageLimit => "fix credentials or quota, then space".into(),
             HaltReason::ProviderRejected => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
-                format!("m switch model for {who} · r retry")
+                if h.message.to_lowercase().contains("message role") {
+                    format!("this provider rejects Codex's developer messages — use it through Claude Code (kind = claude-code) or m switch model for {who}")
+                } else {
+                    format!("m switch model for {who} · r retry")
+                }
             }
             HaltReason::Environment => "fix the environment (see the message above), then r retry".into(),
             HaltReason::GateExhausted => "type feedback for the planner, or space to retry the gate".into(),

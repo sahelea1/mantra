@@ -56,6 +56,7 @@ OPTIONS
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
   --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
+  --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
 
 FILES
   ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
@@ -75,11 +76,12 @@ struct Cli {
     /// `mantra runs resume <id>`.
     resume: Option<String>,
     resume_last: bool,
+    no_sandbox_check: bool,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -107,6 +109,7 @@ fn parse_args() -> Result<Option<Cli>> {
             }
             "run" => cli.run_goal = Some(next()?),
             "--resume-last" => cli.resume_last = true,
+            "--no-sandbox-check" => cli.no_sandbox_check = true,
             "runs" => match next().ok().as_deref() {
                 None | Some("list") | Some("ls") => {
                     runs_list();
@@ -223,6 +226,20 @@ async fn async_main(cli: Cli) -> Result<()> {
         let exe = std::env::current_exe()?;
         settings.codex_command = vec![exe.to_string_lossy().to_string(), "mock-codex".into()];
     }
+    // L1: on a Linux box where unprivileged user namespaces are off, every worker command dies
+    // in bubblewrap. Say so once, up front — and don't start a run on it without a nod.
+    // (MANTRA_SANDBOX_WARNING=<text> forces the notice — stress.sh renders it in demo mode.)
+    let sandbox_warning = std::env::var("MANTRA_SANDBOX_WARNING").ok().filter(|w| !w.is_empty()).or_else(|| if demo || cli.snapshot.is_some() { None } else { util::sandbox_probe().err() });
+    if let (Some(w), true, false) = (&sandbox_warning, cli.run_goal.is_some() || cli.resume.is_some() || cli.resume_last, cli.no_sandbox_check) {
+        eprintln!("mantra: sandbox check failed — {w}\n");
+        eprint!("start anyway? workers' commands will fail unless the roles use sandbox = \"danger-full-access\" [y/N] ");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("not started. (mantra --no-sandbox-check skips this question)");
+            return Ok(());
+        }
+    }
     ui::theme::init(&settings);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
@@ -242,6 +259,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         app.pattern_name = p;
     }
     app.start_solo();
+    if let Some(w) = sandbox_warning {
+        app.set_sandbox_warning(w);
+    }
     if let Some(goal) = &cli.run_goal {
         app.start_run(goal);
     }

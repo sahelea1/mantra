@@ -42,4 +42,14 @@ $bin runs delete "$id" --yes | grep -q '^deleted' || { echo "MISSING: mantra run
 $bin runs | grep -q 'no runs yet' || { $bin runs; echo "MISSING: the deleted run should be gone"; exit 1; }
 git -C "$proj" branch --list 'mantra*' | grep -q . && { git -C "$proj" branch --list 'mantra*'; echo "MISSING: run branches should be deleted"; exit 1; }
 echo "runs ok"
+
+# WP12.4: the startup sandbox notice (forced via MANTRA_SANDBOX_WARNING; the real probe never runs in demo mode).
+echo "sandbox notice…"
+export MANTRA_HOME="$(mktemp -d)"
+out=$(MANTRA_SANDBOX_WARNING="user namespaces are blocked (test)" $bin --demo --snapshot "wait:0.3;sweep:welcome-sandbox;snap:welcome-sandbox;key:ctrl+o;sweep:stage-sandbox;snap:stage-sandbox;type:build a thing;key:enter;until:plan review@60" 2>&1)
+echo "$out" | grep -E 'sweep ok|panicked|timeout'
+echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC with the sandbox notice"; exit 1; }
+echo "$out" | grep -q 'sandbox: user namespaces are blocked' || { echo "$out"; echo "MISSING: welcome screens should show the sandbox notice"; exit 1; }
+grep -q 'sandbox: user namespaces are blocked' "$MANTRA_HOME"/runs/*/*/journal.jsonl || { echo "MISSING: a run's journal should carry the sandbox notice"; exit 1; }
+echo "sandbox notice ok"
 echo "all sizes rendered without panics"

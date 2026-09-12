@@ -165,6 +165,10 @@ pub struct App {
     /// Ids of this project's unfinished runs at startup (welcome-screen notice); kept in sync by
     /// `/runs` resume/delete.
     pub unfinished_runs: Vec<String>,
+    /// `util::sandbox_probe` failure at startup (Linux without user namespaces): shown on the
+    /// welcome screens, in the Solo log and in every run's pulse, so nobody burns gate rounds on
+    /// `bwrap` errors (L1).
+    pub sandbox_warning: Option<String>,
     pub probes: HashMap<AgentId, (String, Instant)>,
     pub pulse_scroll: usize,
     pub force_clear: bool,
@@ -467,6 +471,7 @@ impl App {
             pattern_name,
             branch,
             unfinished_runs,
+            sandbox_warning: None,
             probes: HashMap::new(),
             pulse_scroll: 0,
             force_clear: false,
@@ -730,11 +735,21 @@ impl App {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
         }
+        if let Some(w) = &self.sandbox_warning {
+            run.log("⚠", "amber", format!("sandbox: {}", crate::util::trunc(w, 140)));
+        }
         self.run = Some(run);
         // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
         // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
         self.screen = Screen::Stage;
         self.sel = 0;
+    }
+
+    /// Record a failed sandbox probe (done once at startup, never in demo mode). The welcome
+    /// screens show it while they're up; every run's pulse repeats it (`start_run`) so it is on
+    /// screen exactly where a `bwrap` failure would otherwise be puzzling.
+    pub fn set_sandbox_warning(&mut self, why: String) {
+        self.sandbox_warning = Some(why);
     }
 
     /// `/runs`: this project's runs, newest first. Runs of other projects are only counted — a

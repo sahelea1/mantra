@@ -163,6 +163,12 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(format!("     {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
     }
+    if let Some(w) = &app.sandbox_warning {
+        lines.push(Line::default());
+        let width = area.width.saturating_sub(18) as usize;
+        lines.push(Line::from(Span::styled(format!("     {} sandbox: {}", theme::g("⚠", "!"), trunc(w, width.max(20))), theme::fg(theme::AMBER))));
+        lines.push(Line::from(Span::styled("       (mantra doctor shows the full fix)", theme::faint())));
+    }
     if app.demo {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("     demo mode — simulated agents, nothing is sent to an API", theme::fg(theme::ROSE))));

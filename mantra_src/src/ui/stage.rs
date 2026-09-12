@@ -359,6 +359,12 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         l.push(Line::default());
         l.push(Line::from(Span::styled(format!("   {} {n} unfinished run{} — /runs to resume or delete", theme::g("↻", "~"), if n == 1 { "" } else { "s" }), theme::fg(theme::AMBER))));
     }
+    if let Some(w) = &app.sandbox_warning {
+        l.push(Line::default());
+        let width = area.width.saturating_sub(16) as usize;
+        l.push(Line::from(Span::styled(format!("   {} sandbox: {}", theme::g("⚠", "!"), trunc(w, width.max(20))), theme::fg(theme::AMBER))));
+        l.push(Line::from(Span::styled("     workers' commands would fail under Codex's sandbox — mantra doctor shows the fix", theme::faint())));
+    }
     f.render_widget(Paragraph::new(l), area);
 }
 

@@ -127,6 +127,8 @@ mantra-role: orchestrator
 - Mantra wakes you with [mantra:event] messages. Handle them briefly, then mantra_wait again.
 - Mantra automatically: saves each worker's output, retries API errors, merges work, runs the gate,
   and moves to the next phase. You don't need to do any of that.
+- Never prompt a worker whose task is done — its report is final and it won't answer. After spawning,
+  call mantra_wait. At most one mantra_prompt per event; silence (mantra_wait) is the normal answer.
 - [mantra:handoff]: write a handoff note (≤10 lines) for your successor: decisions, risks, anything the next phase must know.
 "#;
 

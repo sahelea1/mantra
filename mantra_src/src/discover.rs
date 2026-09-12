@@ -123,7 +123,10 @@ pub fn parse_models(body: &str) -> Option<Vec<Found>> {
             continue;
         }
         if !out.iter().any(|f| f.id == id) {
-            out.push(Found { context: context_of(item), reasoning: reasoning_of(item), id });
+            // LibertAI/OpenRouter-style catalogues often say nothing about reasoning but name
+            // the thinking variant in the id (`glm-5.3-thinking`): those accept an effort.
+            let reasoning = reasoning_of(item).or_else(|| lower.contains("thinking").then_some(true));
+            out.push(Found { context: context_of(item), reasoning, id });
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -311,6 +314,10 @@ mod tests {
         assert_eq!(get("z-ai/glm-5.2").reasoning, Some(true));
         assert_eq!(get("meta/llama-4").reasoning, Some(false));
         assert_eq!(get("plain").reasoning, None);
+        let lib = r#"{"data":[{"id":"glm-5.3-thinking","object":"model"},{"id":"glm-5.3","object":"model"}]}"#;
+        let m = parse_models(lib).unwrap();
+        assert_eq!(m.iter().find(|f| f.id == "glm-5.3-thinking").unwrap().reasoning, Some(true), "a -thinking id is reasoning-capable");
+        assert_eq!(m.iter().find(|f| f.id == "glm-5.3").unwrap().reasoning, None);
         let c = from_provider("zai", &get("z-ai/glm-5.2"));
         assert_eq!((c.context, c.context_known, c.efforts.len()), (Some(202752), true, 3));
         let c = from_provider("zai", &get("plain"));
