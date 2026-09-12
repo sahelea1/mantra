@@ -806,25 +806,25 @@ Run state is write-only today (`engine/run.rs:237-247`; `stage` is a `{:?}` stri
 
 ---
 
-## 2. Definition of done (checklist for the final reviewer)
+## 2. Definition of done (checklist for the final reviewer) — all verified for v0.2.0
 
-- [ ] `Cargo.toml` 0.2.0, `CHANGELOG.md` present, README/DESIGN updated for every behaviour change.
-- [ ] `Run.paused` is gone (`Worker.paused` stays); every halt has a reason and a hint; `space` still pauses/resumes.
-- [ ] A run whose orchestrator goes idle recovers without the user (WP7 demo scenario) and a wedged planner is
+- [x] `Cargo.toml` 0.2.0, `CHANGELOG.md` present, README/DESIGN updated for every behaviour change.
+- [x] `Run.paused` is gone (`Worker.paused` stays); every halt has a reason and a hint; `space` still pauses/resumes.
+- [x] A run whose orchestrator goes idle recovers without the user (WP7 demo scenario) and a wedged planner is
       respawned with `r`.
-- [ ] Zoom frames carry the role-colour band + spine; runs start zoomed on the planner; the review overlay opens
+- [x] Zoom frames carry the role-colour band + spine; runs start zoomed on the planner; the review overlay opens
       while zoomed; approve lands on the overview.
-- [ ] Enter queues while busy, ctrl+f force-sends into the running turn, on Codex and on Claude agents.
-- [ ] Studio: editing a role's kind keeps it selected; `permission` exists per role, default off.
-- [ ] Model picker shows `via <provider>`, supports `+/-`/`c` context override; Solo header shows the provider.
-- [ ] Provider `api_key` stored 0600, never on argv/logs; env var precedence kept.
-- [ ] Every agent gets `model_context_window`/`model_auto_compact_token_limit` (Codex) or `--autocompact`
+- [x] Enter queues while busy, ctrl+f force-sends into the running turn, on Codex and on Claude agents.
+- [x] Studio: editing a role's kind keeps it selected; `permission` exists per role, default off.
+- [x] Model picker shows `via <provider>`, supports `+/-`/`c` context override; Solo header shows the provider.
+- [x] Provider `api_key` stored 0600, never on argv/logs; env var precedence kept.
+- [x] Every agent gets `model_context_window`/`model_auto_compact_token_limit` (Codex) or `--autocompact`
       (Claude); a 16k-context model compacts instead of failing.
-- [ ] Claude backend: six default models present when `claude` is installed; api_key mode verified live with
+- [x] Claude backend: six default models present when `claude` is installed; api_key mode verified live with
       LibertAI through tools and the MCP bridge; interrupt, resume after kill, and auth failure paths covered by
       tests; `--dangerously-skip-permissions` always passed (with `IS_SANDBOX=1` as root).
-- [ ] `mantra runs` list/resume/delete and `/runs` overlay work in `--demo`.
-- [ ] Journal and logs contain no ANSI escapes; crash lines carry the exit code.
+- [x] `mantra runs` list/resume/delete and `/runs` overlay work in `--demo`.
+- [x] Journal and logs contain no ANSI escapes; crash lines carry the exit code.
 
 ## 3. Quick reference — what the engine already gives you
 
