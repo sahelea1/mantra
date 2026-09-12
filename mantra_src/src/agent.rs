@@ -111,6 +111,9 @@ pub struct Agent {
     /// Provider id this agent's model runs on (set at spawn) — used to name the provider in
     /// halt messages (e.g. `ProviderRejected`).
     pub provider: String,
+    /// Which runtime this agent's process is (Codex app-server or Claude Code) — for wording only;
+    /// every protocol-level difference is handled in `hub`.
+    pub backend: crate::config::ProviderKind,
     pub effort: String,
     pub cwd: PathBuf,
     /// Codex approval policy this agent was spawned with ("never" | "on-request" | "untrusted").
@@ -162,6 +165,7 @@ impl Agent {
             model_alias: String::new(),
             model: String::new(),
             provider: String::new(),
+            backend: crate::config::ProviderKind::Codex,
             effort: "medium".into(),
             cwd,
             approval: "never".into(),

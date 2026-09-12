@@ -281,6 +281,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.model_alias = m.alias.clone();
     a.model = m.model.clone();
     a.provider = m.provider.clone();
+    a.backend = backend;
     a.effort = effort;
     a.ctx_window = Some(cw);
     a.approval = o.approval.clone();
@@ -1199,13 +1200,14 @@ impl App {
                 if let Some(a) = self.agents.get_mut(&agent) {
                     a.status = if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
                     a.activity = if restarting { "restarting".into() } else { "crashed".into() };
-                    a.notice(Level::Error, format!("codex process {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                    let what = if a.backend == crate::config::ProviderKind::ClaudeCode { "claude process" } else { "codex process" };
+                    a.notice(Level::Error, format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
                 }
                 if self.in_run(agent) {
                     self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));
                 }
                 if Some(agent) == self.solo && !restarting {
-                    self.toast("Solo agent is down — check `codex` is installed & logged in (see log), /new to retry", Level::Error);
+                    self.toast("Solo agent is down — check the CLI is installed & logged in / the provider key (see log), /new to retry", Level::Error);
                 }
             }
             HubEvent::Exited { agent } => {

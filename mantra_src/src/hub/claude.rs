@@ -83,12 +83,12 @@ pub(super) async fn run_claude_process(
     command.args(&args).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     apply_env(&mut command, spec, &cs);
 
-    crate::mlog!("DEBUG claude spawn: {} {}", prog, args.join(" "));
+    crate::mlog!("claude {id}: spawn {} {}", prog, args.join(" "));
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Exit::Crashed(format!("failed to start `{}`: {e}", claude_cmd.join(" "))),
     };
-    crate::mlog!("DEBUG claude spawned pid={:?}", child.id());
+    crate::mlog!("claude {id}: spawned pid={:?}", child.id());
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill().await;
         return Exit::Crashed("claude: missing stdio pipes".into());
@@ -119,7 +119,6 @@ pub(super) async fn run_claude_process(
                         return Exit::Shutdown;
                     }
                     Some(Cmd::Turn { text }) | Some(Cmd::Steer { text }) => {
-                        crate::mlog!("DEBUG claude writing turn text len={}", text.len());
                         // Claude does its own queueing: a line written mid-turn is injected at the
                         // next tool boundary (verified, §10.1) — Turn and Steer are the same wire op.
                         if write_line(&mut stdin, &user_line(&text)).await.is_err() {
@@ -585,8 +584,15 @@ impl Translator {
                 out.push(token_usage(self.agent, post, 0, None));
             }
             "api_retry" => {
-                if matches!(v.get("error_status").and_then(|x| x.as_i64()), Some(401) | Some(403)) {
-                    self.fatal_auth = Some(format!("auth error {:?} (killed before the CLI's own retries)", v.get("error_status")));
+                if let Some(status @ (401 | 403)) = v.get("error_status").and_then(|x| x.as_i64()) {
+                    // Surface it as a failed turn first (Solo shows the error, a run halts with
+                    // `HaltReason::Auth`), then the process is killed so the CLI's own ten retries
+                    // don't hammer the provider with the same bad key.
+                    let msg = format!("HTTP {status} from the provider — check this provider's API key (or its base_url)");
+                    out.push(HubEvent::Notif { agent: self.agent, method: "turn/completed".into(), params: json!({"turn": {"status": "failed", "error": {"message": msg, "codexErrorInfo": "unauthorized"}}}) });
+                    self.turn_open = false;
+                    self.open_tools.clear();
+                    self.fatal_auth = Some(format!("auth error {status} — bad API key for this provider?"));
                 }
             }
             // status (compacting/success/failed), task_started, task_notification, task_summary,
@@ -668,13 +674,10 @@ impl Translator {
             let output = usage.and_then(|u| u.get("output_tokens")).and_then(as_u64).unwrap_or(0);
             let cache_read = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(as_u64).unwrap_or(0);
             let cache_creation = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(as_u64).unwrap_or(0);
-            let window = v
-                .get("modelUsage")
-                .and_then(|m| m.as_object())
-                .and_then(|o| o.values().next())
-                .and_then(|e| e.get("contextWindow"))
-                .and_then(as_u64)
-                .or(if self.autocompact > 0 { Some(self.autocompact) } else { None });
+            // The window Mantra configured (and passed as `--autocompact`) is what the gauge and the
+            // compaction threshold are about; the API's own `contextWindow` is only a fallback.
+            let reported = v.get("modelUsage").and_then(|m| m.as_object()).and_then(|o| o.values().next()).and_then(|e| e.get("contextWindow")).and_then(as_u64);
+            let window = if self.autocompact > 0 { Some(self.autocompact) } else { reported };
             out.push(token_usage(self.agent, input + cache_read + cache_creation, output, Some((input + output, window))));
         }
         let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -905,6 +908,33 @@ mod tests {
     /// interrupt sent while idle, via the unguarded 'x' keybinding) must never set
     /// `interrupt_pending`, and must therefore never bleed "interrupted" into an unrelated later
     /// turn that in fact completed normally.
+    /// A 401/403 from the provider must show up as a failed turn (`unauthorized`, so a run halts
+    /// with `HaltReason::Auth` and Solo prints the error) *and* mark the process for a kill before
+    /// the CLI's own retries — never as a silent crash with a Debug-formatted status.
+    #[test]
+    fn provider_auth_error_fails_the_turn_and_kills_the_process() {
+        let mut tr = Translator::new(1, 200_000);
+        let assistant = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hi"}]}});
+        let _ = tr.on_line(&assistant, false);
+        let retry = json!({"type": "system", "subtype": "api_retry", "error_status": 401, "attempt": 1});
+        let out = tr.on_line(&retry, false);
+        let err = out.iter().find_map(|e| match e {
+            HubEvent::Notif { method, params, .. } if method == "turn/completed" => Some(params["turn"].clone()),
+            _ => None,
+        });
+        let err = err.expect("a failed turn must be reported");
+        assert_eq!(err["status"], "failed");
+        assert_eq!(err["error"]["codexErrorInfo"], "unauthorized");
+        assert!(err["error"]["message"].as_str().unwrap().contains("HTTP 401"));
+        assert!(!tr.turn_open);
+        let reason = tr.fatal_auth.clone().expect("the process must be killed before the CLI retries");
+        assert!(reason.contains("401") && !reason.contains("Some("), "{reason}");
+        // a 5xx retry is not fatal
+        let mut tr2 = Translator::new(1, 200_000);
+        assert!(tr2.on_line(&json!({"type": "system", "subtype": "api_retry", "error_status": 503}), false).is_empty());
+        assert!(tr2.fatal_auth.is_none());
+    }
+
     #[test]
     fn uncorrelated_control_response_never_arms_a_later_unrelated_turn() {
         let mut tr = Translator::new(1, 200_000);
