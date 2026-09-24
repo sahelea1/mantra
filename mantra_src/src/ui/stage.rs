@@ -658,13 +658,21 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         return;
     }
 
-    // ── top row: planner mini-node + orchestrator
+    // ── top row: planner mini-node + orchestrator (+ the manager mini-node on the right)
     let show_planner = w >= 84;
-    // The orchestrator stays centred over the fork, but shifts right to clear the planner node.
-    let orch_w = if show_planner { (w - 32).clamp(34, 56) } else { (w - 4).clamp(30, 62) };
+    let show_manager = show_planner && run.manager.is_some() && w >= 90;
+    // The orchestrator stays centred over the fork, but shifts to clear the side nodes.
+    let orch_w = if show_manager {
+        (w - 60).clamp(30, 56)
+    } else if show_planner {
+        (w - 32).clamp(34, 56)
+    } else {
+        (w - 4).clamp(30, 62)
+    };
     let mut ox = cx - orch_w / 2;
     if show_planner {
-        ox = ox.max(x0 + 29).min(x0 + w - orch_w - 1);
+        let right = if show_manager { x0 + w - 28 - orch_w } else { x0 + w - orch_w - 1 };
+        ox = ox.max(x0 + 29).min(right);
     }
     let orch = Rect { x: ox as u16, y: y0 as u16, width: orch_w as u16, height: 4 };
     let oa = run.orchestrator.and_then(|o| app.agents.get(&o));
@@ -693,6 +701,28 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
                 for x in ex1..=ex2 {
                     let c = if (x - ph).rem_euclid(4) == 0 { theme::g("▸", ">") } else { theme::g("─", "-") };
                     cv.ch(x, ey, c, theme::fg(theme::ROSE));
+                }
+            } else {
+                cv.hline(ex1, ex2, ey, theme::g("┄", "."), theme::faint());
+            }
+        }
+    }
+    if show_manager {
+        // The manager watches from the right: a busy manager is intervening somewhere, so its
+        // edge to the orchestrator marches like a prompt; otherwise it is a quiet dotted line.
+        let mr = Rect { x: (x0 + w - 27) as u16, y: y0 as u16, width: 26, height: 3 };
+        let ma = run.manager.and_then(|m| app.agents.get(&m));
+        let mcol = role_col(run, &run.pattern.flow.manager);
+        let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
+        agent_card(cv, mr, run, ma, "manager", &mglyph, mcol, vec![], run.manager.is_some() && run.manager == sel);
+        let ey = y0 + 1;
+        let (ex1, ex2) = (orch.x as i32 + orch.width as i32, mr.x as i32 - 1);
+        if ex2 > ex1 {
+            if ma.map(|a| a.busy()).unwrap_or(false) {
+                let ph = anim::march(90) as i32;
+                for x in ex1..=ex2 {
+                    let c = if (x + ph).rem_euclid(4) == 0 { theme::g("◂", "<") } else { theme::g("─", "-") };
+                    cv.ch(x, ey, c, theme::fg(mcol));
                 }
             } else {
                 cv.hline(ex1, ex2, ey, theme::g("┄", "."), theme::faint());
@@ -878,13 +908,25 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
             y += 1;
         }
     }
+    // the manager (if the pattern has one) keeps watching through the finale
+    let ax = x + w + 4;
+    let aw = (area.x as i32 + area.width as i32 - ax - 1).min(34);
+    let mut ay = area.y as i32;
+    if aw >= 20 {
+        if let Some(m) = run.manager {
+            let ma = app.agents.get(&m);
+            let mcol = role_col(run, &run.pattern.flow.manager);
+            let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
+            let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 3 };
+            agent_card(cv, r, run, ma, "manager", &mglyph, mcol, vec![], Some(m) == sel);
+            ay += 4;
+        }
+    }
     // ad-hoc fix workers spawned by the verifier
     let adhoc: Vec<&Worker> = run.workers.iter().filter(|w| w.adhoc).collect();
     if !adhoc.is_empty() {
-        let ax = x + w + 4;
-        let aw = (area.x as i32 + area.width as i32 - ax - 1).min(34);
         if aw >= 20 {
-            let mut ay = area.y as i32 + 1;
+            ay += 1;
             cv.put(ax, ay, "ad-hoc fixes", theme::dim());
             ay += 1;
             for wk in adhoc {

@@ -115,6 +115,54 @@ pub fn orchestrator_tools() -> Vec<Value> {
     v
 }
 
+/// The manager's tools (`flow.manager`): everything it needs to see the whole run and to get any
+/// agent moving again, plus the two rungs above it — the planner (for plan changes) and the user.
+/// It never edits code, so no spawning of new tasks and no gate report.
+pub fn manager_tools() -> Vec<Value> {
+    let mut v = vec![
+        tool(
+            "mantra_journal",
+            "Read the run's recent journal: what Mantra and every agent did, in order (newest last). Start here when something looks wrong.",
+            json!({"lines": {"type": "integer", "description": "how many recent lines (default 40, max 200)"}}),
+            &[],
+        ),
+        tool("mantra_prompt", "Send a message to any agent: steer a running one, follow up an idle one, or answer a question it asked. Name it by task id or role (planner, orchestrator, gate, finale).", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        tool("mantra_interrupt", "Interrupt an agent's current turn (it keeps its thread; follow up with mantra_prompt).", json!({"agent": {"type": "string"}}), &["agent"]),
+        tool("mantra_set_effort", "Change an agent's reasoning effort (applies from its next turn) — heavier for a hard problem it keeps getting wrong, lighter for one that overthinks.", json!({"agent": {"type": "string"}, "effort": {"type": "string"}}), &["agent", "effort"]),
+        tool(
+            "mantra_respawn",
+            "Restart an agent in place with a fresh thread — planner, orchestrator, gate, finale, or a task id. The new agent is briefed with the current state plus your note. For an agent that is looping, confused or unresponsive. Doing this during an escalated halt also resumes the run.",
+            json!({"agent": {"type": "string"}, "note": {"type": "string", "description": "what the fresh agent must know or do differently"}}),
+            &["agent"],
+        ),
+        tool(
+            "mantra_retry",
+            "Respawn a failed or stuck worker task with a fresh thread, optionally with a better prompt. Doing this during an escalated halt also resumes the run (the task gets one more attempt).",
+            json!({"task_id": {"type": "string"}, "prompt": {"type": "string", "description": "optional replacement prompt"}}),
+            &["task_id"],
+        ),
+        tool("mantra_pause_agents", "Pause (interrupt) agents so they stop working until resumed.", json!({"agents": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}}), &["agents"]),
+        tool("mantra_resume_agents", "Resume paused agents.", json!({"agents": {"type": "array", "items": {"type": "string"}}}), &["agents"]),
+        tool("mantra_brief_orchestrator", "Send instructions to the orchestrator of the current phase (it acts on them right away).", json!({"message": {"type": "string"}}), &["message"]),
+        tool(
+            "mantra_resume_run",
+            "Resume a halted run (gate or attempts exhausted, an agent's turn failed) because the plan is right as it is. `note` goes to the agent that was stuck as concrete guidance (an exhausted task gets one more attempt). If the tasks or the gate checks themselves are wrong, ask the planner instead (mantra_ask): it can revise the plan, which resumes the run by itself.",
+            json!({"note": {"type": "string"}}),
+            &[],
+        ),
+        ask_tool("planner"),
+        tool(
+            "mantra_ask_user",
+            "Ask the user. Only when nobody in the team can decide: credentials, the machine itself, or a trade-off that is theirs. The run keeps going; their answer arrives as a [from the user] message.",
+            json!({"question": {"type": "string"}}),
+            &["question"],
+        ),
+        tool("mantra_wait", "End your turn and wait. Mantra wakes you with the next escalation or health digest.", json!({}), &[]),
+    ];
+    v.extend(agent_tools());
+    v
+}
+
 pub fn gate_tools(may_spawn: bool, worker_roles: &[String]) -> Vec<Value> {
     let mut v = vec![gate_report_tool(), ask_tool("orchestrator")];
     v.extend(agent_tools());
@@ -175,6 +223,23 @@ mantra-role: orchestrator
 - [mantra:handoff]: write a handoff note (≤10 lines) for your successor: decisions, risks, anything the next phase must know.
 "#;
 
+pub const MANAGER_PROTOCOL: &str = r#"
+mantra-role: manager
+## Mantra protocol
+- Agents are addressed by task id (e.g. p1-auth) or role: planner, orchestrator, gate, finale.
+- Mantra wakes you with [mantra:escalation] (the run is halted until someone acts — you are first in
+  line, the planner after you), [mantra:watchdog] (an agent nobody could get moving) and [mantra:health]
+  (a periodic digest). Read, decide, act, then call mantra_wait.
+- Smallest fix first: a concrete hint (mantra_prompt, or mantra_resume_run(note) when halted) → a sharper
+  prompt or a fresh start (mantra_retry / mantra_respawn) → a change to the plan or the gate checks (mantra_ask
+  the planner; it revises the plan, which resumes the run) → the user (mantra_ask_user), last of all.
+- A halted run continues only through mantra_resume_run, mantra_retry/mantra_respawn, or the planner revising
+  the plan. A message alone (mantra_prompt) does not resume it.
+- Never prompt a worker whose task is done. At most one message per agent per wake; on a healthy digest
+  the right answer is just mantra_wait.
+- You never edit code, never commit, never run the project: you steer the agents that do.
+"#;
+
 pub const WORKER_PROTOCOL: &str = r#"
 mantra-role: worker
 ## Mantra protocol
@@ -202,10 +267,12 @@ mantra-role: gate
 pub const ARCHITECT_PROMPT: &str = r#"
 mantra-role: architect
 You are the Pattern Architect inside Mantra's Studio. You design agent workflows ("patterns") with the user.
-A pattern is TOML with: name, description, [settings], [roles.<name>] (kind = planner|orchestrator|worker|gate,
+A pattern is TOML with: name, description, [settings], [roles.<name>] (kind = planner|manager|orchestrator|worker|gate,
 glyph = one narrow symbol like ✦ ◉ ◇ ◆ ◎ ▲ ■ ● ★, color = saffron|violet|teal|cyan|green|rose|red|amber|blue|gray,
 model = alias, effort = low|medium|high|xhigh|max, sandbox, description, instructions), and [flow]
-(planner, orchestrator, phase_gate, on_reprompt, and [[flow.finale]] steps with role, task, may_spawn).
+(planner, manager ("" = none: a run-wide supervisor that unsticks agents and resolves halts before the
+planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]] steps with role, task, may_spawn).
+[settings] also has manager_minutes (how often the manager gets a health digest; 0 = escalations only).
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.
 If validation fails, fix and retry. Finally explain the change in 1-3 sentences.
 "#;

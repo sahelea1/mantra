@@ -236,6 +236,16 @@ async fn gate_turn(m: &mut Mock) {
     m.say("GATE: pass — everything is coherent and the checks are green.").await;
 }
 
+async fn manager_turn(m: &mut Mock, text: &str) {
+    if text.contains("[mantra:escalation]") {
+        let _ = m.tool_use("mantra_resume_run", json!({"note": "Try once more; run the failing check yourself before reporting."})).await;
+        m.say("Resumed the run with a hint for the stuck agent.").await;
+        return;
+    }
+    let _ = m.tool_use("mantra_wait", json!({})).await;
+    m.say("Nothing to change — waiting for the next event.").await;
+}
+
 pub async fn run() {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let get = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
@@ -284,6 +294,7 @@ pub async fn run() {
                     "orchestrator" => orchestrator_turn(&mut m, &text).await,
                     "worker" => worker_turn(&mut m).await,
                     "gate" => gate_turn(&mut m).await,
+                    "manager" => manager_turn(&mut m, &text).await,
                     _ => m.say(&format!("(mock claude) received: {}", crate::util::trunc(&text, 80))).await,
                 }
                 m.result(turn_n).await;

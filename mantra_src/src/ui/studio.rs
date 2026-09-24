@@ -19,7 +19,7 @@ const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes"];
+const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -60,7 +60,7 @@ fn select_by_index(app: &mut App, i: usize) {
 }
 
 fn flow_fields(app: &App) -> Vec<String> {
-    let mut v = vec!["planner".to_string(), "orchestrator".into(), "phase_gate".into(), "on_reprompt".into()];
+    let mut v = vec!["planner".to_string(), "manager".into(), "orchestrator".into(), "phase_gate".into(), "on_reprompt".into()];
     for i in 0..app.studio.pattern.flow.finale.len() {
         v.push(format!("finale[{i}].role"));
         v.push(format!("finale[{i}].task"));
@@ -96,6 +96,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "watchdog_seconds" => s.watchdog_seconds.to_string(),
                 "watchdog_escalate_seconds" => s.watchdog_escalate_seconds.to_string(),
                 "review_minutes" => if s.review_minutes == 0 { "off".into() } else { s.review_minutes.to_string() },
+                "manager_minutes" => if s.manager_minutes == 0 { "off (escalations only)".into() } else { s.manager_minutes.to_string() },
                 _ => String::new(),
             }
         }
@@ -103,6 +104,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
             let f = &p.flow;
             match field {
                 "planner" => f.planner.clone(),
+                "manager" => if f.manager.trim().is_empty() { "none".into() } else { f.manager.clone() },
                 "orchestrator" => f.orchestrator.clone(),
                 "phase_gate" => f.phase_gate.clone(),
                 "on_reprompt" => f.on_reprompt.clone(),
@@ -194,13 +196,18 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     clamp_watchdog(s);
                 }
                 "review_minutes" => s.review_minutes = (s.review_minutes as i64 + d as i64).clamp(0, 240) as u64,
+                "manager_minutes" => s.manager_minutes = (s.manager_minutes as i64 + d as i64).clamp(0, 240) as u64,
                 _ => return,
             }
         }
         "⇢ flow" => {
+            // The manager is optional: its options are "" (none) plus every role of kind manager.
+            let mut managers: Vec<String> = vec![String::new()];
+            managers.extend(p.roles.iter().filter(|(_, r)| r.kind == "manager").map(|(n, _)| n.clone()));
             let f = &mut p.flow;
             match field {
                 "planner" => f.planner = cycle(&roles, &f.planner, d),
+                "manager" => f.manager = cycle(&managers, &f.manager, d),
                 "orchestrator" => f.orchestrator = cycle(&roles, &f.orchestrator, d),
                 "phase_gate" => f.phase_gate = cycle(&roles, &f.phase_gate, d),
                 "on_reprompt" => f.on_reprompt = cycle(&roles, &f.on_reprompt, d),
@@ -469,6 +476,12 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         };
         pl.push(row(rg(&p.flow.planner)));
         pl.push(arrow("writes the phased plan"));
+        if let Some(m) = p.manager_role() {
+            let mut v = rg(m);
+            v.push(Span::styled(" supervises the whole run", theme::faint()));
+            pl.push(row(v));
+            pl.push(arrow("unsticks agents, resolves halts"));
+        }
         pl.push(row(rg(&p.flow.orchestrator)));
         pl.push(arrow(&format!("spawns ≤{} in parallel / phase", p.settings.max_parallel)));
         let mut ws = vec![];
@@ -653,7 +666,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
             }
             if app.studio.pattern.roles.contains_key(&entry) {
                 let fl = &app.studio.pattern.flow;
-                let used = [&fl.planner, &fl.orchestrator, &fl.phase_gate, &fl.on_reprompt].iter().any(|x| **x == entry) || fl.finale.iter().any(|s| s.role == entry);
+                let used = [&fl.planner, &fl.manager, &fl.orchestrator, &fl.phase_gate, &fl.on_reprompt].iter().any(|x| **x == entry) || fl.finale.iter().any(|s| s.role == entry);
                 if used {
                     app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
                 } else {

@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const KINDS: &[&str] = &["planner", "orchestrator", "worker", "gate"];
+pub const KINDS: &[&str] = &["planner", "manager", "orchestrator", "worker", "gate"];
 pub const COLORS: &[&str] = &["saffron", "violet", "teal", "cyan", "green", "rose", "red", "amber", "blue", "gray"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Role {
-    /// planner | orchestrator | worker | gate
+    /// planner | manager | orchestrator | worker | gate
     pub kind: String,
     pub glyph: String,
     pub color: String,
@@ -72,6 +72,10 @@ pub struct PatternSettings {
     /// How often (minutes) the orchestrator is shown every running worker's recent work and asked
     /// to check the parallel work stays coherent. 0 turns the periodic review off.
     pub review_minutes: u64,
+    /// How often (minutes) the manager (`flow.manager`, if the pattern has one) gets a run-wide
+    /// health digest — every agent's state, the journal — and is asked whether anything needs
+    /// unsticking. 0 turns the digest off (the manager is then woken by escalations only).
+    pub manager_minutes: u64,
 }
 
 impl Default for PatternSettings {
@@ -89,6 +93,7 @@ impl Default for PatternSettings {
             watchdog_seconds: 90,
             watchdog_escalate_seconds: 240,
             review_minutes: 3,
+            manager_minutes: 5,
         }
     }
 }
@@ -112,6 +117,12 @@ impl Default for FinaleStep {
 #[serde(default)]
 pub struct Flow {
     pub planner: String,
+    /// The run-wide supervisor (kind = "manager"), or "" for none. It outlives phases: halts the
+    /// run cannot sort out itself and agents the watchdog cannot get moving go to it first, and it
+    /// gets a periodic health digest (`settings.manager_minutes`). It acts through the same tools
+    /// the orchestrator and the user have — prompt, respawn, retry, resume — and hands plan
+    /// changes up to the planner.
+    pub manager: String,
     pub orchestrator: String,
     pub phase_gate: String,
     pub on_reprompt: String,
@@ -120,7 +131,7 @@ pub struct Flow {
 
 impl Default for Flow {
     fn default() -> Self {
-        Flow { planner: "planner".into(), orchestrator: "orchestrator".into(), phase_gate: "qa".into(), on_reprompt: "planner".into(), finale: vec![] }
+        Flow { planner: "planner".into(), manager: String::new(), orchestrator: "orchestrator".into(), phase_gate: "qa".into(), on_reprompt: "planner".into(), finale: vec![] }
     }
 }
 
@@ -145,7 +156,7 @@ impl Pattern {
         toml::from_str(DEFAULT_PATTERN).expect("built-in pattern must parse")
     }
 
-    /// The default pattern with planner/orchestrator moved to a Claude Code model (`fable51`) and
+    /// The default pattern with planner/manager/orchestrator moved to a Claude Code model (`fable51`) and
     /// workers to another (`sonnet5`) — gate roles are left on their Codex models, so this exercises
     /// a genuinely mixed-backend run (`v02plan.md` §10.6). Built by editing `builtin()` in memory
     /// rather than a second embedded TOML, so the two patterns can never silently drift apart on
@@ -156,7 +167,7 @@ impl Pattern {
         p.description = format!("{} — planner/orchestrator on Claude Code (fable51), workers on Claude Code (sonnet5)", p.description);
         for role in p.roles.values_mut() {
             match role.kind.as_str() {
-                "planner" | "orchestrator" => role.model = "fable51".into(),
+                "planner" | "manager" | "orchestrator" => role.model = "fable51".into(),
                 "worker" => role.model = "sonnet5".into(),
                 _ => {}
             }
@@ -176,6 +187,13 @@ impl Pattern {
 
     pub fn role(&self, name: &str) -> Option<&Role> {
         self.roles.get(name)
+    }
+
+    /// The manager role's name, when the flow names one that exists (`""` in `flow.manager`
+    /// means the pattern runs without a manager — the planner is then the top of the chain).
+    pub fn manager_role(&self) -> Option<&str> {
+        let m = self.flow.manager.trim();
+        (!m.is_empty() && self.roles.get(m).map(|r| r.kind == "manager").unwrap_or(false)).then_some(m)
     }
 
     pub fn worker_roles(&self) -> Vec<String> {
@@ -218,6 +236,9 @@ impl Pattern {
             _ => {}
         };
         need(&self.flow.planner, "planner", "planner", &mut errs);
+        if !self.flow.manager.trim().is_empty() {
+            need(&self.flow.manager, "manager", "manager", &mut errs);
+        }
         need(&self.flow.orchestrator, "orchestrator", "orchestrator", &mut errs);
         need(&self.flow.phase_gate, "gate", "phase_gate", &mut errs);
         if !self.roles.contains_key(&self.flow.on_reprompt) {
@@ -309,6 +330,7 @@ max_tasks_per_phase = 8
 watchdog_seconds = 90
 watchdog_escalate_seconds = 240
 review_minutes = 3             # the orchestrator re-reads every worker's recent work this often (0 = off)
+manager_minutes = 5            # the manager gets a run-wide health digest this often (0 = escalations only)
 
 [roles.planner]
 kind = "planner"
@@ -331,6 +353,28 @@ Keep the tooling later gates need (virtualenvs, node_modules, build caches) in p
 hygiene and cleanup belong in the final phase, never in a phase whose gate still needs them. Gate `checks`
 must run as-is on this machine — prefer what already exists over bootstrapping tools.
 Also write `orchestrator_brief`: how the orchestrator should supervise this particular project.
+"""
+
+[roles.manager]
+kind = "manager"
+glyph = "◈"
+color = "blue"
+model = "sol"
+effort = "high"
+sandbox = "read-only"
+description = "Supervises the whole run: keeps every agent moving, unsticks what stalls, fixes course on the fly"
+instructions = """
+You are the Manager of a multi-agent software team run by Mantra. You never edit code yourself.
+The planner designs the plan, an orchestrator runs one phase at a time, workers build in parallel,
+gates check and merge. Your job is the whole run: that everyone who should be working is working,
+that a stuck, looping or failing agent gets unstuck (a concrete hint, a sharper prompt, a fresh
+start, a different effort), and that a halt is resolved by the team instead of waiting for a person.
+Mantra wakes you with escalations (a gate or task out of attempts, an agent whose turns keep
+failing, an agent the watchdog could not get moving) and with a periodic health digest.
+Read the state first (mantra_status, mantra_log on the agent involved, mantra_journal), then make
+the smallest intervention that gets the run moving again. Changes to the plan, the tasks or the
+gate checks are the planner's to make: hand those up with mantra_ask. Ask the user only when
+nobody in the team can decide (credentials, the machine, a trade-off that is theirs).
 """
 
 [roles.orchestrator]
@@ -402,6 +446,7 @@ instructions = "You are the security agent. Sweep the changes for vulnerabilitie
 
 [flow]
 planner = "planner"
+manager = "manager"
 orchestrator = "orchestrator"
 phase_gate = "qa"
 on_reprompt = "planner"
@@ -431,6 +476,39 @@ mod tests {
         let back = Pattern::from_toml(&p.to_toml()).unwrap();
         assert_eq!(back, p);
     }
+    #[test]
+    fn manager_role_is_optional_and_validated() {
+        let p = Pattern::builtin();
+        assert_eq!(p.manager_role(), Some("manager"));
+        assert_eq!(p.roles["manager"].kind, "manager");
+        assert!(p.roles["manager"].sandbox == "read-only", "the manager never edits code");
+        assert_eq!(p.settings.manager_minutes, 5);
+        // no manager at all is fine
+        let mut none = Pattern::builtin();
+        none.flow.manager = String::new();
+        assert!(none.validate().is_ok());
+        assert_eq!(none.manager_role(), None);
+        // an old pattern file written before the manager existed loads without one
+        let old = DEFAULT_PATTERN.replace("manager = \"manager\"\n", "").replace("manager_minutes = 5", "");
+        let old_p = Pattern::from_toml(&old).unwrap();
+        assert_eq!(old_p.manager_role(), None);
+        assert_eq!(old_p.settings.manager_minutes, 5, "the default applies");
+        // flow.manager must name a role of kind manager
+        let mut bad = Pattern::builtin();
+        bad.flow.manager = "planner".into();
+        let errs = bad.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("flow.manager") && e.contains("manager")), "{errs:?}");
+        assert_eq!(bad.manager_role(), None);
+        let mut missing = Pattern::builtin();
+        missing.flow.manager = "nope".into();
+        assert!(missing.validate().is_err());
+        // the ordered roles put the manager between planner and orchestrator
+        let kinds: Vec<String> = p.ordered_roles().into_iter().map(|(_, r)| r.kind).collect();
+        assert_eq!(kinds[0], "planner");
+        assert_eq!(kinds[1], "manager");
+        assert_eq!(kinds[2], "orchestrator");
+    }
+
     #[test]
     fn catches_errors() {
         let mut p = Pattern::builtin();
@@ -468,7 +546,7 @@ mod tests {
         assert_eq!(p.name, "mantra-default-claude");
         for (name, role) in &p.roles {
             match role.kind.as_str() {
-                "planner" | "orchestrator" => assert_eq!(role.model, "fable51", "role '{name}'"),
+                "planner" | "manager" | "orchestrator" => assert_eq!(role.model, "fable51", "role '{name}'"),
                 "worker" => assert_eq!(role.model, "sonnet5", "role '{name}'"),
                 "gate" => assert_ne!(role.model, "fable51", "gate role '{name}' must keep its Codex model — only planner/orchestrator/worker move"),
                 _ => {}

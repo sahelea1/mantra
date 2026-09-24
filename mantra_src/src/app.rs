@@ -241,15 +241,14 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         extra.push(format!("model_context_window={cw}"));
         extra.push("-c".into());
         extra.push(format!("model_auto_compact_token_limit={}", cw * compact_pct.min(99) as u64 / 100));
-        if m.is_custom_provider() {
+        if m.is_custom_provider() && m.efforts().is_empty() {
+            // No effort control → don't send any reasoning block (strict gateways reject it).
+            // (Models *with* efforts need nothing extra: Codex ≥ 0.150 sends `reasoning.effort`
+            // to any model once `turn/start` carries an effort, and the old
+            // `model_supports_reasoning_summaries` key is now unrecognised — passing it put a
+            // "Codex is ignoring 1 unrecognized configuration setting" banner in every log.)
             extra.push("-c".into());
-            if m.efforts().is_empty() {
-                // No effort control → don't send any reasoning block (strict gateways reject it).
-                extra.push("model_reasoning_summary=\"none\"".into());
-            } else {
-                // Codex only sends reasoning params to models it doesn't know when told they support them.
-                extra.push("model_supports_reasoning_summaries=true".into());
-            }
+            extra.push("model_reasoning_summary=\"none\"".into());
         }
         if !o.extra_writable.is_empty() {
             let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
@@ -635,6 +634,7 @@ impl App {
         let Some(r) = &self.run else { return vec![] };
         let mut v = vec![];
         v.extend(r.planner);
+        v.extend(r.manager);
         v.extend(r.orchestrator);
         for w in &r.workers {
             if let Some(a) = w.agent {

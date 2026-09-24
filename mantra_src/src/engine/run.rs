@@ -155,8 +155,20 @@ pub enum Expect {
     Working(String),
     Gating,
     Finale(usize),
-    /// The planner, while the orchestrator waits on a question it passed up (`mantra_ask`).
+    /// The planner, while the orchestrator (or the manager) waits on a question it passed up
+    /// (`mantra_ask`).
     Answering,
+    /// The manager, while it holds an escalated halt or a watchdog case nobody else could clear.
+    Managing,
+}
+
+/// A halt handed to the manager (`flow.manager`) before the planner: when, by when it must have
+/// acted (else the planner gets it), whether it has had its one reminder, and the halt's message
+/// so the planner's escalation can carry the same text.
+struct ManagerEscalation {
+    deadline: Instant,
+    reminded: bool,
+    message: String,
 }
 
 /// A question the planner put to the user (`mantra_ask_user`) — the top rung of the chain of
@@ -231,6 +243,9 @@ pub struct Run {
     pub plan: Option<Plan>,
     pub plan_version: u32,
     pub planner: Option<AgentId>,
+    /// The run-wide supervisor (`flow.manager`), spawned when the first phase starts and re-spawned
+    /// on demand; `None` when the pattern has no manager role.
+    pub manager: Option<AgentId>,
     pub orchestrator: Option<AgentId>,
     pub gate_agent: Option<AgentId>,
     pub finale_agent: Option<AgentId>,
@@ -291,6 +306,15 @@ pub struct Run {
     /// quiet spell costs the pulse feed exactly one line. An entry is dropped the moment the agent
     /// speaks again, which is what lets a *later* spell be reported afresh.
     silent_flagged: HashSet<AgentId>,
+    /// Messages for the manager, delivered together the next time it is idle (`wake_manager`).
+    manager_inbox: Vec<String>,
+    /// When the manager last got a health digest (`settings.manager_minutes`).
+    last_health: Instant,
+    /// A halt currently in the manager's hands (see `escalate_to_manager`).
+    manager_escalation: Option<ManagerEscalation>,
+    /// The watchdog woke the manager about an idle agent (ladder step 3): when, the deadline, and
+    /// who it was about. Past the deadline with no reaction, the planner gets it as before.
+    manager_watchdog: Option<(Instant, Instant, String)>,
 }
 
 impl Run {
@@ -308,6 +332,7 @@ impl Run {
             plan: None,
             plan_version: 0,
             planner: None,
+            manager: None,
             orchestrator: None,
             gate_agent: None,
             finale_agent: None,
@@ -346,6 +371,10 @@ impl Run {
             last_gate_blocker: None,
             planner_watchdog: None,
             silent_flagged: HashSet::new(),
+            manager_inbox: vec![],
+            last_health: Instant::now(),
+            manager_escalation: None,
+            manager_watchdog: None,
         }
     }
 
@@ -383,6 +412,8 @@ impl Run {
         let slot_of = |a: AgentId| -> String {
             if Some(a) == self.planner {
                 "planner".into()
+            } else if Some(a) == self.manager {
+                "manager".into()
             } else if Some(a) == self.orchestrator {
                 "orchestrator".into()
             } else if Some(a) == self.gate_agent {
@@ -518,6 +549,7 @@ impl Run {
         }
         self.halt = None;
         self.escalation_open = false;
+        self.manager_escalation = None;
         self.last_verify_sig = None;
         self.alerts.clear();
         for a in std::mem::take(&mut self.paused_agents) {
@@ -563,15 +595,55 @@ impl Run {
             return;
         }
         self.halt(ctx, reason, agent, message.clone());
+        // With a manager in the pattern it is first in line — it has the operational tools
+        // (hint, retry, respawn, resume) and hands a plan problem up itself. Without one, or if
+        // it does not act in time (`manager_tick`), the planner gets it as before.
+        if self.has_manager() {
+            self.escalate_to_manager(ctx, message);
+        } else {
+            self.escalate_to_planner(ctx, message);
+        }
+    }
+
+    /// What every escalation prompt carries: the workers, the last gate report, the last checks.
+    fn escalation_context(&self, ctx: &dyn Ctx) -> (String, String) {
+        let status = self.status_text(ctx);
+        let checks = self.check_summary();
+        let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
+        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}\n", if *ok { "pass" } else { "fail" }, trunc(s, 400))).unwrap_or_default();
+        (phase, format!("Workers:\n{status}{report}Gate checks (last run):\n{checks}"))
+    }
+
+    /// The manager's rung of an escalated halt: it gets the same facts as the planner would, the
+    /// operational moves it has, and a deadline (`watchdog_escalate_seconds`) after which the
+    /// planner is asked instead — so a silent manager never keeps a run halted.
+    fn escalate_to_manager(&mut self, ctx: &mut dyn Ctx, message: String) {
+        let Some(m) = self.ensure_manager(ctx) else {
+            self.escalate_to_planner(ctx, message);
+            return;
+        };
+        let secs = self.pattern.settings.watchdog_escalate_seconds.max(120);
+        let (phase, facts) = self.escalation_context(ctx);
+        self.manager_escalation = Some(ManagerEscalation { deadline: Instant::now() + Duration::from_secs(secs), reminded: false, message: message.clone() });
+        self.log("◈", "blue", format!("escalated to the manager: {}", trunc(&message, 60)));
+        self.mark_edge(m);
+        ctx.prompt(
+            m,
+            format!(
+                "[mantra:escalation] {message}\n\nWe are in {phase}; the run is halted until someone acts, and you are first in line.\n{facts}\n\nFind out what actually went wrong (mantra_log on the agent involved, mantra_journal), then act with one of:\n- mantra_resume_run(note) — the plan is right; give the stuck agent a concrete hint and let it try again (an exhausted task gets one more attempt).\n- mantra_retry(task_id, prompt) or mantra_respawn(agent, note) — a fresh start with a sharper brief; during this halt that also resumes the run.\n- mantra_ask(question) — when the tasks or the gate checks themselves are wrong (a check that cannot pass on this machine is a plan bug, not a QA failure): the planner can revise the plan, which resumes the run by itself.\n- mantra_ask_user(question) — only if nobody in the team can decide.\nIf you do nothing within {secs}s the planner gets it. Then summarize in 2-4 lines."
+            ),
+        );
+    }
+
+    /// Chain of command, top rung before the user: a halt the run could not sort out by itself
+    /// (gate exhausted, attempts exhausted) is handed to the planner with everything it needs to
+    /// decide — revise the phase, give the stuck agent a hint and resume, or ask the user.
+    fn escalate_to_planner(&mut self, ctx: &mut dyn Ctx, message: String) {
         let p = match self.planner {
             Some(p) => p,
             None => self.spawn_planner(ctx),
         };
-        let status = self.status_text(ctx);
-        let checks = self.check_summary();
-        let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
-        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}
-", if *ok { "pass" } else { "fail" }, trunc(s, 400))).unwrap_or_default();
+        let (phase, facts) = self.escalation_context(ctx);
         self.escalation_open = true;
         self.log("✦", "saffron", format!("escalated to the planner: {}", trunc(&message, 60)));
         self.mark_edge(p);
@@ -581,9 +653,7 @@ impl Run {
                 "[mantra:escalation] {message}
 
 We are in {phase}; the run is halted until you act.
-Workers:
-{status}{report}Gate checks (last run):
-{checks}
+{facts}
 
 Decide, then act with exactly one of:
 - mantra_revise_plan — fix this phase's tasks or gate checks (a check that cannot pass on this machine is a plan bug, not a QA failure); the run resumes by itself with the revised phase.
@@ -639,6 +709,9 @@ Then summarize in 2-4 lines.",
         if Some(a) == self.planner {
             return Some("planner".into());
         }
+        if Some(a) == self.manager {
+            return Some("manager".into());
+        }
         if Some(a) == self.orchestrator {
             return Some("orchestrator".into());
         }
@@ -653,6 +726,9 @@ Then summarize in 2-4 lines.",
     pub fn role_name_of(&self, a: AgentId) -> Option<String> {
         if Some(a) == self.planner {
             return Some(self.pattern.flow.planner.clone());
+        }
+        if Some(a) == self.manager {
+            return Some(self.pattern.flow.manager.clone());
         }
         if Some(a) == self.orchestrator {
             return Some(self.pattern.flow.orchestrator.clone());
@@ -680,7 +756,7 @@ Then summarize in 2-4 lines.",
     }
 
     pub fn all_agents(&self) -> Vec<AgentId> {
-        let mut v: Vec<AgentId> = [self.planner, self.orchestrator, self.gate_agent, self.finale_agent].into_iter().flatten().collect();
+        let mut v: Vec<AgentId> = [self.planner, self.manager, self.orchestrator, self.gate_agent, self.finale_agent].into_iter().flatten().collect();
         v.extend(self.workers.iter().filter_map(|w| w.agent));
         v.dedup();
         v
@@ -698,8 +774,10 @@ Then summarize in 2-4 lines.",
         let n = name.trim().trim_start_matches('@').to_lowercase();
         match n.as_str() {
             "planner" => return self.planner,
+            "manager" => return self.manager,
             "orchestrator" | "orch" => return self.orchestrator,
             "gate" | "qa" => return self.gate_agent.or(self.finale_agent),
+            "finale" => return self.finale_agent,
             _ => {}
         }
         if let Some(w) = self.workers.iter().rev().find(|w| w.task.id.to_lowercase() == n) {
@@ -714,6 +792,9 @@ Then summarize in 2-4 lines.",
     pub fn name_of(&self, a: AgentId) -> String {
         if Some(a) == self.planner {
             return "planner".into();
+        }
+        if Some(a) == self.manager {
+            return "manager".into();
         }
         if Some(a) == self.orchestrator {
             return "orchestrator".into();
@@ -855,11 +936,18 @@ Then summarize in 2-4 lines.",
             }
             Stage::Setup | Stage::Review | Stage::Done | Stage::Failed(_) => {}
         }
-        // The orchestrator passed a question up: now the planner is the one who must act (unless
-        // it, in turn, is waiting on the user).
-        if let (Some(o), Some(p)) = (self.orchestrator, self.planner) {
-            if self.pending_questions.contains_key(&o) && !asking(p) && !v.iter().any(|(a, _)| *a == p) {
+        // The orchestrator (or the manager) passed a question up: now the planner is the one who
+        // must act (unless it, in turn, is waiting on the user).
+        if let Some(p) = self.planner {
+            let asked = [self.orchestrator, self.manager].into_iter().flatten().any(|q| self.pending_questions.contains_key(&q));
+            if asked && !asking(p) && !v.iter().any(|(a, _)| *a == p) {
                 v.push((p, Expect::Answering));
+            }
+        }
+        // The manager holds an escalated halt or a watchdog case: it must act, whatever the stage.
+        if let Some(m) = self.manager {
+            if (self.manager_escalation.is_some() || self.manager_watchdog.is_some()) && !asking(m) && !v.iter().any(|(a, _)| *a == m) {
+                v.push((m, Expect::Managing));
             }
         }
         v
@@ -886,8 +974,8 @@ Then summarize in 2-4 lines.",
         if !self.orch_inbox.is_empty() {
             return true;
         }
-        // someone below it is waiting for an answer
-        if self.pending_questions.keys().any(|a| Some(*a) != self.orchestrator) {
+        // someone below it is waiting for an answer (the manager asks the planner, not it)
+        if self.pending_questions.keys().any(|a| Some(*a) != self.orchestrator && Some(*a) != self.manager) {
             return true;
         }
         if self.workers.iter().any(|w| matches!(w.state, WState::Running | WState::Preparing | WState::Retrying(_))) {
@@ -992,6 +1080,11 @@ Then summarize in 2-4 lines.",
         self.cleanup_done = false;
         self.log("◆", "saffron", format!("phase {}/{} — {}", idx + 1, plan.phases.len(), phase.name));
 
+        if idx == 0 {
+            // The manager watches the whole build: it comes in with the first phase, briefed
+            // once, and stays until the run ends.
+            self.ensure_manager(ctx);
+        }
         let fresh = self.pattern.settings.orchestrator_context != "compact";
         let orch = match self.orchestrator {
             Some(o) if !fresh => {
@@ -1578,6 +1671,21 @@ Then summarize in 2-4 lines.",
                 _ => None,
             };
             if let Some(reason) = reason {
+                // The manager is a supervisor, not a step of the run: its turn failing past the
+                // retry cap must never halt the build it watches. Drop it (a fresh one comes with
+                // the next event) and hand anything it held to the planner.
+                if reason == HaltReason::AgentTurnFailed && Some(a) == self.manager {
+                    self.log("◈", "amber", format!("manager: turn failed ({}) — a fresh manager comes with the next event", trunc(&msg, 60)));
+                    self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+                    ctx.stop(a, true);
+                    self.manager = None;
+                    self.retry_counts.remove(&a);
+                    self.manager_watchdog = None;
+                    if let Some(e) = self.manager_escalation.take() {
+                        self.escalate_to_planner(ctx, e.message);
+                    }
+                    return;
+                }
                 // WP7.3: a planner/orchestrator/gate/finale turn that fails past the retry cap
                 // gets one free respawn (with a resume prompt) before the run gives up on it.
                 if reason == HaltReason::AgentTurnFailed {
@@ -1611,6 +1719,32 @@ Then summarize in 2-4 lines.",
             if let Some(tag) = self.watchdog_role_tag(a) {
                 self.turn_fail_retried.remove(&tag);
             }
+        }
+
+        if Some(a) == self.manager {
+            if status == "completed" {
+                self.manager_watchdog = None;
+            }
+            // An escalated halt it was handed but did not act on (no resume, no restart, no
+            // question up or to the user): one reminder, then the planner gets it.
+            let waiting = self.pending_questions.contains_key(&a) || self.question.as_ref().map(|q| q.from == a).unwrap_or(false);
+            if self.halted() && status == "completed" && !waiting {
+                if let Some(e) = &mut self.manager_escalation {
+                    if !e.reminded {
+                        e.reminded = true;
+                        self.mark_edge(a);
+                        ctx.prompt(a, "[mantra:escalation] The run is still halted and nothing changed. Act now: mantra_resume_run(note), mantra_retry / mantra_respawn, mantra_ask the planner, or mantra_ask_user.".into());
+                    } else {
+                        let msg = e.message.clone();
+                        self.manager_escalation = None;
+                        self.log("◈", "amber", "the manager did not resolve the halt — the planner gets it");
+                        self.escalate_to_planner(ctx, msg);
+                    }
+                    return;
+                }
+            }
+            self.wake_manager(ctx);
+            return;
         }
 
         if Some(a) == self.planner && matches!(self.stage, Stage::Planning) {
@@ -1858,7 +1992,12 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.last_tick = Instant::now();
-        if !self.is_active() || self.halted() {
+        if !self.is_active() {
+            return;
+        }
+        // The manager's deadlines and inbox run while halted too: it is who resolves halts.
+        self.manager_tick(ctx);
+        if self.halted() {
             return;
         }
         let now = Instant::now();
@@ -1972,6 +2111,18 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
+        if let Some((set_at, deadline, about)) = self.manager_watchdog.clone() {
+            if Instant::now() >= deadline {
+                let responded = self.manager.and_then(|m| ctx.agent(m)).map(|a| a.last_event > set_at || a.busy()).unwrap_or(false);
+                if !responded {
+                    // The manager did not react either: the planner is next, exactly as it would
+                    // have been without a manager.
+                    self.manager_watchdog = None;
+                    self.log("⏰", "amber", format!("the manager did not act on {about} — waking the planner (watchdog)"));
+                    self.wake_planner_for_idle(ctx, &about);
+                }
+            }
+        }
         let ws_secs = self.pattern.settings.watchdog_seconds.max(1);
         let es_secs = self.pattern.settings.watchdog_escalate_seconds.max(ws_secs + 1);
         // The stall tripwire in `tick` only walks `self.workers`, and the ladder below only ever
@@ -2042,7 +2193,8 @@ Then summarize in 2-4 lines.",
                     Expect::Planning => "planning".into(),
                     Expect::Gating => "clearing the phase gate".into(),
                     Expect::Finale(_) => "finishing the finale step".into(),
-                    Expect::Answering => "answering the orchestrator's question (mantra_brief_orchestrator, or mantra_ask_user)".into(),
+                    Expect::Answering => "answering the question passed up to you (mantra_brief_orchestrator or mantra_prompt, or mantra_ask_user)".into(),
+                    Expect::Managing => "resolving the halt / the idle agent handed to you (mantra_resume_run, mantra_retry, mantra_respawn, mantra_prompt, or mantra_ask the planner)".into(),
                 };
                 self.log("⏰", "amber", format!("{name} idle {secs}s — nudging (watchdog)"));
                 self.mark_edge(a);
@@ -2052,6 +2204,11 @@ Then summarize in 2-4 lines.",
                 if Some(a) == self.orchestrator {
                     self.log("⏰", "amber", format!("orchestrator idle {secs}s — respawning (watchdog)"));
                     let _ = self.respawn(ctx, a, Some(format!("[mantra:watchdog] You were idle for {secs}s and were respawned. Pick up the phase.")));
+                } else if Some(a) == self.manager {
+                    // The manager itself went quiet on something in its hands: a fresh one, told
+                    // what is open (`respawn_manager` carries the escalation).
+                    self.log("⏰", "amber", format!("manager idle {secs}s — respawning (watchdog)"));
+                    self.respawn_manager(ctx, Some(format!("[mantra:watchdog] The previous manager was idle for {secs}s on this. Deal with it now.")));
                 } else if Some(a) == self.planner {
                     // No orchestrator exists yet (the planner itself is the idle agent, i.e.
                     // `Stage::Planning`) — pushing into `orch_event`/`orch_inbox` here would just
@@ -2070,14 +2227,44 @@ Then summarize in 2-4 lines.",
                     self.halt(ctx, HaltReason::AgentTurnFailed, p, format!("the planner has been unresponsive for {secs}s (watchdog)"));
                     return;
                 }
-                let Some(p) = self.planner else { return };
+                if Some(a) == self.manager {
+                    // Even a respawned manager did nothing: the planner takes over what it held.
+                    let about = self.manager_watchdog.take().map(|(_, _, who)| who);
+                    if let Some(e) = self.manager_escalation.take() {
+                        self.log("⏰", "amber", format!("manager still idle {secs}s — the planner gets the halt (watchdog)"));
+                        self.escalate_to_planner(ctx, e.message);
+                    } else if let Some(who) = about {
+                        self.log("⏰", "amber", format!("manager still idle {secs}s — waking the planner about {who} (watchdog)"));
+                        self.wake_planner_for_idle(ctx, &who);
+                    }
+                    return;
+                }
+                // With a manager, it gets the case first (once per case); the planner only if it
+                // does not react by the deadline (`watchdog_tick`).
+                if self.has_manager() && self.manager_watchdog.is_none() {
+                    if let Some(m) = self.ensure_manager(ctx) {
+                        self.log("⏰", "amber", format!("{name} still idle {secs}s — waking the manager (watchdog)"));
+                        self.mark_edge(m);
+                        let es = self.pattern.settings.watchdog_escalate_seconds.max(1);
+                        ctx.prompt(m, format!("[mantra:watchdog] {name} has been idle for {secs}s and neither a nudge nor the orchestrator got it moving. Find out why (mantra_log {name}, mantra_journal) and get it moving: mantra_prompt, mantra_respawn / mantra_retry, mantra_set_effort, or mantra_brief_orchestrator. If the task itself is the problem, mantra_ask the planner. If you do nothing within {es}s the planner is woken instead."));
+                        self.manager_watchdog = Some((Instant::now(), Instant::now() + Duration::from_secs(es), name));
+                        return;
+                    }
+                }
                 self.log("⏰", "amber", format!("{name} still idle {secs}s — waking the planner (watchdog)"));
-                self.mark_edge(p);
-                ctx.prompt(p, format!("[mantra:watchdog] The orchestrator did not act on {name} (idle {secs}s). Decide: mantra_brief_orchestrator, mantra_revise_plan, mantra_spawn_adhoc, or mantra_pause_agents."));
-                self.planner_watchdog = Some((Instant::now(), Instant::now() + Duration::from_secs(self.pattern.settings.watchdog_escalate_seconds.max(1))));
+                self.wake_planner_for_idle(ctx, &name);
             }
             _ => {}
         }
+    }
+
+    /// Ladder step 3 without (or after) the manager: the planner is told about the idle agent
+    /// and given a deadline of its own (`planner_watchdog`), past which the run halts.
+    fn wake_planner_for_idle(&mut self, ctx: &mut dyn Ctx, name: &str) {
+        let Some(p) = self.planner else { return };
+        self.mark_edge(p);
+        ctx.prompt(p, format!("[mantra:watchdog] The orchestrator did not act on {name} (idle). Decide: mantra_brief_orchestrator, mantra_revise_plan, mantra_spawn_adhoc, or mantra_pause_agents."));
+        self.planner_watchdog = Some((Instant::now(), Instant::now() + Duration::from_secs(self.pattern.settings.watchdog_escalate_seconds.max(1))));
     }
 
     /// `space`: the user's own pause/resume, distinct from a failure halt only by `HaltReason`
@@ -2103,15 +2290,19 @@ Then summarize in 2-4 lines.",
     /// User typed into the Mandala prompt (not addressed to a specific agent).
     pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str) {
         if let Some(q) = self.question.take() {
-            // The planner asked; this is the answer — straight back to it, whatever the stage.
-            let asked = format!("the planner asks: {}", q.text);
+            // The planner (or the manager) asked; this is the answer — straight back to it,
+            // whatever the stage.
+            let who = self.name_of(q.from);
+            let asked = format!("the {who} asks: {}", q.text);
             self.alerts.retain(|a| *a != asked);
-            self.log("›", "rose", format!("you → planner (answer): {}", trunc(text, 60)));
+            self.log("›", "rose", format!("you → {who} (answer): {}", trunc(text, 60)));
             self.mark_edge(q.from);
-            ctx.prompt(
-                q.from,
-                format!("[from the user] (answering your question: {})\n{text}\n\nAct on it — brief the orchestrator (mantra_brief_orchestrator), revise the plan (mantra_revise_plan) or resume the run (mantra_resume_run) as needed — then summarize in 2-4 lines.", trunc(&q.text, 200)),
-            );
+            let next = if Some(q.from) == self.manager {
+                "Act on it — resume the run (mantra_resume_run), restart an agent (mantra_retry / mantra_respawn), brief the orchestrator, or hand a plan change to the planner (mantra_ask) — then summarize in 2-4 lines."
+            } else {
+                "Act on it — brief the orchestrator (mantra_brief_orchestrator), revise the plan (mantra_revise_plan) or resume the run (mantra_resume_run) as needed — then summarize in 2-4 lines."
+            };
+            ctx.prompt(q.from, format!("[from the user] (answering your question: {})\n{text}\n\n{next}", trunc(&q.text, 200)));
             return;
         }
         match self.stage.clone() {
@@ -2154,6 +2345,257 @@ Then summarize in 2-4 lines.",
             }
             None => false,
         }
+    }
+
+    // ───────────────────────────── manager ─────────────────────────────
+
+    /// The pattern has a manager role (`flow.manager` names a role of kind `manager`).
+    pub fn has_manager(&self) -> bool {
+        self.pattern.manager_role().is_some()
+    }
+
+    /// Spawn the manager agent (no brief yet). `resume`: a saved thread/session id to re-attach to.
+    pub(super) fn spawn_manager_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
+        let name = self.pattern.flow.manager.trim().to_string();
+        let role = self.role(&name);
+        let req = SpawnReq {
+            name: "manager".into(),
+            role_name: name,
+            instructions: format!("{}\n{}", role.instructions, tools::MANAGER_PROTOCOL),
+            cwd: self.workspace_dir(),
+            tools: tools::manager_tools(),
+            effort: None,
+            extra_writable: vec![],
+            context_override: None,
+            role,
+        };
+        let id = match resume {
+            Some(t) => ctx.spawn_resumed(req, t),
+            None => ctx.spawn(req),
+        };
+        self.manager = Some(id);
+        id
+    }
+
+    /// The manager, spawned and briefed on first need. `None` when the pattern has no manager.
+    fn ensure_manager(&mut self, ctx: &mut dyn Ctx) -> Option<AgentId> {
+        if !self.has_manager() {
+            return None;
+        }
+        if let Some(m) = self.manager {
+            return Some(m);
+        }
+        let id = self.spawn_manager_with(ctx, None);
+        let glyph = self.role(&self.pattern.flow.manager.clone()).glyph;
+        self.log(&glyph, "blue", "manager started — it supervises the whole run");
+        self.mark_edge(id);
+        let brief = self.manager_brief("You manage this run.");
+        ctx.prompt(id, brief);
+        Some(id)
+    }
+
+    /// The manager's opening (or respawn) brief: the goal, the plan's shape, the settings that
+    /// decide when Mantra gives up on something, and what will wake it.
+    pub(super) fn manager_brief(&self, lead: &str) -> String {
+        let s = &self.pattern.settings;
+        let plan = match &self.plan {
+            Some(p) => {
+                let cur = self.phase_idx();
+                let phases: Vec<String> = p
+                    .phases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ph)| {
+                        let mark = match cur {
+                            Some(c) if i < c => "done",
+                            Some(c) if i == c => "CURRENT",
+                            _ => "pending",
+                        };
+                        format!("- phase {}: {} ({} task{}) — {mark}", i + 1, ph.name, ph.tasks.len(), if ph.tasks.len() == 1 { "" } else { "s" })
+                    })
+                    .collect();
+                let finale: Vec<&str> = self.pattern.flow.finale.iter().map(|f| f.role.as_str()).collect();
+                format!("Plan: {} — {}\n{}\nFinale: {}\n", p.title, trunc(&p.summary, 400), phases.join("\n"), if finale.is_empty() { "none".to_string() } else { finale.join(" → ") })
+            }
+            None => "Plan: not written yet.\n".into(),
+        };
+        format!(
+            "[mantra:manage] {lead}\nGoal:\n{}\n\n{plan}\nRun settings: up to {} tasks in parallel; each task gets {} attempts in total; a gate gets {} rounds; the watchdog nudges an idle agent after {}s and escalates after {}s; you get a health digest every {}.\n\nNothing needs you yet: call mantra_wait. Mantra wakes you when something does.",
+            self.brief,
+            s.max_parallel,
+            self.max_attempts(),
+            s.gate_max_rounds,
+            s.watchdog_seconds,
+            s.watchdog_escalate_seconds,
+            if s.manager_minutes == 0 { "never (escalations only)".to_string() } else { format!("{} min", s.manager_minutes) }
+        )
+    }
+
+    /// Queue a message for the manager; delivered (with a run overview) as soon as it is idle.
+    fn manager_event(&mut self, ctx: &mut dyn Ctx, text: String) {
+        if !self.has_manager() {
+            return;
+        }
+        self.manager_inbox.push(text);
+        self.wake_manager(ctx);
+    }
+
+    /// Deliver the manager's inbox when it can take it. Unlike `wake_orch` this also runs while
+    /// the run is halted — the manager is who resolves halts.
+    fn wake_manager(&mut self, ctx: &mut dyn Ctx) {
+        if self.manager_inbox.is_empty() || !self.is_active() {
+            return;
+        }
+        let Some(m) = self.ensure_manager(ctx) else {
+            self.manager_inbox.clear();
+            return;
+        };
+        let Some(a) = ctx.agent(m) else { return };
+        if a.busy() || a.thread_id.is_none() || matches!(a.status, Status::Starting) || a.stopped_by_user {
+            return;
+        }
+        let msgs = std::mem::take(&mut self.manager_inbox);
+        let overview = self.overview_text(ctx);
+        self.mark_edge(m);
+        ctx.prompt(m, format!("{}\n\nRun overview:\n{overview}\nDecide what (if anything) to do, then call mantra_wait.", msgs.join("\n\n")));
+    }
+
+    /// The whole run on one screen, for the manager: stage and halt, the plan's progress, every
+    /// non-worker agent with what it is doing and for how long it has been quiet, the workers
+    /// (`status_text`), and the tail of the journal.
+    pub(super) fn overview_text(&self, ctx: &dyn Ctx) -> String {
+        let mut s = format!("Stage: {} · running for {}\n", super::state::stage_label(&self.stage), fmt_dur(self.elapsed()));
+        if let Some(h) = &self.halt {
+            s.push_str(&format!("HALTED ({}) for {}: {}\n", reason_label(h.reason), fmt_dur(h.since.elapsed()), h.message));
+        }
+        if let Some(q) = &self.question {
+            s.push_str(&format!("Open question to the user from the {}: {}\n", self.name_of(q.from), trunc(&q.text, 160)));
+        }
+        if let Some(p) = &self.plan {
+            let cur = self.phase_idx();
+            for (i, ph) in p.phases.iter().enumerate() {
+                let mark = match cur {
+                    Some(c) if i < c => "done",
+                    Some(c) if i == c => "CURRENT",
+                    _ if matches!(self.stage, Stage::Finale { .. } | Stage::Done) => "done",
+                    _ => "pending",
+                };
+                s.push_str(&format!("- phase {}: {} — {mark}\n", i + 1, ph.name));
+            }
+        }
+        s.push_str("Agents:\n");
+        let mut listed: Vec<AgentId> = vec![];
+        for (label, id) in [("planner", self.planner), ("manager", self.manager), ("orchestrator", self.orchestrator), ("gate", self.gate_agent), ("finale", self.finale_agent)] {
+            let Some(a) = id else { continue };
+            if listed.contains(&a) {
+                continue;
+            }
+            listed.push(a);
+            let Some(ag) = ctx.agent(a) else { continue };
+            let state = if ag.stopped_by_user {
+                "STOPPED by the user".to_string()
+            } else if self.pending_questions.contains_key(&a) {
+                "waiting for an answer to its question".to_string()
+            } else if ag.busy() {
+                format!("busy (last output {} ago)", fmt_dur(ag.last_event.elapsed()))
+            } else {
+                format!("idle for {}", fmt_dur(ag.last_event.elapsed()))
+            };
+            s.push_str(&format!("- {label} [{}]: {state}, activity: {}, tokens {}\n", ag.role, trunc(&ag.activity, 60), fmt_tokens(ag.tokens_total)));
+        }
+        s.push_str("Workers:\n");
+        s.push_str(&self.status_text(ctx));
+        s.push_str("Recent journal:\n");
+        s.push_str(&self.journal_text(14));
+        s
+    }
+
+    /// The last `n` journal lines, oldest first.
+    fn journal_text(&self, n: usize) -> String {
+        let lines: Vec<String> = self.pulse.iter().rev().take(n).map(|p| format!("{} {} {}", p.t, p.glyph, p.text)).collect();
+        let mut out = String::new();
+        for l in lines.iter().rev() {
+            out.push_str(l);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The manager's share of `tick`. Runs while halted too: a halt in the manager's hands has a
+    /// deadline, past which (and once the manager is idle and not waiting on the planner or the
+    /// user) the planner gets it — a silent manager never keeps a run halted.
+    fn manager_tick(&mut self, ctx: &mut dyn Ctx) {
+        if !self.has_manager() {
+            return;
+        }
+        if let Some(e) = &self.manager_escalation {
+            if Instant::now() >= e.deadline {
+                let m = self.manager;
+                let busy = m.and_then(|m| ctx.agent(m)).map(|a| a.busy() || matches!(a.status, Status::Starting)).unwrap_or(false);
+                let waiting = m.map(|m| self.pending_questions.contains_key(&m) || self.question.as_ref().map(|q| q.from == m).unwrap_or(false)).unwrap_or(false);
+                if !self.halted() {
+                    self.manager_escalation = None;
+                } else if !busy && !waiting {
+                    let msg = e.message.clone();
+                    self.manager_escalation = None;
+                    self.log("◈", "amber", "the manager did not resolve the halt in time — the planner gets it");
+                    self.escalate_to_planner(ctx, msg);
+                }
+            }
+        }
+        self.health_tick(ctx);
+        self.wake_manager(ctx);
+    }
+
+    /// Every `settings.manager_minutes` while building or in the finale, the manager gets the run
+    /// overview and is asked whether anything needs unsticking. Skipped (not postponed) while a
+    /// halt is open — the escalation already has its attention.
+    fn health_tick(&mut self, ctx: &mut dyn Ctx) {
+        let every = self.pattern.settings.manager_minutes;
+        if every == 0 || self.halted() || !matches!(self.stage, Stage::Phase { .. } | Stage::Finale { .. }) {
+            return;
+        }
+        if self.last_health.elapsed() < Duration::from_secs(every * 60) {
+            return;
+        }
+        if self.manager.and_then(|m| ctx.agent(m)).map(|a| a.busy() || a.thread_id.is_none()).unwrap_or(true) {
+            return; // mid-turn (or gone): try again next tick, it will be respawned by the wake
+        }
+        self.last_health = Instant::now();
+        self.log("◈", "blue", "manager health check");
+        self.manager_event(ctx, format!("[mantra:health] Periodic health check (every {every} min). Is the run healthy — is everyone who should be working working, is anyone stuck, looping, failing repeatedly or drifting from the goal? Intervene only where something is actually off (at most one message per agent); otherwise just call mantra_wait."));
+    }
+
+    /// The manager restarting an agent during an escalated halt *is* its decision to go on: lift
+    /// the halt first (an exhausted task gets its extra attempt), so the retry/respawn is accepted.
+    /// Returns whether a halt was lifted.
+    fn lift_halt_for_restart(&mut self, ctx: &mut dyn Ctx, by: AgentId) -> bool {
+        let Some(h) = &self.halt else { return false };
+        if !matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) {
+            return false;
+        }
+        if h.reason == HaltReason::AttemptsExhausted {
+            self.extra_attempts += 1;
+        }
+        self.log("▶", "green", format!("{} lifted the halt to restart an agent", self.name_of(by)));
+        self.resume_by(ctx, Some(by));
+        true
+    }
+
+    fn respawn_manager(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        if let Some(old) = self.manager.take() {
+            self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(old, true);
+        }
+        let id = self.spawn_manager_with(ctx, None);
+        self.mark_edge(id);
+        let brief = self.manager_brief("[mantra:respawn] You are the new manager of this run (the previous one was respawned).");
+        let mut prompt = join_note(note, brief);
+        if let Some(e) = &self.manager_escalation {
+            prompt.push_str(&format!("\n\nOPEN ESCALATION — the run is halted and it is yours to resolve: {}\nAct with mantra_resume_run(note), mantra_retry/mantra_respawn, or mantra_ask the planner.", e.message));
+        }
+        ctx.prompt(id, prompt);
+        self.log("↻", "violet", "manager respawned (watchdog/manual)");
     }
 
     /// Spawn a fresh orchestrator agent for the current phase (extracted out of `start_phase` so
@@ -2202,6 +2644,10 @@ Then summarize in 2-4 lines.",
         }
         if Some(a) == self.orchestrator {
             self.respawn_orchestrator(ctx, note);
+            return Ok(());
+        }
+        if Some(a) == self.manager {
+            self.respawn_manager(ctx, note);
             return Ok(());
         }
         if Some(a) == self.gate_agent {
@@ -2356,7 +2802,7 @@ Then summarize in 2-4 lines.",
                         done.push(n);
                     }
                 }
-                self.log("‖", "amber", format!("planner paused {}", done.join(", ")));
+                self.log("‖", "amber", format!("{} paused {}", self.name_of(a), done.join(", ")));
                 (format!("paused: {}", done.join(", ")), true)
             }
             "mantra_resume_agents" => {
@@ -2375,15 +2821,38 @@ Then summarize in 2-4 lines.",
             }
             "mantra_brief_orchestrator" => {
                 let m = s("message");
-                let answering = self.orchestrator.map(|o| self.pending_questions.remove(&o).is_some()).unwrap_or(false);
-                self.log("✦", "saffron", format!("planner → orchestrator{}: {}", if answering { " (answer)" } else { "" }, trunc(&m, 60)));
+                let from = self.name_of(a);
+                // Only the planner's brief answers a question the orchestrator passed up to it;
+                // the manager briefing the orchestrator meanwhile must not swallow that question.
+                let answering = Some(a) == self.planner && self.orchestrator.map(|o| self.pending_questions.remove(&o).is_some()).unwrap_or(false);
+                self.log("✦", "saffron", format!("{from} → orchestrator{}: {}", if answering { " (answer)" } else { "" }, trunc(&m, 60)));
                 if let Some(o) = self.orchestrator {
                     self.mark_edge(o);
                 }
-                self.orch_inbox.push(format!("[from the planner] {m}"));
+                self.orch_inbox.push(format!("[from the {from}] {m}"));
                 ("delivered — the orchestrator acts on it right after your turn".into(), true)
             }
-            "mantra_status" => (self.status_text(ctx), true),
+            "mantra_status" => (if Some(a) == self.manager { self.overview_text(ctx) } else { self.status_text(ctx) }, true),
+            "mantra_journal" => {
+                let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(40).clamp(1, 200) as usize;
+                let t = self.journal_text(n);
+                (if t.is_empty() { "(the journal is empty)".to_string() } else { t }, true)
+            }
+            "mantra_respawn" => {
+                let n = s("agent");
+                let note = Some(s("note")).filter(|x| !x.trim().is_empty());
+                match self.resolve(&n) {
+                    Some(t) if t == a => ("you cannot respawn yourself".into(), false),
+                    Some(t) => {
+                        let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a);
+                        match self.respawn(ctx, t, note) {
+                            Ok(()) => (format!("{n} respawned with a fresh thread{}", if lifted { " — the run resumed" } else { "" }), true),
+                            Err(e) => (e, false),
+                        }
+                    }
+                    None => (format!("unknown agent '{n}'"), false),
+                }
+            }
             "mantra_log" => {
                 let n = s("agent");
                 let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2491,13 +2960,16 @@ Then summarize in 2-4 lines.",
             },
             "mantra_retry" => {
                 let tid = s("task_id");
+                let lifted = Some(a) == self.manager && self.worker_idx(self.resolve(&tid).unwrap_or_default()).is_some() && self.lift_halt_for_restart(ctx, a);
                 match self.resolve(&tid) {
                     Some(t) => {
                         if let Some(refusal) = self.worker_done_guard(t) {
                             return (refusal.into(), false);
                         }
                         let p = Some(s("prompt")).filter(|x| !x.is_empty());
-                        (self.retry_worker(ctx, t, p), true)
+                        let r = self.retry_worker(ctx, t, p);
+                        let ok = !r.starts_with("REFUSED");
+                        (if lifted { format!("{r} — the run resumed") } else { r }, ok)
                     }
                     None => {
                         // never spawned (or worktree failed): spawn fresh
@@ -2525,10 +2997,11 @@ Then summarize in 2-4 lines.",
                 if let Some(open) = &self.question {
                     return (format!("REJECTED: your earlier question is still open ({}) — wait for that answer", trunc(&open.text, 60)), false);
                 }
+                let who = self.name_of(a);
                 self.question = Some(Question { from: a, text: q.clone(), since: Instant::now() });
-                self.log("?", "saffron", format!("planner asks you: {}", trunc(&q, 70)));
-                self.alerts.push(format!("the planner asks: {q}"));
-                ctx.notify(&format!("Mantra: the planner has a question — {}", trunc(&q, 80)));
+                self.log("?", "saffron", format!("{who} asks you: {}", trunc(&q, 70)));
+                self.alerts.push(format!("the {who} asks: {q}"));
+                ctx.notify(&format!("Mantra: the {who} has a question — {}", trunc(&q, 80)));
                 ("the user has been asked; their answer arrives as a [from the user] message. End your turn now — the run continues meanwhile.".into(), true)
             }
             "mantra_resume_run" => {
@@ -2541,13 +3014,14 @@ Then summarize in 2-4 lines.",
                 if reason == HaltReason::AttemptsExhausted {
                     self.extra_attempts += 1;
                 }
-                self.log("✦", "saffron", format!("planner resumed the run: {}", trunc(&note, 60)));
+                let who = self.name_of(a);
+                self.log(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", format!("{who} resumed the run: {}", trunc(&note, 60)));
                 if !note.trim().is_empty() {
                     if let Some(t) = target {
                         self.mark_edge(t);
-                        ctx.prompt(t, format!("[from the planner] {note}"));
+                        ctx.prompt(t, format!("[from the {who}] {note}"));
                     }
-                    self.orch_inbox.push(format!("[from the planner] The run was halted ({}) and is resuming. {note}", trunc(&reason_label(reason), 40)));
+                    self.orch_inbox.push(format!("[from the {who}] The run was halted ({}) and is resuming. {note}", trunc(&reason_label(reason), 40)));
                 }
                 self.resume_by(ctx, Some(a));
                 (format!("resumed ({}). End your turn.", if note.trim().is_empty() { "no note" } else { "your note was delivered" }), true)
@@ -2680,7 +3154,7 @@ Then summarize in 2-4 lines.",
     /// waiting, so its idle turn end is not read as "done", and the rung above is expected to act.
     fn ask_up(&mut self, ctx: &mut dyn Ctx, a: AgentId, q: String) -> (String, bool) {
         let from = self.name_of(a);
-        let to_planner = Some(a) == self.orchestrator || matches!(self.stage, Stage::Finale { .. }) || self.orchestrator.is_none();
+        let to_planner = Some(a) == self.orchestrator || Some(a) == self.manager || matches!(self.stage, Stage::Finale { .. }) || self.orchestrator.is_none();
         self.pending_questions.insert(a, q.clone());
         if to_planner {
             let p = match self.planner {
@@ -2890,6 +3364,14 @@ mod halt_tests {
         assert!(!run.halted(), "space toggles a manual pause back off");
     }
 
+    /// The built-in pattern with its manager removed: the chain of command then ends at the
+    /// planner, which is what the planner-escalation tests below pin down.
+    fn no_manager() -> Pattern {
+        let mut p = Pattern::builtin();
+        p.flow.manager = String::new();
+        p
+    }
+
     fn one_task_phase() -> Plan {
         Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks: vec![Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() }], ..Default::default() }
     }
@@ -2899,7 +3381,7 @@ mod halt_tests {
     #[test]
     fn watchdog_nudges_then_respawns_then_wakes_planner() {
         let mut ctx = TestCtx::new();
-        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
         let planner = ctx.add_idle();
         let orch = ctx.add_idle();
         run.planner = Some(planner);
@@ -3240,7 +3722,7 @@ mod halt_tests {
     #[test]
     fn gate_exhaustion_escalates_to_the_planner_and_resume_run_lets_it_continue() {
         let mut ctx = TestCtx::new();
-        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
         let planner = ctx.add_idle();
         let gate = ctx.add_idle();
         run.planner = Some(planner);
@@ -3273,7 +3755,7 @@ mod halt_tests {
     #[test]
     fn identical_verify_failures_escalate_before_the_rounds_run_out() {
         let mut ctx = TestCtx::new();
-        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
         let planner = ctx.add_idle();
         let gate = ctx.add_idle();
         run.planner = Some(planner);
@@ -3507,5 +3989,288 @@ mod halt_tests {
         let first = run.halt.as_ref().unwrap().message.clone();
         run.on_environment_broken(&mut ctx, worker_agent, "bwrap: a different failure".into());
         assert_eq!(run.halt.as_ref().unwrap().message, first, "a second EnvironmentBroken must not overwrite the first halt");
+    }
+
+    // Manager tests (v0.4) ---------------------------------------------------------------------
+
+    /// A run halted on gate exhaustion, with the built-in pattern (which has a manager).
+    fn halted_gate_run(ctx: &mut TestCtx) -> (Run, AgentId, AgentId) {
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let gate = ctx.add_idle();
+        run.planner = Some(planner);
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let blocked = "GATE: fail — the venv is gone";
+        for _ in 0..2 {
+            ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
+            run.on_turn_done(ctx, gate, "completed", None, None);
+        }
+        assert!(run.halted());
+        (run, planner, gate)
+    }
+
+    #[test]
+    fn escalation_goes_to_the_manager_first_and_to_the_planner_when_it_does_nothing() {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, _gate) = halted_gate_run(&mut ctx);
+        let manager = run.manager.expect("the halt spawns the manager");
+        let esc = ctx.prompts.iter().find(|(a, t)| *a == manager && t.contains("[mantra:escalation]")).map(|(_, t)| t.clone()).expect("the manager is handed the halt");
+        assert!(esc.contains("mantra_resume_run") && esc.contains("mantra_retry") && esc.contains("mantra_respawn") && esc.contains("mantra_ask"), "{esc}");
+        assert!(esc.contains("first in line"), "{esc}");
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]")), "the planner is not bothered while the manager has it");
+        assert!(run.expected_active().iter().any(|(a, e)| *a == manager && *e == Expect::Managing), "the watchdog expects the manager to act");
+
+        // The manager ends its turn without acting: one reminder…
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, manager, "completed", None, None);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("still halted")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == planner));
+        // …then the planner gets it, with the same message.
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, manager, "completed", None, None);
+        let esc = ctx.prompts.iter().find(|(a, t)| *a == planner && t.contains("[mantra:escalation]")).map(|(_, t)| t.clone()).expect("the planner is next");
+        assert!(esc.contains("mantra_revise_plan") && esc.contains("gate stuck"), "{esc}");
+        assert!(run.manager_escalation.is_none());
+        assert!(run.halted(), "still halted: now it is the planner's");
+    }
+
+    #[test]
+    fn manager_escalation_deadline_hands_the_halt_to_the_planner() {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, _gate) = halted_gate_run(&mut ctx);
+        let manager = run.manager.unwrap();
+        ready(&mut ctx, manager);
+        run.manager_escalation.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        ctx.prompts.clear();
+        run.manager_tick(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]")), "{:?}", ctx.prompts);
+        assert!(run.manager_escalation.is_none());
+        // a manager that is waiting on the planner (it asked) is not overtaken by the deadline
+        let (mut run2, planner2, _) = halted_gate_run(&mut ctx);
+        let m2 = run2.manager.unwrap();
+        ready(&mut ctx, m2);
+        let (_, ok) = run2.handle_tool(&mut ctx, m2, "mantra_ask", &json!({"question": "the check needs a venv — amend the gate?"}));
+        assert!(ok);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner2 && t.contains("[mantra:question]") && t.contains("mantra_prompt")));
+        ctx.prompts.clear();
+        run2.manager_escalation.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        run2.manager_tick(&mut ctx);
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner2 && t.contains("[mantra:escalation]")), "the planner already has the question: {:?}", ctx.prompts);
+        // the planner answers the manager by name, and the answer comes back marked as such
+        let (_, ok) = run2.handle_tool(&mut ctx, planner2, "mantra_prompt", &json!({"agent": "manager", "message": "yes — I am revising the gate"}));
+        assert!(ok);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == m2 && t.contains("[from the planner] (answering your question)")));
+        assert!(!run2.waiting_for_answer(m2));
+    }
+
+    #[test]
+    fn manager_resume_run_lifts_the_halt_and_the_note_reaches_the_stuck_agent() {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, gate) = halted_gate_run(&mut ctx);
+        let manager = run.manager.unwrap();
+        ctx.prompts.clear();
+        let (msg, ok) = run.handle_tool(&mut ctx, manager, "mantra_resume_run", &json!({"note": "the venv is at .venv — do not recreate it"}));
+        assert!(ok, "{msg}");
+        assert!(!run.halted());
+        assert!(run.manager_escalation.is_none());
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[from the manager]") && t.contains(".venv")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:resume]")), "the manager itself is not told to continue");
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == planner));
+        // and a later idle turn of the manager is nothing special any more
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, manager, "completed", None, None);
+        assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn manager_retry_during_an_attempts_exhausted_halt_resumes_and_respawns_the_task() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        let w = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let mut wk = mk_worker("t1", "worker-small", w, WState::Failed("tests never pass".into()));
+        wk.attempt = 5;
+        run.workers.push(wk);
+        run.halt_and_escalate(&mut ctx, HaltReason::AttemptsExhausted, Some(w), "t1 has used all 5 attempts — not respawning.".into());
+        let manager = run.manager.expect("spawned for the escalation");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:escalation]") && t.contains("t1 has used all")));
+        let before = run.max_attempts();
+        ctx.prompts.clear();
+        let (msg, ok) = run.handle_tool(&mut ctx, manager, "mantra_retry", &json!({"task_id": "t1", "prompt": "run the tests with -x and fix the first failure only"}));
+        assert!(ok, "{msg}");
+        assert!(msg.contains("the run resumed"), "{msg}");
+        assert!(!run.halted());
+        assert_eq!(run.max_attempts(), before + 1, "the retry is the extra attempt");
+        let newest = run.workers.iter().rev().find(|x| x.task.id == "t1").unwrap();
+        assert_eq!(newest.attempt, 6);
+        assert!(matches!(newest.state, WState::Preparing | WState::Queued), "{:?}", newest.state);
+        assert_eq!(newest.prompt, "run the tests with -x and fix the first failure only");
+    }
+
+    #[test]
+    fn manager_respawn_restarts_any_agent_and_never_itself() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let manager = run.ensure_manager(&mut ctx).unwrap();
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:manage]") && t.contains("mantra_wait")));
+        let (msg, ok) = run.handle_tool(&mut ctx, manager, "mantra_respawn", &json!({"agent": "orchestrator", "note": "you kept prompting a finished worker"}));
+        assert!(ok, "{msg}");
+        let new_orch = run.orchestrator.unwrap();
+        assert_ne!(new_orch, orch);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == new_orch && t.contains("finished worker") && t.contains("[mantra:respawn]")));
+        let (msg, ok) = run.handle_tool(&mut ctx, manager, "mantra_respawn", &json!({"agent": "manager"}));
+        assert!(!ok, "{msg}");
+        // the user can respawn the manager, and the fresh one is briefed as a manager
+        run.respawn(&mut ctx, manager, None).unwrap();
+        let m2 = run.manager.unwrap();
+        assert_ne!(m2, manager);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == m2 && t.contains("new manager")));
+        assert_eq!(run.name_of(m2), "manager");
+        assert_eq!(run.role_name_of(m2).as_deref(), Some("manager"));
+    }
+
+    #[test]
+    fn watchdog_rung_three_wakes_the_manager_before_the_planner() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        ctx.set_idle_secs(orch, 90);
+        run.watchdog_tick(&mut ctx);
+        ctx.set_idle_secs(orch, 240);
+        run.watchdog_tick(&mut ctx);
+        let new_orch = run.orchestrator.unwrap();
+        ctx.prompts.clear();
+        ctx.set_idle_secs(new_orch, 480);
+        run.watchdog_tick(&mut ctx);
+        let manager = run.manager.expect("rung 3 brings in the manager");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:watchdog]") && t.contains("orchestrator")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("did not act")), "the planner waits its turn");
+        assert!(run.expected_active().iter().any(|(a, e)| *a == manager && *e == Expect::Managing));
+        // the manager never reacts (no event since it was woken) by its deadline: the planner, as before
+        ready(&mut ctx, manager);
+        ctx.set_idle_secs(manager, 3000);
+        let (_, _, about) = run.manager_watchdog.clone().unwrap();
+        run.manager_watchdog = Some((Instant::now() - Duration::from_secs(1000), Instant::now() - Duration::from_secs(1), about));
+        ctx.prompts.clear();
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("did not act")), "{:?}", ctx.prompts);
+        assert!(run.manager_watchdog.is_none());
+    }
+
+    #[test]
+    fn a_failing_manager_is_dropped_not_halted_on() {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, _gate) = halted_gate_run(&mut ctx);
+        let manager = run.manager.unwrap();
+        ctx.prompts.clear();
+        for _ in 0..4 {
+            run.on_turn_done(&mut ctx, manager, "failed", Some("stream closed".into()), Some(ErrKind::Other));
+        }
+        assert!(run.manager.is_none(), "the manager is dropped");
+        assert!(run.halted(), "the original halt stands…");
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted, "…and is not replaced by an AgentTurnFailed about the manager");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]")), "what it held goes to the planner: {:?}", ctx.prompts);
+        // the next event brings a fresh manager
+        run.resume(&mut ctx);
+        run.manager_inbox.push("[mantra:health] test".into());
+        run.wake_manager(&mut ctx);
+        assert!(run.manager.is_some());
+    }
+
+    #[test]
+    fn health_digest_reaches_an_idle_manager_with_the_overview() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_busy();
+        let w = ctx.add_busy();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        let manager = run.ensure_manager(&mut ctx).unwrap();
+        ready(&mut ctx, manager);
+        run.last_health = Instant::now() - Duration::from_secs(6 * 60);
+        run.last_tick = Instant::now() - Duration::from_secs(2);
+        ctx.prompts.clear();
+        run.tick(&mut ctx);
+        let d = ctx.prompts.iter().find(|(a, t)| *a == manager && t.contains("[mantra:health]")).map(|(_, t)| t.clone()).expect("digest");
+        assert!(d.contains("Run overview") && d.contains("- t1 [worker-small]") && d.contains("orchestrator [") && d.contains("Recent journal"), "{d}");
+        // not again right away, and never while halted
+        ctx.prompts.clear();
+        run.last_tick = Instant::now() - Duration::from_secs(2);
+        run.tick(&mut ctx);
+        assert!(ctx.prompts.is_empty());
+        let mut off = Pattern::builtin();
+        off.settings.manager_minutes = 0;
+        let mut quiet = Run::new(PathBuf::from("."), off, "test".into());
+        quiet.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        quiet.plan = Some(one_task_phase());
+        quiet.last_health = Instant::now() - Duration::from_secs(60 * 60);
+        quiet.health_tick(&mut ctx);
+        assert!(quiet.manager.is_none(), "manager_minutes = 0: no digest, no manager spawned for one");
+    }
+
+    #[test]
+    fn manager_status_journal_and_ask_user() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let manager = run.ensure_manager(&mut ctx).unwrap();
+        run.log("✓", "green", "something happened");
+        let (st, ok) = run.handle_tool(&mut ctx, manager, "mantra_status", &json!({}));
+        assert!(ok && st.contains("Stage:") && st.contains("Agents:") && st.contains("- manager ["), "{st}");
+        let (j, ok) = run.handle_tool(&mut ctx, manager, "mantra_journal", &json!({"lines": 5}));
+        assert!(ok && j.contains("something happened"), "{j}");
+        let (_, ok) = run.handle_tool(&mut ctx, manager, "mantra_ask_user", &json!({"question": "the key expired — which one should I use?"}));
+        assert!(ok);
+        assert!(run.alerts.iter().any(|a| a.starts_with("the manager asks:")));
+        ctx.prompts.clear();
+        run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[from the user]") && t.contains("mantra_resume_run")), "{:?}", ctx.prompts);
+        assert!(run.question.is_none() && run.alerts.is_empty());
+    }
+
+    #[test]
+    fn brief_from_the_manager_does_not_answer_a_question_the_orchestrator_asked_the_planner() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let manager = run.ensure_manager(&mut ctx).unwrap();
+        let (_, ok) = run.handle_tool(&mut ctx, orch, "mantra_ask", &json!({"question": "rename the module?"}));
+        assert!(ok && run.waiting_for_answer(orch));
+        let (_, ok) = run.handle_tool(&mut ctx, manager, "mantra_brief_orchestrator", &json!({"message": "keep going on t1"}));
+        assert!(ok);
+        assert!(run.waiting_for_answer(orch), "the manager's brief is not the planner's answer");
+        assert!(run.orch_inbox.iter().any(|m| m.starts_with("[from the manager]")));
+        let (_, ok) = run.handle_tool(&mut ctx, planner, "mantra_brief_orchestrator", &json!({"message": "yes, rename it"}));
+        assert!(ok && !run.waiting_for_answer(orch));
     }
 }

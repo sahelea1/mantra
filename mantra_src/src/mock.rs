@@ -468,9 +468,32 @@ async fn script(e: &Em, text: &str) -> Outcome {
         "orchestrator" => orchestrator(e, text).await,
         "worker" => worker(e, text).await,
         "gate" => gate(e, text).await,
+        "manager" => manager(e, text).await,
         "architect" => architect(e, text).await,
         _ => solo(e, text).await,
     }
+}
+
+/// The manager (v0.4): reads, and only acts when handed something — a hint on an escalated halt,
+/// a word to the orchestrator on a watchdog case, `mantra_wait` on a healthy digest.
+async fn manager(e: &Em, text: &str) -> Outcome {
+    if text.contains("[mantra:escalation]") {
+        step!(e.think("**Reading the halt**\n\nThe run is halted. The journal says the last attempt was close — a concrete hint should do; the plan itself looks right.").await);
+        let _ = e.tool("mantra_journal", json!({"lines": 20})).await;
+        let _ = e.tool("mantra_resume_run", json!({"note": "Try once more, and this time run the failing check yourself before reporting."})).await;
+        step!(e.say("Resumed the run with a hint for the stuck agent.").await);
+        return Outcome::Done;
+    }
+    if text.contains("[mantra:watchdog]") {
+        let _ = e.tool("mantra_status", json!({})).await;
+        let _ = e.tool("mantra_brief_orchestrator", json!({"message": "One of your workers has gone quiet — check on it, and respawn it (mantra_retry) if it does not answer."})).await;
+        step!(e.say("Asked the orchestrator to deal with the quiet worker.").await);
+    } else {
+        step!(e.think("**Health check**\n\nEveryone who should be working is working; nothing is looping or drifting.").await);
+    }
+    let _ = e.tool("mantra_wait", json!({})).await;
+    step!(e.say("Nothing to change — waiting for the next event.").await);
+    Outcome::Done
 }
 
 async fn solo(e: &Em, text: &str) -> Outcome {

@@ -71,6 +71,7 @@ impl Run {
                     self.fail_run(ctx, "plan.json is missing (or has no such phase) — this run cannot be resumed".into());
                     return;
                 }
+                self.resume_manager(ctx, st);
                 self.restore_workers(st);
                 match step {
                     PhaseStep::Orchestrating => self.resume_orchestrating(ctx, idx, st),
@@ -94,6 +95,7 @@ impl Run {
                 }
             }
             Stage::Finale { idx } => {
+                self.resume_manager(ctx, st);
                 self.restore_workers(st);
                 // Unfinished ad-hoc fixes lost their agent with the old process: fresh attempts.
                 let redo: Vec<(Task, String, Option<String>)> = self
@@ -114,6 +116,21 @@ impl Run {
             Stage::Failed(why) => self.log("✗", "red", format!("this run had failed ({why}) — opened read-only; delete it from /runs")),
         }
         self.save_state();
+    }
+
+    /// The manager (`flow.manager`) comes back with its own thread when the state has one — its
+    /// memory of the run so far is the point of it — otherwise fresh, briefed like a respawn.
+    fn resume_manager(&mut self, ctx: &mut dyn Ctx, st: &RunState) {
+        if !self.has_manager() {
+            return;
+        }
+        let thread = st.agents.iter().find(|a| a.slot == "manager").and_then(|a| a.thread_id.clone());
+        let attached = thread.is_some();
+        let m = self.spawn_manager_with(ctx, thread);
+        self.mark_edge(m);
+        let brief = self.manager_brief(if attached { "[mantra:resume] Mantra restarted; you are re-attached as this run's manager. What you knew still holds — here is the run as it stands now." } else { "[mantra:resume] Mantra restarted; you are this run's new manager." });
+        ctx.prompt(m, brief);
+        self.log("◈", "blue", if attached { "manager re-attached" } else { "manager started (fresh — no saved thread)" });
     }
 
     fn resume_planning(&mut self, ctx: &mut dyn Ctx, st: &RunState) {
@@ -402,7 +419,27 @@ mod tests {
         run.resume_boot(&mut ctx, &st);
         assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Merging });
         assert!(ctx.jobs.iter().any(|j| j.contains("Merge")), "{:?}", ctx.jobs);
-        assert!(ctx.spawned.is_empty(), "no agent is needed until the checks come back");
+        assert_eq!(ctx.spawned, vec![("manager".to_string(), None)], "no phase agent is needed until the checks come back — only the run-wide manager comes back (fresh: no saved thread)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_resume_reattaches_the_manager_to_its_thread() {
+        let dir = tmp("manager");
+        let st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating }, vec![worker("a", "done", 1, None)], vec![AgentState { slot: "manager".into(), thread_id: Some("thr-m".into()), ..Default::default() }]);
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run"));
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert!(ctx.spawned.contains(&("manager".to_string(), Some("thr-m".to_string()))), "{:?}", ctx.spawned);
+        let m = run.manager.expect("manager set");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == m && t.contains("[mantra:resume]") && t.contains("re-attached") && t.contains("phase 1")), "{:?}", ctx.prompts);
+        // a pattern without a manager spawns none
+        let mut p = Pattern::builtin();
+        p.flow.manager = String::new();
+        let mut run2 = Run::from_state(&st, p, Some(plan()), dir.join("run2"));
+        let mut ctx2 = Fake::new();
+        run2.resume_boot(&mut ctx2, &st);
+        assert!(!ctx2.spawned.iter().any(|(n, _)| n == "manager"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

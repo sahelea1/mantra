@@ -606,9 +606,16 @@ fn doctor() {
     // (observed in this sandbox for `claude` under `subscription` auth, §0.3) can never hang doctor.
     let (good, text) = probe_cli(&s.codex_command[0], " — npm i -g @openai/codex");
     println!("{} codex: {text}", ok(good));
+    let r = config::Registry::load();
     if let Ok(o) = std::process::Command::new(&s.codex_command[0]).args(["login", "status"]).output() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        println!("{} login: {}", ok(o.status.success()), t.lines().next().unwrap_or("").trim());
+        let line = login_status_line(&t);
+        let needed = codex_account_needed(&s, &r);
+        match (o.status.success(), needed.is_empty()) {
+            (true, _) => println!("{} login: {line}", ok(true)),
+            (false, false) => println!("{} login: {line} — needed by {} (run `codex login`)", ok(false), needed.join(", ")),
+            (false, true) => println!("  login: {line} — not needed: the default model and pattern roles all run on custom providers"),
+        }
     }
     let (good, text) = probe_cli(&s.claude_command[0], " (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)");
     println!("{} claude: {text}", ok(good));
@@ -638,7 +645,6 @@ fn doctor() {
         println!("  side panel / pulse toggle is ctrl+t (ctrl+b is your tmux prefix)");
     }
     println!("  config: {}", config::home().display());
-    let r = config::Registry::load();
     println!("  models: {}", r.models.iter().map(|m| format!("{}={}", m.alias, m.model)).collect::<Vec<_>>().join(", "));
     for p in &r.providers {
         let key_src = |p: &config::ProviderEntry| -> String {
@@ -666,6 +672,40 @@ fn doctor() {
         }
     }
     println!("  log: {}", config::log_path().display());
+}
+
+/// The one line of `codex login status` output that says whether we are logged in. Codex prints
+/// warnings first (`WARNING: proceeding, even though we could not create PATH aliases …`), on the
+/// same stream, so "the first line" used to show the warning instead of the verdict.
+fn login_status_line(out: &str) -> String {
+    let meaningful = |l: &str| {
+        let t = l.trim();
+        let low = t.to_lowercase();
+        !t.is_empty() && !low.starts_with("warning") && !low.starts_with("warn:") && !low.starts_with("error") && !low.contains("bubblewrap")
+    };
+    out.lines().filter(|l| meaningful(l)).last().or_else(|| out.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim().to_string()
+}
+
+/// Who actually needs Codex's own OpenAI login: the Solo default model and the default pattern's
+/// roles that run on the built-in `openai` provider. Empty when everything goes through custom
+/// providers (their keys are checked per provider below), so "Not logged in" is not a failure.
+fn codex_account_needed(s: &config::Settings, r: &config::Registry) -> Vec<String> {
+    let mut v = vec![];
+    let on_codex_account = |alias: &str| {
+        let m = r.resolve(alias);
+        !m.is_custom_provider() && r.backend_of(&m) == config::ProviderKind::Codex
+    };
+    if on_codex_account(&s.default_model) {
+        v.push(format!("the default model `{}`", s.default_model));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Ok(p) = engine::pattern::Pattern::load(&s.default_pattern, &cwd) {
+        let roles: Vec<String> = p.ordered_roles().into_iter().filter(|(_, role)| on_codex_account(&role.model)).map(|(n, _)| n).collect();
+        if !roles.is_empty() {
+            v.push(format!("pattern `{}` roles {}", p.name, roles.join(", ")));
+        }
+    }
+    v
 }
 
 /// The doctor line for one CLI probe (`<cmd0> --version`, 5s cap), as (healthy, text) so the caller
