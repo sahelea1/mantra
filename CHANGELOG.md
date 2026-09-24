@@ -2,6 +2,72 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.4.0 — 2026-09-24
+
+The manager: a role whose job is the whole run. Until now every agent owned a slice — a plan, a
+phase, a task, a gate — and whatever none of them could clear went straight to the planner, or to
+you. Plus two field fixes, and a second provider verified end to end.
+
+- **The manager.** A new role kind, `manager`, named in the pattern by `flow.manager` (`""` = none;
+  pattern files written before this release load unchanged, without one). The built-in
+  `mantra-default` gains `[roles.manager]` (`◈`, blue, `sol` at high effort, read-only sandbox) and
+  `flow.manager = "manager"`; `mantra-default-claude` puts it on `fable51` like the planner and the
+  orchestrator. It is spawned when the first phase starts (after you approve the plan), briefed once
+  with the goal, the plan's phases and the run's settings, and stays through every phase and the
+  finale; `mantra runs resume` re-attaches it to its own thread; `r` respawns it like any agent. It
+  never edits code: it steers the agents that do.
+- **Chain of command: manager → planner → you.** *Gate exhausted* and *attempts exhausted* now go to
+  the manager first, with the same facts the planner used to get. It has `watchdog_escalate_seconds`
+  (240 s by default, never less than 120) to act, one reminder if it ends a turn without acting, and
+  then the planner gets the escalation exactly as before. *Agent turn failed* (a planner, orchestrator,
+  gate or finale turn that failed past its retries and its one free respawn), which used to stop for
+  you at once, goes to the manager too — its move is `mantra_respawn` — and if it does nothing the
+  band is yours, never the planner's (it may be the agent that is failing). Its tools: `mantra_status` (the whole run,
+  for it), `mantra_log`, `mantra_journal` (new: the recent journal), `mantra_prompt` to any agent,
+  `mantra_interrupt`, `mantra_set_effort`, `mantra_respawn` (new: restart any agent in place, with a
+  note), `mantra_retry`, `mantra_pause_agents`/`mantra_resume_agents`, `mantra_brief_orchestrator`,
+  `mantra_resume_run`, `mantra_ask` (→ the planner, for plan or gate-check changes; the planner
+  answers with `mantra_prompt("manager", …)` or a `mantra_revise_plan`, which resumes the run),
+  `mantra_ask_user` (only when nobody in the team can decide — the band reads *the manager asks: …*
+  and your next message answers it) and `mantra_wait`. Restarting an agent during an escalated halt
+  is the decision to go on: `mantra_retry`/`mantra_respawn` lift the halt, and an exhausted task gets
+  one more attempt. A pattern without a manager behaves exactly as v0.3.1 did.
+- **Watchdog: rung 3 wakes the manager.** After the nudge and the orchestrator rung, an agent still
+  idle goes to the manager; if it has not reacted by `watchdog_escalate_seconds`, the planner is
+  woken as before. A manager that sits on a case is itself on the ladder: nudge → respawn (the open
+  escalation carried into the new brief) → the planner takes over what it held. If the manager's own
+  turn fails past its retries it is dropped, never halting the run — whatever it held goes to the
+  next rung (the planner, or you for a failed-turn halt) and a fresh manager comes with the next
+  escalation or health digest.
+- **Health digest.** `settings.manager_minutes` (default 5, `0` = escalations only, in the Studio):
+  while building or in the finale — not while halted — the manager gets a run overview (stage, halt,
+  plan progress, every non-worker agent with busy/idle-for and tokens, all workers, the last journal
+  lines) and is asked to intervene only where something is off, otherwise `mantra_wait`.
+- **On screen.** A manager mini-card at the top right of the stage, mirroring the planner on the
+  left (from 90 columns; above the ad-hoc fixes during the finale), selectable with the arrows or
+  `1`–`9`, zoomable, `@manager …` messages it. The Studio: `flow.manager` cycles through *none* and
+  every role of kind manager, `manager_minutes` is a settings field, the flow panel shows the manager
+  between the planner and the orchestrator, and the architect agent knows the kind. The journal
+  reads `◈ escalated to the manager: …`.
+- **Codex ≥ 0.150 and custom providers.** Codex no longer recognises the
+  `model_supports_reasoning_summaries` config key, and Mantra passing it for custom-provider models
+  put a *Codex is ignoring 1 unrecognized configuration setting* banner at the top of every agent
+  log. Gone: Codex sends the reasoning effort to any model on its own now (a model without an
+  `efforts` list still gets `model_reasoning_summary = "none"` and no effort).
+- **`mantra doctor`'s login line.** It printed the first line of `codex login status`, which on some
+  machines is a WARNING about PATH aliases rather than the verdict. It now prints the verdict — and
+  when every configured model (the Solo default and the default pattern's roles) runs on custom
+  providers, it says the Codex login is *not needed* instead of showing ✗.
+- **OpenRouter, verified end to end.** `openai/gpt-5.6-luna` through Codex's Responses API
+  (`base_url = "https://openrouter.ai/api/v1"`, `env_key = "OPENROUTER_API_KEY"`): Solo turns and
+  full Mandala runs, plan → phases → gates → finale. The README's custom-provider section gains the
+  paste-ready `[[provider]]` / `[[model]]` blocks.
+- 133 unit tests (19 new: escalation to the manager first and to the planner when it does nothing,
+  the deadline hand-over, halts lifted by `mantra_resume_run`/`mantra_retry`/`mantra_respawn`, the
+  watchdog rungs around the manager, a failing manager dropped rather than halting, re-attachment on
+  resume, `flow.manager` validation and old pattern files); the mock gains a scripted manager, so
+  `--demo` shows it at work.
+
 ## v0.3.1
 
 Four things a real run got wrong, fixed at the root. Driven by a second support bundle.

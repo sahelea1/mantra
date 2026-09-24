@@ -22,7 +22,7 @@ You already have a coding agent in your terminal. Mantra is the room you put it 
 |  | what you get |
 |---|---|
 | **Solo** | One agent, with everything you actually want on screen: the diff it is writing, its plan, how full its context is, what it is running right now. Type while it works. |
-| **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a QA gate merges and checks their work, and a finale does heavy QA, a security sweep and a final verification. |
+| **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a QA gate merges and checks their work, a manager watches the whole run and unsticks whatever stalls, and a finale does heavy QA, a security sweep and a final verification. |
 
 Mantra does not reimplement an agent loop. It drives the official CLIs — `codex app-server` and `claude -p` — one process per agent. Your logins, sandboxes and model access keep working exactly as they do today; you just get a room where several of them can work at once without stepping on each other.
 
@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.3.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.4.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80)
@@ -125,9 +125,9 @@ Press `ctrl+o`, describe the goal, and this happens:
 
 <img src="docs/img/plan-review.png" alt="The plan review overlay: phases, tasks, scopes, acceptance criteria and gate checks" width="920">
 
-**2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together.
+**2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together. Above it, from the first phase to the end of the finale, a **manager** watches the whole run: anything that stalls or halts reaches it first, and every few minutes it gets a health digest of the whole team.
 
-**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. A check that keeps failing identically, or a gate that runs out of rounds, goes to the planner to fix — the plan, the checks, or a hint — before it ever stops for you.
+**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
 
 **4. The finale**: heavy QA → a security sweep → the planner verifying its own plan, able to spawn ad-hoc fixers.
 
@@ -147,6 +147,24 @@ You can talk to anyone: plain text on the stage re-prompts the planner, `@p2-api
 </details>
 
 <details>
+<summary>The manager: someone whose job is the whole run</summary>
+
+Every other agent owns a slice — a plan, a phase, a task, a gate. The **manager** owns the run. It starts with the first phase (right after you approve the plan), is briefed once with the goal, the phases and the run's settings, and stays through every phase and the finale. It never edits code: its sandbox is read-only and its tools only steer other agents. In the default pattern it is `◈`, on `sol` at high effort (`fable51` in `mantra-default-claude`).
+
+Two things wake it:
+
+- **Escalations.** A gate or a task out of attempts, an agent whose turn failed past its free respawn, or an agent the watchdog could not get moving, reaches the manager before the planner (or you), with the same facts. It reads first — `mantra_status` is the whole run for it, `mantra_log` on the agent involved, `mantra_journal` for the recent journal — then makes the smallest intervention: a hint (`mantra_prompt`, or `mantra_resume_run` when halted), a fresh start (`mantra_retry` a task, `mantra_respawn` any agent with a note), a different effort, a word to the orchestrator. Restarting an agent during an escalated halt *is* the decision to go on: it lifts the halt, and an exhausted task gets one more attempt. Changes to the plan or the gate checks are the planner's — it hands those up with `mantra_ask`.
+- **A health digest**, every `manager_minutes` (default 5) while the team builds or the finale runs: stage, plan progress, every non-worker agent with what it is doing and how long it has been quiet, all workers, the last journal lines — and the instruction to intervene only where something is off, otherwise `mantra_wait`.
+
+It asks you (`mantra_ask_user`) only when nobody in the team can decide — credentials, the machine, a trade-off that is yours. The band reads *the manager asks: …* and your next message answers it.
+
+On the stage it is the mini-card at the top right, mirroring the planner on the left (from 90 columns; during the finale it sits above the ad-hoc fixes). Select it with the arrows or `1`–`9`, zoom into it, message it with `@manager …`, respawn it with `r`. `mantra runs resume` re-attaches it to its own thread, so what it learned about the run is kept. It is a supervisor, not a step of the run: if its own turn fails past the retries it is dropped — never a halt — whatever it held goes on to the next rung (the planner, or you for a failed turn), and a fresh manager comes with the next escalation or health digest.
+
+**Turning it off.** Set `flow.manager = ""` — in the Studio (flow → manager → *none*) or in your pattern file — and the planner is the top of the chain again, exactly as before; pattern files written before v0.4.0 load unchanged, without a manager. `manager_minutes = 0` keeps the manager for escalations only, with no periodic digest.
+
+</details>
+
+<details>
 <summary>When something goes wrong: halts</summary>
 
 <img src="docs/img/halt.png" alt="A halted run: an amber band naming the agent, the provider error and the key that fixes it" width="920">
@@ -159,9 +177,9 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 | auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
 | provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
 | environment | a command died in the sandbox (`bwrap`, user namespaces) | fix the machine — `mantra doctor` prints the sysctl |
-| gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the planner has already been handed it (see below); `space` retries, or type feedback |
-| attempts exhausted | a task used every attempt | the planner has been handed it; `r` on the task resumes and retries |
-| agent turn failed | a role's turn failed past its retries and one free respawn | `r` respawns it |
+| gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
+| attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
+| agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
 
 </details>
 
@@ -172,10 +190,10 @@ A long run should never quietly stop. Mantra knows who *should* be working at an
 
 1. idle for `watchdog_seconds` (90 s): nudge the agent;
 2. idle for `watchdog_escalate_seconds` (240 s): respawn the orchestrator, or wake it about the idle agent;
-3. twice that: wake the planner to sort it out;
+3. twice that: wake the manager, when the pattern has one — and if it has not reacted by `watchdog_escalate_seconds`, wake the planner to sort it out (without a manager the planner is woken straight away, as before);
 4. still nothing: halt, rather than pretend.
 
-Every rung is journaled with `⏰`, and the idle agent's card turns amber. Any agent can also be respawned by hand with `r` (or `ctrl+r`, or `/respawn`) — planner, orchestrator, gate, finale step or worker, each restarted with a prompt carrying the current state.
+Every rung is journaled with `⏰`, and the idle agent's card turns amber. A manager that sits on a case it was handed climbs the same ladder: nudge, respawn, then the planner takes over what it held. Any agent can also be respawned by hand with `r` (or `ctrl+r`, or `/respawn`) — planner, orchestrator, gate, finale step or worker, each restarted with a prompt carrying the current state.
 
 There are guards for the silly failures too: a worker whose task is already done cannot be prompted, an orchestrator that prompts the same stuck worker three times in five minutes gets that worker respawned instead, and nothing can be spawned while the run is halted.
 
@@ -205,11 +223,12 @@ Decisions travel **up**, never sideways, and only reach you when they have to:
 |---|---|---|---|
 | worker, gate, finale agent | the orchestrator | `mantra_ask` | the orchestrator's `mantra_prompt` |
 | orchestrator | the planner | `mantra_ask` | the planner's `mantra_brief_orchestrator` |
-| planner | **you** | `mantra_ask_user` | your next message on the stage |
+| manager | the planner — for a change to the plan or the gate checks | `mantra_ask` | the planner's `mantra_prompt("manager", …)`, or a `mantra_revise_plan` that resumes the run |
+| planner, manager | **you** | `mantra_ask_user` | your next message on the stage |
 
-An agent that stops to wait is shown as *asked a question · waiting for the answer* — never mistaken for "done" — and the rung above it becomes the one the watchdog expects to act. The planner is told to decide by itself whenever the answer keeps the end product and the plan's intent, and to ask you only when it changes what is being built, its scope, or is a trade-off only you can make. A question to you is a saffron band, not a halt: the run keeps going meanwhile.
+An agent that stops to wait is shown as *asked a question · waiting for the answer* — never mistaken for "done" — and the rung above it becomes the one the watchdog expects to act. The planner is told to decide by itself whenever the answer keeps the end product and the plan's intent, and to ask you only when it changes what is being built, its scope, or is a trade-off only you can make. The manager asks you only when nobody in the team can decide. A question to you is a saffron band, not a halt: the run keeps going meanwhile.
 
-The same chain carries halts. *Gate exhausted* and *attempts exhausted* go to the planner first, with the failing checks and their output, and it has exactly three moves: `mantra_revise_plan` (the run resumes by itself — a task changed after it was done is re-opened, a phase already gating goes back to building, a changed gate just re-runs its checks), `mantra_resume_run` with a hint for the stuck agent, or `mantra_ask_user`. If it does nothing, one reminder; then the band is yours.
+The same chain carries halts: **manager → planner → you**. *Gate exhausted* and *attempts exhausted* go to the manager first, with the failing checks and their output. It has `watchdog_escalate_seconds` to act — a hint and `mantra_resume_run`, a fresh start with `mantra_retry` / `mantra_respawn` (during an escalated halt that lifts it), `mantra_ask` to the planner when the tasks or the checks themselves are wrong — and one reminder if it ends a turn without acting; then the planner gets the escalation exactly as before, with exactly three moves: `mantra_revise_plan` (the run resumes by itself — a task changed after it was done is re-opened, a phase already gating goes back to building, a changed gate just re-runs its checks), `mantra_resume_run` with a hint for the stuck agent, or `mantra_ask_user`. If it does nothing, one reminder; then the band is yours. A pattern without a manager skips the first rung.
 
 `settings.review_minutes` (default 3, `0` off) sets how often the orchestrator gets a digest of every running worker — activity, files touched, recent log — to check that the parallel work stays coherent with each other and with the phase goal.
 
@@ -264,6 +283,25 @@ This is also the way around gateways that reject Codex's `developer` role: same 
 | `env_key` | **name** of the environment variable holding the key |
 | `api_key` | *or* paste the key directly: stored `0600`, delivered only through the child process's environment, never on argv or in logs |
 
+Any provider that speaks the Responses API works. OpenRouter, verified end to end — Solo turns and full Mandala runs through gates and finale:
+
+```toml
+[[provider]]
+id = "openrouter"
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+
+[[model]]
+alias = "luna-or"
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+context_window = 400000
+efforts = ["low", "medium", "high"]
+```
+
+A custom-provider model with an `efforts` list gets a reasoning effort like any OpenAI model — Codex ≥ 0.150 sends it on its own, nothing extra is configured; one without gets no reasoning block at all, which keeps strict gateways happy.
+
 Press `D` on a provider and Mantra fetches its catalogue: context windows are read from whatever field the provider uses (and marked *assumed* at 200k when it reports none), reasoning effort is enabled only when the model actually supports it, and models you already have are never duplicated.
 
 `t` runs a real test turn including a `developer` message — so a gateway that rejects that role fails here, not three minutes into a run. Starting a run also pre-flights every role's provider and refuses with the exact missing variable name.
@@ -305,9 +343,9 @@ A resume never replays what the old process was in the middle of. It restarts at
 |---|---|
 | planning | the planner is re-attached to its thread and asked to finish the plan |
 | plan review | the saved plan goes straight back up for review |
-| a phase in progress | a fresh orchestrator, briefed with the current status; running workers re-attach to their own threads when their worktree still exists, otherwise they are re-spawned with the same prompt |
+| a phase in progress | a fresh orchestrator, briefed with the current status; the manager re-attached to its own thread; running workers re-attach to their own threads when their worktree still exists, otherwise they are re-spawned with the same prompt |
 | merging / checks / gate | the merge → checks → gate sequence simply runs again (it is idempotent) |
-| finale | that step starts over |
+| finale | that step starts over, the manager re-attached |
 | finished | opens read-only, so `/land` still works |
 
 </details>
@@ -318,9 +356,9 @@ A resume never replays what the old process was in the middle of. It restarts at
 
 <img src="docs/img/studio.png" alt="The Studio: roles with model, effort, sandbox and permission, plus the architect agent" width="920">
 
-A pattern is the shape of a team: roles (model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts) and flow (who plans, who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation.
+A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation; its flow panel shows the manager between the planner and the orchestrator.
 
-Or describe what you want and let the **architect agent** edit the pattern while you watch: *"add a docs writer after security"*, *"make workers cheaper"*, *"put the planner on Claude"*.
+Or describe what you want and let the **architect agent** edit the pattern while you watch: *"add a docs writer after security"*, *"make workers cheaper"*, *"put the planner on Claude"*, *"run without a manager"*.
 
 ---
 
@@ -356,7 +394,7 @@ Or describe what you want and let the **architect agent** edit the pattern while
 | `r` | respawn the selected agent · `m` switch its model |
 | `x` | interrupt · `c` compact · `+/-` effort |
 | `p` | plan · `a` approve · `d` diff · `s` studio |
-| `@name …` | message one agent; plain text re-prompts the planner — or answers its open question |
+| `@name …` | message one agent (`@manager` included); plain text re-prompts the planner — or answers the planner's or the manager's open question |
 
 </details>
 
@@ -417,8 +455,8 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 <details>
 <summary>How this is tested, and what is not covered</summary>
 
-- `cargo build` with zero warnings, 114 unit tests (including the chain of command, escalation, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
-- Real runs against a live provider with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale, compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
+- `cargo build` with zero warnings, 133 unit tests (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- Real runs against live providers with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale (LibertAI, and OpenRouter's `openai/gpt-5.6-luna` through Codex's Responses API), compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
 
 </details>
@@ -456,6 +494,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.3.1** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.4.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>
