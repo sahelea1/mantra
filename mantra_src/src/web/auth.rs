@@ -101,7 +101,11 @@ impl Limiter {
 }
 
 pub fn sha256_hex(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    sha256_hex_bytes(s.as_bytes())
+}
+
+pub fn sha256_hex_bytes(b: &[u8]) -> String {
+    Sha256::digest(b).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub struct PasswordAuth {

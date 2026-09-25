@@ -376,6 +376,7 @@
         const acts = actionList(a);
         return h('div', { class: 'agent-head', key: 'ahead' },
             h('div', { class: 'agent-id' },
+                wide ? null : P.iconBtn('back', () => M.act.back('/'), 'Back', { cls: 'back' }),
                 P.glyph(a, 'xl'),
                 h('div', { class: 'agent-names' },
                     h('h1', null, a.worker ? a.worker.task_id : a.name, a.worker && a.worker.title ? h('span', { class: 'agent-role' }, ' · ' + a.worker.title) : a.role && a.role !== a.name ? h('span', { class: 'agent-role' }, ' · ' + a.role) : null),

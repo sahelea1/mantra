@@ -326,13 +326,15 @@
             opts.copy && value ? P.iconBtn('copy', () => M.act.copy(typeof opts.copy === 'string' ? opts.copy : value), 'Copy ' + label.toLowerCase()) : null);
     }
 
+    // Each platform: a list of steps; each step a list of parts where CERT_LINK becomes the link.
+    const CERT_LINK = {};
     const CERT_STEPS = [
-        ['iPhone / iPad', ['Open ', ['a', '/cert.pem'], ' in Safari → “Profile Downloaded”.', 'Settings › Profile Downloaded › Install.', 'Settings › General › About › Certificate Trust Settings › turn on full trust for “mantra on …”.']],
-        ['Android', ['Download ', ['a', '/cert.pem'], '.', 'Settings › Security › Encryption & credentials › Install a certificate › CA certificate.', 'Chrome trusts it after a restart. Some other browsers ignore user certificates for service workers — use Chrome.']],
-        ['macOS', ['Download ', ['a', '/cert.pem'], ' and open it in Keychain Access (System keychain).', 'Double-click “mantra on …” › Trust › When using this certificate: Always Trust.']],
-        ['Windows', ['Download ', ['a', '/cert.pem'], ', open it › Install Certificate › Local Machine.', 'Place it in “Trusted Root Certification Authorities”.']],
-        ['Linux (Chrome)', ['chrome://settings/certificates › Authorities › Import › ', ['a', '/cert.pem'], ' › trust for websites.']],
-        ['Firefox', ['about:preferences#privacy › Certificates › View Certificates › Authorities › Import ', ['a', '/cert.pem'], '.']],
+        ['iPhone / iPad', [['Open ', CERT_LINK, ' in Safari → “Profile Downloaded”.'], ['Settings › Profile Downloaded › Install.'], ['Settings › General › About › Certificate Trust Settings › turn on full trust for “mantra on …”.']]],
+        ['Android', [['Download ', CERT_LINK, '.'], ['Settings › Security › Encryption & credentials › Install a certificate › CA certificate.'], ['Chrome trusts it after a restart. Some other Android browsers ignore user certificates for service workers — use Chrome.']]],
+        ['macOS', [['Download ', CERT_LINK, ' and open it in Keychain Access (System keychain).'], ['Double-click “mantra on …” › Trust › When using this certificate: Always Trust.']]],
+        ['Windows', [['Download ', CERT_LINK, ', open it › Install Certificate › Local Machine.'], ['Place it in “Trusted Root Certification Authorities”.']]],
+        ['Linux (Chrome)', [['chrome://settings/certificates › Authorities › Import ', CERT_LINK, ' › Trust this certificate for identifying websites.']]],
+        ['Firefox', [['about:preferences#privacy › Certificates › View Certificates › Authorities › Import ', CERT_LINK, '.']]],
     ];
     function certCard() {
         const s = S();
@@ -342,21 +344,8 @@
             h('div', { class: 'form-row' }, h('a', { class: 'btn sm', href: '/cert.pem', download: 'mantra-cert.pem' }, icon('download'), h('span', null, 'Download certificate'))),
             h('div', { class: 'accordion' }, CERT_STEPS.map(([os, steps]) => h('details', { key: os },
                 h('summary', null, os),
-                h('ol', null, (Array.isArray(steps[0]) || typeof steps[0] === 'string' ? groupSteps(steps) : []).map((st, i) => h('li', { key: i }, st)))))),
+                h('ol', null, steps.map((parts, i) => h('li', { key: i }, parts.map((x) => x === CERT_LINK ? h('a', { href: '/cert.pem', download: 'mantra-cert.pem' }, 'cert.pem') : x)))))))
         ], { key: 'cert', icon: 'cert' });
-    }
-    // Steps are strings, except an ['a', href] pair inside the first sentence(s) for a link.
-    function groupSteps(steps) {
-        const out = [];
-        let cur = [];
-        for (const x of steps) {
-            if (Array.isArray(x)) cur.push(h('a', { href: x[1], download: 'mantra-cert.pem' }, x[1]));
-            else if (cur.length && !/[.”]$/.test(typeof cur[cur.length - 1] === 'string' ? cur[cur.length - 1] : '')) cur.push(x);
-            else { if (cur.length) out.push(cur); cur = [x]; }
-            if (typeof x === 'string' && /[.”]$/.test(x)) { out.push(cur); cur = []; }
-        }
-        if (cur.length) out.push(cur);
-        return out;
     }
 
     function aboutCard() {

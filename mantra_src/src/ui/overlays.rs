@@ -25,7 +25,133 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) {
         Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
         Overlay::Discover(st) => discover(f, area, st),
         Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
+        Overlay::Web => web(f, area, app),
+        Overlay::Remote => remote(f, area, app),
     }
+}
+
+/// Wrapped lines of `text` in `width` columns, each styled `st` (the link is ~110 chars).
+fn wrapped(text: &str, width: usize, indent: &str, st: ratatui::style::Style) -> Vec<Line<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let w = width.saturating_sub(indent.chars().count()).max(8);
+    chars.chunks(w).map(|c| Line::from(vec![Span::raw(indent.to_string()), Span::styled(c.iter().collect::<String>(), st)])).collect()
+}
+
+/// `/web`: where the web UI is and how it is protected.
+fn web(f: &mut Frame, area: Rect, app: &App) {
+    let w = 84u16.min(area.width.saturating_sub(2));
+    let inner = w.saturating_sub(4) as usize;
+    let k = |a: &str| Span::styled(format!("  {a:<12}"), theme::bold(theme::accent()));
+    let mut l: Vec<Line> = vec![];
+    match app.web.as_ref().map(|x| &x.info).filter(|i| i.listen.is_some()) {
+        None => {
+            l.push(Line::from(Span::styled("  The web UI is off.", theme::text())));
+            l.push(Line::default());
+            l.push(Line::from(Span::styled("  mantra --web                                   this machine (http://127.0.0.1:7777)", theme::muted())));
+            l.push(Line::from(Span::styled("  mantra --web 0.0.0.0:7777 --web-tls            your phone on the LAN (needs a password:", theme::muted())));
+            l.push(Line::from(Span::styled("                                                 MANTRA_WEB_PASSWORD or --web-password)", theme::muted())));
+            l.push(Line::from(Span::styled("  mantra --remote                                from anywhere, end-to-end encrypted", theme::muted())));
+        }
+        Some(i) => {
+            for (n, u) in i.urls.iter().enumerate() {
+                l.push(Line::from(vec![k(if n == 0 { "open" } else { "" }), Span::styled(u.clone(), theme::bold(theme::fg(theme::CYAN)))]));
+            }
+            let tls = if i.self_signed {
+                format!("on — Mantra's own certificate; install its CA on each device from {}/cert.pem", i.urls.first().cloned().unwrap_or_default())
+            } else if i.tls {
+                "on — your certificate".to_string()
+            } else {
+                "off — phones can't install the app or get notifications over http (--web-tls)".to_string()
+            };
+            let mut first = true;
+            for line in wrapped(&tls, inner.saturating_sub(14), "", if i.tls { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }) {
+                let mut spans = vec![k(if first { "https" } else { "" })];
+                spans.extend(line.spans);
+                l.push(Line::from(spans));
+                first = false;
+            }
+            let pw = if i.password { "on".to_string() } else { "off — localhost only".to_string() };
+            l.push(Line::from(vec![k("password"), Span::styled(pw, if i.password { theme::fg(theme::GREEN) } else { theme::muted() })]));
+            let subs = app.web.as_ref().and_then(|x| x.push.as_ref()).map(|p| p.store.lock().map(|s| s.list().len()).unwrap_or(0));
+            let push = match subs {
+                Some(n) => format!("on · {n} device{} subscribed", if n == 1 { "" } else { "s" }),
+                None => "off".into(),
+            };
+            l.push(Line::from(vec![k("push"), Span::styled(push, theme::muted())]));
+            let n = app.web.as_ref().map(|x| x.reg.count(crate::web::ConnKind::Local)).unwrap_or(0);
+            l.push(Line::from(vec![k("browsers"), Span::styled(format!("{n} connected"), theme::muted())]));
+        }
+    }
+    l.push(Line::default());
+    l.push(Line::from(Span::styled("  /remote for the relay link · esc", theme::faint())));
+    let r = centered(area, w, l.len() as u16 + 2);
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(l).block(block("web", theme::TEAL)), r);
+}
+
+/// `/remote`: link, code, password and a scannable QR code; `r` rotates the identity.
+fn remote(f: &mut Frame, area: Rect, app: &App) {
+    let Some(rem) = app.web.as_ref().and_then(|x| x.remote.as_ref()) else {
+        let l = vec![
+            Line::from(Span::styled("  Remote access is off.", theme::text())),
+            Line::default(),
+            Line::from(Span::styled("  mantra --remote      reach this session from anywhere through remote.mantra.codes;", theme::muted())),
+            Line::from(Span::styled("                       end-to-end encrypted — the relay only ever sees ciphertext", theme::muted())),
+            Line::default(),
+            Line::from(Span::styled("  esc", theme::faint())),
+        ];
+        let r = centered(area, 90, l.len() as u16 + 2);
+        f.render_widget(Clear, r);
+        f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
+        return;
+    };
+    let info = rem.info();
+    let qr: Option<Vec<String>> = info.qr.as_ref().filter(|_| !theme::ascii()).map(|rows| {
+        let m: Vec<Vec<bool>> = rows.iter().map(|r| r.chars().map(|c| c == '1').collect()).collect();
+        crate::web::qr::half_blocks(&m, 2)
+    });
+    let qr_w = qr.as_ref().and_then(|q| q.first()).map(|r| r.chars().count() as u16).unwrap_or(0);
+    let w = 86u16.max(qr_w + 6).min(area.width.saturating_sub(2));
+    let inner = w.saturating_sub(4) as usize;
+    let k = |a: &str| Span::styled(format!("  {a:<10}"), theme::bold(theme::accent()));
+    let mut l: Vec<Line> = vec![];
+    let (state, col) = match (info.connected, &info.last_error) {
+        (true, _) => (format!("connected · {} client{}", info.clients, if info.clients == 1 { "" } else { "s" }), theme::GREEN),
+        (false, Some(e)) => (format!("reconnecting — {}", crate::util::trunc(e, 60)), theme::AMBER),
+        (false, None) => ("connecting…".to_string(), theme::AMBER),
+    };
+    l.push(Line::from(vec![k("relay"), Span::styled(format!("{}  ", info.relay), theme::muted()), Span::styled(state, theme::fg(col))]));
+    match &info.link {
+        Some(link) => {
+            let mut first = true;
+            for line in wrapped(link, inner.saturating_sub(12), "", theme::bold(theme::fg(theme::CYAN))) {
+                let mut spans = vec![k(if first { "link" } else { "" })];
+                spans.extend(line.spans);
+                l.push(Line::from(spans));
+                first = false;
+            }
+        }
+        None => l.push(Line::from(vec![k("link"), Span::styled("deriving the key…", theme::dim())])),
+    }
+    l.push(Line::from(vec![k("code"), Span::styled(info.code.clone().unwrap_or_default(), theme::bold(theme::text())), Span::styled("  + the password, at remote.mantra.codes", theme::faint())]));
+    l.push(Line::from(vec![k("password"), Span::styled(info.password.clone().unwrap_or_default(), theme::bold(theme::fg(theme::SAFFRON)))]));
+    // The QR only when it fits whole: a clipped code doesn't scan.
+    let room = area.height.saturating_sub(l.len() as u16 + 6);
+    if let Some(q) = qr.filter(|q| q.len() as u16 <= room && qr_w + 4 <= w) {
+        l.push(Line::default());
+        let pad = " ".repeat(((inner as u16).saturating_sub(qr_w) / 2) as usize);
+        let st = ratatui::style::Style::default().fg(ratatui::style::Color::White).bg(ratatui::style::Color::Black);
+        for row in q {
+            l.push(Line::from(vec![Span::raw(pad.clone()), Span::styled(row, st)]));
+        }
+    } else if info.link.is_some() {
+        l.push(Line::from(Span::styled("  (enlarge the terminal to show the QR code)", theme::faint())));
+    }
+    l.push(Line::default());
+    l.push(Line::from(Span::styled("  anyone with the link, or the code and password, can drive this session · r new link (rotate) · esc", theme::faint())));
+    let r = centered(area, w, l.len() as u16 + 2);
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
 }
 
 fn help(f: &mut Frame, area: Rect) {
@@ -43,6 +169,7 @@ fn help(f: &mut Frame, area: Rect) {
         k("ctrl+g", "inbox: approvals & alerts from all agents"),
         k("ctrl+t · F2", "toggle side panel / pulse feed"),
         k("ctrl+l", "redraw the screen"),
+        k("/web · /remote", "web UI address & security · remote link, code, password, QR"),
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
         k("pgup / pgdn", "scroll (mouse wheel too)"),
         k("/", "commands (tab completes) · ! runs a shell command"),
@@ -391,6 +518,24 @@ pub fn key(app: &mut App, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let keep = match top {
         Overlay::Help => None,
+        Overlay::Web => match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+            _ => Some(Overlay::Web),
+        },
+        Overlay::Remote => match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+            KeyCode::Char('r') if !ctrl => {
+                match app.web.as_ref().and_then(|w| w.remote.clone()) {
+                    Some(r) => {
+                        r.rotate();
+                        app.toast("new remote link — the old link, code and QR no longer work", crate::agent::Level::Ok);
+                    }
+                    None => app.toast("remote access is off (mantra --remote)", crate::agent::Level::Info),
+                }
+                Some(Overlay::Remote)
+            }
+            _ => Some(Overlay::Remote),
+        },
         Overlay::ModelPicker { mut sel, target } => {
             let n = app.registry.models.len().max(1);
             match k.code {

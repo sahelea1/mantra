@@ -190,7 +190,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut crumbs = vec![Span::styled("  mandala", theme::bold(theme::fg(theme::VIOLET)))];
     crumbs.push(Span::styled(format!("  {} overview", theme::g("›", ">")), theme::faint()));
-    let mut right = vec![];
+    let mut right = web_badges(app);
     if let Some(b) = app.inbox_badge() {
         right.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
     }

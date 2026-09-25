@@ -20,6 +20,8 @@ pub enum AppEvent {
     Job(JobTag, JobOut),
     /// One discovery source answered (Codex catalog or a provider's /models).
     Discovered { source: String, result: Result<Vec<crate::discover::Candidate>, String> },
+    /// A command from a web client (`--web` / `--remote`), executed by `App::web_command`.
+    Web(crate::web::Inbound),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -53,6 +55,10 @@ pub enum Overlay {
     Discover(DiscoverState),
     /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
     Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
+    /// `/web`: the local web UI's addresses and security.
+    Web,
+    /// `/remote`: the relay link, code, password and QR (`r` rotates).
+    Remote,
 }
 
 /// The model-discovery picker.
@@ -130,6 +136,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/studio", "pattern studio (roles, flow, architect agent)"),
     ("/models", "model registry (context, efforts, providers)"),
     ("/inbox", "approvals & alerts"),
+    ("/web", "web UI: address, TLS, password (mantra --web)"),
+    ("/remote", "remote link, code, password & QR (mantra --remote)"),
     ("/verbose", "toggle verbose log (ctrl+e)"),
     ("/help", "keys & commands"),
     ("/quit", "exit Mantra"),
@@ -183,6 +191,9 @@ pub struct App {
     pub force_clear: bool,
     /// Set on every Stage↔Zoom switch; drives a brief header tint so a jump never feels silent.
     pub flash_screen: Option<Instant>,
+    /// The web layer, when `--web` / `--remote` is on: replies to web commands, the relay
+    /// identity for `/remote`, push subscriptions.
+    pub web: Option<crate::web::Link>,
 }
 
 /// Options for creating any agent (Solo, run agents, architect, probes).
@@ -512,6 +523,7 @@ impl App {
             pulse_scroll: 0,
             force_clear: false,
             flash_screen: None,
+            web: None,
         }
     }
 
@@ -528,7 +540,7 @@ impl App {
             || self.flash_screen.map(|f| f.elapsed() < Duration::from_millis(450)).unwrap_or(false)
     }
 
-    fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
+    pub(crate) fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
         let mut run = self.run.take()?;
         let r = {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
@@ -538,7 +550,7 @@ impl App {
         Some(r)
     }
 
-    fn in_run(&self, a: AgentId) -> bool {
+    pub(crate) fn in_run(&self, a: AgentId) -> bool {
         self.run.as_ref().map(|r| r.all_agents().contains(&a)).unwrap_or(false)
     }
 
@@ -580,7 +592,7 @@ impl App {
 
     /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
     /// `reduce_motion` is on) so the overview/zoom switch never feels silent.
-    fn set_screen(&mut self, s: Screen) {
+    pub(crate) fn set_screen(&mut self, s: Screen) {
         let jump = matches!((self.screen, s), (Screen::Stage, Screen::Zoom(_)) | (Screen::Zoom(_), Screen::Stage));
         if jump && crate::ui::theme::motion() {
             self.flash_screen = Some(Instant::now());
@@ -1099,6 +1111,7 @@ impl App {
                 }
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
+            AppEvent::Web(i) => self.web_command(i),
         }
     }
 
@@ -1827,7 +1840,7 @@ impl App {
     /// interrupt (a halt, `mantra_interrupt`), this one *sticks*: `Agent::stopped_by_user` tells
     /// the engine to stand down — no planner nudge, no watchdog, no retry, no resume prompt — until
     /// someone messages the agent again. Returns whether there was a live turn to stop.
-    fn interrupt_by_user(&mut self, a: AgentId) -> bool {
+    pub(crate) fn interrupt_by_user(&mut self, a: AgentId) -> bool {
         let Some(ag) = self.agents.get_mut(&a) else { return false };
         if !ag.busy() {
             return false;
@@ -1934,7 +1947,7 @@ impl App {
         }
     }
 
-    fn force_prompt(&mut self, id: AgentId) {
+    pub(crate) fn force_prompt(&mut self, id: AgentId) {
         let text = self.input.text().trim_end().to_string();
         let empty_queue = self.agents.get(&id).map(|a| a.queued.is_empty()).unwrap_or(true);
         if text.trim().is_empty() && empty_queue {
@@ -1948,7 +1961,7 @@ impl App {
     }
 
     /// ctrl+x on an empty input: discard the focused agent's whole queue.
-    fn discard_queue(&mut self) {
+    pub(crate) fn discard_queue(&mut self) {
         if !self.input.is_empty() {
             return;
         }
@@ -1962,7 +1975,7 @@ impl App {
         }
     }
 
-    fn command(&mut self, line: &str) {
+    pub(crate) fn command(&mut self, line: &str) {
         let (cmd, arg) = line.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((line, ""));
         let target = self.focus_agent();
         match cmd {
@@ -2042,6 +2055,8 @@ impl App {
             "/studio" => self.open_studio(),
             "/models" => self.enter_screen(Screen::Models),
             "/inbox" => self.overlays.push(Overlay::Inbox { sel: 0 }),
+            "/web" => self.overlays.push(Overlay::Web),
+            "/remote" => self.overlays.push(Overlay::Remote),
             "/verbose" => self.verbose = !self.verbose,
             _ => self.toast(format!("unknown command {cmd} — /help"), Level::Warn),
         }

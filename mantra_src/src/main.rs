@@ -12,6 +12,7 @@ mod mock_claude;
 mod rpc;
 mod ui;
 mod util;
+mod web;
 
 use anyhow::Result;
 use app::{App, AppEvent};
@@ -52,18 +53,29 @@ USAGE
   mantra doctor                          check codex, login, terminal, config
   mantra --version
 
+  mantra --web [ADDR:PORT] [--web-password PW] [--web-tls]   web UI (phone + desktop) on this machine/LAN
+  mantra --remote [URL]                                     reach this session from anywhere via a relay (E2EE)
+  mantra --headless --web ... / --remote                     the same without a terminal
+
 OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
   --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
   --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
+  --web-listen ADDR:PORT   where the web UI listens (default 127.0.0.1:7777; 8080 = 127.0.0.1:8080)
+  --web-password PW        web UI password — needed off localhost; MANTRA_WEB_PASSWORD is better
+                           (flags show up in `ps`). Also derives the --remote link's key
+  --web-tls                HTTPS with Mantra's own certificate (install its CA from /cert.pem)
+  --web-cert F --web-key F HTTPS with your own PEM certificate and key
+  --headless               no terminal UI (needs --web or --remote); ctrl+c / SIGTERM stop it
 
 FILES
   ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
   ~/.mantra/models.toml            models, context windows, efforts, providers
   ~/.mantra/patterns/              your patterns (the Studio saves here)
   ~/.mantra/runs/<project>/<id>/   per-run plan, journal and outputs
+  ~/.mantra/web/                   TLS cert, push keys/subscriptions, sessions, remote identity (0600)
   Nothing is written into your projects. An old ~/.config/mantra is copied over on first start.
 ";
 
@@ -78,11 +90,12 @@ struct Cli {
     resume: Option<String>,
     resume_last: bool,
     no_sandbox_check: bool,
+    web: web::CliWeb,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false, web: web::CliWeb::default() };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -111,6 +124,30 @@ fn parse_args() -> Result<Option<Cli>> {
             "run" => cli.run_goal = Some(next()?),
             "--resume-last" => cli.resume_last = true,
             "--no-sandbox-check" => cli.no_sandbox_check = true,
+            "--web" => {
+                cli.web.web = true;
+                // Optional value: only taken when it reads as an address (`--web run "…"` stays a run).
+                if let Some(v) = args.get(i + 1).filter(|v| !v.starts_with('-') && web::parse_listen(v).is_some()) {
+                    cli.web.listen = Some(v.clone());
+                    i += 1;
+                }
+            }
+            "--web-listen" => {
+                cli.web.web = true;
+                cli.web.listen = Some(next()?);
+            }
+            "--web-password" => cli.web.password = Some(next()?),
+            "--web-tls" => cli.web.tls = true,
+            "--web-cert" => cli.web.cert = Some(PathBuf::from(next()?)),
+            "--web-key" => cli.web.key = Some(PathBuf::from(next()?)),
+            "--remote" => {
+                let url = args.get(i + 1).filter(|v| v.starts_with("ws://") || v.starts_with("wss://")).cloned();
+                if url.is_some() {
+                    i += 1;
+                }
+                cli.web.remote = Some(url);
+            }
+            "--headless" => cli.web.headless = true,
             "runs" => match next().ok().as_deref() {
                 None | Some("list") | Some("ls") => {
                     runs_list();
@@ -194,9 +231,17 @@ fn demo_project() -> Result<PathBuf> {
     Ok(dir)
 }
 
-async fn async_main(cli: Cli) -> Result<()> {
+async fn async_main(mut cli: Cli) -> Result<()> {
     let mut settings = config::Settings::load();
     let mut registry = config::Registry::load();
+    // Validate the web flags before anything else starts (a bad address is a usage error).
+    let env_pw = std::env::var("MANTRA_WEB_PASSWORD").ok().filter(|p| !p.is_empty());
+    let web_cfg = web::WebConfig::resolve(&cli.web, &settings.web, env_pw)?;
+    let headless = cli.web.headless;
+    if headless {
+        // Nobody can answer a question on stdin.
+        cli.no_sandbox_check = true;
+    }
     let mut demo = cli.demo;
     if !demo && !codex_available(&settings.codex_command) {
         eprintln!("mantra: `{}` not found — starting in DEMO mode (simulated agents).\n        Install Codex with `npm i -g @openai/codex`, then `codex login`.", settings.codex_command.join(" "));
@@ -258,6 +303,10 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
     ui::theme::init(&settings);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    let mut web = match web_cfg {
+        Some(c) if cli.snapshot.is_none() => Some(web::Web::start(c, tx.clone()).await?),
+        _ => None,
+    };
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
     {
         let tx = tx.clone();
@@ -274,6 +323,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     let enable_bridge = registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode);
     let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), hub_tx, enable_bridge);
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
+    app.web = web.as_ref().map(|w| w.link());
     if let Some(p) = cli.pattern {
         app.pattern_name = p;
     }
@@ -289,6 +339,45 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
     if let Some(script) = cli.snapshot.clone() {
         return snapshot(app, rx, &script, cli.size).await;
+    }
+    if let Some(w) = &web {
+        announce_web(w, headless).await;
+    }
+    if headless {
+        let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                let sigterm = async {
+                    match term.as_mut() {
+                        Some(t) => {
+                            t.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm => {}
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = quit_tx.send(());
+        });
+        mlog!("headless: running (ctrl+c or SIGTERM stops)");
+        let res = event_loop(Option::<&mut Terminal<TestBackend>>::None, &mut app, &mut rx, &mut web, Some(quit_rx)).await;
+        eprintln!("mantra: shutting down");
+        if let Some(w) = web.as_mut() {
+            w.shutdown();
+        }
+        app.shutdown();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if app.demo {
+            eprintln!("demo project left at {}", app.project.display());
+        }
+        return res;
     }
 
     terminal::enable_raw_mode()?;
@@ -344,8 +433,14 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
         }
     }
-    let res = event_loop(&mut terminal, &mut app, &mut rx).await;
+    if let Some(u) = web.as_ref().and_then(|w| w.link().info.urls.first().cloned()) {
+        app.toast(format!("web UI on {u} — /web for details"), agent::Level::Info);
+    }
+    let res = event_loop(Some(&mut terminal), &mut app, &mut rx, &mut web, None).await;
     stop.store(true, Ordering::Relaxed);
+    if let Some(w) = web.as_mut() {
+        w.shutdown();
+    }
     app.shutdown();
     restore_terminal(kbd);
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -420,32 +515,89 @@ fn restore_terminal(kbd: bool) {
     let _ = terminal::disable_raw_mode();
 }
 
-async fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Result<()> {
-    let mut dirty = true;
-    let frame = Duration::from_millis(1000 / app.settings.fps.clamp(4, 60) as u64);
-    let mut last_draw = Instant::now() - frame;
-    let mut last_title = String::new();
-    loop {
-        let animating = app.animating();
-        if app.force_clear {
-            app.force_clear = false;
-            terminal.clear()?;
-            dirty = true;
+/// Tell the user where the web UI / remote link is. Headless: stderr is the only place, so the
+/// remote password is printed there (once); with a TUI it lives in `/web` and `/remote`.
+async fn announce_web(w: &web::Web, headless: bool) {
+    let link = w.link();
+    if headless {
+        for u in &link.info.urls {
+            eprintln!("mantra web: {u}{}", if link.info.password { "  (password required)" } else { "" });
         }
-        if dirty || (animating && last_draw.elapsed() >= frame) {
-            // Synchronized output: the terminal (and tmux ≥ 3.4) paints each frame atomically — no tearing.
-            let _ = ratatui::crossterm::queue!(std::io::stdout(), terminal::BeginSynchronizedUpdate);
-            terminal.draw(|f| safe_draw(f, app))?;
-            let _ = execute!(std::io::stdout(), terminal::EndSynchronizedUpdate);
-            last_draw = Instant::now();
-            dirty = false;
-            let t = app.title();
-            if t != last_title {
-                let _ = execute!(std::io::stdout(), terminal::SetTitle(&t));
-                last_title = t;
+        if link.info.self_signed {
+            if let Some(u) = link.info.urls.first() {
+                eprintln!("mantra web: trust this server on your devices: {u}/cert.pem");
             }
         }
-        let wait = if animating { frame.saturating_sub(last_draw.elapsed()).max(Duration::from_millis(5)) } else { Duration::from_millis(1000) };
+    }
+    if let Some(r) = &w.remote {
+        let ready = r.ready(Duration::from_secs(10)).await;
+        if headless {
+            let info = r.info();
+            if ready {
+                eprintln!("mantra remote: link {}", info.link.unwrap_or_default());
+            }
+            eprintln!("mantra remote: code {}", info.code.unwrap_or_default());
+            eprintln!("mantra remote: password {}", info.password.unwrap_or_default());
+        }
+    }
+}
+
+/// Minimum spacing of web deltas (≈15/s): enough for streaming text to feel live.
+const WEB_PUBLISH_EVERY: Duration = Duration::from_millis(66);
+
+async fn next_web_control(web: &mut Option<web::Web>) -> Option<web::Control> {
+    match web {
+        Some(w) => w.next_control().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn event_loop<B: Backend>(mut terminal: Option<&mut Terminal<B>>, app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppEvent>, web: &mut Option<web::Web>, quit: Option<tokio::sync::oneshot::Receiver<()>>) -> Result<()> {
+    let mut dirty = true;
+    let mut web_dirty = true;
+    let frame = Duration::from_millis(1000 / app.settings.fps.clamp(4, 60) as u64);
+    let mut last_draw = Instant::now() - frame;
+    let mut last_pub = Instant::now() - WEB_PUBLISH_EVERY;
+    let mut last_title = String::new();
+    let mut quit = quit;
+    loop {
+        let animating = app.animating();
+        if let Some(t) = terminal.as_deref_mut() {
+            if app.force_clear {
+                app.force_clear = false;
+                t.clear()?;
+                dirty = true;
+            }
+            if dirty || (animating && last_draw.elapsed() >= frame) {
+                // Synchronized output: the terminal (and tmux ≥ 3.4) paints each frame atomically — no tearing.
+                let _ = ratatui::crossterm::queue!(std::io::stdout(), terminal::BeginSynchronizedUpdate);
+                t.draw(|f| safe_draw(f, app))?;
+                let _ = execute!(std::io::stdout(), terminal::EndSynchronizedUpdate);
+                last_draw = Instant::now();
+                dirty = false;
+                let title = app.title();
+                if title != last_title {
+                    let _ = execute!(std::io::stdout(), terminal::SetTitle(&title));
+                    last_title = title;
+                }
+            }
+        } else {
+            app.force_clear = false;
+            dirty = false;
+        }
+        let mut wait = if animating && terminal.is_some() { frame.saturating_sub(last_draw.elapsed()).max(Duration::from_millis(5)) } else { Duration::from_millis(1000) };
+        if web.is_some() && web_dirty {
+            // A change the rate limit held back still goes out: wake up when it may.
+            wait = wait.min(WEB_PUBLISH_EVERY.saturating_sub(last_pub.elapsed()).max(Duration::from_millis(5)));
+        }
+        let quit_signal = async {
+            match quit.as_mut() {
+                Some(q) => {
+                    let _ = q.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             ev = rx.recv() => {
                 match ev {
@@ -459,18 +611,36 @@ async fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, rx: &
                                 Err(_) => break,
                             }
                         }
-                        if is_resize { terminal.autoresize()?; }
+                        if is_resize {
+                            if let Some(t) = terminal.as_deref_mut() {
+                                t.autoresize()?;
+                            }
+                        }
                         dirty = true;
+                        web_dirty = true;
                     }
                     None => break,
                 }
+            }
+            c = next_web_control(web) => {
+                if let (Some(c), Some(w)) = (c, web.as_mut()) {
+                    w.on_control(c, app);
+                    last_pub = Instant::now();
+                    web_dirty = false;
+                }
+            }
+            _ = quit_signal => {
+                app.quit = true;
             }
             _ = tokio::time::sleep(wait) => {}
         }
         app.tick();
         if !app.notes.is_empty() {
             let notes = std::mem::take(&mut app.notes);
-            if app.settings.notify {
+            if let Some(w) = web.as_ref() {
+                w.notes(&notes, app);
+            }
+            if app.settings.notify && terminal.is_some() {
                 let mut out = std::io::stdout();
                 for n in notes {
                     let n = n.replace(['\x07', '\x1b'], "");
@@ -482,6 +652,15 @@ async fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, rx: &
                     }
                 }
                 let _ = out.flush();
+            }
+        }
+        if let Some(w) = web.as_mut() {
+            // Timers (elapsed, quiet, toasts expiring) move while animating even without events.
+            let since = last_pub.elapsed();
+            if (web_dirty && since >= WEB_PUBLISH_EVERY) || (animating && since >= Duration::from_secs(1)) {
+                w.publish(app);
+                last_pub = Instant::now();
+                web_dirty = false;
             }
         }
         if app.quit {

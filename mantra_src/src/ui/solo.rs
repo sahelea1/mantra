@@ -35,7 +35,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
             if app.demo {
                 c.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
-            let mut r = vec![];
+            let mut r = super::web_badges(app);
             if let Some(b) = app.inbox_badge().filter(|_| app.approval_for(id).is_none()) {
                 r.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
             }

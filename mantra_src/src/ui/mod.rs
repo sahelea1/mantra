@@ -156,6 +156,21 @@ pub fn header(f: &mut Frame, area: Rect, crumbs: Vec<Span<'static>>, right: Vec<
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Header crumbs for the web layer: `⌂ web` while the local UI is up, `⇄ remote` green when the
+/// relay is connected, amber while (re)connecting.
+pub fn web_badges(app: &App) -> Vec<Span<'static>> {
+    let Some(w) = &app.web else { return vec![] };
+    let mut v = vec![];
+    if w.info.listen.is_some() {
+        v.push(Span::styled(format!("{} web  ", theme::g("⌂", "~")), theme::fg(theme::TEAL)));
+    }
+    if let Some(r) = &w.remote {
+        let up = r.inner().lock().connected;
+        v.push(Span::styled(format!("{} remote  ", theme::g("⇄", "<>")), theme::fg(if up { theme::GREEN } else { theme::AMBER })));
+    }
+    v
+}
+
 /// "sol · high ▰▰▰▱▱ · ctx 23%" chip for an agent.
 pub fn model_chip(a: &Agent, app: &App) -> Vec<Span<'static>> {
     let m = app.registry.resolve(&a.model_alias);

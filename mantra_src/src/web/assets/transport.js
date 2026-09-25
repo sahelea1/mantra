@@ -156,14 +156,18 @@
                 if (this.state === 'open' && Date.now() - this.lastRx > 30000) { this.t.close(); this.onClose({ code: 0, opened: true }); }
                 else if (this.state !== 'open') this.retryNow();
             };
+            this.onOffline = () => { if (this.state !== 'open' && !this.stopped) this.setState('offline'); };
             root.addEventListener('online', this.onOnline);
-            root.addEventListener('offline', () => { if (this.state !== 'open') this.setState('offline'); });
+            root.addEventListener('offline', this.onOffline);
             document.addEventListener('visibilitychange', this.onVisible);
         }
         start() { this.stopped = false; this.connect(); }
         stop() {
             this.stopped = true;
             clearTimeout(this.retryTimer); clearInterval(this.pingTimer);
+            root.removeEventListener('online', this.onOnline);
+            root.removeEventListener('offline', this.onOffline);
+            document.removeEventListener('visibilitychange', this.onVisible);
             this.t.close();
             this.rejectAll('disconnected');
         }
