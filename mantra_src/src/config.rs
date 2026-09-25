@@ -101,6 +101,38 @@ pub struct Settings {
     pub fps: u32,
     /// Send desktop notifications (OSC 9 / bell) on run milestones.
     pub notify: bool,
+    /// `[web]`: defaults for `--web` / `--remote` (flags override).
+    pub web: WebSettings,
+}
+
+/// `[web]` in settings.toml: defaults for `--web` / `--remote`. Flags override.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebSettings {
+    /// Listen address; "" → 127.0.0.1:7777.
+    pub listen: String,
+    /// Web UI password ("" → none). `MANTRA_WEB_PASSWORD` is the preferred way; when one is stored
+    /// here settings.toml is written 0600.
+    pub password: String,
+    /// Self-signed TLS (ignored when `cert`/`key` are set).
+    pub tls: bool,
+    /// Your own PEM certificate + key (implies TLS).
+    pub cert: String,
+    pub key: String,
+    /// Relay for `--remote`; "" → wss://remote.mantra.codes.
+    pub relay: String,
+    /// Extra DNS names / IPs for the self-signed certificate.
+    pub sans: Vec<String>,
+    /// Web Push notifications to subscribed devices.
+    pub push: bool,
+    /// VAPID `sub` claim (mailto:… or https://…); "" → https://mantra.codes.
+    pub contact: String,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self { listen: String::new(), password: String::new(), tls: false, cert: String::new(), key: String::new(), relay: String::new(), sans: vec![], push: true, contact: String::new() }
+    }
 }
 
 impl Default for Settings {
@@ -119,6 +151,7 @@ impl Default for Settings {
             side_panel: true,
             fps: 12,
             notify: true,
+            web: WebSettings::default(),
         }
     }
 }
@@ -141,7 +174,13 @@ impl Settings {
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(home())?;
         let body = toml::to_string_pretty(self)?;
-        atomic_write(&home().join("settings.toml"), &format!("# Mantra settings\n{body}"))
+        let body = format!("# Mantra settings\n{body}");
+        // A web password in the file makes it a secret (same rule as a key in models.toml).
+        if self.web.password.is_empty() {
+            atomic_write(&home().join("settings.toml"), &body)
+        } else {
+            atomic_write_restricted(&home().join("settings.toml"), &body)
+        }
     }
 }
 

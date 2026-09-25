@@ -137,6 +137,11 @@ impl Hub {
         tokio::spawn(agent_task(id, spec, cmd, ev, rx, delay));
     }
 
+    /// Whether an agent process is registered under this id (the web API validates ids with it).
+    pub fn has_agent(&self, id: AgentId) -> bool {
+        self.agents.contains_key(&id)
+    }
+
     pub fn send(&self, id: AgentId, c: Cmd) {
         if let Some(tx) = self.agents.get(&id) {
             let _ = tx.send(c);

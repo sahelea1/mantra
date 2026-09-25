@@ -157,6 +157,9 @@ pub struct Agent {
     pub retry_note: Option<String>,
     turn_first_item: usize,
     notice_seq: u64,
+    /// Items dropped from the front of `items` so far (the MAX_ITEMS trim). `trimmed + i` is a
+    /// stable ordinal for `items[i]` that survives trims — the web UI keys transcripts by it.
+    pub trimmed: u64,
 }
 
 impl Agent {
@@ -205,7 +208,18 @@ impl Agent {
             retry_note: None,
             turn_first_item: 0,
             notice_seq: 0,
+            trimmed: 0,
         }
+    }
+
+    /// Ordinal of `items[0]` (see `trimmed`).
+    pub fn items_first_ord(&self) -> u64 {
+        self.trimmed
+    }
+
+    /// One past the ordinal of the last item.
+    pub fn items_total_ord(&self) -> u64 {
+        self.trimmed + self.items.len() as u64
     }
 
     pub fn busy(&self) -> bool {
@@ -261,6 +275,7 @@ impl Agent {
         if self.items.len() >= MAX_ITEMS {
             let drop = MAX_ITEMS / 5;
             self.items.drain(..drop);
+            self.trimmed += drop as u64;
             self.turn_first_item = self.turn_first_item.saturating_sub(drop);
             self.index.clear();
             for (i, it) in self.items.iter().enumerate() {

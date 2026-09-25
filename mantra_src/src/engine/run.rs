@@ -117,6 +117,19 @@ pub enum WState {
     Cancelled,
 }
 
+/// Stable name of a worker state — the saved `state.json` and the web protocol both use it.
+pub fn worker_state_str(s: &WState) -> &'static str {
+    match s {
+        WState::Queued => "queued",
+        WState::Preparing => "preparing",
+        WState::Running => "running",
+        WState::Retrying(_) => "retrying",
+        WState::Done => "done",
+        WState::Failed(_) => "failed",
+        WState::Cancelled => "cancelled",
+    }
+}
+
 pub struct Worker {
     pub task: Task,
     pub prompt: String,
@@ -204,6 +217,9 @@ struct WatchState {
 
 #[derive(Clone)]
 pub struct Pulse {
+    /// 1-based sequence number of this line within the run (`Run::pulse_seq` when it was logged):
+    /// the web UI sends only lines newer than the last one it sent.
+    pub n: u64,
     pub at: Instant,
     pub t: String,
     pub glyph: String,
@@ -269,6 +285,8 @@ pub struct Run {
     pub conflicts: Vec<String>,
     pub gate_report: Option<(bool, String)>,
     pub pulse: VecDeque<Pulse>,
+    /// Total pulse lines ever logged by this run (the ring above keeps only the last 300).
+    pub pulse_seq: u64,
     pub phase_started: Instant,
     pub ws: Option<Workspace>,
     pub handoff: String,
@@ -356,6 +374,7 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             pulse: VecDeque::new(),
+            pulse_seq: 0,
             phase_started: Instant::now(),
             ws: None,
             handoff: String::new(),
@@ -398,7 +417,8 @@ impl Run {
         // Defensive: crash reasons and agent-supplied text can carry ANSI from a subprocess's
         // stderr; the journal and pulse feed must never show raw escape codes.
         let text = crate::util::strip_ansi(&text.into());
-        let p = Pulse { at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
+        self.pulse_seq += 1;
+        let p = Pulse { n: self.pulse_seq, at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
         crate::mlog!("[run {}] {} {}", self.id, p.glyph, p.text);
         let line = json!({"t": crate::util::unix_secs(), "glyph": p.glyph, "text": p.text}).to_string();
         let _ = std::fs::create_dir_all(&self.dir);
@@ -444,14 +464,10 @@ impl Run {
             .workers
             .iter()
             .map(|w| {
-                let (state, error) = match &w.state {
-                    WState::Queued => ("queued", String::new()),
-                    WState::Preparing => ("preparing", String::new()),
-                    WState::Running => ("running", String::new()),
-                    WState::Retrying(_) => ("retrying", String::new()),
-                    WState::Done => ("done", String::new()),
-                    WState::Failed(e) => ("failed", e.clone()),
-                    WState::Cancelled => ("cancelled", String::new()),
+                let state = worker_state_str(&w.state);
+                let error = match &w.state {
+                    WState::Failed(e) => e.clone(),
+                    _ => String::new(),
                 };
                 let mut report = w.report.clone();
                 crate::util::tail_bytes(&mut report, 6000);
@@ -715,6 +731,25 @@ Then summarize in 2-4 lines.",
     /// chain? (`mantra_ask`; the stage card and `status_text` say so instead of "idle".)
     pub fn waiting_for_answer(&self, a: AgentId) -> bool {
         self.pending_questions.contains_key(&a)
+    }
+
+    /// What an agent asked up the chain and is waiting to have answered (`mantra_ask`), if anything.
+    pub fn question_of(&self, a: AgentId) -> Option<&str> {
+        self.pending_questions.get(&a).map(|s| s.as_str())
+    }
+
+    /// Stable machine name of the halt reason (the web protocol's `halted.reason`).
+    pub fn halt_reason_str(&self) -> Option<&'static str> {
+        self.halt.as_ref().map(|h| match h.reason {
+            HaltReason::User => "user",
+            HaltReason::Auth => "auth",
+            HaltReason::UsageLimit => "usage_limit",
+            HaltReason::ProviderRejected => "provider_rejected",
+            HaltReason::Environment => "environment",
+            HaltReason::GateExhausted => "gate_exhausted",
+            HaltReason::AttemptsExhausted => "attempts_exhausted",
+            HaltReason::AgentTurnFailed => "agent_turn_failed",
+        })
     }
 
     /// Short "what to do" text for the halted state, shown in the stage header band and the alert.
