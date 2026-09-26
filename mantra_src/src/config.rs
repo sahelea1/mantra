@@ -121,6 +121,10 @@ pub struct WebSettings {
     pub key: String,
     /// Relay for `--remote`; "" → wss://remote.mantra.codes.
     pub relay: String,
+    /// The website remote links open (it serves the web UI; the relay only forwards bytes), so the
+    /// two can live on different hosts. "" → https://remote.mantra.codes for the default relay,
+    /// else the relay's own origin.
+    pub remote_site: String,
     /// Extra DNS names / IPs for the self-signed certificate.
     pub sans: Vec<String>,
     /// Web Push notifications to subscribed devices.
@@ -131,7 +135,7 @@ pub struct WebSettings {
 
 impl Default for WebSettings {
     fn default() -> Self {
-        Self { listen: String::new(), password: String::new(), tls: false, cert: String::new(), key: String::new(), relay: String::new(), sans: vec![], push: true, contact: String::new() }
+        Self { listen: String::new(), password: String::new(), tls: false, cert: String::new(), key: String::new(), relay: String::new(), remote_site: String::new(), sans: vec![], push: true, contact: String::new() }
     }
 }
 

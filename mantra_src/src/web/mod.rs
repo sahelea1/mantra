@@ -34,6 +34,8 @@ use tokio::sync::mpsc;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7777";
 pub const DEFAULT_RELAY: &str = "wss://remote.mantra.codes";
+/// The website remote links point at when the default relay is used.
+pub const DEFAULT_SITE: &str = "https://remote.mantra.codes";
 /// Outbound messages queued for one connection before it is dropped as too slow.
 const MAX_QUEUED: usize = 512;
 
@@ -229,6 +231,8 @@ pub struct CliWeb {
     pub key: Option<PathBuf>,
     /// `--remote [URL]`: `Some(None)` = default relay.
     pub remote: Option<Option<String>>,
+    /// `--remote-site URL`: the website links open (when it is not on the relay's host).
+    pub remote_site: Option<String>,
     pub headless: bool,
 }
 
@@ -241,6 +245,8 @@ pub struct WebConfig {
     pub tls: TlsMode,
     /// Relay URL when `--remote`.
     pub relay: Option<String>,
+    /// The website remote links open (`https://…`), when `--remote`.
+    pub remote_site: Option<String>,
     pub headless: bool,
     pub push: bool,
     /// VAPID `sub` claim (push delivery, package B).
@@ -308,11 +314,24 @@ impl WebConfig {
                 anyhow::bail!("--remote: '{r}' is not a ws:// or wss:// URL");
             }
         }
+        // The site serves the page, the relay forwards bytes: they need not share a host.
+        let remote_site = match &relay {
+            None => None,
+            Some(r) => {
+                let site = cli.remote_site.clone().or_else(|| Some(s.remote_site.clone())).map(|x| x.trim().trim_end_matches('/').to_string()).filter(|x| !x.is_empty());
+                let site = site.unwrap_or_else(|| if r.trim_end_matches('/') == DEFAULT_RELAY { DEFAULT_SITE.to_string() } else { remote::relay_origin(r) });
+                if !(site.starts_with("https://") || site.starts_with("http://")) {
+                    anyhow::bail!("--remote-site: '{site}' is not an http:// or https:// URL");
+                }
+                Some(site)
+            }
+        };
         Ok(Some(WebConfig {
             listen,
             password,
             tls,
             relay,
+            remote_site,
             headless: cli.headless,
             push: s.push,
             contact: if s.contact.trim().is_empty() { "https://mantra.codes".into() } else { s.contact.trim().to_string() },
@@ -411,7 +430,7 @@ impl Web {
             crate::mlog!("web: listening on {}", info.urls.join(" "));
             server = Some(h);
         }
-        let remote = cfg.relay.as_ref().map(|relay| Arc::new(remote::Remote::start(remote::RemoteConfig { relay: relay.clone(), password: cfg.password.clone(), dir: cfg.dir.clone() }, reg.clone(), tx.clone())));
+        let remote = cfg.relay.as_ref().map(|relay| Arc::new(remote::Remote::start(remote::RemoteConfig { relay: relay.clone(), site: cfg.remote_site.clone().unwrap_or_else(|| remote::relay_origin(relay)), password: cfg.password.clone(), dir: cfg.dir.clone() }, reg.clone(), tx.clone())));
         let env = snapshot::Env { tls: info.tls, listen: info.urls.first().cloned(), headless: cfg.headless, push: push_link.is_some() };
         Ok(Web { cfg, reg, ctl_rx, publisher: snapshot::Publisher::new(env), server, remote, push: push_link, vapid_public, info })
     }
@@ -567,6 +586,14 @@ mod tests {
         let remote = CliWeb { remote: Some(None), ..Default::default() };
         let c = WebConfig::resolve(&remote, &s, None).unwrap().unwrap();
         assert_eq!((c.listen, c.relay.as_deref()), (None, Some(DEFAULT_RELAY)));
+        assert_eq!(c.remote_site.as_deref(), Some(DEFAULT_SITE));
+        // a self-hosted relay serves its own site by default; a separate site can be named
+        let own = CliWeb { remote: Some(Some("wss://relay.example.org:8787".into())), ..Default::default() };
+        assert_eq!(WebConfig::resolve(&own, &s, None).unwrap().unwrap().remote_site.as_deref(), Some("https://relay.example.org:8787"));
+        let split = CliWeb { remote_site: Some("https://remote.mantra.codes/".into()), ..own.clone() };
+        assert_eq!(WebConfig::resolve(&split, &s, None).unwrap().unwrap().remote_site.as_deref(), Some("https://remote.mantra.codes"));
+        let bad_site = CliWeb { remote_site: Some("remote.mantra.codes".into()), ..own };
+        assert!(WebConfig::resolve(&bad_site, &s, None).unwrap_err().to_string().contains("--remote-site"));
         // precedence: flag > env > settings
         let st = WebSettings { password: "fromsettings".into(), ..Default::default() };
         let mut f = cli(true);

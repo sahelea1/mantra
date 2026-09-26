@@ -103,15 +103,18 @@
     function groups() {
         const s = S();
         const list = M.store.agentList();
-        const lead = [], workers = [], gate = [], other = [];
+        const lead = [], workers = [], gate = [], other = [], earlier = [];
         for (const a of list) {
-            if (a.role_kind in LEAD) lead.push(a);
+            // Agents of finished phases (an earlier orchestrator, last phase's workers and gate)
+            // are no longer run members; keep them out of the live groups so the current team leads.
+            if (s.run && !a.in_run && a.role_kind !== 'solo' && a.role_kind !== 'architect' && a.role_kind !== 'probe') earlier.push(a);
+            else if (a.role_kind in LEAD) lead.push(a);
             else if (a.role_kind === 'worker') workers.push(a);
             else if (a.role_kind === 'gate' || a.role_kind === 'finale' || a.role_kind === 'probe') gate.push(a);
             else other.push(a);
         }
         lead.sort((x, y) => LEAD[x.role_kind] - LEAD[y.role_kind]);
-        return { lead, workers, gate, other, run: s.run };
+        return { lead, workers, gate, other, earlier, run: s.run };
     }
     function roleLabel(a) {
         if (a.role_kind === 'worker' && a.worker) return a.worker.task_id;
@@ -168,8 +171,10 @@
         const now = Date.now();
         const g = groups();
         const run = g.run;
+        const over = !!(run && run.stage && (run.stage.kind === 'done' || run.stage.kind === 'failed'));
         const out = [];
-        if (g.other.length) out.push(section(run ? 'Also here' : null, g.other.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'other' }));
+        // Without a run the others (Solo) lead; with one they follow the run's own groups.
+        if (g.other.length && !run) out.push(section(null, g.other.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'other' }));
         if (g.lead.length) out.push(section('Leadership', g.lead.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'lead' }));
         if (run) {
             const byTask = new Map();
@@ -184,11 +189,14 @@
             for (const a of g.workers) if (!seen.has(a.id)) rows.push(agentRow(a, { now, compact: opts.compact }));
             const ph = run.stage && run.stage.phase !== undefined ? run.stage.phase : null;
             const phName = ph !== null && S().plan && S().plan.phases[ph] ? S().plan.phases[ph].name : null;
-            out.push(section(ph !== null ? 'Phase ' + (ph + 1) + (phName ? ' · ' + phName : '') : 'Tasks', rows.length ? rows : h('div', { class: 'row-empty' }, 'No tasks yet'), { key: 'workers' }));
+            // A finished run has no tasks left to come: skip the empty placeholders.
+            if (rows.length || !over) out.push(section(ph !== null ? 'Phase ' + (ph + 1) + (phName ? ' · ' + phName : '') : 'Tasks', rows.length ? rows : h('div', { class: 'row-empty' }, 'No tasks yet'), { key: 'workers' }));
         } else if (g.workers.length) out.push(section('Workers', g.workers.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'workers' }));
-        if (g.gate.length || run) {
+        if (g.gate.length || (run && !over)) {
             out.push(section('Gate & finale', g.gate.length ? g.gate.map((a) => agentRow(a, { now, compact: opts.compact })) : h('div', { class: 'row-empty' }, h('span', { class: 'glyph', style: { color: 'var(--faint)' } }, '◎'), ' not yet'), { key: 'gate' }));
         }
+        if (g.other.length && run) out.push(section('Also here', g.other.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'other' }));
+        if (g.earlier.length) out.push(section('Earlier phases', g.earlier.map((a) => agentRow(a, { now, compact: opts.compact })), { key: 'past', cls: 'past' }));
         return out;
     }
 

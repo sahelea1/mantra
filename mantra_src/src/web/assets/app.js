@@ -789,7 +789,8 @@
         M.store.addNote(n);
         const path = n.kind === 'approval' ? (n.agent !== undefined ? '/agent/' + n.agent : '/inbox') : n.kind === 'turn' && n.agent !== undefined ? '/agent/' + n.agent : NOTE_ROUTE[n.kind];
         const text = String(n.text || '').replace(/^Mantra(:| needs you:)\s*/, '');
-        const onScreen = path && location.pathname === base + path;
+        // The Team screen shows the halt/question/review bands too: no need to flash those there.
+        const onScreen = path && (location.pathname === base + path || (NOTE_ROUTE[n.kind] === '/run' && n.kind !== 'done' && n.kind !== 'failed' && S.ui.route.name === 'team'));
         if (!onScreen && n.kind !== 'info') flash(text, n.kind === 'halt' || n.kind === 'failed' ? 'error' : n.kind === 'done' ? 'ok' : 'warn', path ? () => nav(path) : null);
         // Tab in the background and no push on this device: a plain local notification.
         if (document.visibilityState === 'hidden' && !M.push.state().subscribed && 'Notification' in window && Notification.permission === 'granted' && swReg && n.kind !== 'info') {

@@ -68,6 +68,8 @@ OPTIONS
                            (flags show up in `ps`). Also derives the --remote link's key
   --web-tls                HTTPS with Mantra's own certificate (install its CA from /cert.pem)
   --web-cert F --web-key F HTTPS with your own PEM certificate and key
+  --remote-site URL        the website remote links open, when it is not on the relay's host
+                           (the link then names its relay: …#k=…&r=wss://relay)
   --headless               no terminal UI (needs --web or --remote); ctrl+c / SIGTERM stop it
 
 FILES
@@ -147,6 +149,7 @@ fn parse_args() -> Result<Option<Cli>> {
                 }
                 cli.web.remote = Some(url);
             }
+            "--remote-site" => cli.web.remote_site = Some(next()?),
             "--headless" => cli.web.headless = true,
             "runs" => match next().ok().as_deref() {
                 None | Some("list") | Some("ls") => {

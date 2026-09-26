@@ -638,8 +638,24 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
         step!(e.say("Handoff: phase complete. Interfaces are in place; keep naming consistent with `models::*`. No open risks.").await);
         return Outcome::Done;
     }
+    // Demo (MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1): the orchestrator passes the worker's
+    // question up to the user (the run's question band) and relays the answer back down.
+    let ask_user = std::env::var("MANTRA_MOCK_ASK_USER").is_ok();
+    if ask_user && text.contains("[from the user] (answering your question") {
+        let answer = text.lines().nth(1).unwrap_or("").trim().to_string();
+        step!(e.think("**The user decided**\n\nPassing the decision on to the API worker.").await);
+        let _ = e.tool("mantra_prompt", json!({"agent": "p2-api", "message": format!("The user decided: {answer}")})).await;
+        let _ = e.tool("mantra_wait", json!({})).await;
+        return Outcome::Done;
+    }
     if let Some(rest) = text.split("QUESTION from ").nth(1) {
         let who = rest.split(':').next().unwrap_or("").trim().to_string();
+        if ask_user {
+            step!(e.think(&format!("**{who} asked a question**\n\nPagination is a product decision — asking the user.")).await);
+            let _ = e.tool("mantra_ask_user", json!({"question": format!("{who} needs a decision: offset/limit or cursor pagination for the list endpoints?")})).await;
+            let _ = e.tool("mantra_wait", json!({})).await;
+            return Outcome::Done;
+        }
         step!(e.think(&format!("**{who} asked a question**\n\nIt stays within the phase — I can answer it myself.")).await);
         let _ = e.tool("mantra_prompt", json!({"agent": who, "message": "Use cursor-based pagination with an opaque `next` token; page size 50."})).await;
         let _ = e.tool("mantra_wait", json!({})).await;

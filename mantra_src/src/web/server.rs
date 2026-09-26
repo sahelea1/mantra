@@ -256,7 +256,7 @@ async fn cert_pem(State(ctx): State<ServerCtx>) -> Response {
 
 /// SPA routes (the client router owns them) — all get index.html.
 fn is_spa_route(path: &str) -> bool {
-    matches!(path, "/" | "/settings" | "/run" | "/pulse" | "/runs" | "/inbox" | "/login" | "/connect") || path.starts_with("/s/") || path.starts_with("/agent/")
+    matches!(path, "/" | "/settings" | "/run" | "/pulse" | "/runs" | "/inbox" | "/more" | "/login" | "/connect") || path.starts_with("/s/") || path.starts_with("/agent/")
 }
 
 fn serve_asset(a: &Asset, headers: &HeaderMap, path: &str) -> Response {

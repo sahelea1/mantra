@@ -565,7 +565,9 @@ pub fn item_view(ord: u64, it: &Item) -> ItemView {
                 changes
                     .iter()
                     .map(|c| {
-                        let (adds, dels) = crate::util::diff_stats(&c.diff);
+                        // A new file arrives as its plain content, not a diff (same rule as the TUI's convo.rs).
+                        let is_diff = c.diff.lines().any(|l| l.starts_with("@@"));
+                        let (adds, dels) = if c.kind == "add" && !is_diff { (c.diff.lines().count(), 0) } else { crate::util::diff_stats(&c.diff) };
                         ChangeView { path: c.path.clone(), kind: c.kind.clone(), adds, dels }
                     })
                     .collect(),
