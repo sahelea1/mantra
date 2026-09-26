@@ -9,10 +9,14 @@
 pub mod auth;
 pub mod commands;
 pub mod conn;
+// Parts of these are only used by the relay client and push delivery (packages B/C).
+#[allow(dead_code)]
 pub mod crypto;
 pub mod protocol;
+#[allow(dead_code)]
 pub mod push;
 pub mod qr;
+#[allow(dead_code)]
 pub mod remote;
 pub mod server;
 pub mod snapshot;
@@ -62,6 +66,8 @@ pub enum ConnKind {
 pub enum Control {
     /// The client said hello: send it hello + a full snapshot, then include it in broadcasts.
     Hello { conn: ConnId },
+    /// Something outside the App changed (the relay's state, a derived key): publish and redraw.
+    Refresh,
 }
 
 struct ConnEntry {
@@ -128,8 +134,18 @@ impl WebRegistryHandle {
         let _ = self.inner.ctl.send(Control::Hello { conn: id });
     }
 
+    /// Ask the event loop to publish and redraw soon (for state the App doesn't own).
+    pub fn refresh(&self) {
+        let _ = self.inner.ctl.send(Control::Refresh);
+    }
+
     pub fn kind(&self, id: ConnId) -> Option<ConnKind> {
         self.conns().get(&id).map(|c| c.kind)
+    }
+
+    /// Connections receiving broadcasts.
+    pub fn joined(&self) -> usize {
+        self.conns().values().filter(|c| c.joined).count()
     }
 
     /// Connections of a kind (joined or not).
@@ -161,6 +177,8 @@ impl WebRegistryHandle {
         self.send_text(id, msg.to_json().into());
     }
 
+    /// Close one connection (the relay client uses it when a client misbehaves).
+    #[allow(dead_code)]
     pub fn close(&self, id: ConnId, reason: &'static str) {
         let mut c = self.conns();
         if let Some(e) = c.remove(&id) {
@@ -225,6 +243,8 @@ pub struct WebConfig {
     pub relay: Option<String>,
     pub headless: bool,
     pub push: bool,
+    /// VAPID `sub` claim (push delivery, package B).
+    #[allow(dead_code)]
     pub contact: String,
     pub sans: Vec<String>,
     /// `$MANTRA_HOME/web`.
@@ -338,6 +358,7 @@ impl Link {
 
 /// The running web layer, owned by the event loop.
 pub struct Web {
+    #[allow(dead_code)]
     pub cfg: WebConfig,
     reg: WebRegistryHandle,
     ctl_rx: mpsc::UnboundedReceiver<Control>,
@@ -404,8 +425,16 @@ impl Web {
         self.ctl_rx.recv().await
     }
 
-    /// Diff the App against the last publish and broadcast the delta (if any).
+    /// Diff the App against the last publish and broadcast the delta (if any). Skipped while no
+    /// client is connected — a hello always publishes first, so nobody ever sees a stale base.
     pub fn publish(&mut self, app: &App) {
+        if self.reg.joined() == 0 {
+            return;
+        }
+        self.publish_now(app);
+    }
+
+    fn publish_now(&mut self, app: &App) {
         let remote = self.remote.as_ref().map(|r| r.info());
         let Some(d) = self.publisher.publish(app, remote) else { return };
         let local: Arc<str> = ServerMsg::Delta(Box::new(d.clone())).to_json().into();
@@ -424,7 +453,7 @@ impl Web {
             Control::Hello { conn } => {
                 // Flush pending changes to everyone first, so the snapshot and the next delta
                 // this connection sees are consecutive.
-                self.publish(app);
+                self.publish_now(app);
                 let Some(kind) = self.reg.kind(conn) else { return };
                 let hello = ServerMsg::Hello(HelloMsg {
                     protocol: PROTOCOL,
@@ -445,6 +474,7 @@ impl Web {
                 }
                 self.reg.join(conn);
             }
+            Control::Refresh => self.publish(app),
         }
     }
 

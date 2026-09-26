@@ -369,6 +369,12 @@
             body ? h('div', { class: 'empty-body' }, body) : null,
             actions ? h('div', { class: 'empty-actions' }, actions) : null);
     }
+    // What to say while there is nothing to show yet, by connection state.
+    function waitText() {
+        const st = S().conn.state;
+        if (st === 'reconnecting' || st === 'offline') return 'Can’t reach Mantra — retrying…';
+        return S().conn.mode === 'relay' ? 'Waiting for Mantra…' : 'Connecting to Mantra…';
+    }
     function loading(text) {
         return h('div', { class: 'empty loading', key: 'loading' }, h('div', { class: 'mandala-spin', 'aria-hidden': 'true' }), h('div', { class: 'empty-body' }, text || 'Loading…'));
     }
@@ -394,6 +400,6 @@
     M.parts = {
         glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
-        haltBand, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
+        haltBand, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };
 })(window.Mantra = window.Mantra || {});

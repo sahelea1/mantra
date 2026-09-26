@@ -295,7 +295,7 @@ pub struct ItemAppend {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(untagged)]
 pub enum ItemDelta {
-    Full(ItemView),
+    Full(Box<ItemView>),
     Append(ItemAppend),
 }
 
@@ -629,7 +629,7 @@ pub fn item_delta(old: Option<&ItemView>, new: &ItemView) -> ItemDelta {
             }
         }
     }
-    ItemDelta::Full(new.clone())
+    ItemDelta::Full(Box::new(new.clone()))
 }
 
 fn status_str(s: &Status) -> (&'static str, Option<String>) {
@@ -726,11 +726,6 @@ struct RunFacts {
     members: HashSet<AgentId>,
     expected: HashSet<AgentId>,
     workers: HashMap<AgentId, WorkerView>,
-}
-
-pub fn agent_view(app: &App, a: &Agent) -> AgentView {
-    let facts = run_facts(app);
-    agent_view_with(app, a, &facts)
 }
 
 fn run_facts(app: &App) -> RunFacts {
@@ -1077,6 +1072,7 @@ impl Publisher {
         Publisher { env, seq: 0, prev: None, items: HashMap::new(), pulse: VecDeque::new(), pulse_sent: 0, pulse_run: None, plan_cache: None, patterns: None }
     }
 
+    #[cfg(test)]
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -1088,11 +1084,6 @@ impl Publisher {
             self.patterns = Some((Instant::now(), crate::engine::pattern::Pattern::list(&app.project)));
         }
         self.patterns.as_ref().map(|(_, p)| p.clone()).unwrap_or_default()
-    }
-
-    /// Force the next publish to re-read the pattern list (after `set_pattern`).
-    pub fn invalidate_patterns(&mut self) {
-        self.patterns = None;
     }
 
     fn plan(&mut self, r: Option<&Run>) -> Option<PlanView> {
@@ -1125,7 +1116,7 @@ impl Publisher {
         let snap = self.build(app, remote);
         let items = self.diff_items(app);
         let pulse = self.diff_pulse(app.run.as_ref());
-        let Some(prev) = self.prev.replace(snap) else { return None };
+        let prev = self.prev.replace(snap)?;
         let snap = self.prev.as_ref()?;
         let mut d = DeltaMsg::default();
         if snap.app != prev.app {
@@ -1202,7 +1193,7 @@ impl Publisher {
                     }
                     None => {
                         let view = item_view(ord, it);
-                        deltas.push(ItemDelta::Full(view.clone()));
+                        deltas.push(ItemDelta::Full(Box::new(view.clone())));
                         cache.views.push_back((fp, view));
                     }
                 }

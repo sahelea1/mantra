@@ -25,7 +25,6 @@ pub struct TlsMaterial {
     pub key_pem: String,
     /// The CA certificate to install on devices (`/cert.pem`); `None` for your own certificate.
     pub ca_pem: Option<String>,
-    pub sans: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
@@ -144,7 +143,7 @@ fn self_signed_at(dir: &Path, sans: &[String], now: u64) -> Result<TlsMaterial> 
     let same_names = meta.sans == sans;
     if !ca_fresh && fresh_enough && same_names {
         if let (Ok(cert), Ok(key)) = (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
-            return Ok(TlsMaterial { chain_pem: format!("{cert}{ca_pem}"), key_pem: key, ca_pem: Some(ca_pem), sans: sans.to_vec() });
+            return Ok(TlsMaterial { chain_pem: format!("{cert}{ca_pem}"), key_pem: key, ca_pem: Some(ca_pem) });
         }
     }
     let issuer = Issuer::new(ca_params(&ca_cn, now)?, &ca_key);
@@ -164,14 +163,14 @@ fn self_signed_at(dir: &Path, sans: &[String], now: u64) -> Result<TlsMaterial> 
     let meta = Meta { sans: sans.to_vec(), not_after_unix: not_after, ca_cn };
     write_secret(&dir.join("meta.json"), &serde_json::to_string_pretty(&meta)?)?;
     crate::mlog!("web: tls certificate for [{}]", sans.join(", "));
-    Ok(TlsMaterial { chain_pem: format!("{}{ca_pem}", cert.pem()), key_pem: kp.serialize_pem(), ca_pem: Some(ca_pem), sans: sans.to_vec() })
+    Ok(TlsMaterial { chain_pem: format!("{}{ca_pem}", cert.pem()), key_pem: kp.serialize_pem(), ca_pem: Some(ca_pem) })
 }
 
 /// `--web-cert/--web-key`: your own PEM files.
 pub fn load(cert: &Path, key: &Path) -> Result<TlsMaterial> {
     let chain_pem = std::fs::read_to_string(cert).map_err(|e| anyhow::anyhow!("--web-cert: cannot read {}: {e}", cert.display()))?;
     let key_pem = std::fs::read_to_string(key).map_err(|e| anyhow::anyhow!("--web-cert: cannot read {}: {e}", key.display()))?;
-    Ok(TlsMaterial { chain_pem, key_pem, ca_pem: None, sans: vec![] })
+    Ok(TlsMaterial { chain_pem, key_pem, ca_pem: None })
 }
 
 /// rustls server config (HTTP/1.1 only; WebSockets need nothing more).

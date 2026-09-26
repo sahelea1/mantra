@@ -303,9 +303,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     }
     ui::theme::init(&settings);
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    // (Also with --snapshot, so the /web and /remote overlays can be rendered headlessly.)
     let mut web = match web_cfg {
-        Some(c) if cli.snapshot.is_none() => Some(web::Web::start(c, tx.clone()).await?),
-        _ => None,
+        Some(c) => Some(web::Web::start(c, tx.clone()).await?),
+        None => None,
     };
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
     {
@@ -622,13 +623,19 @@ async fn event_loop<B: Backend>(mut terminal: Option<&mut Terminal<B>>, app: &mu
                     None => break,
                 }
             }
-            c = next_web_control(web) => {
-                if let (Some(c), Some(w)) = (c, web.as_mut()) {
+            c = next_web_control(web) => match (c, web.as_mut()) {
+                // Relay state / key changes: publish on the normal cadence, redraw the header.
+                (Some(web::Control::Refresh), Some(_)) => {
+                    web_dirty = true;
+                    dirty = true;
+                }
+                (Some(c), Some(w)) => {
                     w.on_control(c, app);
                     last_pub = Instant::now();
                     web_dirty = false;
                 }
-            }
+                _ => {}
+            },
             _ = quit_signal => {
                 app.quit = true;
             }

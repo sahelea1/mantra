@@ -72,7 +72,7 @@ fn web(f: &mut Frame, area: Rect, app: &App) {
             }
             let pw = if i.password { "on".to_string() } else { "off — localhost only".to_string() };
             l.push(Line::from(vec![k("password"), Span::styled(pw, if i.password { theme::fg(theme::GREEN) } else { theme::muted() })]));
-            let subs = app.web.as_ref().and_then(|x| x.push.as_ref()).map(|p| p.store.lock().map(|s| s.list().len()).unwrap_or(0));
+            let subs = app.web.as_ref().and_then(|x| x.push.as_ref()).filter(|_| i.push).map(|p| p.store.lock().map(|s| s.list().len()).unwrap_or(0));
             let push = match subs {
                 Some(n) => format!("on · {n} device{} subscribed", if n == 1 { "" } else { "s" }),
                 None => "off".into(),
@@ -148,7 +148,8 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
         l.push(Line::from(Span::styled("  (enlarge the terminal to show the QR code)", theme::faint())));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled("  anyone with the link, or the code and password, can drive this session · r new link (rotate) · esc", theme::faint())));
+    l.push(Line::from(Span::styled("  the link — or the code + password — opens this session: share it like a key", theme::faint())));
+    l.push(Line::from(Span::styled("  r new link (the old one stops working) · esc", theme::faint())));
     let r = centered(area, w, l.len() as u16 + 2);
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);

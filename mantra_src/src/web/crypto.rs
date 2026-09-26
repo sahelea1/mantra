@@ -86,7 +86,7 @@ impl Cipher {
             let nonce = Self::nonce(self.dir, ctr);
             let aad = [self.dir];
             // AES-GCM encryption only fails for plaintexts beyond 64 GiB.
-            let ct = self.aead.encrypt(Nonce::from_slice(&nonce), Payload { msg: chunk, aad: &aad }).unwrap_or_default();
+            let ct = self.aead.encrypt(&Nonce::from(nonce), Payload { msg: chunk, aad: &aad }).unwrap_or_default();
             let mut f = Vec::with_capacity(9 + ct.len());
             f.push(if i == last { T_DATA } else { T_CONT });
             f.extend_from_slice(&ctr.to_be_bytes());
@@ -115,7 +115,7 @@ impl Cipher {
         let rdir = if self.dir == DIR_HOST { DIR_CLIENT } else { DIR_HOST };
         let nonce = Self::nonce(rdir, ctr);
         let aad = [rdir];
-        let pt = self.aead.decrypt(Nonce::from_slice(&nonce), Payload { msg: &frame[9..], aad: &aad }).map_err(|_| "decryption failed (wrong key or tampered frame)".to_string())?;
+        let pt = self.aead.decrypt(&Nonce::from(nonce), Payload { msg: &frame[9..], aad: &aad }).map_err(|_| "decryption failed (wrong key or tampered frame)".to_string())?;
         self.recv_ctr = self.recv_ctr.saturating_add(1);
         if self.partial.len().saturating_add(pt.len()) > MAX_MESSAGE {
             return Err("message too large".into());

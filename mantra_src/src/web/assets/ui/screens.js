@@ -50,12 +50,12 @@
 
     function teamScreen() {
         const s = S();
-        if (!s.synced) return page('team', [P.loading(s.conn.state === 'open' ? 'Syncing…' : 'Connecting to Mantra…')]);
+        if (!s.synced) return page('team', [P.loading(s.conn.state === 'open' ? 'Syncing…' : P.waitText())]);
         const app = s.app || {};
         const kids = [];
         if (app.sandbox_warning) kids.push(h('div', { class: 'notice-card', key: 'sandbox' }, icon('alert'), h('span', null, app.sandbox_warning)));
-        kids.push(P.bands());
         if (s.run) kids.push(P.runCard());
+        kids.push(P.bands());
         const agents = M.store.agentList();
         if (!agents.length) kids.push(P.empty('team', 'No agents yet', s.run ? 'The run is starting its first agent…' : 'Start a Solo session or a run.', [P.btn('New Solo session', () => M.act.cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && M.act.nav('/agent/' + d.agent)), { kind: 'primary' })]));
         else kids.push(h('div', { class: 'team', key: 'team' }, P.teamList()));
@@ -99,7 +99,7 @@
 
     function runScreen() {
         const s = S();
-        if (!s.synced) return page('run', [P.loading()]);
+        if (!s.synced) return page('run', [P.loading(P.waitText())]);
         const run = s.run;
         if (!run) {
             return page('run', [P.empty('run', 'No run open', 'Runs plan a goal into phases and build it with a team of agents.', [
@@ -119,15 +119,16 @@
             h('h1', { class: 'run-title' }, run.brief),
             P.stageRail(run, plan, true),
             h('div', { class: 'run-stats' },
-                stat('stage', st.label), stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens)), stat('busy', String(run.busy_count || 0)),
-                run.branch ? stat('branch', run.branch) : null),
+                stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens)), stat('busy', String(run.busy_count || 0))),
+            run.branch ? h('div', { class: 'run-branch mono dim' }, '⎇ ' + run.branch) : null,
             st.error ? h('div', { class: 'errbox' }, icon('alert'), h('span', null, st.error)) : null));
-        kids.push(P.bands());
+        // The review card below replaces the review band here.
+        kids.push(P.haltBand(run), P.questionBand(run));
         if (st.kind === 'review' && plan) {
             kids.push(card('Review the plan', [
                 h('p', { class: 'sec-sub' }, 'Approve to start phase 1, or tell the planner what to change.'),
                 h('div', { class: 'band-actions' }, P.btn('Approve plan', () => M.act.cmd('plan_approve', {}, { busyKey: 'approve-plan', ok: 'Plan approved' }), { kind: 'primary', icon: 'check', busyKey: 'approve-plan' })),
-                P.feedbackField('plan-feedback', 'Feedback for the planner…', 'Send feedback'),
+                P.feedbackField('plan-feedback', 'What should change?', 'Send'),
             ], { key: 'review', cls: 'review-card', icon: 'plan' }));
         }
         if (plan) kids.push(planView(plan));
@@ -173,7 +174,7 @@
     }
     function pulseScreen() {
         const s = S();
-        if (!s.synced) return page('pulse', [P.loading()]);
+        if (!s.synced) return page('pulse', [P.loading(P.waitText())]);
         const f = s.ui.pulseFilter;
         const list = pulseList(500, f);
         return page('pulse', [
@@ -186,7 +187,7 @@
     const NOTE_ICON = { halt: '⛔', question: '?', approval: '⚑', review: '☰', done: '✦', failed: '✗', turn: '◆', info: 'ℹ' };
     function inboxScreen() {
         const s = S();
-        if (!s.synced) return page('inbox', [P.loading()]);
+        if (!s.synced) return page('inbox', [P.loading(P.waitText())]);
         const kids = [];
         const run = s.run;
         if (run) kids.push(P.bands());
@@ -422,7 +423,7 @@
                 h('p', { class: 'sec-sub' }, 'Enter the web password (', h('code', null, '--web-password'), ' or ', h('code', null, 'MANTRA_WEB_PASSWORD'), ').'),
                 h('input', { class: 'input big', type: 'password', autocomplete: 'current-password', placeholder: 'Password', 'aria-label': 'Password', value: L.pw, autofocus: true, oninput: (e) => { L.pw = e.target.value; if (L.error) L.error = null; M.act.changed(); } }),
                 L.error ? h('div', { class: 'auth-err', role: 'alert' }, L.error) : null,
-                h('button', { type: 'submit', class: 'btn primary big' + (L.busy ? ' is-busy' : ''), disabled: !L.pw || L.busy || null }, h('span', null, L.busy ? 'Signing in…' : 'Sign in'), L.busy ? h('span', { class: 'spin' }) : null)));
+                h('button', { type: 'submit', class: 'btn primary big' + (L.busy ? ' is-busy' : ''), disabled: L.busy || null }, h('span', null, L.busy ? 'Signing in…' : 'Sign in'), L.busy ? h('span', { class: 'spin' }) : null)));
     }
 
     // ── Connect (relay) ──────────────────────────────────────────────────────────────────────────
@@ -438,6 +439,7 @@
         const submit = async (e) => {
             e.preventDefault();
             if (C.step) return;
+            if (!C.pw) { C.error = 'Enter the password'; M.act.changed(); return; }
             await R.connectWith(needPwOnly ? R.pendingSid : C.code, C.pw, C.remember);
         };
         const sid = needPwOnly ? R.pendingSid : MantraCrypto.normalizeCode(C.code);
@@ -459,7 +461,7 @@
                     P.toggle(C.remember, (on) => { C.remember = on; M.act.changed(); }, 'Remember this device', 'reconnect later without the password (the key is stored non-extractable in this browser)', { key: 'rem', disabled: busy }),
                     C.error ? h('div', { class: 'auth-err', role: 'alert' }, C.error) : null,
                     busy ? h('div', { class: 'auth-step' }, h('span', { class: 'spin' }), C.step) : null,
-                    h('button', { type: 'submit', class: 'btn primary big', disabled: busy || !C.pw || !sid || null }, h('span', null, busy ? 'Connecting…' : 'Connect')),
+                    h('button', { type: 'submit', class: 'btn primary big', disabled: busy || null }, h('span', null, busy ? 'Connecting…' : 'Connect')),
                     h('p', { class: 'fine' }, icon('lock'), 'End-to-end encrypted: the relay only forwards ciphertext. Your password never leaves this device.')),
                 saved.length && !needPwOnly ? h('div', { class: 'auth-card saved', key: 'saved' },
                     h('h2', null, 'On this device'),

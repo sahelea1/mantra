@@ -26,7 +26,20 @@
         return { cls: 'ok', label: '' };
     }
 
-    function secs(ms) { return ms < 10000 ? (ms / 1000).toFixed(1) + 's' : F.durShort(ms); }
+    // While text streams in, a `**` or backtick may be open; hide the dangling marker until its
+    // partner arrives instead of flashing raw asterisks.
+    function openMarkers(t) {
+        const fences = (t.match(/^\s*```/gm) || []).length;
+        if (fences % 2) return t;
+        const lines = t.split('\n');
+        let last = lines[lines.length - 1];
+        if (((last.match(/\*\*/g) || []).length) % 2) last = last.replace(/\*\*(?!.*\*\*)/, '');
+        if (((last.match(/`/g) || []).length) % 2) last = last.replace(/`(?!.*`)/, '');
+        lines[lines.length - 1] = last;
+        return lines.join('\n');
+    }
+
+    function secs(ms) { return ms < 1000 ? Math.max(1, Math.round(ms)) + 'ms' : ms < 10000 ? (ms / 1000).toFixed(1) + 's' : F.durShort(ms); }
 
     function tail(text, n) {
         const lines = String(text || '').replace(/\s+$/, '').split('\n');
@@ -39,7 +52,7 @@
             case 'user':
                 return h('div', { key: k, class: 'msg user' }, h('div', { class: 'bubble' }, F.inline(it.text)));
             case 'agent':
-                return h('div', { key: k, class: 'msg agent md' + (it.done ? '' : ' streaming') }, F.markdown(it.text), it.done ? null : h('span', { class: 'caret', 'aria-hidden': 'true' }));
+                return h('div', { key: k, class: 'msg agent md' + (it.done ? '' : ' streaming') }, F.markdown(it.done ? it.text : openMarkers(it.text)));
             case 'reasoning': {
                 const open = exp || verbose;
                 const first = String(it.text || '').trim().split('\n').filter(Boolean);
@@ -328,8 +341,8 @@
         const sel = Math.min(s.ui.sugSel || 0, Math.max(0, sug.length - 1));
         const wide = M.act.wide();
         const placeholder = a.role_kind === 'solo'
-            ? 'Message ' + a.name + '…  (! runs a shell command)'
-            : 'Message ' + (a.run_name || a.name) + '…' + (s.run ? '  (@name to redirect)' : '');
+            ? 'Message ' + a.name + (wide ? '…  (! runs a shell command)' : '…')
+            : 'Message ' + (a.run_name || a.name) + '…' + (s.run && wide ? '  (@name redirects)' : '');
         return h('div', { class: 'composer' + (a.busy ? ' busy' : ''), key: 'composer' },
             sug.length ? h('div', { class: 'suggest', role: 'listbox', key: 'sug' }, sug.map((x, i) => h('button', {
                 type: 'button', key: x.key, role: 'option', 'aria-selected': String(i === sel), class: 'sug' + (i === sel ? ' on' : ''),
@@ -349,7 +362,7 @@
                     },
                 }),
                 h('div', { class: 'composer-btns' },
-                    a.busy && text.trim() ? h('button', { type: 'button', class: 'btn sm ghost force', title: 'Send now — interrupt-free steer into the current turn (Ctrl+Enter)', disabled: !open || null, onclick: () => submit(a, true) }, 'Send now') : null,
+                    a.busy && text.trim() && !sug.length ? h('button', { type: 'button', class: 'btn sm ghost force', title: 'Send now — interrupt-free steer into the current turn (Ctrl+Enter)', disabled: !open || null, onclick: () => submit(a, true) }, 'Send now') : null,
                     a.busy && !text.trim() ? h('button', { type: 'button', class: 'ibtn stop', title: 'Interrupt ' + a.name, 'aria-label': 'Interrupt', disabled: !open || null, onclick: () => M.act.cmd('interrupt', { agent: a.id }, { ok: 'Interrupted' }) }, icon('stop')) : null,
                     h('button', { type: 'button', class: 'send', title: a.busy ? 'Queue (sent after this turn)' : 'Send', 'aria-label': a.busy ? 'Queue message' : 'Send', disabled: !open || !text.trim() || null, onclick: () => submit(a, false) }, icon('send')))),
             !open ? h('div', { class: 'composer-note' }, 'Not connected — your message stays here until Mantra is back') : null);
@@ -380,31 +393,49 @@
                 P.glyph(a, 'xl'),
                 h('div', { class: 'agent-names' },
                     h('h1', null, a.worker ? a.worker.task_id : a.name, a.worker && a.worker.title ? h('span', { class: 'agent-role' }, ' · ' + a.worker.title) : a.role && a.role !== a.name ? h('span', { class: 'agent-role' }, ' · ' + a.role) : null),
-                    h('div', { class: 'agent-meta' },
-                        P.modelChip(a, () => M.act.sheet({ kind: 'model', agent: a.id })),
-                        P.ctxGauge(a),
-                        P.statusPill(a))),
+                    P.statusPill(a)),
                 wide ? null : P.iconBtn('dots', () => M.act.sheet({ kind: 'actions', agent: a.id }), 'Actions')),
+            h('div', { class: 'agent-meta' },
+                P.modelChip(a, () => M.act.sheet({ kind: 'model', agent: a.id })),
+                P.ctxGauge(a),
+                (a.plan || []).length ? h('button', { type: 'button', class: 'chip', onclick: () => M.act.sheet({ kind: 'steps', agent: a.id }) }, F.icon('plan'), a.plan_done + '/' + a.plan_total) : null,
+                (a.files || []).length ? h('button', { type: 'button', class: 'chip', onclick: () => M.act.sheet({ kind: 'diff', agent: a.id }) }, h('span', { class: 'add' }, '+' + a.files_adds), h('span', { class: 'del' }, '−' + a.files_dels)) : null),
             wide ? h('div', { class: 'agent-actions' }, acts.map((x) => P.btn(x.label, x.run, { sm: true, kind: 'ghost', icon: x.icon, key: x.id, disabled: x.disabled || S().conn.state !== 'open' }))) : null);
+    }
+
+    // A failed or crashed agent gets its fixes right above the composer.
+    function troubleCard(a) {
+        if (a.status !== 'failed' && a.status !== 'crashed') return null;
+        const canRespawn = a.in_run || a.status === 'crashed';
+        return h('div', { class: 'agent-trouble', key: 'trouble', role: 'alert' },
+            h('div', null, h('b', null, a.status === 'crashed' ? a.name + ' crashed' : a.name + '’s last turn failed')),
+            a.status_detail ? h('div', { class: 'band-msg' }, F.trunc(a.status_detail, 300)) : null,
+            h('div', { class: 'band-actions' },
+                P.btn('Switch model', () => M.act.sheet({ kind: 'model', agent: a.id }), { sm: true, icon: 'model', key: 'm' }),
+                canRespawn ? P.btn('Respawn', () => M.act.cmd('respawn', { agent: a.id }, { busyKey: 'respawn' + a.id, ok: 'Respawning ' + a.name }), { sm: true, icon: 'respawn', busyKey: 'respawn' + a.id, key: 'r' }) : null,
+                !canRespawn ? h('span', { class: 'dim sm' }, 'Send a message to try again.') : null));
     }
 
     function agentScreen(id) {
         const s = S();
         const a = M.store.agent(id);
         if (!a) {
-            if (!s.synced) return P.loading('Connecting…');
+            if (!s.synced) return P.loading(P.waitText());
             return h('div', { class: 'screen-pad' }, P.empty('agent', 'This agent is gone', 'It may have finished and been archived, or Mantra restarted.', [P.btn('Back to the team', () => M.act.nav('/'), { kind: 'primary' })]));
         }
         delete s.ui.unread[a.id];
         const aps = s.approvals.filter((x) => x.agent === a.id);
         const q = s.run && s.run.question && s.run.question.from === a.id ? P.questionBand(s.run) : null;
+        const trouble = troubleCard(a);
         return h('div', { class: 'agent-screen', key: 'agent' + a.id },
             header(a),
             transcript(a),
             h('div', { class: 'agent-foot', key: 'foot' },
-                q,
-                aps.length ? h('div', { class: 'approvals', key: 'aps' }, aps.map((ap) => P.approvalCard(ap))) : null,
-                queueBar(a),
+                q || trouble || aps.length || (a.queued || []).length ? h('div', { class: 'foot-stack', key: 'stack' },
+                    trouble,
+                    q,
+                    aps.length ? h('div', { class: 'approvals', key: 'aps' }, aps.map((ap) => P.approvalCard(ap))) : null,
+                    queueBar(a)) : null,
                 composer(a)));
     }
 

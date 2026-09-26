@@ -138,6 +138,7 @@
     });
 
     function focusAgentId() {
+        if (S.ui.route.name === 'agent' && M.store.agent(S.ui.route.id)) return S.ui.route.id;
         const f = S.ui.focus;
         if (f !== null && f !== undefined && M.store.agent(f)) return Number(f);
         const list = M.store.agentList();
@@ -221,6 +222,8 @@
             default: return SC.teamScreen();
         }
     }
+    // Tips and warnings live where people look first, not on every screen.
+    const BANNER_ROUTES = { team: 1, settings: 1, more: 1 };
     const TITLES = { run: 'Run', pulse: 'Pulse', inbox: 'Inbox', runs: 'Runs', settings: 'Settings', more: 'More' };
 
     function topbar(r) {
@@ -261,7 +264,7 @@
             connBar(),
             fixed ? null : topbar(r),
             h('main', { class: 'content' + (fixed ? ' fixed' : ''), key: 'content' },
-                fixed ? null : banners(),
+                fixed || !BANNER_ROUTES[r.name] ? null : banners(),
                 h('div', { class: 'screen anim-' + (motion() ? S.ui.anim || 'fade' : 'none') + (fixed ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
             tabbar(r));
     }
@@ -283,7 +286,7 @@
                 run ? h('div', { class: 'side-run', key: 'sr' }, P.runCard({ compact: true })) : null,
                 run && run.halted ? h('button', { type: 'button', class: 'side-alert halt', key: 'sh', onclick: () => nav('/') }, '⛔ ', P.HALT_TITLE[run.halted.reason] || 'Halted') : null,
                 run && run.question ? h('button', { type: 'button', class: 'side-alert question', key: 'sq', onclick: () => nav('/') }, '? ', (run.question.from_name || 'agent') + ' has a question') : null,
-                S.synced ? h('div', { class: 'side-team', key: 'st' }, P.teamList({ compact: true })) : h('div', { class: 'side-loading' }, P.loading('Connecting…'))),
+                S.synced ? h('div', { class: 'side-team', key: 'st' }, P.teamList({ compact: true })) : h('div', { class: 'side-loading' }, P.loading(P.waitText()))),
             h('nav', { class: 'side-nav', 'aria-label': 'Sections' },
                 item('/', 'team', 'Overview', 'team'),
                 item('/run', 'run', 'Run', 'run', run && (run.halted || run.question) ? '!' : 0),
@@ -386,7 +389,7 @@
             h('main', { class: 'main', key: 'main' },
                 connBar(),
                 mainHeader(r),
-                r.name === 'agent' ? null : banners(),
+                BANNER_ROUTES[r.name] ? banners() : null,
                 h('div', { class: 'main-body' + (r.name === 'agent' ? ' fill' : ''), key: 'mb' },
                     h('div', { class: 'screen anim-' + (motion() ? 'fade' : 'none') + (r.name === 'agent' ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
                 r.name === 'agent' && mqWide.matches && !S.ui.panelOpen ? h('button', { type: 'button', class: 'panel-reopen', title: 'Show side panel', onclick: () => M.store.setPref('panelOpen', true) }, icon('panel')) : null),

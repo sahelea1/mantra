@@ -95,6 +95,9 @@ impl App {
         match cmd {
             Command::Send { agent, text, force } => {
                 self.agent_ok(agent)?;
+                if !self.hub.has_agent(agent) {
+                    return Err("that agent's process has ended (respawn it, or start a new session)".into());
+                }
                 let mode = if force.unwrap_or(false) { Send::Force } else { Send::Queue };
                 let text = text.trim_end().to_string();
                 if text.trim().is_empty() && mode == Send::Queue {

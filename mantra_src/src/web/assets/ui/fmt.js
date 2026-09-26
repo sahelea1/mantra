@@ -168,7 +168,7 @@
                         const depth = Math.min(3, Math.floor(m[1].replace(/\t/g, '    ').length / 2));
                         const task = /^\[([ xX])\]\s+(.*)$/.exec(m[3]);
                         items.push(h('li', { class: depth ? 'd' + depth : null, 'data-n': ordered ? m[2].replace(/[.)]/, '') : null },
-                            task ? [h('span', { class: 'task' + (task[1] !== ' ' ? ' done' : '') }, task[1] !== ' ' ? '✓' : ''), ' ', inline(task[2])] : inline(m[3])));
+                            task ? [h('span', { class: 'md-task' + (task[1] !== ' ' ? ' done' : '') }, task[1] !== ' ' ? '✓' : ''), ' ', inline(task[2])] : inline(m[3])));
                         i++;
                     } else if (lines[i].trim() && /^\s{2,}\S/.test(lines[i]) && items.length) {
                         // continuation line of the previous item

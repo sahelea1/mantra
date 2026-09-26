@@ -77,11 +77,17 @@ impl Inner {
         Some((s.sid.clone(), s.host_token.clone(), s.key?))
     }
 
+    /// Update what `/remote` and the web UI show; publishes when anything changed.
     pub fn set_status(&self, connected: bool, clients: u32, last_error: Option<String>) {
         let mut s = self.lock();
+        let changed = s.connected != connected || s.clients != clients || s.last_error != last_error;
         s.connected = connected;
         s.clients = clients;
         s.last_error = last_error;
+        drop(s);
+        if changed {
+            self.web.refresh();
+        }
     }
 
     fn persist(&self) {
@@ -109,6 +115,7 @@ impl Inner {
                 s.key = Some(key);
                 drop(s);
                 me.generation.send_modify(|g| *g = g.wrapping_add(1));
+                me.web.refresh();
             }
         });
     }
@@ -236,6 +243,7 @@ impl Remote {
         self.inner.persist();
         self.inner.derive_key();
         self.inner.generation.send_modify(|g| *g = g.wrapping_add(1));
+        self.inner.web.refresh();
         crate::mlog!("remote: identity rotated");
     }
 
