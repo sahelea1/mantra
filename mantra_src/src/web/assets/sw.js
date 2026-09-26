@@ -1,6 +1,6 @@
 // Mantra web UI — service worker: offline shell, Web Push, notification clicks. Spec §9.2, §11.1.
 //
-// __MANTRA_SW_VERSION__ below: web/server.rs substitutes it per build (like /config.js); a static bundle (the relay site) `sed`s the same token from its Dockerfile at image build time.
+// The placeholder token in the VERSION literal below is substituted per build by web/server.rs (the same idea as /config.js); a static bundle (the relay site) `sed`s that same token from its Dockerfile at image build time.
 //
 // Caching is network-first for everything (falling back to the cache when offline) rather than
 // cache-first for assets: the assets are embedded in the Mantra binary and change with it while
