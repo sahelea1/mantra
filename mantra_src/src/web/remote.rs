@@ -166,8 +166,38 @@ pub fn code_of(sid: &str) -> String {
 pub fn link_of(site: &str, relay: &str, sid: &str, key: &[u8; 32]) -> String {
     let site = site.trim_end_matches('/');
     let relay = relay.trim_end_matches('/');
-    let r = if relay_origin(relay) == site { String::new() } else { format!("&r={relay}") };
+    let r = if relay_origin(relay) == site { String::new() } else { format!("&r={}", fragment_value(relay)) };
     format!("{site}/s/{sid}#k={}{r}", crypto::b64url_encode(key))
+}
+
+/// Percent-encode a value for the link's fragment. The page reads it with `URLSearchParams`,
+/// which splits on `&` and `=` and turns `+` into a space — so everything but unreserved
+/// characters and the `:`/`/` every relay URL has is encoded (a relay behind a proxy may well
+/// carry `?a=b&c` or `#`).
+fn fragment_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A plain `ws://` relay on another machine: the host can use it, but a browser on an https page
+/// may not (mixed content), so shared links would never connect. Loopback is the local-testing case.
+pub fn relay_without_tls(relay: &str) -> bool {
+    let Some(rest) = relay.trim().strip_prefix("ws://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    !loopback
 }
 
 pub struct Remote {
@@ -298,8 +328,21 @@ const STRIKE_LIMIT: usize = 10;
 const STRIKE_WINDOW: Duration = Duration::from_secs(600);
 const BLOCK_FOR: Duration = Duration::from_secs(600);
 /// The relay's answer to a new sid from an IPv4 address that already hosts one (one hosting
-/// session per address, `--max-hosts-per-ip`).
+/// session per address, `--max-hosts-per-ip`). Only matched when an older relay sends no
+/// `X-Mantra-Relay-Error` header.
 const RELAY_IP_TAKEN: &str = "this address already hosts a session";
+/// Clients tracked per relay connection — the relay's own per-session cap (16), so a leaked sid
+/// can't make the host allocate a conn and a task per `open` without limit.
+const MAX_CLIENTS: usize = 16;
+/// Of those, at most this many may still be short of the protocol hello (not yet proven to know
+/// the key); the rest of the room stays for devices that did.
+const MAX_UNHELLOED: usize = 8;
+/// After a relay reconnect the relay replays `open` for clients still attached to it; a client
+/// not replayed within this long is gone.
+const REPLAY_WAIT: Duration = Duration::from_secs(5);
+/// While the relay connection is down clients are kept for a reconnect at most this long: the
+/// relay's idle timeout, after which it has closed them (4410) for certain.
+const MAX_ADRIFT: Duration = Duration::from_secs(90);
 
 type Cid = [u8; 16];
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -310,6 +353,11 @@ async fn run(inner: Arc<Inner>) {
     let mut generation = inner.generation.subscribe();
     let mut backoff = BACKOFF_MIN;
     let mut strikes = Strikes::default();
+    // Outlives single relay connections: the relay replays `open` for browsers still attached
+    // after a host reconnect, and those browsers keep their E2EE session (they never redo the
+    // hello), so their cipher state must survive here too.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut clients = Clients::new(inner.web.clone(), inner.tx.clone(), [0u8; 32], out_tx);
     loop {
         generation.borrow_and_update();
         let Some((sid, token, key)) = inner.identity() else {
@@ -319,17 +367,23 @@ async fn run(inner: Arc<Inner>) {
             }
             continue;
         };
+        // A rotated identity has a new key: nobody from the old one can follow.
+        clients.rekey(key);
         let ended = tokio::select! {
-            e = session(&inner, &sid, &token, &key, &mut strikes) => e,
+            e = session(&inner, &sid, &token, &mut clients, &mut out_rx, &mut strikes) => e,
             c = generation.changed() => {
                 if c.is_err() {
                     return;
                 }
                 // A new identity: the old connection (and its clients) is gone, dial the new one now.
+                clients.detach(Instant::now());
                 backoff = BACKOFF_MIN;
                 continue;
             }
         };
+        clients.detach(Instant::now());
+        // Bounded even while the relay stays unreachable: clients nobody can replay any more go.
+        clients.prune(Instant::now());
         if ended.healthy {
             backoff = BACKOFF_MIN;
         }
@@ -362,16 +416,15 @@ struct Ended {
 }
 
 /// One relay connection, start to end.
-async fn session(inner: &Arc<Inner>, sid: &str, token: &str, key: &[u8; 32], strikes: &mut Strikes) -> Ended {
+async fn session(inner: &Arc<Inner>, sid: &str, token: &str, clients: &mut Clients, out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Cid, Outbound)>, strikes: &mut Strikes) -> Ended {
     let ws = match dial(&inner.relay, sid, token).await {
         Ok(ws) => ws,
         Err(error) => return Ended { healthy: false, error },
     };
     crate::mlog!("remote: connected to the relay");
-    inner.set_status(true, 0, None);
     let since = Instant::now();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut clients = Clients::new(inner.web.clone(), inner.tx.clone(), *key, out_tx);
+    clients.attach(since);
+    inner.set_status(true, clients.ready(), None);
     let (mut sink, mut stream) = ws.split();
     let mut sweep = tokio::time::interval(SWEEP_EVERY);
     sweep.tick().await;
@@ -435,7 +488,7 @@ async fn session(inner: &Arc<Inner>, sid: &str, token: &str, key: &[u8; 32], str
         inner.set_status(true, clients.ready(), None);
     };
     let _ = sink.close().await;
-    // `clients` drops here: every relay client is unregistered (they reconnect by themselves).
+    // `clients` stay (the caller detaches them): a quick reconnect gets them replayed by the relay.
     Ended { healthy: since.elapsed() >= HEALTHY_AFTER, error }
 }
 
@@ -526,20 +579,39 @@ fn describe(e: tokio_tungstenite::tungstenite::Error) -> String {
     match e {
         Error::Http(resp) => {
             let body = resp.body().as_deref().map(|b| String::from_utf8_lossy(&b[..b.len().min(300)]).to_string()).unwrap_or_default();
-            refusal(resp.status().as_u16(), &body)
+            let code = resp.headers().get("x-mantra-relay-error").and_then(|v| v.to_str().ok());
+            refusal(resp.status().as_u16(), code, &body)
         }
         other => format!("cannot reach the relay: {other}"),
     }
 }
 
-fn refusal(status: u16, body: &str) -> String {
+/// The relay's refusal of the host upgrade. `code` is its `X-Mantra-Relay-Error` header (the
+/// relay README's table) and wins; without it (an older relay) the status and body decide.
+fn refusal(status: u16, code: Option<&str>, body: &str) -> String {
+    const IP_TAKEN: &str = "another Mantra session is already hosted from this network address — the relay allows one per IPv4 address; this one connects once that session ends";
+    const BAD_TOKEN: &str = "the relay has this session bound to a different host token (another Mantra with the same session?) — it frees up 10 minutes after that host leaves, or rotate the link in /remote";
+    const IPV6: &str = "the relay only accepts hosts over IPv4, and this connection reached it over IPv6 (through a proxy or VPN?)";
+    const RATE: &str = "the relay is rate-limiting this address (too many connections a minute)";
+    const BAD_SID: &str = "the relay does not know this session address — check the --remote URL (a path in front of /host?)";
+    const FULL: &str = "the relay is full right now (too many sessions)";
+    match code.map(str::trim) {
+        Some("ip-taken") => return IP_TAKEN.into(),
+        Some("bad-token") => return BAD_TOKEN.into(),
+        Some("ipv6") => return IPV6.into(),
+        Some("rate-limited") => return RATE.into(),
+        Some("bad-sid") => return BAD_SID.into(),
+        Some("full") => return FULL.into(),
+        // Unknown (newer) code: fall back to what the status says.
+        _ => {}
+    }
     let body = sanitize(body);
     match status {
-        409 if body.contains(RELAY_IP_TAKEN) => "another Mantra session is already hosted from this network address — the relay allows one per IPv4 address; this one connects once that session ends".into(),
-        409 => "the relay has this session bound to a different host token (another Mantra with the same session?) — it frees up 10 minutes after that host leaves, or rotate the link in /remote".into(),
+        409 if body.contains(RELAY_IP_TAKEN) => IP_TAKEN.into(),
+        409 => BAD_TOKEN.into(),
         403 => format!("the relay refused this host{}", if body.is_empty() { String::new() } else { format!(": {body}") }),
-        429 => "the relay is rate-limiting this address".into(),
-        503 => "the relay is full right now".into(),
+        429 => RATE.into(),
+        503 => FULL.into(),
         s => format!("the relay refused the connection (HTTP {s}{})", if body.is_empty() { String::new() } else { format!(": {body}") }),
     }
 }
@@ -585,6 +657,7 @@ fn close_frame(cid: &Cid) -> Frame {
 
 /// Failed handshakes per client IP (§10.3): 10 in 10 minutes → that IP's `open`s are ignored for
 /// 10 minutes. Survives relay reconnects; bounded so a flood of addresses can't grow it forever.
+/// Clients the relay reports without an address share one bucket rather than going unthrottled.
 #[derive(Default)]
 struct Strikes {
     hits: HashMap<String, VecDeque<Instant>>,
@@ -593,6 +666,7 @@ struct Strikes {
 
 impl Strikes {
     fn is_blocked(&mut self, ip: &str, now: Instant) -> bool {
+        let ip = bucket(ip);
         match self.blocked.get(ip) {
             Some(until) if *until > now => true,
             Some(_) => {
@@ -604,9 +678,7 @@ impl Strikes {
     }
 
     fn strike(&mut self, ip: &str, now: Instant) {
-        if ip.is_empty() {
-            return;
-        }
+        let ip = bucket(ip);
         if self.hits.len() >= 4096 && !self.hits.contains_key(ip) {
             self.hits.retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < STRIKE_WINDOW));
             self.blocked.retain(|_, until| *until > now);
@@ -627,6 +699,15 @@ impl Strikes {
     }
 }
 
+/// The strikes key for a relay-reported IP; a missing one is not a free pass.
+fn bucket(ip: &str) -> &str {
+    if ip.is_empty() {
+        "unknown"
+    } else {
+        ip
+    }
+}
+
 /// One browser behind the relay.
 struct Client {
     conn: ConnId,
@@ -638,12 +719,15 @@ struct Client {
     opened: Instant,
     last_ping: Instant,
     missed: u8,
+    /// Set while the relay connection it came through is gone: forgotten at this instant unless
+    /// the relay replays its `open` on the next connection first.
+    adrift: Option<Instant>,
     /// Moves this client's outbound queue into the relay task's channel.
     fwd: JoinHandle<()>,
 }
 
-/// Every client of one relay connection. Pure bookkeeping — frames in, frames out — so it is
-/// testable without a network; `session` owns the socket.
+/// Every client behind the relay, across reconnects. Pure bookkeeping — frames in, frames out —
+/// so it is testable without a network; `session` owns the socket.
 struct Clients {
     web: WebRegistryHandle,
     tx: UnboundedSender<AppEvent>,
@@ -659,7 +743,43 @@ impl Clients {
 
     /// Clients past the hello (what `/remote` shows as connected).
     fn ready(&self) -> u32 {
-        self.map.values().filter(|c| c.hello_seen).count().min(u32::MAX as usize) as u32
+        self.map.values().filter(|c| c.hello_seen && c.adrift.is_none()).count().min(u32::MAX as usize) as u32
+    }
+
+    /// A different key (rotate): every client belongs to the old identity.
+    fn rekey(&mut self, key: [u8; 32]) {
+        if self.key != key {
+            let all: Vec<Cid> = self.map.keys().copied().collect();
+            for cid in all {
+                self.forget(&cid);
+            }
+            self.key = key;
+        }
+    }
+
+    /// The relay connection is gone: keep everyone for a reconnect, but not forever.
+    fn detach(&mut self, now: Instant) {
+        for c in self.map.values_mut() {
+            c.adrift.get_or_insert(now + MAX_ADRIFT);
+        }
+    }
+
+    /// A new relay connection: whoever the relay still has is replayed within `REPLAY_WAIT`.
+    fn attach(&mut self, now: Instant) {
+        self.prune(now);
+        for c in self.map.values_mut() {
+            if let Some(t) = c.adrift.as_mut() {
+                *t = (*t).min(now + REPLAY_WAIT);
+            }
+        }
+    }
+
+    /// Forget adrift clients whose time is up (no relay to tell).
+    fn prune(&mut self, now: Instant) {
+        let gone: Vec<Cid> = self.map.iter().filter(|(_, c)| c.adrift.is_some_and(|t| t <= now)).map(|(k, _)| *k).collect();
+        for cid in gone {
+            self.forget(&cid);
+        }
     }
 
     /// A text control frame from the relay: `open` / `close`.
@@ -672,8 +792,19 @@ impl Clients {
                 if strikes.is_blocked(&ip, now) {
                     return vec![close_frame(&cid)];
                 }
-                // The relay replays `open` for clients that survived a host reconnect; start over.
+                // The relay replays `open` for clients still attached after a host reconnect: the
+                // browser keeps its E2EE session (it never repeats the hello), so do we.
+                if let Some(c) = self.map.get_mut(&cid).filter(|c| c.adrift.is_some()) {
+                    c.adrift = None;
+                    c.ip = ip;
+                    return vec![];
+                }
+                // Any other repeat of a known id: start over.
                 self.forget(&cid);
+                let unhelloed = self.map.values().filter(|c| !c.hello_seen).count();
+                if self.map.len() >= MAX_CLIENTS || unhelloed >= MAX_UNHELLOED {
+                    return vec![close_frame(&cid)];
+                }
                 let mut h = self.web.register(ConnKind::Relay);
                 let conn = h.id;
                 let out = self.out.clone();
@@ -685,7 +816,7 @@ impl Clients {
                         }
                     }
                 });
-                self.map.insert(cid, Client { conn, ip, cipher: None, hello_seen: false, opened: now, last_ping: now, missed: 0, fwd });
+                self.map.insert(cid, Client { conn, ip, cipher: None, hello_seen: false, opened: now, last_ping: now, missed: 0, adrift: None, fwd });
                 vec![]
             }
             Some("close") => {
@@ -715,11 +846,13 @@ impl Clients {
                 .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
             let Some(cr) = cr else {
                 strikes.strike(&c.ip.clone(), now);
-                return self.drop_client(&cid);
+                return self.refuse(&cid, "hello");
             };
             let hr = crypto::random_bytes::<16>();
             c.cipher = Some(crypto::Cipher::new(&crypto::conn_key(&self.key, &cr, &hr), crypto::DIR_HOST));
-            let reply = serde_json::json!({"v": 1, "hr": crypto::b64url_encode(&hr), "protocol": super::protocol::PROTOCOL, "version": env!("CARGO_PKG_VERSION")});
+            // Nothing else before the client proves the key: protocol and version travel in the
+            // encrypted `hello` (§5), so a guessed sid learns nothing about this Mantra.
+            let reply = serde_json::json!({"v": 1, "hr": crypto::b64url_encode(&hr)});
             return vec![bin(&cid, &crypto::hello_frame(&reply.to_string()))];
         };
         let text = match cipher.open(payload) {
@@ -732,6 +865,7 @@ impl Clients {
             // that is what the strike limit throttles. Later it is a broken client.
             if !c.hello_seen {
                 strikes.strike(&c.ip.clone(), now);
+                return self.refuse(&cid, "badkey");
             }
             return self.drop_client(&cid);
         };
@@ -767,7 +901,12 @@ impl Clients {
     /// Hello deadline (10 s) and, when `ping`, the E2EE keep-alive: a `{"t":"ping"}` every 25 s,
     /// two unanswered ones drop the client.
     fn sweep(&mut self, now: Instant, ping: bool) -> Vec<Frame> {
-        let late: Vec<Cid> = self.map.iter().filter(|(_, c)| !c.hello_seen && now.duration_since(c.opened) >= super::conn::HELLO_TIMEOUT).map(|(k, _)| *k).collect();
+        let late: Vec<Cid> = self
+            .map
+            .iter()
+            .filter(|(_, c)| (!c.hello_seen && now.duration_since(c.opened) >= super::conn::HELLO_TIMEOUT) || c.adrift.is_some_and(|t| t <= now))
+            .map(|(k, _)| *k)
+            .collect();
         let mut out = vec![];
         for cid in late {
             out.extend(self.drop_client(&cid));
@@ -776,7 +915,7 @@ impl Clients {
             let ping_json = serde_json::json!({"t": "ping"}).to_string();
             let mut dead = vec![];
             for (cid, c) in self.map.iter_mut() {
-                let Some(cipher) = c.cipher.as_mut().filter(|_| c.hello_seen) else { continue };
+                let Some(cipher) = c.cipher.as_mut().filter(|_| c.hello_seen && c.adrift.is_none()) else { continue };
                 if now.duration_since(c.last_ping) < super::conn::PING_EVERY.saturating_sub(SWEEP_EVERY) {
                     continue;
                 }
@@ -792,6 +931,15 @@ impl Clients {
                 out.extend(self.drop_client(&cid));
             }
         }
+        out
+    }
+
+    /// A failed handshake, said once in plaintext (`0x01 {"err":"badkey"|"hello"}`, §10.3) before
+    /// the close, so the browser can tell a wrong password from a dropped connection — the relay's
+    /// close code alone can't (it is 4000 for both, or none at all).
+    fn refuse(&mut self, cid: &Cid, why: &str) -> Vec<Frame> {
+        let mut out = vec![bin(cid, &crypto::hello_frame(&serde_json::json!({"err": why}).to_string()))];
+        out.extend(self.drop_client(cid));
         out
     }
 
@@ -840,6 +988,20 @@ mod tests {
         // relay moved to its own host: the link names it, the site stays put
         let split = link_of("https://remote.mantra.codes/", "wss://relay.example.org:8787", sid, &[0u8; 32]);
         assert_eq!(split, "https://remote.mantra.codes/s/abcdefghijklmnopqrstuvwxyz#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&r=wss://relay.example.org:8787");
+        // a relay URL with its own query/fragment characters survives URLSearchParams on the page
+        let odd = link_of("https://remote.mantra.codes", "wss://gw.example.org/mantra?tenant=a&x=b+c#y", sid, &[0u8; 32]);
+        assert!(odd.ends_with("&r=wss://gw.example.org/mantra%3Ftenant%3Da%26x%3Db%2Bc%23y"), "{odd}");
+        let r = odd.split_once("&r=").unwrap().1;
+        assert!(!r.contains(['&', '=', '#', '+', '?']), "{r}");
+    }
+
+    #[test]
+    fn plain_ws_relays_off_this_machine_are_flagged() {
+        assert!(relay_without_tls("ws://relay.lan:8787"));
+        assert!(relay_without_tls("ws://192.168.1.4:8787/x"));
+        for ok in ["ws://127.0.0.1:8787", "ws://localhost", "ws://[::1]:8787/", "ws://127.0.0.2:1", "wss://relay.lan:8787", "wss://remote.mantra.codes"] {
+            assert!(!relay_without_tls(ok), "{ok}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -893,12 +1055,23 @@ mod tests {
 
     #[test]
     fn relay_refusals_read_like_sentences() {
-        let one_per_ip = refusal(409, "this address already hosts a session\n");
+        // the relay's X-Mantra-Relay-Error header decides, whatever the body says
+        let one_per_ip = refusal(409, Some("ip-taken"), "some other wording entirely");
         assert!(one_per_ip.contains("one per IPv4 address") && !one_per_ip.contains("409"), "{one_per_ip}");
-        assert!(refusal(409, "").contains("different host token"));
-        assert_eq!(refusal(403, "hosts must connect over IPv4"), "the relay refused this host: hosts must connect over IPv4");
+        assert!(refusal(409, Some("bad-token"), "this address already hosts a session").contains("different host token"), "header beats body");
+        assert!(refusal(403, Some("ipv6"), "").contains("over IPv6"));
+        assert!(refusal(429, Some("rate-limited"), "").contains("rate-limiting"));
+        assert!(refusal(404, Some("bad-sid"), "not found").contains("--remote URL"));
+        assert!(refusal(503, Some(" full "), "").contains("full"));
+        // an older relay without the header: status and body (substring) still work
+        let old = refusal(409, None, "this address already hosts a session\n");
+        assert_eq!(old, one_per_ip);
+        assert!(refusal(409, None, "").contains("different host token"));
+        assert_eq!(refusal(403, None, "hosts must connect over IPv4"), "the relay refused this host: hosts must connect over IPv4");
+        // an unknown (newer) code falls back to the status
+        assert!(refusal(503, Some("something-new"), "").contains("full"));
         // the body is untrusted: control characters never reach the UI, length is capped
-        let odd = refusal(418, &format!("\x1b[31mred\x07{}", "x".repeat(1000)));
+        let odd = refusal(418, None, &format!("\x1b[31mred\x07{}", "x".repeat(1000)));
         assert!(odd.starts_with("the relay refused the connection (HTTP 418: ") && !odd.chars().any(|c| c.is_control()) && odd.len() < 300, "{odd}");
     }
 
@@ -920,6 +1093,14 @@ mod tests {
             st.strike("a", t0 + STRIKE_WINDOW.mul_f64(i as f64 * 0.2));
         }
         assert!(!st.is_blocked("a", t0 + STRIKE_WINDOW * 4));
+        // no address from the relay is one shared bucket, not a free pass
+        let mut st = Strikes::default();
+        for i in 0..STRIKE_LIMIT {
+            st.strike("", t0 + Duration::from_secs(i as u64));
+        }
+        assert!(st.is_blocked("", t0 + Duration::from_secs(20)));
+        assert!(st.is_blocked("unknown", t0 + Duration::from_secs(20)));
+        assert!(!st.is_blocked("203.0.113.9", t0 + Duration::from_secs(20)));
     }
 
     /// The browser side of §10.3, as `crypto.js` does it.
@@ -947,7 +1128,8 @@ mod tests {
             assert_eq!(&b[..16], &self.cid);
             assert_eq!(b[16], crypto::T_HELLO);
             let v: serde_json::Value = serde_json::from_slice(&b[17..]).unwrap();
-            assert_eq!(v["protocol"], 1);
+            assert_eq!(v.as_object().map(|o| o.len()), Some(2), "only v and hr before the key is proven: {v}");
+            assert_eq!(v["v"], 1);
             let hr: [u8; 16] = crypto::b64url_decode(v["hr"].as_str().unwrap()).unwrap().try_into().unwrap();
             self.cipher = Some(crypto::Cipher::new(&crypto::conn_key(key, &self.cr, &hr), crypto::DIR_CLIENT));
         }
@@ -962,6 +1144,128 @@ mod tests {
             let Frame::Bin(b) = frame else { panic!("expected binary, got {frame:?}") };
             String::from_utf8(self.cipher.as_mut().unwrap().open(&b[16..]).unwrap().unwrap()).unwrap()
         }
+    }
+
+    /// The plaintext refusal a browser gets before its close: `[cid][0x01]{"err":why}`.
+    fn refused(cid: &Cid, why: &str) -> Vec<Frame> {
+        let mut f = cid.to_vec();
+        f.extend(crypto::hello_frame(&serde_json::json!({"err": why}).to_string()));
+        vec![Frame::Bin(f), close_frame(cid)]
+    }
+
+    /// Receivers a test keeps alive so the Clients' senders stay connected.
+    type Keep = (tokio::sync::mpsc::UnboundedReceiver<AppEvent>, tokio::sync::mpsc::UnboundedReceiver<(Cid, Outbound)>);
+
+    fn clients(key: [u8; 32]) -> (Clients, WebRegistryHandle, tokio::sync::mpsc::UnboundedReceiver<super::super::Control>, Keep) {
+        let (ctl, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = WebRegistryHandle::new(ctl);
+        let (tx, app) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, out) = tokio::sync::mpsc::unbounded_channel();
+        (Clients::new(reg.clone(), tx, key, out_tx), reg, ctl_rx, (app, out))
+    }
+
+    #[tokio::test]
+    async fn a_relay_reconnect_keeps_attached_browsers_encrypted_session() {
+        let key = [4u8; 32];
+        let (mut cl, reg, mut ctl_rx, _keep) = clients(key);
+        let mut st = Strikes::default();
+        let t0 = Instant::now();
+        let mut b = FakeBrowser::new(1);
+        let mut gone = FakeBrowser::new(2);
+        for x in [&mut b, &mut gone] {
+            cl.control(&x.open(), &mut st, t0);
+            let r = cl.binary(&x.hello(), &mut st, t0);
+            x.accept(&r[0], &key);
+            assert!(cl.binary(&x.send(r#"{"t":"hello","protocol":1}"#), &mut st, t0).is_empty());
+        }
+        while ctl_rx.try_recv().is_ok() {}
+        assert_eq!(cl.ready(), 2);
+        // the relay connection drops; a moment later the host is back and the relay replays
+        // `open` for the browser still attached to it (not for the one that left meanwhile)
+        cl.detach(t0 + Duration::from_secs(1));
+        assert_eq!(cl.ready(), 0, "nobody is reachable while the relay connection is down");
+        let t1 = t0 + Duration::from_secs(3);
+        cl.attach(t1);
+        assert!(cl.control(&b.open(), &mut st, t1).is_empty());
+        assert_eq!(cl.ready(), 1);
+        // the browser carries on with its next counter — no new hello, no strike, same conn
+        let pong = cl.binary(&b.send(r#"{"t":"ping"}"#), &mut st, t1);
+        assert_eq!(b.read(&pong[0]), r#"{"t":"pong"}"#);
+        assert!(!st.is_blocked("203.0.113.7", t1));
+        assert_eq!(reg.count(ConnKind::Relay), 2);
+        // the one never replayed is dropped once REPLAY_WAIT is over
+        assert!(cl.sweep(t1 + Duration::from_secs(1), false).is_empty());
+        assert_eq!(cl.sweep(t1 + REPLAY_WAIT, false), vec![close_frame(&gone.cid)]);
+        assert_eq!(reg.count(ConnKind::Relay), 1);
+        assert_eq!(cl.ready(), 1);
+        // a relay that stays away long enough takes everyone with it; so does a new key
+        cl.detach(t1 + Duration::from_secs(10));
+        cl.prune(t1 + Duration::from_secs(10) + MAX_ADRIFT);
+        assert_eq!(reg.count(ConnKind::Relay), 0);
+        let mut c = FakeBrowser::new(3);
+        cl.control(&c.open(), &mut st, t1);
+        let r = cl.binary(&c.hello(), &mut st, t1);
+        c.accept(&r[0], &key);
+        cl.rekey([5u8; 32]);
+        assert_eq!(reg.count(ConnKind::Relay), 0, "a rotated identity forgets the old one's clients");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_key_or_hello_gets_a_plaintext_refusal_before_the_close() {
+        let (mut cl, _reg, _ctl, _keep) = clients([1u8; 32]);
+        let mut st = Strikes::default();
+        let now = Instant::now();
+        let mut b = FakeBrowser::new(1);
+        cl.control(&b.open(), &mut st, now);
+        let r = cl.binary(&b.hello(), &mut st, now);
+        b.accept(&r[0], &[2u8; 32]);
+        assert_eq!(cl.binary(&b.send(r#"{"t":"hello","protocol":1}"#), &mut st, now), refused(&b.cid, "badkey"));
+        let c = FakeBrowser::new(2);
+        cl.control(&c.open(), &mut st, now);
+        let mut junk = c.cid.to_vec();
+        junk.extend(crypto::hello_frame(r#"{"v":2}"#));
+        assert_eq!(cl.binary(&junk, &mut st, now), refused(&c.cid, "hello"));
+        // after the protocol hello a broken frame is no key problem: a plain close, no refusal
+        let mut d = FakeBrowser::new(3);
+        cl.control(&d.open(), &mut st, now);
+        let r = cl.binary(&d.hello(), &mut st, now);
+        d.accept(&r[0], &[1u8; 32]);
+        cl.binary(&d.send(r#"{"t":"hello","protocol":1}"#), &mut st, now);
+        let mut bad = d.cid.to_vec();
+        bad.extend([crypto::T_DATA, 0, 0, 0, 0, 0, 0, 0, 9]);
+        bad.extend([0u8; 16]);
+        assert_eq!(cl.binary(&bad, &mut st, now), vec![close_frame(&d.cid)]);
+    }
+
+    #[tokio::test]
+    async fn relay_clients_are_capped() {
+        let key = [6u8; 32];
+        let (mut cl, reg, _ctl, _keep) = clients(key);
+        let mut st = Strikes::default();
+        let now = Instant::now();
+        // un-helloed opens (no key needed to send those) stop at MAX_UNHELLOED
+        for i in 0..MAX_UNHELLOED as u8 {
+            assert!(cl.control(&FakeBrowser::new(100 + i).open(), &mut st, now).is_empty());
+        }
+        let extra = FakeBrowser::new(200);
+        assert_eq!(cl.control(&extra.open(), &mut st, now), vec![close_frame(&extra.cid)]);
+        assert_eq!(reg.count(ConnKind::Relay), MAX_UNHELLOED);
+        let idle: Vec<Cid> = (0..MAX_UNHELLOED as u8).map(|i| [100 + i; 16]).collect();
+        for cid in &idle {
+            cl.control(&serde_json::json!({"t": "close", "c": hex(cid)}).to_string(), &mut st, now);
+        }
+        // devices that proved the key fill the rest, up to MAX_CLIENTS in all
+        for i in 0..MAX_CLIENTS as u8 {
+            let mut b = FakeBrowser::new(1 + i);
+            assert!(cl.control(&b.open(), &mut st, now).is_empty(), "client {i}");
+            let r = cl.binary(&b.hello(), &mut st, now);
+            b.accept(&r[0], &key);
+            cl.binary(&b.send(r#"{"t":"hello","protocol":1}"#), &mut st, now);
+        }
+        assert_eq!(cl.ready() as usize, MAX_CLIENTS);
+        let late = FakeBrowser::new(201);
+        assert_eq!(cl.control(&late.open(), &mut st, now), vec![close_frame(&late.cid)]);
+        assert_eq!(reg.count(ConnKind::Relay), MAX_CLIENTS);
     }
 
     #[tokio::test]
@@ -1021,7 +1325,7 @@ mod tests {
             cl.control(&b.open(), &mut st, now);
             let r = cl.binary(&b.hello(), &mut st, now);
             b.accept(&r[0], &[2u8; 32]); // the browser derived its key from the wrong password
-            assert_eq!(cl.binary(&b.send(r#"{"t":"hello","protocol":1}"#), &mut st, now), vec![close_frame(&b.cid)]);
+            assert_eq!(cl.binary(&b.send(r#"{"t":"hello","protocol":1}"#), &mut st, now), refused(&b.cid, "badkey"));
         }
         assert_eq!(reg.count(ConnKind::Relay), 0);
         let b = FakeBrowser::new(99);
@@ -1032,7 +1336,7 @@ mod tests {
         cl.control(&other, &mut st, now);
         let mut junk = vec![7u8; 16];
         junk.extend([crypto::T_DATA, 0, 0]);
-        assert_eq!(cl.binary(&junk, &mut st, now), vec![close_frame(&[7; 16])]);
+        assert_eq!(cl.binary(&junk, &mut st, now), refused(&[7; 16], "hello"));
         // a client that never says hello is closed after 10 s
         let mut b = FakeBrowser::new(50);
         b.cid = [50; 16];
@@ -1042,8 +1346,8 @@ mod tests {
         assert_eq!(cl.sweep(now + Duration::from_secs(11), false), vec![close_frame(&b.cid)]);
     }
 
-    /// A relay that refuses every host upgrade with `status` and `body`.
-    async fn refusing_relay(status: &'static str, body: &'static str) -> std::net::SocketAddr {
+    /// A relay that refuses every host upgrade with `status`, extra `headers` and `body`.
+    async fn refusing_relay(status: &'static str, headers: &'static str, body: &'static str) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -1051,7 +1355,7 @@ mod tests {
             while let Ok((mut s, _)) = l.accept().await {
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf).await;
-                let _ = s.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                let _ = s.write_all(format!("HTTP/1.1 {status}\r\n{headers}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
             }
         });
         addr
@@ -1059,10 +1363,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_session_per_ipv4_refusal_is_shown_and_retried() {
-        let dir = std::env::temp_dir().join(format!("mantra-remote-409-{}", std::process::id()));
+        // the relay's header, with a body in words this build has never seen
+        refusal_reaches_last_error("header", "X-Mantra-Relay-Error: ip-taken\r\n", "one IPv4, one host", "one per IPv4 address").await;
+        // an older relay: no header, the known body
+        refusal_reaches_last_error("body", "", "this address already hosts a session", "one per IPv4 address").await;
+        refusal_reaches_last_error("token", "X-Mantra-Relay-Error: bad-token\r\n", "this address already hosts a session", "different host token").await;
+    }
+
+    async fn refusal_reaches_last_error(tag: &str, headers: &'static str, body: &'static str, want: &str) {
+        let dir = std::env::temp_dir().join(format!("mantra-remote-409-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let addr = refusing_relay("409 Conflict", "this address already hosts a session").await;
+        let addr = refusing_relay("409 Conflict", headers, body).await;
         let (ctl, _c) = tokio::sync::mpsc::unbounded_channel();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: None, dir: dir.clone() }, WebRegistryHandle::new(ctl), tx);
@@ -1075,8 +1387,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let e = seen.expect("the refusal shows up in RemoteInfo.last_error");
-        assert!(e.contains("one per IPv4 address"), "{e}");
+        assert!(e.contains(want), "{tag}: {e}");
         assert!(!r.info().connected);
+        r.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The blocker case: the host's relay connection drops and comes back while the browser stays
+    /// attached to the relay — the relay replays `open`, the browser just carries on encrypted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_reconnect_keeps_the_browser_session_through_run() {
+        let dir = std::env::temp_dir().join(format!("mantra-remote-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (ctl, _ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = WebRegistryHandle::new(ctl);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone() }, reg.clone(), tx);
+        assert!(r.ready(Duration::from_secs(20)).await);
+        let key = r.inner().identity().unwrap().2;
+        async fn next_bin(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Vec<u8> {
+            loop {
+                if let Message::Binary(x) = ws.next().await.unwrap().unwrap() {
+                    return x.to_vec();
+                }
+            }
+        }
+        let mut ws = tokio_tungstenite::accept_async(l.accept().await.unwrap().0).await.unwrap();
+        let mut b = FakeBrowser::new(8);
+        ws.send(Message::Text(b.open().into())).await.unwrap();
+        ws.send(Message::Binary(b.hello().into())).await.unwrap();
+        b.accept(&Frame::Bin(next_bin(&mut ws).await), &key);
+        ws.send(Message::Binary(b.send(r#"{"t":"hello","protocol":1}"#).into())).await.unwrap();
+        ws.send(Message::Binary(b.send(r#"{"t":"ping"}"#).into())).await.unwrap();
+        loop {
+            let f = next_bin(&mut ws).await;
+            if b.read(&Frame::Bin(f)).contains("pong") {
+                break;
+            }
+        }
+        // the relay drops the host; the host dials again and gets the still-attached browser replayed
+        drop(ws);
+        let mut ws = tokio::time::timeout(Duration::from_secs(10), async { tokio_tungstenite::accept_async(l.accept().await.unwrap().0).await.unwrap() }).await.expect("the host reconnects");
+        ws.send(Message::Text(b.open().into())).await.unwrap();
+        ws.send(Message::Binary(b.send(r#"{"t":"ping"}"#).into())).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let f = next_bin(&mut ws).await;
+                let t = b.read(&Frame::Bin(f));
+                if t.contains("pong") {
+                    break t;
+                }
+            }
+        })
+        .await
+        .expect("the same E2EE session answers after the reconnect");
+        assert_eq!(got, r#"{"t":"pong"}"#);
+        assert_eq!(reg.count(ConnKind::Relay), 1, "still the one registered conn");
         r.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }

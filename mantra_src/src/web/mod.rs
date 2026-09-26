@@ -250,7 +250,6 @@ pub struct WebConfig {
     pub headless: bool,
     pub push: bool,
     /// VAPID `sub` claim (push delivery, package B).
-    #[allow(dead_code)]
     pub contact: String,
     pub sans: Vec<String>,
     /// `$MANTRA_HOME/web`.
@@ -283,6 +282,11 @@ impl WebConfig {
         if cli.cert.is_some() != cli.key.is_some() {
             anyhow::bail!("--web-cert and --web-key go together");
         }
+        // Checked before the early return below: otherwise `--remote-site` alone (or with `--web`)
+        // would be dropped without a word. The settings value is fine unused (it waits for --remote).
+        if cli.remote_site.is_some() && cli.remote.is_none() {
+            anyhow::bail!("--remote-site needs --remote");
+        }
         if !cli.web && cli.remote.is_none() {
             return Ok(None);
         }
@@ -292,6 +296,14 @@ impl WebConfig {
             let addr = parse_listen(&raw).ok_or_else(|| anyhow::anyhow!("--web: '{raw}' is not host:port or port"))?;
             if !addr.ip().is_loopback() && password.is_none() {
                 anyhow::bail!("--web: listening on {addr} needs a password (--web-password, MANTRA_WEB_PASSWORD or [web] password); without one Mantra only listens on localhost");
+            }
+            // Loopback without a password trusts whoever reaches the port — tolerable when the
+            // person at this terminal started it for themselves, not for an unattended service
+            // that is typically reached through a port-forward or tunnel (which also arrives
+            // from 127.0.0.1). `--headless --remote` alone has no listener and gets a generated
+            // remote password, so it is unaffected.
+            if cli.headless && password.is_none() {
+                anyhow::bail!("--headless needs a password (--web-password / MANTRA_WEB_PASSWORD): nobody is at this terminal to vouch for localhost");
             }
             Some(addr)
         } else {
@@ -339,6 +351,20 @@ impl WebConfig {
             dir: crate::config::home().join("web"),
         }))
     }
+
+    /// Legal but risky setups, said once at startup (log + TUI toast).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = vec![];
+        if self.listen.is_some_and(|a| a.ip().is_loopback()) && self.password.is_none() {
+            w.push(format!("web UI on {} without a password — anything that can reach this port (port-forwards, tunnels) is trusted", self.listen.map(|a| a.ip().to_string()).unwrap_or_default()));
+        }
+        if let Some(r) = &self.relay {
+            if remote::relay_without_tls(r) {
+                w.push("relay without TLS: browsers on https pages cannot reach it".into());
+            }
+        }
+        w
+    }
 }
 
 /// What the TUI's `/web` overlay shows.
@@ -377,7 +403,6 @@ impl Link {
 
 /// The running web layer, owned by the event loop.
 pub struct Web {
-    #[allow(dead_code)]
     pub cfg: WebConfig,
     reg: WebRegistryHandle,
     ctl_rx: mpsc::UnboundedReceiver<Control>,
@@ -401,7 +426,7 @@ impl Web {
             let dir = cfg.dir.join("push");
             let _ = std::fs::create_dir_all(&dir);
             tls::restrict_dir(&dir);
-            match push::Vapid::load_or_create(&dir) {
+            match push::Vapid::load_or_create(&dir).map(|v| v.with_contact(cfg.contact.clone())) {
                 Ok(v) => {
                     let store = Arc::new(Mutex::new(push::Store::load(&dir)));
                     vapid_public = Some(v.public_b64url.clone());
@@ -409,6 +434,9 @@ impl Web {
                 }
                 Err(e) => crate::mlog!("web: push disabled — cannot create VAPID keys: {e}"),
             }
+        }
+        for w in cfg.warnings() {
+            crate::mlog!("web: {w}");
         }
         let mut info = LinkInfo { listen: cfg.listen, password: cfg.password.is_some(), push: push_link.is_some(), ..Default::default() };
         let mut server = None;
@@ -583,6 +611,18 @@ mod tests {
         assert_eq!(WebConfig::resolve(&half, &s, None).unwrap_err().to_string(), "--web-cert and --web-key go together");
         let headless = CliWeb { headless: true, ..Default::default() };
         assert_eq!(WebConfig::resolve(&headless, &s, None).unwrap_err().to_string(), "--headless needs --web or --remote (nothing would be reachable)");
+        // headless with a local listener: loopback alone is no reason to skip the password
+        let hw = CliWeb { headless: true, ..cli(true) };
+        assert_eq!(WebConfig::resolve(&hw, &s, None).unwrap_err().to_string(), "--headless needs a password (--web-password / MANTRA_WEB_PASSWORD): nobody is at this terminal to vouch for localhost");
+        assert!(WebConfig::resolve(&hw, &s, Some("pw".into())).unwrap().is_some());
+        let hr = CliWeb { headless: true, remote: Some(Some("ws://127.0.0.1:8787".into())), ..Default::default() };
+        assert!(WebConfig::resolve(&hr, &s, None).unwrap().is_some(), "remote alone has no listener; its password is generated");
+        // --remote-site without --remote is a mistake, not a no-op
+        for c in [CliWeb { remote_site: Some("https://example.com".into()), ..cli(true) }, CliWeb { remote_site: Some("https://example.com".into()), ..Default::default() }] {
+            assert_eq!(WebConfig::resolve(&c, &s, None).unwrap_err().to_string(), "--remote-site needs --remote");
+        }
+        let site_setting = WebSettings { remote_site: "https://example.com".into(), ..Default::default() };
+        assert!(WebConfig::resolve(&cli(true), &site_setting, None).is_ok(), "a remote_site setting waits quietly for --remote");
         let remote = CliWeb { remote: Some(None), ..Default::default() };
         let c = WebConfig::resolve(&remote, &s, None).unwrap().unwrap();
         assert_eq!((c.listen, c.relay.as_deref()), (None, Some(DEFAULT_RELAY)));
@@ -601,6 +641,17 @@ mod tests {
         f.password = Some("fromflag".into());
         assert_eq!(WebConfig::resolve(&f, &st, Some("fromenv".into())).unwrap().unwrap().password.as_deref(), Some("fromflag"));
         assert_eq!(WebConfig::resolve(&cli(true), &st, None).unwrap().unwrap().password.as_deref(), Some("fromsettings"));
+    }
+
+    #[test]
+    fn risky_setups_are_announced() {
+        let s = WebSettings::default();
+        let open = WebConfig::resolve(&cli(true), &s, None).unwrap().unwrap();
+        assert_eq!(open.warnings(), vec!["web UI on 127.0.0.1 without a password — anything that can reach this port (port-forwards, tunnels) is trusted".to_string()]);
+        assert!(WebConfig::resolve(&cli(true), &s, Some("pw".into())).unwrap().unwrap().warnings().is_empty());
+        let plain = |r: &str| WebConfig::resolve(&CliWeb { remote: Some(Some(r.into())), ..Default::default() }, &s, None).unwrap().unwrap().warnings();
+        assert_eq!(plain("ws://relay.lan:8787"), vec!["relay without TLS: browsers on https pages cannot reach it".to_string()]);
+        assert!(plain("ws://127.0.0.1:8787").is_empty() && plain("ws://localhost:8787/").is_empty() && plain("wss://relay.lan").is_empty());
     }
 
     #[test]

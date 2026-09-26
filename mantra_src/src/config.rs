@@ -618,8 +618,8 @@ pub fn atomic_write(path: &Path, body: &str) -> Result<()> {
     write_atomic(path, body, false)
 }
 
-/// Like `atomic_write`, but the file is `chmod 0600` (Unix) before the rename — used when the
-/// content holds a secret (an API key pasted into `models.toml`).
+/// Like `atomic_write`, but the file is 0600 (Unix) from the moment it exists — used when the
+/// content holds a secret (an API key pasted into `models.toml`, the web layer's keys and tokens).
 pub fn atomic_write_restricted(path: &Path, body: &str) -> Result<()> {
     write_atomic(path, body, true)
 }
@@ -629,21 +629,58 @@ fn write_atomic(path: &Path, body: &str, restrict: bool) -> Result<()> {
         std::fs::create_dir_all(d)?;
     }
     let tmp = path.with_extension("tmp~");
-    std::fs::write(&tmp, body)?;
     if restrict {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
+        write_restricted(&tmp, body)?;
+    } else {
+        std::fs::write(&tmp, body)?;
     }
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The secret must never sit on disk at the umask's mode, not even between write and chmod: the
+/// file is created 0600, and a stale temp file left by a crash is narrowed (fchmod) before any
+/// byte of the new content lands in it.
+fn write_restricted(tmp: &Path, body: &str) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(body.as_bytes())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn restricted_writes_never_exist_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mantra-restricted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.json");
+        // a stale, world-readable temp file from a crash is narrowed before the secret goes in
+        let tmp = path.with_extension("tmp~");
+        std::fs::write(&tmp, "old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_restricted(&path, "{\"k\":\"s3cret\"}").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"k\":\"s3cret\"}");
+        assert!(!tmp.exists());
+        // the temp file itself is created 0600 (checked directly, no rename in between)
+        write_restricted(&tmp, "x").unwrap();
+        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn effort_resolution() {
         let r = Registry::defaults();

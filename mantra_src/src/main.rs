@@ -64,13 +64,16 @@ OPTIONS
   --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
   --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
   --web-listen ADDR:PORT   where the web UI listens (default 127.0.0.1:7777; 8080 = 127.0.0.1:8080)
-  --web-password PW        web UI password — needed off localhost; MANTRA_WEB_PASSWORD is better
-                           (flags show up in `ps`). Also derives the --remote link's key
+  --web-password PW        web UI password — needed off localhost and with --headless;
+                           MANTRA_WEB_PASSWORD is better (flags show up in `ps`). Also derives
+                           the --remote link's key. Without one, localhost is trusted: a
+                           port-forward or tunnel to the port (ssh -L, docker -p) lets anyone in
   --web-tls                HTTPS with Mantra's own certificate (install its CA from /cert.pem)
   --web-cert F --web-key F HTTPS with your own PEM certificate and key
   --remote-site URL        the website remote links open, when it is not on the relay's host
                            (the link then names its relay: …#k=…&r=wss://relay)
-  --headless               no terminal UI (needs --web or --remote); ctrl+c / SIGTERM stop it
+  --headless               no terminal UI (needs --web or --remote, and a password with --web);
+                           ctrl+c / SIGTERM stop it
 
 FILES
   ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
@@ -334,6 +337,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     app.start_solo();
     if let Some(w) = sandbox_warning {
         app.set_sandbox_warning(w);
+    }
+    // Web::start already logged these; the toast is for the person looking at the TUI.
+    if let Some(w) = web.as_ref().map(|w| w.cfg.warnings()).filter(|w| !w.is_empty()) {
+        app.toast(w.join(" · "), crate::agent::Level::Warn);
     }
     if let Some(goal) = &cli.run_goal {
         app.start_run(goal);

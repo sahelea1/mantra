@@ -884,17 +884,28 @@
         del(sid) { return this.tx('readwrite', (s) => s.delete(sid)).catch(() => { }); },
     };
 
-    function validRelay(u) { return typeof u === 'string' && /^wss:\/\/[^\s/]+/i.test(u) || /^ws:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?/i.test(u || ''); }
+    // wss:// anywhere; plain ws:// only where the browser will let us use it — from an http: page
+    // (an https: page may not open ws://: mixed content) or to this machine.
+    function validRelay(u) {
+        if (typeof u !== 'string') return false;
+        if (/^wss:\/\/[^\s/]+/i.test(u)) return true;
+        if (!/^ws:\/\/[^\s/]+/i.test(u)) return false;
+        return location.protocol === 'http:' || /^ws:\/\/(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(u);
+    }
 
     M.relay = {
-        sid: null, raw: null, relay: null, pendingSid: null, offerRemember: false,
+        sid: null, master: null, relay: null, pendingSid: null, offerRemember: false,
         defaultRelay() { return validRelay(CFG.relay) ? CFG.relay : 'wss://remote.mantra.codes'; },
         async boot() {
             const m = /^\/s\/([a-z2-7]{26})(\/.*)?$/i.exec(location.pathname);
             const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
-            // A link may name its relay (#r=wss://…) so the site and the relay can live on
-            // different hosts; the page's own config is the default.
-            const relay = validRelay(hash.get('r')) ? hash.get('r') : this.defaultRelay();
+            // A link may name its relay (#r=wss://…, percent-encoded; URLSearchParams decodes it)
+            // so the site and the relay can live on different hosts; the page's config is the default.
+            const named = hash.get('r');
+            const relay = validRelay(named) ? named : this.defaultRelay();
+            if (named && relay !== named) flash('This link names a relay this page can’t use (' + named + ') — trying ' + relay + ' instead', 'warn');
+            // Older pages kept the raw key in sessionStorage; nothing does any more.
+            try { for (const k of Object.keys(sessionStorage)) if (k.startsWith('mantra.k.')) sessionStorage.removeItem(k); } catch (_) { }
             S.ui.devices = await IDB.all();
             if (!m) { this.toConnect(); return; }
             const sid = m[1].toLowerCase();
@@ -917,8 +928,7 @@
                 changed();
                 return;
             }
-            const ss = sessionGet(sid);
-            if (ss) { await this.start(sid, ss.raw, null, ss.relay || relay); return; }
+            // No key in the address (a reload after we dropped it): a remembered device, or the password.
             const saved = S.ui.devices.find((d) => d.sid === sid);
             if (saved) { await this.start(sid, null, saved.key, saved.relay || relay, true); return; }
             this.pendingSid = sid;
@@ -954,11 +964,14 @@
             history.replaceState({ d: 0 }, '', base);
             await this.start(d.sid, null, d.key, d.relay || this.defaultRelay(), true);
         },
+        // The raw key bytes live only until they are imported as a non-extractable CryptoKey; that
+        // key (for the transport and, opted in, IndexedDB) is all this page keeps.
         async start(sid, raw, key, relay, remembered) {
-            this.sid = sid; this.raw = raw; this.relay = relay;
+            this.sid = sid; this.relay = relay;
             S.ui.remembered = !!remembered;
             const master = key || await C.importMasterKey(raw, false);
-            if (raw) sessionPut(sid, raw, relay);
+            if (raw) raw.fill(0);
+            this.master = master;
             S.ui.connect = Object.assign({}, S.ui.connect || { code: '', pw: '' }, { step: 'Connecting to the relay…', error: null });
             if (S.ui.route.name === 'connect') S.ui.route = parse(location.pathname);
             if (S.ui.route.name === 'connect' || S.ui.route.name === 'login') S.ui.route = { name: 'team' };
@@ -975,7 +988,6 @@
         },
         onState() { },
         onFatal(m) {
-            sessionDel(this.sid);
             const saved = (S.ui.devices || []).find((d) => d.sid === this.sid);
             let err = m.error;
             if (m.code === 'badkey' && saved) err = 'This saved session no longer opens — the link was probably rotated. Forget it and use the new link or code.';
@@ -983,9 +995,9 @@
             this.toConnect(err);
         },
         async remember() {
-            if (!this.raw) { S.ui.remembered = true; changed(); return; }
+            if (!this.master || S.ui.remembered) { S.ui.remembered = true; changed(); return; }
             try {
-                const key = await C.importMasterKey(this.raw, false);
+                const key = this.master;
                 await IDB.put({ sid: this.sid, relay: this.relay, key, label: (S.app && S.app.project_name) || 'Mantra session', saved_at: Date.now() });
                 S.ui.devices = await IDB.all();
                 S.ui.remembered = true;
@@ -1003,17 +1015,12 @@
             changed();
         },
         disconnect() {
-            sessionDel(this.sid);
+            this.master = null;
             if (client) client.stop();
             client = null;
             location.assign('/');
         },
     };
-    function sessionGet(sid) {
-        try { const v = JSON.parse(sessionStorage.getItem('mantra.k.' + sid) || 'null'); return v ? { raw: C.unb64url(v.k), relay: v.r } : null; } catch (_) { return null; }
-    }
-    function sessionPut(sid, raw, relay) { try { sessionStorage.setItem('mantra.k.' + sid, JSON.stringify({ k: C.b64url(raw), r: relay })); } catch (_) { } }
-    function sessionDel(sid) { try { sessionStorage.removeItem('mantra.k.' + sid); } catch (_) { } }
 
     // ── timers ───────────────────────────────────────────────────────────────────────────────────
     // Elapsed clocks tick every second while something is live; relative times every 30 s.

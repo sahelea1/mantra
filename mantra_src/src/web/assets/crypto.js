@@ -6,6 +6,10 @@
 //   conn key = HKDF-SHA256(ikm = key, salt = client_random || host_random, info = "mantra-remote-v1", 32)
 //   nonce    = dir(1) || 00 00 00 || counter(u64 BE), AAD = the dir byte
 //   frame    = type(1) || ...   0x01 hello JSON, 0x02 data (final), 0x03 data (continued)
+//   hello    = client {"v":1,"cr":…} → host {"v":1,"hr":…} (nothing else before the key is proven;
+//              protocol/version arrive in the encrypted server hello). A host that refuses the
+//              handshake sends one plaintext 0x01 {"err":"badkey"|"hello"} and closes.
+//   message  = at most MAX_MESSAGE bytes of plaintext once fragments are joined (crypto.rs too)
 'use strict';
 (function (root) {
     const enc = new TextEncoder();
@@ -18,6 +22,8 @@
     const T_HELLO = 0x01, T_DATA = 0x02, T_CONT = 0x03;
     // The relay caps frames at 1 MiB; 900 kB of plaintext leaves room for the header and tag.
     const FRAG = 900000;
+    // crypto.rs MAX_MESSAGE: a reassembled message larger than this is refused.
+    const MAX_MESSAGE = 16 * 1024 * 1024;
 
     // ── encodings ────────────────────────────────────────────────────────────────────────────────
     function b64url(bytes) {
@@ -169,7 +175,7 @@
     }
 
     root.MantraCrypto = {
-        PBKDF2_ITERS, DIR_HOST, DIR_CLIENT, T_HELLO, T_DATA, T_CONT, FRAG,
+        PBKDF2_ITERS, DIR_HOST, DIR_CLIENT, T_HELLO, T_DATA, T_CONT, FRAG, MAX_MESSAGE,
         b64url, unb64url, base32, unbase32, normalizeCode, formatCode, concat, random, u64be, readU64be, nonce,
         deriveKey, importMasterKey, connKey, seal, open, helloFrame, parseFrame, sealMessage,
         utf8: (b) => dec.decode(b), bytes: (s) => enc.encode(s),

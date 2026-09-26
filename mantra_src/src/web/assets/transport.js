@@ -47,7 +47,8 @@
         // master: a HKDF CryptoKey from MantraCrypto.importMasterKey
         constructor(relay, sid, master) { this.relay = relay.replace(/\/+$/, ''); this.sid = sid; this.master = master; this.ws = null; }
         connect() {
-            this.opened = false; this.ck = null; this.tx = 0; this.rx = 0; this.gotData = false; this.frags = [];
+            this.opened = false; this.ck = null; this.tx = 0; this.rx = 0; this.gotData = false; this.frags = []; this.fragBytes = 0;
+            this.failReason = null;
             this.rxChain = Promise.resolve(); this.txChain = Promise.resolve();
             let ws;
             try { ws = new WebSocket(this.relay + '/c/' + this.sid); } catch (e) { setTimeout(() => this.onclose({ code: 0, reason: String(e), opened: false }), 0); return; }
@@ -68,13 +69,18 @@
             ws.onclose = (ev) => {
                 clearTimeout(this.helloTimer);
                 if (this.ws !== ws) return;
-                this.ws = null;
-                const info = { code: ev.code, reason: ev.reason, opened: this.opened };
-                // The host closes a client whose first encrypted frame doesn't decrypt — that is
-                // how a wrong password/code looks from here (the host never says why).
-                if (this.ck && !this.gotData && (ev.code === 4000 || ev.code === 1000 || ev.code === 1005)) info.badkey = true;
-                if (this.failReason) info.local = this.failReason;
-                this.onclose(info);
+                // Frames that arrived before the close may still be decrypting; the host's badkey
+                // refusal is one of them, so let the chain settle before judging the close.
+                this.rxChain.then(() => {
+                    if (this.ws !== ws) return;
+                    this.ws = null;
+                    const info = { code: ev.code, reason: ev.reason, opened: this.opened };
+                    // A wrong password/code is known only from the host's plaintext {"err":"badkey"}
+                    // frame or a local decrypt failure (both land in failReason). A close code alone
+                    // never means it: 1005/1006 is also what a dropped mobile connection looks like.
+                    if (this.failReason) info.local = this.failReason;
+                    this.onclose(info);
+                });
             };
             ws.onerror = () => { };
         }
@@ -85,13 +91,19 @@
         async recv(ws, buf) {
             if (this.ws !== ws) return;
             const f = C.parseFrame(buf);
+            // The host's one plaintext refusal before it closes us (§10.3): {"err":"badkey"} when
+            // our first encrypted frame didn't decrypt (wrong password/code), {"err":"hello"} when
+            // it couldn't read our hello. Unauthenticated, but a relay could just as well drop us.
+            if (f.type === C.T_HELLO && f.json && typeof f.json.err === 'string' && !this.gotData) {
+                throw new Error(f.json.err === 'badkey' ? 'badkey' : 'proto');
+            }
             if (!this.ck) {
                 if (f.type !== C.T_HELLO) throw new Error('proto');
                 const j = f.json || {};
                 if (j.v !== 1 || typeof j.hr !== 'string') throw new Error('proto');
                 const hr = C.unb64url(j.hr);
                 if (hr.length !== 16) throw new Error('proto');
-                this.hostHello = j;
+                // Protocol and version come later, inside the encrypted server hello (§5).
                 this.ck = await C.connKey(this.master, this.cr, hr);
                 clearTimeout(this.helloTimer);
                 this.opened = true;
@@ -104,13 +116,15 @@
             let pt;
             try { pt = await C.open(this.ck, C.DIR_HOST, f.counter, f.body); } catch (_) { throw new Error(this.gotData ? 'proto' : 'badkey'); }
             this.gotData = true;
+            // Same cap as crypto.rs MAX_MESSAGE: a peer can't make us buffer fragments forever.
+            this.fragBytes += pt.length;
+            if (this.fragBytes > C.MAX_MESSAGE) throw new Error('proto');
             if (f.type === C.T_CONT) {
                 this.frags.push(pt);
-                if (this.frags.length > 64) throw new Error('proto');
                 return;
             }
             const whole = this.frags.length ? C.concat(...this.frags, pt) : pt;
-            this.frags = [];
+            this.frags = []; this.fragBytes = 0;
             let msg;
             try { msg = JSON.parse(C.utf8(whole)); } catch (_) { return; }
             if (this.ws === ws) this.onmessage(msg);
@@ -248,7 +262,7 @@
             this.synced = false;
             this.rejectAll('connection lost');
             if (this.stopped) return;
-            if (info.badkey || info.local === 'badkey') {
+            if (info.local === 'badkey') {
                 this.stopped = true;
                 this.setState('failed', 'Wrong password or code');
                 this.emit('fatal', { code: 'badkey', error: 'Wrong password or code' });
