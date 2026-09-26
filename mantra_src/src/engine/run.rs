@@ -31,7 +31,8 @@ pub enum JobOut {
     Setup(Result<Workspace, String>),
     Wt(Result<(PathBuf, String), String>),
     Merge(git::MergeResult),
-    Checks(Vec<CheckResult>),
+    /// The results, plus the paths the checks left behind that were discarded before any commit.
+    Checks(Vec<CheckResult>, Vec<String>),
     Text(Result<String, String>),
 }
 
@@ -1497,7 +1498,18 @@ Then summarize in 2-4 lines.",
         self.log("⎔", "blue", format!("running {} gate check(s){}", checks.len(), if round > 0 { " (verify)" } else { "" }));
         let dir = self.workspace_dir();
         let timeout = Duration::from_secs(self.pattern.settings.check_timeout_secs);
-        ctx.job(JobTag::Checks { phase: idx, round }, Box::new(move || JobOut::Checks(git::run_checks(&dir, &checks, timeout))));
+        // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
+        // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
+        let tidy = self.ws.as_ref().map(|w| w.worktree).unwrap_or(false);
+        ctx.job(
+            JobTag::Checks { phase: idx, round },
+            Box::new(move || {
+                let before = if tidy { git::status_snapshot(&dir) } else { None };
+                let results = git::run_checks(&dir, &checks, timeout);
+                let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
+                JobOut::Checks(results, dropped)
+            }),
+        );
     }
 
     fn check_summary(&self) -> String {
@@ -1784,9 +1796,12 @@ Then summarize in 2-4 lines.",
                 let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), m.log);
                 self.run_checks(ctx, phase, 0);
             }
-            (JobTag::Checks { phase, round }, JobOut::Checks(results)) => {
+            (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped)) => {
                 for c in &results {
                     self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s)", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
+                }
+                if !dropped.is_empty() {
+                    self.log("⌫", "blue", format!("dropped {} file(s) left behind by checks", dropped.len()));
                 }
                 let all_ok = results.iter().all(|c| c.ok);
                 self.checks = results;
@@ -4061,10 +4076,10 @@ mod halt_tests {
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
         let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail()));
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![]));
         assert!(!run.halted());
         assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[mantra:gate-round 2]") && t.contains("Permission denied") && t.contains("mantra_ask")), "round 2 with the output and the escape hatch: {:?}", ctx.prompts);
-        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 2 }, JobOut::Checks(fail()));
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 2 }, JobOut::Checks(fail(), vec![]));
         assert!(run.halted(), "the identical failure twice means nobody is fixing it");
         assert!(run.halt.as_ref().unwrap().message.contains("identically"));
         assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));

@@ -1,6 +1,7 @@
 //! Workspace isolation: every parallel worker gets its own git worktree; phases merge at the gate.
 //! All functions are blocking and meant to run on a background thread.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -249,6 +250,53 @@ pub struct CheckResult {
     pub secs: u64,
 }
 
+/// `git status --porcelain -z` as path → XY code ("??" for untracked). Ignored files are absent,
+/// exactly as `add -A` would leave them out.
+pub type StatusSnapshot = BTreeMap<String, String>;
+
+pub fn status_snapshot(dir: &Path) -> Option<StatusSnapshot> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["status", "--porcelain", "-z"]).stdin(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut snap = BTreeMap::new();
+    let mut it = text.split('\0').filter(|e| e.len() > 3);
+    while let Some(e) = it.next() {
+        let (xy, path) = e.split_at(2);
+        snap.insert(path[1..].to_string(), xy.to_string());
+        if xy.starts_with('R') || xy.starts_with('C') {
+            it.next(); // the rename/copy source follows as its own entry
+        }
+    }
+    Some(snap)
+}
+
+/// Drop what the gate checks left behind so the phase commit never picks it up: a test runner's
+/// `__pycache__`, a build's scratch output, a formatter's edits. Only paths that were clean before
+/// the checks ran are touched — anything a worker or the gate agent produced was already in the
+/// `before` snapshot and stays. New untracked paths are removed (`git clean`, so ignored files
+/// under them survive), modified or deleted tracked files are restored from HEAD. Returns the
+/// paths dropped.
+pub fn discard_check_artifacts(dir: &Path, before: &StatusSnapshot) -> Vec<String> {
+    let Some(after) = status_snapshot(dir) else { return vec![] };
+    let mut dropped = vec![];
+    for (path, xy) in &after {
+        if before.contains_key(path) {
+            continue;
+        }
+        let ok = if xy == "??" {
+            git(dir, &["clean", "-fdq", "--", path]).is_ok()
+        } else {
+            git(dir, &["checkout", "-q", "HEAD", "--", path]).is_ok()
+        };
+        if ok {
+            dropped.push(path.clone());
+        }
+    }
+    dropped
+}
+
 pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration) -> Vec<CheckResult> {
     let mut out = vec![];
     for cmd in cmds {
@@ -296,4 +344,61 @@ pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration) -> Vec<CheckRe
         out.push(CheckResult { cmd: cmd.clone(), ok: code == Some(0), code, output, secs: start.elapsed().as_secs() });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway repo with one committed file, a `.gitignore` and a non-empty `HEAD`.
+    fn temp_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mantra-git-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        commit_all(&dir, "init").unwrap();
+        dir
+    }
+
+    fn head_files(dir: &Path) -> Vec<String> {
+        git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn check_leftovers_never_reach_the_phase_commit() {
+        let dir = temp_repo("checks");
+        // what a worker produced before the checks ran stays a candidate for the commit
+        std::fs::write(dir.join("worker.txt"), "by a worker\n").unwrap();
+        let before = status_snapshot(&dir).unwrap();
+        let cmds = vec!["mkdir -p __pycache__ && echo x > __pycache__/t.pyc && echo two >> tracked.txt && echo l > run.log".to_string()];
+        let res = run_checks(&dir, &cmds, Duration::from_secs(10));
+        assert!(res[0].ok, "{}", res[0].output);
+        let mut dropped = discard_check_artifacts(&dir, &before);
+        dropped.sort();
+        assert_eq!(dropped, vec!["__pycache__/", "tracked.txt"], "only the checks' leftovers, not the worker's file or the ignored log");
+        assert!(!dir.join("__pycache__").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "one\n", "the tracked file is back at HEAD");
+        assert!(dir.join("worker.txt").exists(), "a worker's file is never deleted");
+        assert!(dir.join("run.log").exists(), "ignored files are none of our business");
+        assert!(commit_all(&dir, "mantra: phase 1").unwrap());
+        let files = head_files(&dir);
+        assert!(files.contains(&"worker.txt".to_string()), "{files:?}");
+        assert!(!files.iter().any(|f| f.starts_with("__pycache__")), "{files:?}");
+        assert_eq!(git(&dir, &["show", "HEAD:tracked.txt"]).unwrap(), "one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clean_check_drops_nothing_and_a_worker_edit_survives() {
+        let dir = temp_repo("clean");
+        std::fs::write(dir.join("tracked.txt"), "edited by a worker\n").unwrap();
+        let before = status_snapshot(&dir).unwrap();
+        let res = run_checks(&dir, &["true".to_string()], Duration::from_secs(10));
+        assert!(res[0].ok);
+        assert!(discard_check_artifacts(&dir, &before).is_empty());
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "edited by a worker\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
