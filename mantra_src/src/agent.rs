@@ -103,6 +103,20 @@ pub enum Signal {
     EnvironmentBroken(String),
 }
 
+/// True when `text` names a sandbox that failed to start at all — bubblewrap, user namespaces,
+/// AppArmor's restriction knob, or "sandbox" paired with a failure word — as opposed to a role's
+/// own read-only limit refusing a write ("failed to write file"), which is not a broken
+/// environment but the role's own scope. Shared by the `EnvironmentBroken` signal below and by
+/// `ask_up`'s pre-routing check, so both halt on the same, single definition of "broken".
+pub fn looks_like_broken_sandbox(text: &str) -> bool {
+    let hay = text.to_lowercase();
+    hay.contains("bwrap")
+        || hay.contains("user namespace")
+        || hay.contains("unprivileged_userns")
+        || hay.contains("apparmor_restrict")
+        || (hay.contains("sandbox") && (hay.contains("fail") || hay.contains("denied") || hay.contains("cannot") || hay.contains("unable")))
+}
+
 pub struct Agent {
     pub id: AgentId,
     pub name: String,
@@ -635,10 +649,9 @@ impl Agent {
                 if !done {
                     self.activity = format!("$ {short}");
                 } else {
-                    // WP12.4/L1: a bubblewrap/user-namespace failure means every agent's shell
-                    // commands are dead on this host — surface it once as a run-level signal.
-                    let hay = out_for_probe.to_lowercase();
-                    if hay.contains("bwrap") || hay.contains("user namespaces") {
+                    // WP12.4/L1: a broken sandbox means every agent's shell commands are dead on
+                    // this host — surface it once as a run-level signal.
+                    if looks_like_broken_sandbox(&out_for_probe) {
                         signal = Some(Signal::EnvironmentBroken(crate::util::trunc(&out_for_probe, 300)));
                     }
                 }
@@ -1081,5 +1094,17 @@ mod tests {
         let s = split_diff(d);
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].0, "y");
+    }
+
+    #[test]
+    fn broken_sandbox_detection_is_specific() {
+        assert!(super::looks_like_broken_sandbox("bwrap: loopback: Failed RTM_NEWADDR"));
+        assert!(super::looks_like_broken_sandbox("Codex's Linux sandbox uses bubblewrap and needs access to create USER NAMESPACES."));
+        assert!(super::looks_like_broken_sandbox("kernel.unprivileged_userns_clone = 0"));
+        assert!(super::looks_like_broken_sandbox("kernel.apparmor_restrict_unprivileged_userns = 1"));
+        assert!(super::looks_like_broken_sandbox("the sandbox denied this operation"));
+        // a read-only role refusing a write is its own scope, not a broken environment
+        assert!(!super::looks_like_broken_sandbox("Failed to write file: README.md"));
+        assert!(!super::looks_like_broken_sandbox("tests failed: 2 assertions"));
     }
 }

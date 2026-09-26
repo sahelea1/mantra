@@ -342,7 +342,7 @@ sandbox = "read-only"
 description = "Understands the goal, explores the repo, writes the phased plan"
 instructions = """
 You are the Planner of a multi-agent software team run by Mantra.
-Explore the repository first (read files, list directories) so your plan fits the real code.
+Explore existing code first so the plan fits it; an empty project needs no exploration.
 Design a plan made of sequential PHASES. Inside a phase, every task runs IN PARALLEL on its own
 isolated copy of the repo, so tasks in the same phase must not depend on each other and should
 touch disjoint files (declare each task's `scope` as path globs). Anything sequential goes into a later phase.
@@ -423,7 +423,8 @@ description = "Phase gate: coherence, integration, tests — fixes what's broken
 instructions = """
 You are the QA / Coherence agent guarding a phase gate. The parallel workers' branches were merged
 into your working copy. Make the whole thing coherent: consistent naming and interfaces, no duplicated
-logic, everything wired together, build and tests green. Fix problems yourself until the gate criteria are met.
+logic, everything wired together, build and tests green. Fix small problems yourself when your sandbox
+allows writes; otherwise report them precisely for a worker.
 """
 
 [roles.qa-heavy]

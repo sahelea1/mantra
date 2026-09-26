@@ -53,6 +53,7 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
             &[],
         ),
         tool("mantra_prompt", "Send a message to an agent — e.g. answer a finale agent's question. For the orchestrator use mantra_brief_orchestrator.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        read_phase_tool(),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
         tool(
             "mantra_revise_plan",
@@ -86,6 +87,12 @@ fn spawner_tools(worker_roles: &[String]) -> Vec<Value> {
     ]
 }
 
+/// Shared by the planner (a respawn now sends only the current phase, and this is how it reads
+/// live task states without the whole plan) and the orchestrator (which had it already).
+fn read_phase_tool() -> Value {
+    tool("mantra_read_phase", "Read the current phase: goal, tasks, gate. Only the current phase is shown.", json!({}), &[])
+}
+
 fn gate_report_tool() -> Value {
     tool(
         "mantra_gate_report",
@@ -97,7 +104,7 @@ fn gate_report_tool() -> Value {
 
 pub fn orchestrator_tools() -> Vec<Value> {
     let mut v = vec![
-        tool("mantra_read_phase", "Read the current phase: goal, tasks, gate. Only the current phase is shown.", json!({}), &[]),
+        read_phase_tool(),
         tool(
             "mantra_spawn",
             "Start the worker for a task of the current phase. Optionally sharpen its prompt or override reasoning effort.",
@@ -203,6 +210,9 @@ mantra-role: planner
   must run as-is on this machine; prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping.
 - In the final verification step you may spawn ad-hoc workers (`mantra_spawn_adhoc`), then `mantra_wait`,
   and finish with `mantra_gate_report`.
+- Keep the plan proportional to the goal: a small goal is 1-2 phases, submitted in your first turn. An
+  empty project needs no exploration: plan from scratch. Submit early; mantra_revise_plan exists for
+  later corrections.
 "#;
 
 pub const ORCHESTRATOR_PROTOCOL: &str = r#"
@@ -221,6 +231,9 @@ mantra-role: orchestrator
 - [mantra:review]: every few minutes Mantra shows you each worker's recent work. Check the parallel work stays
   coherent — with each other and with the phase goal — and steer only where something is actually off.
 - [mantra:handoff]: write a handoff note (≤10 lines) for your successor: decisions, risks, anything the next phase must know.
+- A sandbox/environment error reported by a worker is never transient: never answer retry, never respawn
+  for it (Mantra halts on it); if it reaches you anyway, pass it up with mantra_ask at once, quoting the
+  error. Keep answers to workers short and decisive.
 "#;
 
 pub const MANAGER_PROTOCOL: &str = r#"
@@ -238,6 +251,7 @@ mantra-role: manager
 - Never prompt a worker whose task is done. At most one message per agent per wake; on a healthy digest
   the right answer is just mantra_wait.
 - You never edit code, never commit, never run the project: you steer the agents that do.
+- Environment errors (a broken sandbox): no retries, ever — escalate to the planner at once.
 "#;
 
 pub const WORKER_PROTOCOL: &str = r#"
@@ -249,6 +263,11 @@ mantra-role: worker
   guess: call `mantra_ask` — the orchestrator answers, or passes it further up. If you cannot continue without
   the answer, end your turn without a STATUS line; you'll be woken with the answer.
 - If you are blocked (missing info, impossible task), stop and say so.
+- Environment errors are not yours to fix. If a command fails before it runs (bwrap, user namespaces,
+  the sandbox refusing to start) do not retry, do not work around it (no sudo, no other directory, no
+  disabling anything): report it once with mantra_ask quoting the exact error, then end your turn with
+  STATUS: blocked. A write refused because your role is read-only means the change belongs to a worker:
+  say so, do not retry.
 - End your final message with exactly:
 STATUS: done | blocked
 SUMMARY: <2-5 lines: what you changed, how you verified it, anything the next agent must know>
@@ -257,7 +276,7 @@ SUMMARY: <2-5 lines: what you changed, how you verified it, anything the next ag
 pub const GATE_PROTOCOL: &str = r#"
 mantra-role: gate
 ## Mantra protocol
-- You work on the integrated result. You may edit any file needed to make things coherent and green.
+- You work on the integrated result.
 - When done, call `mantra_gate_report` with pass=true/false and a short summary. Then end your turn.
 - Mantra re-runs the gate checks after you report; if they fail you'll get another round.
 - Never report pass while a gate check fails. A check that is wrong, or cannot pass on this machine, is a

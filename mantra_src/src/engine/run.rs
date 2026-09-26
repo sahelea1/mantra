@@ -8,12 +8,12 @@ use super::state::{AgentState, PhaseHistory, RunState, WorkerState};
 use super::pattern::{Pattern, Role};
 use super::plan::{Phase, Plan, Task};
 use super::tools;
-use crate::agent::{Agent, ErrKind, Status};
+use crate::agent::{looks_like_broken_sandbox, Agent, ErrKind, Status};
 use crate::hub::AgentId;
 use crate::util::{clock, fmt_dur, fmt_tokens, trunc};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -1291,8 +1291,15 @@ Then summarize in 2-4 lines.",
             let r = self.role(&n);
             roles.push_str(&format!("- {n}: {} (model {}, effort {})\n", r.description, r.model, r.effort));
         }
+        // A resumed/respawned planner calls this same function, so an empty project skips the
+        // "explore first" line for it too — nothing new appears after a respawn to explore.
+        let explore = if project_is_empty(&self.workspace_dir()) {
+            "The project directory is empty (greenfield): skip exploration and submit the plan in this turn."
+        } else {
+            "Explore the project, then call mantra_submit_plan."
+        };
         format!(
-            "[mantra:plan]\nUSER REQUEST:\n{}\n\nProject directory: {}\nWorker roles you can assign:\n{roles}\nConstraints: at most {} tasks per phase; up to {} run at once; tasks in one phase run in parallel on isolated copies and must use disjoint scopes; each phase ends with gate checks (shell commands) + a QA agent.\n\nExplore the project, then call mantra_submit_plan.",
+            "[mantra:plan]\nUSER REQUEST:\n{}\n\nProject directory: {}\nWorker roles you can assign:\n{roles}\nConstraints: at most {} tasks per phase; up to {} run at once; tasks in one phase run in parallel on isolated copies and must use disjoint scopes; each phase ends with gate checks (shell commands) + a QA agent.\n\n{explore}",
             self.brief,
             self.workspace_dir().display(),
             s.max_tasks_per_phase,
@@ -1586,6 +1593,13 @@ Then summarize in 2-4 lines.",
         self.last_verify_sig = None;
         let name = self.pattern.flow.phase_gate.clone();
         let role = self.role(&name);
+        // A read-only gate role cannot fix anything itself — say so plainly instead of leaving it
+        // to discover that by trying (empty `sandbox` means workspace-write, same as `Role::default`).
+        let sandbox_note = if role.sandbox == "read-only" {
+            "Your role cannot write files: do not try to edit or create anything. Report every needed change precisely (file, what, why) in mantra_gate_report as fail with a fix list; the orchestrator routes it to a worker."
+        } else {
+            "You may edit files to make the result coherent and green (small fixes; anything larger goes into the report as a fix list)."
+        };
         let reports: String = self.workers.iter().filter(|w| w.state == WState::Done).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 1500))).collect();
         let conflicts = if self.conflicts.is_empty() {
             String::new()
@@ -1603,7 +1617,7 @@ Then summarize in 2-4 lines.",
         let id = ctx.spawn(SpawnReq {
             name: name.clone(),
             role_name: name.clone(),
-            instructions: format!("{}\n{}", role.instructions, tools::GATE_PROTOCOL),
+            instructions: format!("{}\n{}\n{sandbox_note}", role.instructions, tools::GATE_PROTOCOL),
             cwd: self.workspace_dir(),
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
             effort: None,
@@ -1933,6 +1947,19 @@ Then summarize in 2-4 lines.",
         // anything else pauses the run instead of burning tokens.
         if status == "failed" {
             let msg = error.clone().unwrap_or_default();
+            // The process is already relaunching on its own (hub.rs's crash-backoff raced this
+            // turn before it could even start) — a free retry, not a fault of this attempt's
+            // budget, so it must not spend one of `worker_retries`.
+            if msg == "agent restarting" {
+                let wait = Duration::from_secs(4);
+                let name = self.name_of(a);
+                if let Some(wi) = self.worker_idx(a) {
+                    self.workers[wi].state = WState::Retrying(Instant::now() + wait);
+                }
+                self.log("↻", "amber", format!("{name}: relaunching — retrying automatically"));
+                self.continue_queue.push((a, Instant::now() + wait, "[mantra:retry] Your previous turn failed to start while the process was restarting. Continue exactly where you left off.".into()));
+                return;
+            }
             if matches!(kind, Some(ErrKind::Transient) | Some(ErrKind::ContextFull)) {
                 let count = {
                     let n = self.retry_counts.entry(a).or_insert(0);
@@ -2265,6 +2292,13 @@ Then summarize in 2-4 lines.",
 
     pub fn on_crash(&mut self, ctx: &mut dyn Ctx, a: AgentId, reason: &str, restarting: bool) {
         let n = self.name_of(a);
+        // A relaunch Mantra itself asked for (new effort/model, "restart requested") or a fresh
+        // process after a dead resume ("resumed session …") is not a crash: never alert, and never
+        // say "crashed" for something that was asked for.
+        if reason.starts_with("restart") || reason.starts_with("resumed session") {
+            self.log("↻", "amber", format!("{n}: {reason}"));
+            return;
+        }
         if restarting {
             self.log("↻", "amber", format!("{n}: process crashed ({}) — restarting & resuming", trunc(reason, 50)));
         } else {
@@ -2653,6 +2687,9 @@ Then summarize in 2-4 lines.",
     /// `@agent message` from the user. `mode` is `Queue` for a plain Enter (waits behind a busy
     /// agent's current turn) or `Force` for ctrl+f (delivered right away).
     pub fn direct(&mut self, ctx: &mut dyn Ctx, name: &str, text: &str, mode: Send) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
         match self.resolve(name) {
             Some(a) => {
                 self.mark_edge(a);
@@ -2999,10 +3036,18 @@ Then summarize in 2-4 lines.",
         }
         let id = self.spawn_planner(ctx);
         self.mark_edge(id);
-        let stage_txt = format!("{:?}", self.stage);
-        let resume = match &self.plan {
-            Some(p) => format!("[mantra:respawn] A plan v{} exists (attached). Continue from stage {stage_txt}.\n\n{}", self.plan_version, serde_json::to_string_pretty(p).unwrap_or_default()),
-            None => format!("[mantra:respawn] Continue from stage {stage_txt}.\n\n{}", self.planning_prompt()),
+        let stage_txt = super::state::stage_label(&self.stage);
+        // The whole plan used to be attached here, which is exactly the huge context a respawn is
+        // meant to avoid — the current phase (like `respawn_orchestrator`) plus `mantra_read_phase`
+        // for live task states covers what a resuming planner needs; the full plan is one call away.
+        let resume = if self.plan.is_some() {
+            let phase_json = self.current_phase().map(|ph| serde_json::to_string_pretty(ph).unwrap_or_default()).unwrap_or_default();
+            format!(
+                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; ask for the full plan only if you must revise other phases.",
+                self.plan_version
+            )
+        } else {
+            self.planning_prompt()
         };
         ctx.prompt(id, join_note(note, resume));
         self.log("↻", "violet", "planner respawned (watchdog/manual)");
@@ -3509,6 +3554,14 @@ Then summarize in 2-4 lines.",
     /// orchestrator → planner (the planner, in turn, has `mantra_ask_user`). The asker is marked as
     /// waiting, so its idle turn end is not read as "done", and the rung above is expected to act.
     fn ask_up(&mut self, ctx: &mut dyn Ctx, a: AgentId, q: String) -> (String, bool) {
+        // A sandbox/environment error is never a decision to route up the chain: it halts the
+        // whole run at once, on whichever agent first reports it, instead of bouncing between
+        // orchestrator/planner as "transient" while every agent's commands stay dead (WP: engine
+        // roles stick to their job).
+        if looks_like_broken_sandbox(&q) {
+            self.on_environment_broken(ctx, a, q);
+            return ("environment error: the run is halted for the user; do nothing more".into(), true);
+        }
         let from = self.name_of(a);
         let to_planner = Some(a) == self.orchestrator || Some(a) == self.manager || matches!(self.stage, Stage::Finale { .. }) || self.orchestrator.is_none();
         self.pending_questions.insert(a, q.clone());
@@ -3553,6 +3606,18 @@ fn failing_sig(checks: &[CheckResult]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True when `dir` holds nothing but `.git`, `.mantra` and dotfiles — a fresh/greenfield project
+/// the planner does not need to explore before submitting a plan. An unreadable directory is
+/// never treated as empty (the old "explore first" behaviour is the safe default).
+fn project_is_empty(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    !entries.filter_map(|e| e.ok()).any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name != ".git" && name != ".mantra" && !name.starts_with('.')
+    })
 }
 
 fn reason_label(r: HaltReason) -> String {
@@ -3919,6 +3984,31 @@ mod halt_tests {
         let new_planner = run.planner.expect("planner still set after respawn");
         assert_ne!(new_planner, planner);
         assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:respawn]")));
+    }
+
+    /// A respawned planner used to be handed the whole plan (every phase, every task) — exactly
+    /// the huge context a respawn is meant to save. It gets only the current phase now, plus
+    /// `mantra_read_phase` for live task states; the full plan is one call away if it needs it.
+    #[test]
+    fn respawn_planner_sends_only_the_current_phase() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        let mut plan = one_task_phase();
+        plan.phases.push(Phase { id: "p2".into(), name: "two".into(), tasks: vec![Task { id: "t2".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() });
+        run.plan = Some(plan);
+        run.plan_version = 3;
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+
+        run.respawn(&mut ctx, planner, None).unwrap();
+
+        let new_planner = run.planner.expect("planner still set after respawn");
+        let prompt = ctx.prompts.iter().find(|(a, t)| *a == new_planner && t.contains("[mantra:respawn]")).map(|(_, t)| t.clone()).expect("planner briefed");
+        assert!(prompt.contains("plan v3"), "{prompt}");
+        assert!(prompt.contains("\"p1\""), "the current phase must be included: {prompt}");
+        assert!(!prompt.contains("\"p2\""), "a later phase must not be attached — that is what mantra_read_phase / mantra_revise_plan are for: {prompt}");
+        assert!(prompt.contains("mantra_read_phase"), "{prompt}");
     }
 
     /// Review fix: the built-in default pattern's last finale step reuses `self.planner` as the
@@ -4392,6 +4482,28 @@ mod halt_tests {
         let first = run.halt.as_ref().unwrap().message.clone();
         run.on_environment_broken(&mut ctx, worker_agent, "bwrap: a different failure".into());
         assert_eq!(run.halt.as_ref().unwrap().message, first, "a second EnvironmentBroken must not overwrite the first halt");
+    }
+
+    /// A worker's `mantra_ask` naming a broken sandbox must halt the run right there — never
+    /// bounce up to the orchestrator as an ordinary question ("transient, retry", a respawn, …).
+    #[test]
+    fn worker_environment_question_halts_instead_of_reaching_the_orchestrator() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let worker_agent = ctx.add_busy();
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+
+        let (msg, ok) = run.handle_tool(&mut ctx, worker_agent, "mantra_ask", &json!({"question": "bwrap: loopback: Failed RTM_NEWADDR"}));
+        assert!(ok, "{msg}");
+        assert!(run.halted());
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::Environment);
+        assert!(!run.waiting_for_answer(worker_agent), "this is a halt, not an open question");
+        assert!(ctx.prompts.is_empty(), "the orchestrator inbox must never see a sandbox failure: {:?}", ctx.prompts);
     }
 
     // Manager tests (v0.4) ---------------------------------------------------------------------
@@ -5142,5 +5254,44 @@ mod halt_tests {
         let mut failed = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
         failed.fail_run(&mut ctx, "planner did not submit a valid plan".into());
         assert!(failed.finished_unix.is_some());
+    }
+
+    /// A planner spending minutes exploring nothing (an empty project) is exactly the waste this
+    /// checks for: `planning_prompt` — used both for a fresh planner and a resumed/respawned one —
+    /// must tell it up front there is nothing to explore.
+    #[test]
+    fn planning_prompt_skips_exploration_for_an_empty_project() {
+        let dir = std::env::temp_dir().join(format!("mantra-empty-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".mantra")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "").unwrap();
+
+        let run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
+        let prompt = run.planning_prompt();
+        assert!(prompt.contains("The project directory is empty (greenfield)"), "{prompt}");
+        assert!(!prompt.contains("Explore the project"), "{prompt}");
+
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        let prompt = run.planning_prompt();
+        assert!(prompt.contains("Explore the project, then call mantra_submit_plan."), "{prompt}");
+        assert!(!prompt.contains("greenfield"), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_ignores_a_whitespace_only_message() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        run.orchestrator = Some(orch);
+
+        assert!(!run.direct(&mut ctx, "orchestrator", "   ", Send::Auto), "an empty message is not delivered");
+        assert!(ctx.prompts.is_empty(), "nothing must be sent: {:?}", ctx.prompts);
+        assert!(run.pulse.is_empty(), "and nothing logged for it");
+
+        assert!(run.direct(&mut ctx, "orchestrator", "status?", Send::Auto), "a real message still goes through");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("status?")));
     }
 }
