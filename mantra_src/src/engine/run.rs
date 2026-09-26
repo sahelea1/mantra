@@ -2173,7 +2173,9 @@ Then summarize in 2-4 lines.",
         if restarting {
             self.log("↻", "amber", format!("{n}: process crashed ({}) — restarting & resuming", trunc(reason, 50)));
         } else {
-            self.alert(ctx, format!("{n} keeps crashing: {} (select it and press r to restart)", trunc(reason, 80)));
+            // Keep the backend's own error line (`codex exited (code 1): …/proc/self/exe…`): it is
+            // what tells installation apart from protocol, provider or sandbox trouble.
+            self.alert(ctx, format!("{n} keeps crashing: {} (select it and press r to restart)", trunc(reason, 240)));
         }
     }
 

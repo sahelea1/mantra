@@ -269,6 +269,30 @@ pub async fn handshake(conn: &Conn) -> std::result::Result<Value, RpcError> {
     Ok(r)
 }
 
+/// The process's stderr after a request failed before it was ready: waits up to `grace` for the
+/// reader to report `Closed` — a process that died mid-handshake has usually not had its last
+/// stderr line read yet when the pending request fails — else whatever is buffered so far.
+pub async fn stderr_after_failure(conn: &Conn, inc: &mut mpsc::UnboundedReceiver<Incoming>, grace: Duration) -> String {
+    let closed = async {
+        loop {
+            match inc.recv().await {
+                Some(Incoming::Closed { stderr_tail }) => break Some(stderr_tail),
+                Some(_) => continue,
+                None => break None,
+            }
+        }
+    };
+    match tokio::time::timeout(grace, closed).await {
+        Ok(Some(t)) if !t.trim().is_empty() => t,
+        _ => {
+            // The stderr task can still be behind the stdout one on a busy runtime (seen on the
+            // first spawn at startup): give it a moment before settling for what is buffered.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            conn.stderr_tail()
+        }
+    }
+}
+
 /// Codex diagnostics that carry no information for Mantra users and repeat in bulk.
 fn is_stderr_noise(line: &str) -> bool {
     const NOISE: &[&str] = &[

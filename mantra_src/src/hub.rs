@@ -243,6 +243,19 @@ async fn read_bridge_hello(mut stream: UnixStream) -> Option<(AgentId, UnixStrea
 }
 
 const MAX_RESTARTS: u32 = 5;
+/// Attempts (first launch included) a process that never reaches `Ready` gets before the agent
+/// parks: a spawn refused, an app-server that exits before the handshake, a rejected thread start
+/// all fail the same way every time, so retrying five times over minutes only delays the halt.
+const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+
+/// The backoff before the next automatic restart, or `None` when the budget is spent and the
+/// agent should park until the user asks for a restart. `attempt` counts this failure (1-based):
+/// consecutive launch failures for a launch failure, restarts within the 10-minute window
+/// otherwise.
+fn restart_backoff(attempt: u32, launch_failure: bool) -> Option<Duration> {
+    let budget = if launch_failure { MAX_LAUNCH_ATTEMPTS - 1 } else { MAX_RESTARTS };
+    (attempt <= budget).then(|| Duration::from_millis(500 * (1u64 << attempt.min(6))))
+}
 
 async fn agent_task(
     id: AgentId,
@@ -262,6 +275,7 @@ async fn agent_task(
     let mut model = spec.model.clone();
     let mut approval = spec.approval.clone();
     let mut restarts: u32 = 0;
+    let mut launch_failures: u32 = 0;
     let mut window = Instant::now();
 
     'outer: loop {
@@ -269,22 +283,26 @@ async fn agent_task(
             Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, restarts > 0).await,
             Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, restarts > 0).await,
         };
+        let launch_failure = matches!(started, Exit::LaunchFailed(_));
         match started {
             Exit::Shutdown => {
                 let _ = ev.send(HubEvent::Exited { agent: id });
                 return;
             }
-            Exit::Crashed(reason) => {
+            Exit::Crashed(reason) | Exit::LaunchFailed(reason) => {
                 if window.elapsed() > Duration::from_secs(600) {
                     window = Instant::now();
                     restarts = 0;
                 }
                 restarts += 1;
-                let restarting = restarts <= MAX_RESTARTS;
-                crate::mlog!("agent {id} crashed: {reason} (attempt {restarts}, restarting={restarting})");
+                // A crash after `Ready` proves the launch path works: the launch budget is per
+                // unbroken streak of failures to come up, not per lifetime.
+                launch_failures = if launch_failure { launch_failures + 1 } else { 0 };
+                let backoff = restart_backoff(if launch_failure { launch_failures } else { restarts }, launch_failure);
+                let restarting = backoff.is_some();
+                crate::mlog!("agent {id} {}: {reason} (attempt {restarts}, restarting={restarting})", if launch_failure { "failed to launch" } else { "crashed" });
                 let _ = ev.send(HubEvent::Crashed { agent: id, reason, restarting, attempt: restarts });
-                if restarting {
-                    let backoff = Duration::from_millis(500 * (1u64 << restarts.min(6)));
+                if let Some(backoff) = backoff {
                     // Wait out the backoff, but stay responsive to shutdown.
                     let deadline = tokio::time::sleep(backoff);
                     tokio::pin!(deadline);
@@ -314,6 +332,7 @@ async fn agent_task(
                         }
                         Some(Cmd::Restart) => {
                             restarts = 0;
+                            launch_failures = 0;
                             window = Instant::now();
                             continue 'outer;
                         }
@@ -330,7 +349,11 @@ async fn agent_task(
 
 enum Exit {
     Shutdown,
+    /// The process died (or was told to restart) after it had reached `Ready`.
     Crashed(String),
+    /// The process never reached `Ready`: spawn refused, handshake failed, thread start rejected.
+    /// Deterministic in practice, so `agent_task` gives it the short `MAX_LAUNCH_ATTEMPTS` budget.
+    LaunchFailed(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -348,11 +371,14 @@ async fn run_process(
 ) -> Exit {
     let (conn, mut inc, mut child) = match rpc::spawn(codex_cmd, &spec.extra_args, &spec.cwd, &spec.envs) {
         Ok(x) => x,
-        Err(e) => return Exit::Crashed(e.to_string()),
+        Err(e) => return Exit::LaunchFailed(e.to_string()),
     };
     if let Err(e) = rpc::handshake(&conn).await {
+        // Codex says why it died on stderr (`/proc/self/exe` missing, a config it rejects, …);
+        // that line is what the user needs, "codex process exited (-1)" is not.
+        let detail = last_significant_stderr_line(&rpc::stderr_after_failure(&conn, &mut inc, Duration::from_millis(1500)).await);
         let _ = child.kill().await;
-        return Exit::Crashed(format!("handshake failed: {e}"));
+        return Exit::LaunchFailed(if detail.is_empty() { format!("handshake failed: {e}") } else { format!("handshake failed: {e} — {detail}") });
     }
 
     // Start or resume the thread.
@@ -398,7 +424,7 @@ async fn run_process(
         Err(e) => {
             let tail = conn.stderr_tail();
             let _ = child.kill().await;
-            return Exit::Crashed(if tail.trim().is_empty() {
+            return Exit::LaunchFailed(if tail.trim().is_empty() {
                 format!("thread start failed: {e}")
             } else {
                 format!("thread start failed: {e} — {}", tail.replace('\n', " / ").trim())
@@ -567,6 +593,23 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_failures_stop_after_a_short_budget_while_crashes_keep_the_long_one() {
+        // A process that never comes up: 3 attempts in all (2 restarts), quick backoff between them.
+        assert_eq!(restart_backoff(1, true), Some(Duration::from_millis(1000)));
+        assert_eq!(restart_backoff(2, true), Some(Duration::from_millis(2000)));
+        assert_eq!(restart_backoff(3, true), None);
+        assert_eq!(restart_backoff(4, true), None);
+        // A crash mid-work keeps the classic MAX_RESTARTS budget, exponential and capped.
+        for a in 1..=MAX_RESTARTS {
+            assert!(restart_backoff(a, false).is_some(), "restart {a} of {MAX_RESTARTS} must still retry");
+        }
+        assert_eq!(restart_backoff(MAX_RESTARTS + 1, false), None);
+        assert_eq!(restart_backoff(3, false), Some(Duration::from_millis(4000)));
+        assert!(restart_backoff(1, false) < restart_backoff(2, false));
+    }
+
     #[test]
     fn picks_the_last_non_noise_stderr_line() {
         assert_eq!(last_significant_stderr_line("boot ok\nWARNING: bubblewrap sandbox degraded\n"), "boot ok");

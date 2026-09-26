@@ -1275,7 +1275,7 @@ impl App {
                     self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));
                 }
                 if Some(agent) == self.solo && !restarting {
-                    self.toast("Solo agent is down — check the CLI is installed & logged in / the provider key (see log), /new to retry", Level::Error);
+                    self.toast(format!("Solo agent is down: {} — /new to retry (full error in the log)", crate::util::trunc(&reason, 160)), Level::Error);
                 }
             }
             HubEvent::Exited { agent } => {

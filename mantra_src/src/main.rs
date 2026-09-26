@@ -15,6 +15,7 @@ mod util;
 mod web;
 
 use anyhow::Result;
+use serde_json::json;
 use app::{App, AppEvent};
 use ratatui::backend::{Backend, CrosstermBackend, TestBackend};
 use ratatui::crossterm::event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
@@ -804,8 +805,26 @@ fn doctor() {
     // WP10.5: both CLI probes share one 5s timeout (thread + `recv_timeout`), so a hung binary
     // (observed in this sandbox for `claude` under `subscription` auth, §0.3) can never hang doctor.
     let (good, text) = probe_cli(&s.codex_command[0], " — npm i -g @openai/codex");
-    println!("{} codex: {text}", ok(good));
+    println!("{} codex executable: {text}", ok(good));
     let r = config::Registry::load();
+    // Readiness, not presence: the same spawn + `initialize` handshake an agent does, one no-op
+    // command through the configured sandbox, then a clean shutdown — each its own row and
+    // verdict, each bounded by PROBE_TIMEOUT, each failure quoting Codex's own error line.
+    let (server, sandbox) = probe_app_server(&s, &r);
+    match &server {
+        Ok(t) => println!("{} codex app-server: {t}", ok(true)),
+        Err(e) => println!("{} codex app-server: {e}", ok(false)),
+    }
+    let (verdict, text) = provider_row(&s, &r);
+    println!("{} provider: {text}", verdict.map(ok).unwrap_or(" "));
+    match &sandbox {
+        Ok(t) => println!("{} sandbox: {t}", ok(true)),
+        Err(e) => match util::sandbox_probe() {
+            // The kernel knob explains the failure — say so, with the fix.
+            Err(why) if !e.starts_with("skipped") => println!("{} sandbox: {e}\n  {why}", ok(false)),
+            _ => println!("{} sandbox: {e}", ok(false)),
+        },
+    }
     if let Ok(o) = std::process::Command::new(&s.codex_command[0]).args(["login", "status"]).output() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let line = login_status_line(&t);
@@ -823,10 +842,6 @@ fn doctor() {
     }
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
-    match util::sandbox_probe() {
-        Ok(()) => println!("{} sandbox: user namespaces available (Codex's bubblewrap sandbox can run)", ok(true)),
-        Err(e) => println!("{} sandbox: {e}", ok(false)),
-    }
     println!("  terminal: TERM={} COLORTERM={} TERM_PROGRAM={}", std::env::var("TERM").unwrap_or_default(), std::env::var("COLORTERM").unwrap_or_default(), std::env::var("TERM_PROGRAM").unwrap_or_default());
     ui::theme::init(&s);
     println!("  colors: {:?} · glyphs: {}", ui::theme::depth(), if ui::theme::ascii() { "ascii" } else { "unicode" });
@@ -871,6 +886,156 @@ fn doctor() {
         }
     }
     println!("  log: {}", config::log_path().display());
+}
+
+/// Hard cap on each readiness probe in `doctor` (handshake, no-op exec, `GET /models`), so a hung
+/// app-server or a black-holed provider host can never hang doctor itself.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Launches the configured `codex_command` exactly as `hub::run_process` does (`rpc::spawn` with
+/// the registry's `-c model_providers.*` args and the default model's key in the environment),
+/// runs the `initialize`/`initialized` handshake, then asks the server for one `command/exec` of
+/// `true` under the configured sandbox policy — the same exec path an agent's commands take — and
+/// shuts the process down cleanly (stdin closed, short grace, kill). Returns the app-server row
+/// and the sandbox row; a failure carries Codex's own last stderr line, not a generic message.
+fn probe_app_server(s: &config::Settings, r: &config::Registry) -> (Result<String, String>, Result<String, String>) {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => return (Err(format!("no runtime: {e}")), Err("skipped".into())),
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let m = r.resolve(&s.default_model);
+    let envs: Vec<(String, String)> = r.providers.iter().find(|p| p.id == m.provider).and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k))).into_iter().collect();
+    let extra = r.provider_args();
+    let sandbox = s.sandbox.clone();
+    rt.block_on(async move {
+        let started = Instant::now();
+        let (conn, mut inc, mut child) = match rpc::spawn(&s.codex_command, &extra, &cwd, &envs) {
+            Ok(x) => x,
+            Err(e) => return (Err(e.to_string()), Err("skipped — app-server did not start".into())),
+        };
+        let hello = match tokio::time::timeout(PROBE_TIMEOUT, rpc::handshake(&conn)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                let tail = rpc::stderr_after_failure(&conn, &mut inc, Duration::from_millis(1500)).await;
+                let code = child.try_wait().ok().flatten().and_then(|st| st.code()).map(|c| format!(" (exit code {c})")).unwrap_or_default();
+                let _ = child.kill().await;
+                let why = if tail.trim().is_empty() { format!("handshake failed: {e}{code}") } else { format!("handshake failed: {e}{code}\n    {}", tail.trim().replace('\n', "\n    ")) };
+                return (Err(why), Err("skipped — app-server not ready".into()));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return (Err(format!("no answer to `initialize` within {}s", PROBE_TIMEOUT.as_secs())), Err("skipped — app-server not ready".into()));
+            }
+        };
+        let agent = hello.get("userAgent").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let server = Ok(format!("ready — handshake in {:.1}s{}", started.elapsed().as_secs_f32(), if agent.is_empty() { String::new() } else { format!(" · {agent}") }));
+
+        // One harmless command through the sandbox policy the Solo agent would get.
+        let policy = match sandbox.as_str() {
+            "danger-full-access" => json!({ "type": "dangerFullAccess" }),
+            "read-only" => json!({ "type": "readOnly" }),
+            _ => json!({ "type": "workspaceWrite", "writableRoots": [cwd.to_string_lossy()] }),
+        };
+        let params = json!({ "command": ["true"], "cwd": cwd.to_string_lossy(), "sandboxPolicy": policy, "timeoutMs": 5000 });
+        let exec = conn.request_timeout("command/exec", params, PROBE_TIMEOUT).await;
+        let sandbox_row = match exec {
+            Ok(v) => {
+                let code = v.get("exitCode").and_then(|c| c.as_i64()).unwrap_or(-1);
+                let err = v.get("stderr").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                if code == 0 {
+                    Ok(format!("{sandbox} — `true` ran through the app-server sandbox{}", if sandbox == "danger-full-access" { " (no isolation in this mode)" } else { "" }))
+                } else {
+                    Err(format!("{sandbox} — `true` exited {code} in the sandbox{}", if err.is_empty() { String::new() } else { format!(": {}", util::trunc(&err, 300)) }))
+                }
+            }
+            // Codex before `command/exec` existed: probe the sandbox helper it runs commands with.
+            Err(e) if e.code == -32601 => sandbox_helper_probe(&s.codex_command[0], &cwd),
+            Err(e) => {
+                let tail = rpc::stderr_after_failure(&conn, &mut inc, Duration::from_millis(1500)).await;
+                let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+                Err(format!("{sandbox} — command/exec failed: {e}{}", if last.is_empty() { String::new() } else { format!("\n    {}", util::trunc(&last, 300)) }))
+            }
+        };
+
+        // Clean shutdown: closing stdin is how the app-server is told to go; kill only if it lingers.
+        drop(conn);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
+        (server, sandbox_row)
+    })
+}
+
+/// `codex sandbox -- true`: the helper (bundled bubblewrap on Linux, seatbelt on macOS) an older
+/// app-server runs every command through, with a hard cap so a stuck helper can't hang doctor.
+fn sandbox_helper_probe(cmd0: &str, cwd: &std::path::Path) -> Result<String, String> {
+    let name = cmd0.to_string();
+    let dir = cwd.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new(&name).args(["sandbox", "-C"]).arg(&dir).args(["--", "true"]).output());
+    });
+    match rx.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(o)) if o.status.success() => Ok("`codex sandbox -- true` ran (this app-server has no command/exec; its sandbox helper works)".into()),
+        Ok(Ok(o)) => {
+            let err = util::strip_ansi(&String::from_utf8_lossy(&o.stderr));
+            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+            Err(format!("`codex sandbox -- true` exited {:?}{}", o.status.code(), if last.is_empty() { String::new() } else { format!(": {}", util::trunc(&last, 300)) }))
+        }
+        Ok(Err(e)) => Err(format!("couldn't run `{cmd0} sandbox`: {e}")),
+        Err(_) => Err(format!("`codex sandbox -- true` gave no answer within {}s", PROBE_TIMEOUT.as_secs())),
+    }
+}
+
+/// The `provider` doctor row for the default model's provider: is the key source there (the
+/// env var set, or a key stored in models.toml), and does the endpoint accept it — checked with
+/// `GET /models`, which is free on every provider; no inference request is ever sent. The verdict
+/// is `None` when there is nothing Mantra can check (Codex's own account, a subscription login).
+fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, String) {
+    let alias = &s.default_model;
+    let m = r.resolve(alias);
+    if !m.is_custom_provider() {
+        return (None, format!("`{alias}` runs on Codex's own account — see the login row"));
+    }
+    let Some(p) = r.providers.iter().find(|p| p.id == m.provider) else {
+        return (Some(false), format!("`{alias}` uses provider '{}' which is not in /models", m.provider));
+    };
+    let name = r.provider_name(&p.id);
+    let key_src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        format!("${} set", p.env_key.trim())
+    } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+        "key stored in models.toml".to_string()
+    } else {
+        format!("${} NOT set and no key stored (/models to fix)", p.env_var_name())
+    };
+    if p.kind == config::ProviderKind::ClaudeCode {
+        if p.auth != "api_key" {
+            return (None, format!("{name} (Claude Code, subscription) for `{alias}`: `claude` holds the login — nothing to check here"));
+        }
+        return (Some(p.resolve_key().is_some()), format!("{name} (Claude Code, api_key) for `{alias}`: {key_src}"));
+    }
+    let Some(key) = p.resolve_key() else {
+        return (Some(false), format!("{name} for `{alias}`: {key_src}"));
+    };
+    // `GET /models` on a thread with a hard cap: curl's own limit is longer than PROBE_TIMEOUT.
+    let (base, model) = (p.base_url.clone(), m.model.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(discover::list_models(&base, Some(&key)));
+    });
+    let host = p.base_url.trim().trim_end_matches('/').to_string();
+    match rx.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(found)) => {
+            let listed = found.iter().any(|f| f.id == model);
+            (Some(true), format!("{name} for `{alias}`: {key_src} · {host}/models accepts the key ({} models{})", found.len(), if listed { format!(", `{model}` listed") } else { format!("; `{model}` not among them — the tag is sent as-is") }))
+        }
+        Ok(Err(e)) if e.contains("HTTP 401") || e.contains("HTTP 403") => (Some(false), format!("{name} for `{alias}`: {key_src} · key rejected — {e}")),
+        Ok(Err(e)) if e.starts_with("couldn't reach") || e.starts_with("couldn't run") => (Some(false), format!("{name} for `{alias}`: {key_src} · {e}")),
+        // Answered, but not with a model list (no /models endpoint): the key is there, that is all doctor can say.
+        Ok(Err(e)) => (None, format!("{name} for `{alias}`: {key_src} · not verified ({e})")),
+        Err(_) => (Some(false), format!("{name} for `{alias}`: {key_src} · {host}/models gave no answer within {}s", PROBE_TIMEOUT.as_secs())),
+    }
 }
 
 /// The one line of `codex login status` output that says whether we are logged in. Codex prints

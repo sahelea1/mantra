@@ -73,7 +73,7 @@ pub(super) async fn run_claude_process(
         None => return Exit::Crashed("internal error: Claude backend spawned without ClaudeSpawn config".into()),
     };
     let Some((prog, base_args)) = claude_cmd.split_first() else {
-        return Exit::Crashed("empty claude command".into());
+        return Exit::LaunchFailed("empty claude command".into());
     };
     let resume_id = session_id.clone();
     let sid = resume_id.clone().unwrap_or_else(crate::util::uuid_v4);
@@ -86,12 +86,12 @@ pub(super) async fn run_claude_process(
     crate::mlog!("claude {id}: spawn {} {}", prog, args.join(" "));
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => return Exit::Crashed(format!("failed to start `{}`: {e}", claude_cmd.join(" "))),
+        Err(e) => return Exit::LaunchFailed(format!("failed to start `{}`: {e}", claude_cmd.join(" "))),
     };
     crate::mlog!("claude {id}: spawned pid={:?}", child.id());
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill().await;
-        return Exit::Crashed("claude: missing stdio pipes".into());
+        return Exit::LaunchFailed("claude: missing stdio pipes".into());
     };
     let mut stdin = stdin;
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<LineIn>();
