@@ -281,7 +281,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         None => cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?),
     };
     if demo {
-        let exe = std::env::current_exe()?;
+        // The demo needs nothing but this binary and its temp repo — so the exe lookup must
+        // survive a container without /proc/self/exe (util::self_exe falls back to argv[0]).
+        let exe = util::self_exe()?;
         settings.codex_command = vec![exe.to_string_lossy().to_string(), "mock-codex".into()];
         // WP10.6: mirror the Codex override above for the Claude Code backend. Injected in memory
         // (never saved) regardless of `config::claude_available()`, so `--demo --pattern

@@ -583,11 +583,29 @@ impl App {
             },
         );
         self.solo = Some(id);
-        if let Some(why) = self.registry.alias_problem(&self.settings.default_model) {
+        if let Some(why) = self.model_problem(&self.settings.default_model) {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, &why);
             }
         }
+    }
+
+    /// `Registry::alias_problem`, except in demo mode: the mock backends never contact a
+    /// provider, so a missing key for whatever models.toml configures must not block the demo
+    /// (the finding was `--demo` refusing to start over an unset custom-provider variable).
+    fn model_problem(&self, alias: &str) -> Option<String> {
+        if self.demo {
+            return None;
+        }
+        self.registry.alias_problem(alias)
+    }
+
+    /// `Registry::preflight` with the same demo-mode exemption as `model_problem`.
+    fn preflight(&self, pattern: &Pattern) -> Vec<String> {
+        if self.demo {
+            return vec![];
+        }
+        self.registry.preflight(pattern)
     }
 
     /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
@@ -804,7 +822,7 @@ impl App {
                 return;
             }
         };
-        let problems = self.registry.preflight(&pattern);
+        let problems = self.preflight(&pattern);
         if !problems.is_empty() {
             // L3: fail before spending a single turn, naming the role, provider and variable.
             // Shown where the user is looking: as a toast, and in the Solo log if one exists.
@@ -866,7 +884,7 @@ impl App {
             .and_then(|s| Pattern::from_toml(&s).ok())
             .or_else(|| Pattern::load(&st.pattern, &self.project).ok())
             .unwrap_or_else(Pattern::builtin);
-        let problems = self.registry.preflight(&pattern);
+        let problems = self.preflight(&pattern);
         if let Some(p) = problems.first() {
             self.toast(format!("cannot resume: {p}"), Level::Error);
             return;
@@ -2115,6 +2133,33 @@ mod tests {
             other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    #[test]
+    fn demo_mode_skips_provider_key_checks() {
+        // The demo's mock backends never reach a provider: a default model on a custom provider
+        // whose key variable is unset must neither warn about the key nor block a run.
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "testing".into(), provider: "riti".into(), model: "testing".into(), ..Default::default() });
+        let mut settings = Settings::default();
+        settings.default_model = "testing".into();
+        let mut pattern = Pattern::builtin();
+        for r in pattern.roles.values_mut() {
+            r.model = "testing".into();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = std::env::temp_dir().join(format!("mantra-demo-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |demo| App::new(settings.clone(), reg.clone(), dir.clone(), Hub::new(vec![], vec![], ev_tx.clone(), false), tx.clone(), demo);
+        let real = mk(false);
+        assert!(real.model_problem("testing").is_some(), "sanity: the key really is missing");
+        assert!(!real.preflight(&pattern).is_empty());
+        let demo = mk(true);
+        assert_eq!(demo.model_problem("testing"), None);
+        assert!(demo.preflight(&pattern).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

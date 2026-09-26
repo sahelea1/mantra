@@ -310,6 +310,31 @@ fn which_in(cmd: &str, path_var: &str) -> Option<PathBuf> {
     None
 }
 
+/// This binary's own path, for re-spawning itself (`mantra mock-codex`, `mantra mcp-bridge`).
+/// `current_exe()` reads `/proc/self/exe`, which some containers don't mount — then argv[0] is
+/// the next best thing: a path is taken as invoked (a relative one against the cwd), a bare
+/// name is looked up on `$PATH` exactly as the shell that launched us did.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    match std::env::current_exe() {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let arg0 = std::env::args_os().next().unwrap_or_default().to_string_lossy().into_owned();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            exe_from_argv0(&arg0, &std::env::var("PATH").unwrap_or_default(), &cwd)
+                .ok_or_else(|| std::io::Error::new(e.kind(), format!("{e}; and argv[0] {arg0:?} does not name a file either")))
+        }
+    }
+}
+
+/// argv[0] → an absolute path to an existing file, or None. PATH and cwd are parameters for the
+/// same reason as `which_in`'s.
+fn exe_from_argv0(arg0: &str, path_var: &str, cwd: &Path) -> Option<PathBuf> {
+    let p = if arg0.contains(['/', std::path::MAIN_SEPARATOR]) { PathBuf::from(arg0) } else { which_in(arg0, path_var)? };
+    // (`join` keeps an already-absolute path as it is.)
+    let p = cwd.join(p);
+    p.is_file().then_some(p)
+}
+
 /// A one-line, actionable reason a resolved command cannot be executed, or None when it can.
 pub fn exec_problem(path: &Path) -> Option<String> {
     let p = path.display();
@@ -355,6 +380,28 @@ mod tests {
     #[test]
     fn stats() {
         assert_eq!(diff_stats("--- a\n+++ b\n+x\n-y\n+z\n"), (2, 1));
+    }
+    #[test]
+    fn argv0_fallback_for_the_self_exe() {
+        let dir = std::env::temp_dir().join(format!("mantra-argv0-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mantra"), "").unwrap();
+        std::fs::write(dir.join("mantra-here"), "").unwrap();
+        let path_var = std::env::join_paths([dir.join("nowhere"), bin.clone()]).unwrap();
+        let path_var = path_var.to_string_lossy().into_owned();
+        // bare name → looked up on PATH
+        assert_eq!(exe_from_argv0("mantra", &path_var, &dir), Some(bin.join("mantra")));
+        // a relative path is resolved against the cwd, never searched on PATH
+        assert_eq!(exe_from_argv0("./mantra-here", &path_var, &dir), Some(dir.join("./mantra-here")));
+        assert_eq!(exe_from_argv0("./mantra", &path_var, &dir), None);
+        // an absolute path is kept as it is
+        assert_eq!(exe_from_argv0(&bin.join("mantra").to_string_lossy(), "", &dir), Some(bin.join("mantra")));
+        // nothing usable: unknown name, a directory, an empty argv[0]
+        assert_eq!(exe_from_argv0("no-such-binary", &path_var, &dir), None);
+        assert_eq!(exe_from_argv0(&bin.to_string_lossy(), &path_var, &dir), None);
+        assert_eq!(exe_from_argv0("", &path_var, &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn truncation() {

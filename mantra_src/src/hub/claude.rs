@@ -390,11 +390,11 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
 
 /// `{"mcpServers":{"mantra":{"command":"<this mantra binary>","args":["mcp-bridge","--sock",<sock>,
 /// "--agent",<id>]}}}` — spawned by `claude` itself as a stdio MCP server (§10.1, §10.4). Falls back
-/// to the literal `"mantra"` on the vanishingly unlikely chance `current_exe()` fails; `claude` would
-/// then report that server as failed to start, which is a much clearer signal than silently
+/// to the literal `"mantra"` on the vanishingly unlikely chance `util::self_exe()` fails; `claude`
+/// would then report that server as failed to start, which is a much clearer signal than silently
 /// skipping `--mcp-config` and leaving the agent's tool calls unexplained.
 fn mcp_config_json(id: AgentId, sock: &Path) -> Value {
-    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "mantra".into());
+    let exe = crate::util::self_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "mantra".into());
     json!({"mcpServers": {"mantra": {"command": exe, "args": ["mcp-bridge", "--sock", sock.to_string_lossy(), "--agent", id.to_string()]}}})
 }
 

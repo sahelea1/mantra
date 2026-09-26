@@ -299,7 +299,7 @@ fn side_panel(f: &mut Frame, area: Rect, app: &App, id: Option<AgentId>) {
     }
     l.push(Line::default());
     l.push(sec("Session", vec![]));
-    l.push(Line::from(Span::styled(format!(" {} turns · {} tok · {}", a.turn_count, fmt_tokens(a.tokens_total), fmt_dur(a.created.elapsed())), theme::dim())));
+    l.push(Line::from(Span::styled(format!(" {} turns · {} tok{} · {}", a.turn_count, fmt_tokens(a.tokens_total), if app.demo { " (simulated)" } else { "" }, fmt_dur(a.created.elapsed())), theme::dim())));
     l.push(Line::from(Span::styled(format!(" {}", trunc(&a.model, w)), theme::faint())));
     let status = match &a.status {
         Status::Crashed(r) => format!("crashed: {}", trunc(r, w.saturating_sub(10))),

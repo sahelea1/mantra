@@ -967,7 +967,7 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
     }
     y += 1;
     let tokens = run.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-    cv.put(x, y, &format!("Σ {} tokens across all agents", fmt_tokens(tokens)), theme::muted());
+    cv.put(x, y, &format!("Σ {} tokens across all agents{}", fmt_tokens(tokens), if app.demo { " (simulated)" } else { "" }), theme::muted());
     y += 1;
     if let (Some(ws), Stage::Done) = (&run.ws, &run.stage) {
         if ws.worktree {
