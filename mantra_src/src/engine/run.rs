@@ -106,6 +106,34 @@ pub enum Stage {
     Failed(String),
 }
 
+/// A transition that became due while the run was halted — the pause boundary. Results that
+/// arrive mid-pause (a QA report, gate checks, a worker's output, the cleanup commit) are still
+/// recorded, but nothing that *starts* an agent runs until the run resumes: the transition is
+/// remembered here, saved with the state (so a run restored from disk sees it too), and performed
+/// exactly once by `resume` (`perform_pending`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Pending {
+    /// `start_phase(idx)` — past the last phase this means the finale.
+    Phase { idx: usize },
+    /// `start_finale(idx)` — past the last step this completes the run.
+    Finale { idx: usize },
+    /// The gate of phase `idx` at `round`: the gate agent's next round, or a fresh gate agent.
+    Gate { idx: usize, round: u32 },
+    /// `begin_handoff(idx)` — phase `idx` passed its gate.
+    Handoff { idx: usize },
+}
+
+impl Pending {
+    fn label(&self) -> String {
+        match self {
+            Pending::Phase { idx } => format!("phase {}", idx + 1),
+            Pending::Finale { idx } => format!("finale step {}", idx + 1),
+            Pending::Gate { idx, round } => format!("phase {} gate round {round}", idx + 1),
+            Pending::Handoff { idx } => format!("phase {} handoff", idx + 1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WState {
     Queued,
@@ -270,6 +298,8 @@ pub struct Run {
     pub stage: Stage,
     /// `Some` while the run is halted (see `HaltReason`); `None` while running normally.
     pub halt: Option<Halt>,
+    /// A transition deferred by the pause boundary, performed once on resume (see `Pending`).
+    pub pending: Option<Pending>,
     pub plan: Option<Plan>,
     pub plan_version: u32,
     pub planner: Option<AgentId>,
@@ -297,6 +327,9 @@ pub struct Run {
     /// thread/session id is known) for every agent of this run.
     pub agent_meta: HashMap<AgentId, AgentState>,
     pub started_unix: u64,
+    /// When the run completed or stopped (`Stage::Done` / `Failed`): `elapsed` stops here, so
+    /// the duration a finished run shows stays put.
+    pub finished_unix: Option<u64>,
     /// The planner's open question to the user, if any.
     pub question: Option<Question>,
     /// Agents waiting on an answer from the rung above them (worker/gate/finale → orchestrator,
@@ -361,6 +394,7 @@ impl Run {
             brief,
             stage: Stage::Setup,
             halt: None,
+            pending: None,
             plan: None,
             plan_version: 0,
             planner: None,
@@ -383,6 +417,7 @@ impl Run {
             want_review: false,
             agent_meta: HashMap::new(),
             started_unix: crate::util::unix_secs(),
+            finished_unix: None,
             question: None,
             pending_questions: HashMap::new(),
             last_review: Instant::now(),
@@ -502,7 +537,9 @@ impl Run {
             plan_version: self.plan_version,
             stage: self.stage.clone(),
             halted: self.halt.as_ref().map(|h| h.message.clone()),
+            pending: self.pending.clone(),
             started_unix: self.started_unix,
+            finished_unix: self.finished_unix,
             updated_unix: crate::util::unix_secs(),
             ws: self.ws.clone(),
             handoff: self.handoff.clone(),
@@ -526,9 +563,11 @@ impl Run {
     }
 
     /// Wall-clock time since the run was first started — survives a resume (unlike `started`,
-    /// which is this process's `Instant`).
+    /// which is this process's `Instant`). Frozen at `finished_unix` once the run is over: the
+    /// completion time is a result, not a clock.
     pub fn elapsed(&self) -> Duration {
-        Duration::from_secs(crate::util::unix_secs().saturating_sub(self.started_unix))
+        let end = self.finished_unix.unwrap_or_else(crate::util::unix_secs);
+        Duration::from_secs(end.saturating_sub(self.started_unix))
     }
 
     pub fn is_active(&self) -> bool {
@@ -588,19 +627,19 @@ impl Run {
         self.manager_escalation = None;
         self.last_verify_sig = None;
         self.alerts.clear();
-        for a in std::mem::take(&mut self.paused_agents) {
-            if Some(a) == except {
-                continue;
-            }
-            ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
-        }
+        let paused = std::mem::take(&mut self.paused_agents);
         self.log("▶", "green", "run resumed");
         self.save_state();
-        if let Stage::Phase { idx, step } = self.stage.clone() {
+        let t0 = Instant::now();
+        if let Some(p) = self.pending.take() {
+            // A transition that became due during the halt (the pause boundary): now, once.
+            self.perform_pending(ctx, p);
+        } else if let Stage::Phase { idx, step } = self.stage.clone() {
             match step {
                 PhaseStep::Orchestrating => {
                     self.fill_slots(ctx);
                     self.check_phase_done(ctx);
+                    self.kick_orchestrator(ctx, &paused);
                 }
                 PhaseStep::Gate { .. } | PhaseStep::Checks { .. } => {
                     let has_checks = self.current_phase().map(|p| !p.gate.checks.is_empty()).unwrap_or(false);
@@ -620,7 +659,65 @@ impl Run {
                 _ => {}
             }
         }
+        // Re-prompt what the halt interrupted — unless the pick-up above already gave it its
+        // next prompt (`edges` is stamped at every engine prompt) or archived it.
+        let live = self.all_agents();
+        for a in paused {
+            if Some(a) == except || !live.contains(&a) || self.edges.get(&a).map(|t| *t >= t0).unwrap_or(false) {
+                continue;
+            }
+            ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
+        }
         self.wake_orch(ctx);
+    }
+
+    /// The pause boundary: `what` would start agents, but the run is halted. Remember it (on disk
+    /// too) for `resume` to perform — see `Pending`.
+    fn defer(&mut self, what: Pending) {
+        self.log("‖", "amber", format!("{} is due — it starts when the run resumes", what.label()));
+        self.pending = Some(what);
+        self.save_state();
+    }
+
+    /// Perform a transition the pause boundary deferred (`defer`). The caller has taken it out of
+    /// `self.pending`, so it happens once.
+    pub(super) fn perform_pending(&mut self, ctx: &mut dyn Ctx, what: Pending) {
+        self.log("▶", "green", format!("{} was due while halted — starting it", what.label()));
+        match what {
+            Pending::Phase { idx } => self.start_phase(ctx, idx),
+            Pending::Finale { idx } => self.start_finale(ctx, idx),
+            Pending::Handoff { idx } => self.begin_handoff(ctx, idx),
+            Pending::Gate { idx, round } => match self.gate_agent {
+                Some(g) => {
+                    self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
+                    self.gate_report = None;
+                    self.mark_edge(g);
+                    let s = self.check_summary();
+                    ctx.prompt(g, format!("[mantra:gate-round {round}] The run resumed. Continue the gate: fix what's left so it passes, then call mantra_gate_report.\nGate checks:\n{s}"));
+                }
+                None => self.spawn_gate_at_round(ctx, idx, round),
+            },
+        }
+    }
+
+    /// Resume's safety net for an idle orchestrator with tasks nobody has started: one that was
+    /// (re)spawned during the halt had every `mantra_spawn` refused and ended its turn with no
+    /// event ahead to wake it. `paused` are the agents the resume re-prompts anyway.
+    fn kick_orchestrator(&mut self, ctx: &mut dyn Ctx, paused: &[AgentId]) {
+        if !matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
+            return;
+        }
+        let Some(o) = self.orchestrator else { return };
+        if paused.contains(&o) || ctx.agent(o).map(|a| a.busy()).unwrap_or(false) {
+            return;
+        }
+        let missing: Vec<String> = self.current_phase().map(|p| p.tasks.iter().filter(|t| !self.workers.iter().any(|w| w.task.id == t.id)).map(|t| t.id.clone()).collect()).unwrap_or_default();
+        if missing.is_empty() {
+            return;
+        }
+        self.log("◉", "violet", format!("orchestrator idle with {} unstarted task(s) — waking it", missing.len()));
+        self.mark_edge(o);
+        ctx.prompt(o, format!("[mantra:resume] The run resumed. These tasks have no attempt yet: {}. Spawn them with mantra_spawn (spawns were refused while the run was paused), then call mantra_wait.", missing.join(", ")));
     }
 
     /// Chain of command, top rung before the user: a halt the run could not sort out by itself
@@ -1147,6 +1244,10 @@ Then summarize in 2-4 lines.",
     }
 
     pub(super) fn start_phase(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+        if self.halted() {
+            self.defer(Pending::Phase { idx });
+            return;
+        }
         let Some(plan) = self.plan.clone() else { return };
         let Some(phase) = plan.phases.get(idx).cloned() else {
             self.start_finale(ctx, 0);
@@ -1389,6 +1490,10 @@ Then summarize in 2-4 lines.",
     /// identical-blocker halt are both keyed off `round`.
     fn spawn_gate_at_round(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
         let Some(phase) = self.current_phase().cloned() else { return };
+        if self.halted() {
+            self.defer(Pending::Gate { idx, round });
+            return;
+        }
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
         self.last_gate_blocker = None;
@@ -1427,6 +1532,13 @@ Then summarize in 2-4 lines.",
     }
 
     fn begin_handoff(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+        if matches!(self.stage, Stage::Phase { idx: i, step: PhaseStep::Handoff } if i == idx) {
+            return; // already handing off (a second verify result for the same round)
+        }
+        if self.halted() {
+            self.defer(Pending::Handoff { idx });
+            return;
+        }
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
         self.log("✓", "green", "gate passed — archiving workers, writing handoff");
         // archive workers + gate agent
@@ -1496,6 +1608,10 @@ Then summarize in 2-4 lines.",
     }
 
     pub(super) fn start_finale(&mut self, ctx: &mut dyn Ctx, k: usize) {
+        if self.halted() {
+            self.defer(Pending::Finale { idx: k });
+            return;
+        }
         self.workers.retain(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Cancelled));
         let steps = self.pattern.flow.finale.clone();
         let Some(step) = steps.get(k).cloned() else {
@@ -1549,6 +1665,7 @@ Then summarize in 2-4 lines.",
 
     fn finish(&mut self, ctx: &mut dyn Ctx) {
         self.stage = Stage::Done;
+        self.finished_unix = Some(crate::util::unix_secs());
         let ws = self.ws.clone();
         ctx.job(JobTag::Finish, Box::new(move || JobOut::Text(ws.map(|w| git::phase_commit(&w, "mantra: finale").map(|_| "ok".to_string())).unwrap_or(Ok(String::new())))));
         for a in self.all_agents() {
@@ -1570,6 +1687,7 @@ Then summarize in 2-4 lines.",
         self.alerts.push(why.clone());
         ctx.notify(&format!("Mantra: {why}"));
         self.stage = Stage::Failed(why);
+        self.finished_unix = Some(crate::util::unix_secs());
         self.save_state();
     }
 
@@ -1655,6 +1773,8 @@ Then summarize in 2-4 lines.",
                     self.stage = Stage::Phase { idx: phase, step: PhaseStep::Gate { round: round + 1 } };
                     self.gate_report = None;
                     match self.gate_agent {
+                        // results are recorded while halted; the next round waits for the resume
+                        _ if self.halted() => self.defer(Pending::Gate { idx: phase, round: round + 1 }),
                         Some(g) => {
                             self.mark_edge(g);
                             let s = self.check_summary();
@@ -1905,8 +2025,13 @@ Then summarize in 2-4 lines.",
                             self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: round + 1 } };
                             self.gate_report = None;
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
-                            self.mark_edge(a);
-                            ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
+                            if self.halted() {
+                                // the report is recorded; the next round waits for the resume
+                                self.defer(Pending::Gate { idx, round: round + 1 });
+                            } else {
+                                self.mark_edge(a);
+                                ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
+                            }
                         } else {
                             self.halt_and_escalate(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)));
                         }
@@ -4589,5 +4714,171 @@ mod halt_tests {
         assert!(run.orch_inbox.iter().any(|m| m.starts_with("[from the manager]")));
         let (_, ok) = run.handle_tool(&mut ctx, planner, "mantra_brief_orchestrator", &json!({"message": "yes, rename it"}));
         assert!(ok && !run.waiting_for_answer(orch));
+    }
+
+    // Pause boundary --------------------------------------------------------------------------
+
+    fn two_phase_plan() -> Plan {
+        let mut p = one_task_phase();
+        p.phases.push(Phase { id: "p2".into(), name: "p2".into(), tasks: vec![Task { id: "t2".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() });
+        p
+    }
+
+    /// The pause race from the field: paused during the phase-1 gate with the QA report already
+    /// in, the run used to verify, hand off and start phase 2 during the pause — the fresh
+    /// orchestrator's spawns were refused and it sat idle after the resume until a manual retry.
+    #[test]
+    fn pause_at_the_gate_defers_the_handoff_and_phase_two_starts_on_resume() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let gate = ctx.add_busy();
+        let w = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.gate_agent = Some(gate);
+        run.plan = Some(two_phase_plan());
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Done));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+
+        // the QA report lands, then the pause, then the interrupted turn ends
+        let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+        assert!(ok);
+        run.toggle_pause(&mut ctx);
+        let agents_before = ctx.next;
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, gate, "interrupted", None, None);
+
+        assert!(run.halted());
+        assert_eq!(run.pending, Some(Pending::Handoff { idx: 0 }), "the pass is recorded; the handoff waits for the resume");
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } }, "the phase must not advance while paused");
+        assert_eq!(ctx.next, agents_before, "no agent may be spawned while paused");
+        assert!(ctx.prompts.is_empty(), "no agent may be started while paused: {:?}", ctx.prompts);
+        assert_eq!(run.gate_agent, Some(gate));
+
+        // resume: the handoff happens (once), and the phase moves on by itself from there
+        run.toggle_pause(&mut ctx);
+        assert!(!run.halted() && run.pending.is_none());
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("[mantra:handoff]")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate), "the archived gate agent gets no 'continue' prompt: {:?}", ctx.prompts);
+        ctx.agents.get_mut(&orch).unwrap().final_message = Some("phase 1 built t1".into());
+        run.on_turn_done(&mut ctx, orch, "completed", None, None);
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Text(Ok("committed".into())));
+        assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
+        let orch2 = run.orchestrator.expect("phase 2 has an orchestrator");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch2 && t.contains("[mantra:phase] Phase 2/2")), "{:?}", ctx.prompts);
+        // …whose spawn is accepted: phase-2 workers start without anyone retrying anything
+        let (msg, ok) = run.handle_tool(&mut ctx, orch2, "mantra_spawn", &json!({"task_id": "t2"}));
+        assert!(ok, "{msg}");
+        assert!(run.workers.iter().any(|w| w.task.id == "t2" && w.state == WState::Preparing), "{msg}");
+    }
+
+    #[test]
+    fn a_phase_start_due_while_paused_happens_once_on_resume() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let orch = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.plan = Some(two_phase_plan());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Handoff };
+        run.handoff_note_done = true;
+        run.toggle_pause(&mut ctx);
+        let agents_before = ctx.next;
+        // the phase's cleanup commit finishes during the pause: phase 2 is due
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Text(Ok("committed".into())));
+        assert_eq!(run.pending, Some(Pending::Phase { idx: 1 }));
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+        assert_eq!(ctx.next, agents_before, "no orchestrator is spawned while paused");
+        assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("[mantra:phase]")), "{:?}", ctx.prompts);
+        let started = |c: &TestCtx| c.prompts.iter().filter(|(_, t)| t.contains("[mantra:phase] Phase 2/2")).count();
+
+        run.toggle_pause(&mut ctx);
+        assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
+        assert_eq!(started(&ctx), 1, "{:?}", ctx.prompts);
+        assert!(run.pending.is_none());
+        // a later pause/resume does not start it again
+        run.toggle_pause(&mut ctx);
+        run.toggle_pause(&mut ctx);
+        assert_eq!(started(&ctx), 1, "{:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn a_finale_step_reported_while_paused_waits_for_the_resume() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        let finale = ctx.add_busy();
+        run.planner = Some(planner);
+        run.finale_agent = Some(finale);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Finale { idx: 0 };
+        let (_, ok) = run.handle_tool(&mut ctx, finale, "mantra_gate_report", &json!({"pass": true, "summary": "all green"}));
+        assert!(ok);
+        run.toggle_pause(&mut ctx);
+        let agents_before = ctx.next;
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, finale, "interrupted", None, None);
+        assert_eq!(run.pending, Some(Pending::Finale { idx: 1 }));
+        assert_eq!(run.stage, Stage::Finale { idx: 0 });
+        assert_eq!(ctx.next, agents_before);
+        assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+
+        run.toggle_pause(&mut ctx);
+        assert_eq!(run.stage, Stage::Finale { idx: 1 });
+        assert!(run.pending.is_none());
+        assert_eq!(ctx.prompts.iter().filter(|(_, t)| t.contains("[mantra:finale] Step 2/")).count(), 1, "{:?}", ctx.prompts);
+    }
+
+    /// An orchestrator (re)spawned during a pause had its spawns refused and went idle with no
+    /// event ahead to wake it: the resume must get it going, not the watchdog minutes later.
+    #[test]
+    fn resume_wakes_an_idle_orchestrator_that_has_tasks_to_spawn() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let orch = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.toggle_pause(&mut ctx);
+        run.respawn(&mut ctx, orch, None).unwrap();
+        let orch2 = run.orchestrator.unwrap();
+        let (msg, ok) = run.handle_tool(&mut ctx, orch2, "mantra_spawn", &json!({"task_id": "t1"}));
+        assert!(!ok && msg.contains("REFUSED"), "{msg}");
+        ctx.prompts.clear();
+
+        run.toggle_pause(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch2 && t.contains("[mantra:resume]") && t.contains("t1") && t.contains("mantra_spawn")), "{:?}", ctx.prompts);
+        let (msg, ok) = run.handle_tool(&mut ctx, orch2, "mantra_spawn", &json!({"task_id": "t1"}));
+        assert!(ok, "{msg}");
+        // nothing to wake it about once every task has an attempt
+        ctx.prompts.clear();
+        run.toggle_pause(&mut ctx);
+        run.toggle_pause(&mut ctx);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == orch2), "{:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn a_finished_run_keeps_its_duration() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let now = crate::util::unix_secs();
+        run.started_unix = now - 129;
+        assert!(run.elapsed() >= Duration::from_secs(129), "a running run's clock keeps going");
+        run.finish(&mut ctx);
+        assert_eq!(run.stage, Stage::Done);
+        let at = run.finished_unix.expect("completion is stamped");
+        assert!((now..=now + 5).contains(&at), "{at} vs {now}");
+        let done = run.elapsed();
+        assert!((129..=134).contains(&done.as_secs()), "{done:?}");
+        assert!(run.pulse.iter().any(|p| p.text.contains(&format!("run complete in {}", fmt_dur(done)))), "the journal and the screen agree");
+        // an hour later the result screen still reads the same
+        run.started_unix = now - 3600 - 129;
+        run.finished_unix = Some(now - 3600);
+        assert_eq!(run.elapsed(), Duration::from_secs(129));
+        // a stopped run is frozen the same way
+        let mut failed = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        failed.fail_run(&mut ctx, "planner did not submit a valid plan".into());
+        assert!(failed.finished_unix.is_some());
     }
 }

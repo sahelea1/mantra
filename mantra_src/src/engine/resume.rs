@@ -18,7 +18,7 @@
 use super::git;
 use super::pattern::Pattern;
 use super::plan::{Plan, Task};
-use super::run::{Ctx, PhaseRecord, PhaseStep, Run, Stage, WState, Worker};
+use super::run::{Ctx, Pending, PhaseRecord, PhaseStep, Run, Stage, WState, Worker};
 use super::state::{self, RunState};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ impl Run {
         run.plan_version = st.plan_version;
         run.handoff = st.handoff.clone();
         run.started_unix = st.started_unix;
+        // a finished run written before `finished_unix` existed: its last save is the closest
+        run.finished_unix = st.finished_unix.or_else(|| st.finished().then_some(st.updated_unix));
+        run.pending = st.pending.clone();
         run.history = st.history.iter().map(|h| PhaseRecord { name: h.name.clone(), workers: h.workers.clone(), duration: Duration::from_secs(h.secs), ended: Instant::now() }).collect();
         run
     }
@@ -55,6 +58,11 @@ impl Run {
                 }
             }
         }
+        // A transition the pause boundary deferred (`Pending`) is performed below instead of the
+        // stage's usual boot step — once. Before the first phase the planner simply submits its
+        // plan again, and a due gate is reached by the merge → checks → gate sequence anyway
+        // (which regenerates the check results its prompt needs), so those are dropped here.
+        let pending = self.pending.take();
         match self.stage.clone() {
             Stage::Setup => self.start(ctx),
             Stage::Planning => self.resume_planning(ctx, st),
@@ -73,25 +81,28 @@ impl Run {
                 }
                 self.resume_manager(ctx, st);
                 self.restore_workers(st);
-                match step {
-                    PhaseStep::Orchestrating => self.resume_orchestrating(ctx, idx, st),
-                    PhaseStep::Handoff => {
-                        self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
-                        self.handoff_note_done = true;
-                        self.cleanup_done = true;
-                        self.maybe_next_phase(ctx);
-                    }
-                    PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } => {
-                        // Every task had finished; merging is idempotent, so start the gate
-                        // sequence from the top.
-                        self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
-                        self.check_phase_done(ctx);
-                        if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
-                            // state.json disagreed with itself (a task isn't done after all) —
-                            // then the phase is simply still being worked on.
-                            self.resume_orchestrating(ctx, idx, st);
+                match pending {
+                    Some(p @ (Pending::Phase { .. } | Pending::Finale { .. } | Pending::Handoff { .. })) => self.perform_pending(ctx, p),
+                    _ => match step {
+                        PhaseStep::Orchestrating => self.resume_orchestrating(ctx, idx, st),
+                        PhaseStep::Handoff => {
+                            self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
+                            self.handoff_note_done = true;
+                            self.cleanup_done = true;
+                            self.maybe_next_phase(ctx);
                         }
-                    }
+                        PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } => {
+                            // Every task had finished; merging is idempotent, so start the gate
+                            // sequence from the top.
+                            self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+                            self.check_phase_done(ctx);
+                            if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
+                                // state.json disagreed with itself (a task isn't done after all) —
+                                // then the phase is simply still being worked on.
+                                self.resume_orchestrating(ctx, idx, st);
+                            }
+                        }
+                    },
                 }
             }
             Stage::Finale { idx } => {
@@ -107,6 +118,11 @@ impl Run {
                         (w.task.clone(), w.prompt.clone(), w.effort.clone())
                     })
                     .collect();
+                // the previous step reported while the run was paused: its successor was due
+                let idx = match pending {
+                    Some(Pending::Finale { idx }) => idx,
+                    _ => idx,
+                };
                 self.start_finale(ctx, idx);
                 for (task, prompt, effort) in redo {
                     self.spawn_task(ctx, task, Some(prompt), effort);
@@ -477,6 +493,40 @@ mod tests {
         assert!(ctx.spawned.is_empty() && ctx.prompts.is_empty());
         assert!(!run.is_active());
         assert!(run.pulse.iter().any(|p| p.text.contains("/land")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_run_performs_its_pending_transition_once() {
+        let dir = tmp("pending");
+        // paused in the phase-1 handoff, with phase 2 already due (the pause boundary held it)
+        let mut st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, vec![worker("a", "done", 1, None)], vec![]);
+        st.halted = Some("paused by you".into());
+        st.pending = Some(Pending::Phase { idx: 1 });
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run"));
+        assert_eq!(run.pending, Some(Pending::Phase { idx: 1 }));
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
+        assert_eq!(ctx.spawned.iter().filter(|(n, _)| n == "orchestrator").count(), 1, "{:?}", ctx.spawned);
+        assert_eq!(ctx.prompts.iter().filter(|(_, t)| t.contains("[mantra:phase] Phase 2/2")).count(), 1, "{:?}", ctx.prompts);
+        assert!(run.pending.is_none() && !run.halted());
+        let saved = RunState::load(&run.dir).unwrap();
+        assert!(saved.pending.is_none() && saved.halted.is_none(), "performed once: the saved state no longer carries it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_run_comes_back_with_its_duration_frozen() {
+        let dir = tmp("frozen");
+        let mut st = state(&dir, Stage::Done, vec![], vec![]);
+        st.started_unix = 1000;
+        st.finished_unix = Some(1129);
+        st.updated_unix = 5000;
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run")).elapsed(), Duration::from_secs(129));
+        // written before the completion stamp existed: the last save is the closest
+        st.finished_unix = None;
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run")).elapsed(), Duration::from_secs(4000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

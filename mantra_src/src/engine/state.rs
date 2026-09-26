@@ -6,7 +6,7 @@
 //! already writes (`plan.json`, `pattern.toml`, `brief.md`, `journal.jsonl`).
 
 use super::git::Workspace;
-use super::run::{PhaseStep, Stage};
+use super::run::{Pending, PhaseStep, Stage};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -27,7 +27,11 @@ pub struct RunState {
     pub stage: Stage,
     /// Message of the halt in effect when the state was written (`None` while running).
     pub halted: Option<String>,
+    /// A transition that became due during that halt, performed once on resume (`Pending`).
+    pub pending: Option<Pending>,
     pub started_unix: u64,
+    /// When the run completed or stopped, so a finished run's duration stays what it was.
+    pub finished_unix: Option<u64>,
     pub updated_unix: u64,
     pub ws: Option<Workspace>,
     pub handoff: String,
@@ -301,7 +305,9 @@ mod tests {
             plan_version: 2,
             stage: Stage::Phase { idx: 1, step: PhaseStep::Gate { round: 2 } },
             halted: Some("paused by you".into()),
+            pending: Some(Pending::Handoff { idx: 1 }),
             started_unix: 10,
+            finished_unix: None,
             updated_unix: 20,
             ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None }),
             handoff: "phase 1 done".into(),
