@@ -279,6 +279,13 @@
                 this.emit('fatal', { code: 'replaced', error: 'This session was opened elsewhere' });
                 return;
             }
+            if (this.bye === 'rotated') {
+                this.bye = null;
+                this.stopped = true;
+                this.setState('failed', 'This link was rotated on the host');
+                this.emit('fatal', { code: 'rotated', error: 'This link was rotated on the host. Ask for the new link or code.' });
+                return;
+            }
             const rc = this.mode === 'relay' ? RELAY_CLOSE[info.code] : null;
             if (rc && !rc.retry) {
                 this.stopped = true;

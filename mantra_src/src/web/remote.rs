@@ -375,23 +375,21 @@ async fn run(inner: Arc<Inner>) {
         };
         // A rotated identity has a new key: nobody from the old one can follow.
         clients.rekey(key);
-        let ended = tokio::select! {
-            e = session(&inner, &sid, &token, &mut clients, &mut out_rx, &mut strikes) => e,
-            c = generation.changed() => {
-                if c.is_err() {
-                    return;
-                }
-                // A new identity: the old connection (and its clients) is gone, dial the new one now.
-                clients.detach(Instant::now());
-                backoff = BACKOFF_MIN;
-                continue;
-            }
-        };
+        // `session` itself watches `generation` (via the same `&mut` receiver) so a rotate mid-session
+        // can tell attached clients before their connection drops — see the `rotated` arm there.
+        let ended = session(&inner, &sid, &token, &mut clients, &mut out_rx, &mut strikes, &mut generation).await;
         clients.detach(Instant::now());
         // Bounded even while the relay stays unreachable: clients nobody can replay any more go.
         clients.prune(Instant::now());
-        if ended.healthy {
+        if ended.healthy || ended.rotated {
             backoff = BACKOFF_MIN;
+        }
+        if ended.rotated {
+            // The clients already got their notice inside `session`; dial the new identity now,
+            // same as the old immediate-reconnect path.
+            crate::mlog!("remote: {}", ended.error);
+            inner.set_status(false, 0, Some(ended.error));
+            continue;
         }
         let wait = jittered(backoff);
         crate::mlog!("remote: {} — retrying in {:.1}s", ended.error, wait.as_secs_f32());
@@ -417,15 +415,33 @@ fn jittered(d: Duration) -> Duration {
 struct Ended {
     /// It was connected long enough that the next retry starts from the short delay again.
     healthy: bool,
+    /// A rotate ended this session (clients were already told, §10.3/§10.4): reconnect at once,
+    /// same as `healthy`, but skip the normal retry wait too (see `run`).
+    rotated: bool,
     /// Human-readable, shown in `/remote` and the web UI's settings.
     error: String,
 }
 
+impl Ended {
+    fn fail(error: String) -> Ended {
+        Ended { healthy: false, rotated: false, error }
+    }
+}
+
 /// One relay connection, start to end.
-async fn session(inner: &Arc<Inner>, sid: &str, token: &str, clients: &mut Clients, out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Cid, Outbound)>, strikes: &mut Strikes) -> Ended {
+#[allow(clippy::too_many_arguments)]
+async fn session(
+    inner: &Arc<Inner>,
+    sid: &str,
+    token: &str,
+    clients: &mut Clients,
+    out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Cid, Outbound)>,
+    strikes: &mut Strikes,
+    generation: &mut tokio::sync::watch::Receiver<u64>,
+) -> Ended {
     let ws = match dial(&inner.relay, sid, token).await {
         Ok(ws) => ws,
-        Err(error) => return Ended { healthy: false, error },
+        Err(error) => return Ended::fail(error),
     };
     crate::mlog!("remote: connected to the relay");
     let since = Instant::now();
@@ -436,8 +452,19 @@ async fn session(inner: &Arc<Inner>, sid: &str, token: &str, clients: &mut Clien
     sweep.tick().await;
     let mut last_ping = Instant::now();
     let mut relay_missed = 0u8;
+    let mut rotated = false;
     let error = 'conn: loop {
         let frames: Vec<Frame> = tokio::select! {
+            c = generation.changed() => {
+                if c.is_err() {
+                    break 'conn "shutting down".into();
+                }
+                // Nothing else bumps the generation while a session is up: this is a rotate.
+                // Tell every client that finished its hello — sealed with the key it still knows
+                // — before `run`'s `rekey` forgets them and dials the new identity (§10.3/§10.4).
+                rotated = true;
+                clients.rotate_notice()
+            }
             m = stream.next() => match m {
                 Some(Ok(Message::Binary(b))) => clients.binary(&b, strikes, Instant::now()),
                 Some(Ok(Message::Text(t))) => clients.control(t.as_str(), strikes, Instant::now()),
@@ -491,11 +518,14 @@ async fn session(inner: &Arc<Inner>, sid: &str, token: &str, clients: &mut Clien
                 break 'conn format!("lost the relay connection: {e}");
             }
         }
+        if rotated {
+            break 'conn "identity rotated".into();
+        }
         inner.set_status(true, clients.ready(), None);
     };
     let _ = sink.close().await;
     // `clients` stay (the caller detaches them): a quick reconnect gets them replayed by the relay.
-    Ended { healthy: since.elapsed() >= HEALTHY_AFTER, error }
+    Ended { healthy: since.elapsed() >= HEALTHY_AFTER, rotated, error }
 }
 
 /// Dial `{relay}/host/{sid}` over IPv4 (the relay refuses hosts on IPv6) with the host token.
@@ -752,6 +782,21 @@ impl Clients {
     /// Clients past the hello (what `/remote` shows as connected).
     fn ready(&self) -> u32 {
         self.map.values().filter(|c| c.hello_seen && c.adrift.is_none()).count().min(u32::MAX as usize) as u32
+    }
+
+    /// Every client that finished its hello, told the link was rotated — sealed with the key it
+    /// still knows, so it reads before `rekey` drops it and the relay connection closes (§10.3,
+    /// §10.4). Clients still mid-handshake get nothing (they have no cipher to seal with yet);
+    /// they simply vanish, same as any other drop.
+    fn rotate_notice(&mut self) -> Vec<Frame> {
+        let msg = super::protocol::ServerMsg::Bye { reason: "rotated".into() }.to_json();
+        let mut out = vec![];
+        for (cid, c) in self.map.iter_mut() {
+            if let Some(cipher) = c.cipher.as_mut().filter(|_| c.hello_seen) {
+                out.extend(cipher.seal(msg.as_bytes()).iter().map(|f| bin(cid, f)));
+            }
+        }
+        out
     }
 
     /// A different key (rotate): every client belongs to the old identity.
@@ -1482,6 +1527,63 @@ mod tests {
         .expect("the same E2EE session answers after the reconnect");
         assert_eq!(got, r#"{"t":"pong"}"#);
         assert_eq!(reg.count(ConnKind::Relay), 1, "still the one registered conn");
+        r.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// §10.3/§10.4: a rotate tells every attached, hello-completed client before dropping it and
+    /// dialing the new identity — not just a silent close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rotate_notifies_attached_clients_before_dropping_them() {
+        let dir = std::env::temp_dir().join(format!("mantra-remote-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (ctl, _ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = WebRegistryHandle::new(ctl);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone() }, reg.clone(), tx);
+        assert!(r.ready(Duration::from_secs(20)).await);
+        let old_key = r.inner().identity().unwrap().2;
+        async fn next_bin(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Vec<u8> {
+            loop {
+                if let Message::Binary(x) = ws.next().await.unwrap().unwrap() {
+                    return x.to_vec();
+                }
+            }
+        }
+        let mut ws = tokio_tungstenite::accept_async(l.accept().await.unwrap().0).await.unwrap();
+        let mut b = FakeBrowser::new(9);
+        ws.send(Message::Text(b.open().into())).await.unwrap();
+        ws.send(Message::Binary(b.hello().into())).await.unwrap();
+        b.accept(&Frame::Bin(next_bin(&mut ws).await), &old_key);
+        ws.send(Message::Binary(b.send(r#"{"t":"hello","protocol":1}"#).into())).await.unwrap();
+        // drain the encrypted server hello before rotating, so it isn't mistaken for the notice
+        loop {
+            let f = next_bin(&mut ws).await;
+            if b.read(&Frame::Bin(f)).contains(r#""t":"hello""#) {
+                break;
+            }
+        }
+        r.rotate();
+        let notice = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let f = next_bin(&mut ws).await;
+                let t = b.read(&Frame::Bin(f));
+                if t.starts_with(r#"{"t":"bye""#) {
+                    break t;
+                }
+            }
+        })
+        .await
+        .expect("the client gets a bye before the connection drops");
+        assert_eq!(notice, r#"{"t":"bye","reason":"rotated"}"#);
+        // ...and the host reconnects at once, with a new identity nobody from the old one can follow.
+        let mut ws2 = tokio::time::timeout(Duration::from_secs(10), async { tokio_tungstenite::accept_async(l.accept().await.unwrap().0).await.unwrap() }).await.expect("the host reconnects right away");
+        let new_key = r.inner().identity().unwrap().2;
+        assert_ne!(old_key, new_key, "rotate must produce a new key");
+        let _ = ws2.close(None).await;
         r.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }

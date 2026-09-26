@@ -203,19 +203,22 @@
             st === 'failed' && MODE === 'relay' ? h('button', { type: 'button', class: 'link', onclick: () => M.relay.toConnect() }, 'Connect again') : null);
     }
 
-    function banners() {
+    // The install tip is only worth a look on Team (where people land) and Settings (where the
+    // rest of the install/notification controls live) — not on every screen it's allowed on.
+    const INSTALL_ROUTES = { team: 1, settings: 1 };
+    function banners(r) {
         const out = [];
         const dis = S.ui.banners;
         const insecure = location.protocol === 'http:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
         if (insecure && !dis.insecure) {
             out.push(banner('insecure', 'alert', ['Notifications and installing need HTTPS. Restart Mantra with ', h('code', null, '--web-tls'), ', then open the https:// address it prints and install the certificate from Settings › Certificate.']));
         }
-        if (S.ui.install && !dis.install) {
+        if (r && INSTALL_ROUTES[r.name] && S.ui.install && !dis.install) {
             out.push(banner('install', 'download', 'Install Mantra as an app for a full-screen view and notifications.', P.btn('Install', async () => {
                 const ev = S.ui.install; S.ui.install = null; changed();
                 try { ev.prompt(); await ev.userChoice; } catch (_) { }
             }, { sm: true, kind: 'primary' })));
-        } else if (isIOS() && !standalone() && !dis.ios && window.isSecureContext) {
+        } else if (r && INSTALL_ROUTES[r.name] && isIOS() && !standalone() && !dis.ios && window.isSecureContext) {
             out.push(banner('ios', 'download', ['Tip: tap ', h('b', null, 'Share › Add to Home Screen'), ' to install Mantra and get notifications.']));
         }
         if (S.ui.swUpdate) {
@@ -285,7 +288,7 @@
             connBar(),
             fixed ? null : topbar(r),
             h('main', { class: 'content' + (fixed ? ' fixed' : ''), key: 'content' },
-                fixed || !BANNER_ROUTES[r.name] ? null : banners(),
+                fixed || !BANNER_ROUTES[r.name] ? null : banners(r),
                 h('div', { class: 'screen anim-' + (motion() ? S.ui.anim || 'fade' : 'none') + (fixed ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
             tabbar(r));
     }
@@ -410,7 +413,7 @@
             h('main', { class: 'main', key: 'main' },
                 connBar(),
                 mainHeader(r),
-                BANNER_ROUTES[r.name] ? banners() : null,
+                BANNER_ROUTES[r.name] ? banners(r) : null,
                 h('div', { class: 'main-body' + (r.name === 'agent' ? ' fill' : ''), key: 'mb' },
                     h('div', { class: 'screen anim-' + (motion() ? 'fade' : 'none') + (r.name === 'agent' ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
                 r.name === 'agent' && mqWide.matches && !S.ui.panelOpen ? h('button', { type: 'button', class: 'panel-reopen', title: 'Show side panel', onclick: () => M.store.setPref('panelOpen', true) }, icon('panel')) : null),
@@ -834,6 +837,11 @@
         wireClient(c);
         if (S.ui.route.name === 'login') { const r = parse(location.pathname); S.ui.route = r.name === 'login' ? { name: 'team' } : r; history.replaceState({ d: 0 }, '', r.name === 'login' ? '/' : location.pathname); }
         c.start();
+        // Settings › Certificate needs this whenever a session starts — including right after a
+        // fresh login, not just when the page booted already authenticated.
+        if (location.protocol === 'https:') {
+            fetch('/cert.pem', { method: 'HEAD', cache: 'no-store' }).then((r) => { S.ui.certAvailable = r.ok; changed(); }, () => { });
+        }
         changed();
     }
 
@@ -852,9 +860,6 @@
             }
         }
         startLocal();
-        if (location.protocol === 'https:') {
-            fetch('/cert.pem', { method: 'HEAD', cache: 'no-store' }).then((r) => { S.ui.certAvailable = r.ok; changed(); }, () => { });
-        }
     }
 
     // ── relay mode ───────────────────────────────────────────────────────────────────────────────
@@ -991,6 +996,12 @@
             const saved = (S.ui.devices || []).find((d) => d.sid === this.sid);
             let err = m.error;
             if (m.code === 'badkey' && saved) err = 'This saved session no longer opens — the link was probably rotated. Forget it and use the new link or code.';
+            if (m.code === 'rotated') {
+                // The host told us directly (§10.3): don't wait for a badkey guess on the next
+                // retry — drop the stale saved key now, same message either way.
+                err = 'This link was rotated on the host. Ask for the new link or code.';
+                if (saved) this.forget(this.sid);
+            }
             this.pendingSid = m.code === 'badkey' ? this.sid : null;
             this.toConnect(err);
         },

@@ -117,10 +117,14 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
     let mut l: Vec<Line> = vec![];
     let (state, col) = match (info.connected, &info.last_error) {
         (true, _) => (format!("connected · {} client{}", info.clients, if info.clients == 1 { "" } else { "s" }), theme::GREEN),
-        (false, Some(e)) => (format!("reconnecting — {}", crate::util::trunc(e, 60)), theme::AMBER),
+        (false, Some(e)) => (format!("reconnecting — {e}"), theme::AMBER),
         (false, None) => ("connecting…".to_string(), theme::AMBER),
     };
-    l.push(Line::from(vec![k("relay"), Span::styled(format!("{}  ", info.relay), theme::muted()), Span::styled(state, theme::fg(col))]));
+    let relay_txt = format!("{}  ", info.relay);
+    // The relay address and label are fixed-ish; the status (an error message) is the part
+    // that can run long, so it alone gets truncated to whatever room is left on the line.
+    let state_budget = inner.saturating_sub(12 + crate::util::width(&relay_txt)).max(8);
+    l.push(Line::from(vec![k("relay"), Span::styled(relay_txt, theme::muted()), Span::styled(crate::util::trunc(&state, state_budget), theme::fg(col))]));
     match &info.link {
         Some(link) => {
             let mut first = true;

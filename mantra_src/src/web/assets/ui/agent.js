@@ -188,6 +188,16 @@
         }
     }
 
+    // True while the fixed flash toast floats above the composer on a narrow layout — used to give
+    // the transcript extra bottom padding so the toast doesn't hide the last line (F5).
+    function flashAboveComposer() {
+        const s = S();
+        if (M.act.wide() || s.ui.route.name !== 'agent') return false;
+        if ((s.ui.flashes || []).length) return true;
+        const t = s.toast;
+        return !!(t && t.shown + (t.ttl_ms || 4000) > Date.now());
+    }
+
     function transcript(a) {
         const w = win[a.id] || WINDOW;
         const items = a.items;
@@ -209,7 +219,7 @@
         kids.push(busyLine(a));
         kids.push(h('div', { class: 'tx-end', key: 'end' }));
         return h('div', { class: 'tx-wrap', key: 'txw' + a.id },
-            h('div', { class: 'tx', key: 'tx' + a.id, ref: (el) => attach(el, a.id), role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' }, h('div', { class: 'tx-inner' }, kids)),
+            h('div', { class: 'tx', key: 'tx' + a.id, ref: (el) => attach(el, a.id), role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' }, h('div', { class: 'tx-inner' + (flashAboveComposer() ? ' flash-pad' : '') }, kids)),
             showNew ? h('button', { type: 'button', class: 'new-pill', key: 'newpill', onclick: () => { const s2 = scroll[a.id]; if (s2 && s2.el) { s2.stick = true; s2.el.scrollTo({ top: s2.el.scrollHeight, behavior: M.act.motion() ? 'smooth' : 'auto' }); } } }, icon('arrowdown'), 'new') : null);
     }
 

@@ -112,8 +112,7 @@
         const kids = [];
         kids.push(h('div', { class: 'run-hero', key: 'hero' },
             h('div', { class: 'run-hero-top' },
-                h('span', { class: 'mono dim' }, run.id), h('span', { class: 'dim' }, ' · ' + run.pattern),
-                h('span', { class: 'spacer' }),
+                h('span', { class: 'run-hero-id' }, h('span', { class: 'mono dim' }, run.id), h('span', { class: 'dim' }, ' · ' + run.pattern)),
                 run.landable ? P.btn('Land', () => M.act.sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => M.act.cmd('land', {}, { ok: 'Landing…' }) }), { kind: 'primary', icon: 'land', sm: true }) : null,
                 st.kind !== 'done' && st.kind !== 'failed' ? P.btn(run.halted ? 'Resume' : 'Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: run.halted ? 'play' : 'pause', busyKey: 'resume', kind: run.halted ? 'primary' : null }) : null),
             h('h1', { class: 'run-title' }, run.brief),
@@ -192,7 +191,15 @@
         const run = s.run;
         if (run) kids.push(P.bands());
         if (s.approvals.length) kids.push(h('div', { class: 'approvals', key: 'aps' }, h('h3', { class: 'group-title' }, 'Needs your approval'), s.approvals.map((ap) => P.approvalCard(ap, { showAgent: true }))));
-        if (run && (run.alerts || []).length) kids.push(card('Run alerts', h('ul', { class: 'plain' }, run.alerts.map((a, i) => h('li', { key: i }, a))), { key: 'alerts', icon: 'alert', cls: 'warn' }));
+        if (run && (run.alerts || []).length) {
+            // Drop whatever is already shown as a band above (the open halt / question) — keep
+            // this list for alerts that aren't currently live.
+            const shown = [];
+            if (run.halted && run.halted.message) shown.push(run.halted.message);
+            if (run.question && run.question.text) shown.push(run.question.text);
+            const rest = run.alerts.filter((a) => !shown.some((t) => a === t || a.endsWith(t)));
+            if (rest.length) kids.push(card('Run alerts', h('ul', { class: 'plain' }, rest.map((a, i) => h('li', { key: i }, a))), { key: 'alerts', icon: 'alert', cls: 'warn' }));
+        }
         const nothing = !s.approvals.length && !(run && (run.halted || run.question || run.want_review));
         if (nothing) kids.push(P.empty('check', 'All clear', 'Approvals, questions and halts show up here — and on your phone, if you turn on notifications.', [P.btn('Notification settings', () => M.act.nav('/settings'), { icon: 'bell' })]));
         if (s.notes.length) {
