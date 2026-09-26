@@ -32,6 +32,8 @@ pub struct RunState {
     pub started_unix: u64,
     /// When the run completed or stopped, so a finished run's duration stays what it was.
     pub finished_unix: Option<u64>,
+    /// Active run time (halts excluded) up to `updated_unix`; the clock resumes from here.
+    pub active_secs: u64,
     pub updated_unix: u64,
     pub ws: Option<Workspace>,
     pub handoff: String,
@@ -308,6 +310,7 @@ mod tests {
             pending: Some(Pending::Handoff { idx: 1 }),
             started_unix: 10,
             finished_unix: None,
+            active_secs: 7,
             updated_unix: 20,
             ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None }),
             handoff: "phase 1 done".into(),

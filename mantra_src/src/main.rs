@@ -655,7 +655,13 @@ async fn event_loop<B: Backend>(mut terminal: Option<&mut Terminal<B>>, app: &mu
             _ = quit_signal => {
                 app.quit = true;
             }
-            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::time::sleep(wait) => {
+                // Idle (no events, nothing animating) but a clock is on screen: the 1s wait just
+                // elapsed, so let it tick — one frame, not an animation.
+                if !animating && app.clocks_visible() && last_draw.elapsed() >= Duration::from_millis(900) {
+                    dirty = true;
+                }
+            }
         }
         app.tick();
         if !app.notes.is_empty() {

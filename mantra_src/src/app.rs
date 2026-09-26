@@ -545,6 +545,12 @@ impl App {
             || self.flash_screen.map(|f| f.elapsed() < Duration::from_millis(450)).unwrap_or(false)
     }
 
+    /// Something on screen shows a running clock (the run timer, "halted for", agent ages), so an
+    /// idle TUI still needs a redraw about once a second — far cheaper than `animating`.
+    pub fn clocks_visible(&self) -> bool {
+        self.run.is_some() || !self.agents.is_empty()
+    }
+
     pub(crate) fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
         let mut run = self.run.take()?;
         let r = {
@@ -2245,6 +2251,26 @@ mod tests {
 
     fn a_run() -> Run {
         Run::new(PathBuf::from("."), Pattern::builtin(), "build a thing".into())
+    }
+
+    /// The reported bug: a paused run's header ("⏱ 4m20s · halted 1s") stayed frozen until a
+    /// keypress, because nothing animates while halted and the event loop only drew on events.
+    /// The loop now ticks once a second whenever a clock is on screen — and that is only then.
+    #[test]
+    fn a_halted_run_still_wants_a_clock_tick() {
+        let mut app = screen_app();
+        assert!(!app.clocks_visible(), "nothing on screen shows a clock");
+        assert!(!app.animating());
+        let mut run = a_run();
+        let mut ctx = Ctxt { hub: &mut app.hub, agents: &mut app.agents, registry: &app.registry, tx: &app.tx, notes: &mut app.notes };
+        run.toggle_pause(&mut ctx);
+        // the "run paused" pulse line fades for a moment; the bug shows once that is over
+        for p in run.pulse.iter_mut() {
+            p.at = Instant::now() - Duration::from_secs(5);
+        }
+        app.run = Some(run);
+        assert!(!app.animating(), "a paused run is not an animation");
+        assert!(app.clocks_visible(), "but its clocks still tick");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the

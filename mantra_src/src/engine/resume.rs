@@ -38,8 +38,17 @@ impl Run {
         // a finished run written before `finished_unix` existed: its last save is the closest
         run.finished_unix = st.finished_unix.or_else(|| st.finished().then_some(st.updated_unix));
         run.pending = st.pending.clone();
+        run.restore_clock(st, crate::util::unix_secs());
         run.history = st.history.iter().map(|h| PhaseRecord { name: h.name.clone(), workers: h.workers.clone(), duration: Duration::from_secs(h.secs), ended: Instant::now() }).collect();
         run
+    }
+
+    /// Carry the active-time clock over from disk: the saved total, then a new active span from
+    /// `now` — unless the run is already over, in which case it stays frozen. A state file from
+    /// before the clock existed falls back to its wall-clock span (up to `finished_unix` when stamped).
+    pub(super) fn restore_clock(&mut self, st: &RunState, now: u64) {
+        let secs = if st.active_secs == 0 { st.finished_unix.unwrap_or(st.updated_unix).saturating_sub(st.started_unix) } else { st.active_secs };
+        self.set_clock(secs, if self.is_active() { Some(now) } else { None });
     }
 
     /// Pick the run back up at a safe boundary (see the module doc).
@@ -280,6 +289,22 @@ mod tests {
     use crate::hub::AgentId;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn restore_clock_carries_active_time_over() {
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let st = RunState { started_unix: 100, updated_unix: 160, active_secs: 45, ..Default::default() };
+        run.restore_clock(&st, 1000);
+        assert_eq!(run.elapsed_at(1010).as_secs(), 55, "saved total plus the new span");
+        // an older state file (no clock) falls back to its wall-clock span
+        let old = RunState { started_unix: 100, updated_unix: 160, ..Default::default() };
+        run.restore_clock(&old, 1000);
+        assert_eq!(run.elapsed_at(1000).as_secs(), 60);
+        // a finished run stays frozen
+        run.stage = Stage::Done;
+        run.restore_clock(&st, 1000);
+        assert_eq!(run.elapsed_at(5000).as_secs(), 45);
+    }
 
     struct Fake {
         agents: HashMap<AgentId, Agent>,

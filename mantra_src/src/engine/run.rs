@@ -346,6 +346,11 @@ pub struct Run {
     /// When the run completed or stopped (`Stage::Done` / `Failed`): `elapsed` stops here, so
     /// the duration a finished run shows stays put.
     pub finished_unix: Option<u64>,
+    /// Active (not halted, not finished) run time — see `elapsed`. `active_secs` is the sum of
+    /// the closed active spans; `active_since` is the start of the open one (unix secs), `None`
+    /// while halted or after the run ends.
+    active_secs: u64,
+    active_since: Option<u64>,
     /// The planner's open question to the user, if any.
     pub question: Option<Question>,
     /// Agents waiting on an answer from the rung above them (worker/gate/finale → orchestrator,
@@ -434,6 +439,8 @@ impl Run {
             agent_meta: HashMap::new(),
             started_unix: crate::util::unix_secs(),
             finished_unix: None,
+            active_secs: 0,
+            active_since: Some(crate::util::unix_secs()),
             question: None,
             pending_questions: HashMap::new(),
             last_review: Instant::now(),
@@ -556,6 +563,7 @@ impl Run {
             pending: self.pending.clone(),
             started_unix: self.started_unix,
             finished_unix: self.finished_unix,
+            active_secs: self.elapsed().as_secs(),
             updated_unix: crate::util::unix_secs(),
             ws: self.ws.clone(),
             handoff: self.handoff.clone(),
@@ -578,12 +586,42 @@ impl Run {
         self.plan.as_ref()?.phases.get(i)
     }
 
-    /// Wall-clock time since the run was first started — survives a resume (unlike `started`,
-    /// which is this process's `Instant`). Frozen at `finished_unix` once the run is over: the
-    /// completion time is a result, not a clock.
+    /// Active run time: the wall clock minus every halt (a user pause included), frozen once the
+    /// run is done or stopped. Survives a resume (`from_state` carries the total over; the time
+    /// the process was not running is not active time either).
     pub fn elapsed(&self) -> Duration {
-        let end = self.finished_unix.unwrap_or_else(crate::util::unix_secs);
-        Duration::from_secs(end.saturating_sub(self.started_unix))
+        self.elapsed_at(crate::util::unix_secs())
+    }
+
+    pub(super) fn elapsed_at(&self, now: u64) -> Duration {
+        Duration::from_secs(self.active_secs + self.active_since.map(|t| now.saturating_sub(t)).unwrap_or(0))
+    }
+
+    /// Close the open active span (halt, finish, fail): the clock stands still from here.
+    pub(super) fn clock_stop_at(&mut self, now: u64) {
+        if let Some(t) = self.active_since.take() {
+            self.active_secs += now.saturating_sub(t);
+        }
+    }
+
+    /// Open a new active span (resume) — a no-op on a finished run, which stays frozen.
+    pub(super) fn clock_start_at(&mut self, now: u64) {
+        if self.active_since.is_none() && self.is_active() {
+            self.active_since = Some(now);
+        }
+    }
+
+    pub(super) fn set_clock(&mut self, active_secs: u64, active_since: Option<u64>) {
+        self.active_secs = active_secs;
+        self.active_since = active_since;
+    }
+
+    fn clock_stop(&mut self) {
+        self.clock_stop_at(crate::util::unix_secs());
+    }
+
+    fn clock_start(&mut self) {
+        self.clock_start_at(crate::util::unix_secs());
     }
 
     pub fn is_active(&self) -> bool {
@@ -622,6 +660,7 @@ impl Run {
         self.alerts.push(message.clone());
         ctx.notify(&format!("Mantra needs you: {message}"));
         self.halt = Some(Halt { reason, agent, message, since: Instant::now() });
+        self.clock_stop();
         self.save_state();
     }
 
@@ -639,6 +678,7 @@ impl Run {
             return;
         }
         self.halt = None;
+        self.clock_start();
         self.escalation_open = false;
         self.manager_escalation = None;
         self.last_verify_sig = None;
@@ -1712,6 +1752,7 @@ Then summarize in 2-4 lines.",
     fn finish(&mut self, ctx: &mut dyn Ctx) {
         self.stage = Stage::Done;
         self.finished_unix = Some(crate::util::unix_secs());
+        self.clock_stop();
         let ws = self.ws.clone();
         ctx.job(JobTag::Finish, Box::new(move || JobOut::Text(ws.map(|w| git::phase_commit(&w, "mantra: finale").map(|_| "ok".to_string())).unwrap_or(Ok(String::new())))));
         for a in self.all_agents() {
@@ -1735,6 +1776,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Failed(why);
         self.finished_unix = Some(crate::util::unix_secs());
         self.drop_pending("the run stopped");
+        self.clock_stop();
         self.save_state();
     }
 
@@ -2559,6 +2601,7 @@ Then summarize in 2-4 lines.",
         }
         self.log("‖", "amber", "run paused");
         self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), since: Instant::now() });
+        self.clock_stop();
     }
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
@@ -3675,6 +3718,53 @@ mod halt_tests {
         assert!(run.alerts.is_empty(), "a manual pause is not an alert");
         run.toggle_pause(&mut ctx);
         assert!(!run.halted(), "space toggles a manual pause back off");
+    }
+
+    #[test]
+    fn run_clock_counts_active_time_only() {
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.set_clock(0, Some(1000));
+        assert_eq!(run.elapsed_at(1005).as_secs(), 5);
+        // a 10s pause inside a 30s run → 20s of active time
+        run.clock_stop_at(1010);
+        assert_eq!(run.elapsed_at(1015).as_secs(), 10, "frozen while halted");
+        run.clock_start_at(1020);
+        assert_eq!(run.elapsed_at(1030).as_secs(), 20);
+        // a stopped run is frozen the same way, and a resume does not restart it
+        run.stage = Stage::Done;
+        run.clock_stop_at(1030);
+        run.clock_start_at(1100);
+        assert_eq!(run.elapsed_at(1200).as_secs(), 20, "a finished run keeps its duration");
+        // stopping twice is harmless
+        run.clock_stop_at(1300);
+        assert_eq!(run.elapsed_at(1400).as_secs(), 20);
+    }
+
+    #[test]
+    fn user_pause_freezes_the_run_clock() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.set_clock(12, Some(crate::util::unix_secs()));
+        run.toggle_pause(&mut ctx);
+        assert!(run.active_since.is_none(), "space stops the clock");
+        assert_eq!(run.elapsed().as_secs(), 12);
+        run.toggle_pause(&mut ctx);
+        assert!(run.active_since.is_some(), "resume starts a new active span");
+        assert_eq!(run.active_secs, 12);
+    }
+
+    #[test]
+    fn halt_and_resume_bracket_an_active_span() {
+        let mut ctx = TestCtx::new();
+        let busy = ctx.add_busy();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.orchestrator = Some(busy);
+        run.halt(&mut ctx, HaltReason::AgentTurnFailed, Some(busy), "boom".into());
+        assert!(run.active_since.is_none());
+        run.resume(&mut ctx);
+        assert!(run.active_since.is_some());
+        run.fail_run(&mut ctx, "gave up".into());
+        assert!(run.active_since.is_none(), "a stopped run is frozen");
     }
 
     /// The built-in pattern with its manager removed: the chain of command then ends at the
@@ -5035,6 +5125,7 @@ mod halt_tests {
         let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
         let now = crate::util::unix_secs();
         run.started_unix = now - 129;
+        run.set_clock(0, Some(now - 129));
         assert!(run.elapsed() >= Duration::from_secs(129), "a running run's clock keeps going");
         run.finish(&mut ctx);
         assert_eq!(run.stage, Stage::Done);
