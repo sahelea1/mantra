@@ -71,6 +71,16 @@ The installer verifies a sha256, installs to `~/.local/bin` (override with `MANT
 
 Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
+`mantra doctor` probes readiness, not presence — one row and verdict each, every probe capped at 10 s:
+
+- **codex executable** — `codex --version`
+- **codex app-server** — launched exactly as an agent launches it (provider args, the default model's key in the environment) and taken through the `initialize` handshake, then shut down cleanly
+- **provider** — the default model's provider: where its key comes from (`$VAR` set, or stored in `models.toml`) and whether the endpoint accepts it, via `GET /models`; no inference is ever sent, and a placeholder URL such as `example.com` gets no request at all
+- **sandbox** — one `true` run through the configured sandbox policy on that app-server, the same exec path agent commands take (`codex sandbox -- true` on servers without `command/exec`)
+- then `codex login status` (only a failure when something actually runs on Codex's own account), `claude`, `git`, the terminal, tmux, and each provider's key source
+
+A failing row quotes Codex's own stderr line, exit code included. An agent that fails the same way at launch (not logged in, a refused flag, a bad gateway) is halted after 3 attempts with that error, instead of burning through the crash budget.
+
 ---
 
 ## Try it in one minute
@@ -79,7 +89,7 @@ Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tel
 mantra --demo
 ```
 
-Demo mode replaces both CLIs with a simulated one: real UI, real state machine, scripted agents, **no API calls and no cost**. Press `ctrl+o`, type a goal, and watch a full team run play out in about twenty seconds. Every screenshot in this README is demo mode, captured by `docs/tools/shoot.py`.
+Demo mode replaces both CLIs with a simulated one: real UI, real state machine, scripted agents, **no API calls, no provider key and no cost** (token totals read *simulated*). Press `ctrl+o`, type a goal, and watch a full team run play out in about twenty seconds. Every screenshot in this README is demo mode, captured by `docs/tools/shoot.py`.
 
 ```bash
 cd your-project && mantra                       # Solo, in this repo
@@ -127,7 +137,7 @@ Press `ctrl+o`, describe the goal, and this happens:
 
 **2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together. Above it, from the first phase to the end of the finale, a **manager** watches the whole run: anything that stalls or halts reaches it first, and every few minutes it gets a health digest of the whole team.
 
-**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
+**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
 
 **4. The finale**: heavy QA → a security sweep → the planner verifying its own plan, able to spawn ad-hoc fixers.
 
@@ -173,13 +183,15 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 
 | halt | what happened | what the band tells you |
 |---|---|---|
-| paused by you | you pressed `space` | `space` to resume |
+| paused by you | you pressed `space` — nothing new starts until you resume | `space` to resume |
 | auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
 | provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
 | environment | a command died in the sandbox (`bwrap`, user namespaces) | fix the machine — `mantra doctor` prints the sysctl |
 | gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
 | attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
+
+**Pause is a hard boundary.** While a run is paused nothing new starts — no next phase, gate round, handoff or finale step. Results that arrive mid-pause (a QA report, gate checks, a cleanup commit) are recorded; the transition they trigger is kept in `state.json` and performed exactly once on resume, even after a restart. The header's `⏱` counts active time only — it stops on every halt, pause included — and freezes at the final duration when the run completes or stops.
 
 </details>
 
@@ -242,7 +254,7 @@ The same chain carries halts: **manager → planner → you**. *Gate exhausted* 
 
 An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent; `+`/`-` adjust its context window right there.
 
-Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports.
+Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
 
 <details>
 <summary>Claude Code as a backend for any role</summary>
@@ -305,6 +317,8 @@ A custom-provider model with an `efforts` list gets a reasoning effort like any 
 Press `D` on a provider and Mantra fetches its catalogue: context windows are read from whatever field the provider uses (and marked *assumed* at 200k when it reports none), reasoning effort is enabled only when the model actually supports it, and models you already have are never duplicated.
 
 `t` runs a real test turn including a `developer` message — so a gateway that rejects that role fails here, not three minutes into a run. Starting a run also pre-flights every role's provider and refuses with the exact missing variable name.
+
+A provider added with `n` is a **draft** until its URL and key are real: `/models` shows *draft — why* (the `example.com` placeholder, a malformed URL, an env var that is not set and no stored key) and `t`/`D` stay off, so no credential is ever sent to a placeholder. A placeholder URL — `example.com` and the other RFC 2606 names — is refused by runs and by `mantra doctor` as well. Plain `http://` to a LAN box (`http://192.168.1.20:8000/v1`) is a real provider.
 
 </details>
 
@@ -408,13 +422,14 @@ The same process that draws the TUI can also serve a small, installable web app 
 - **What the relay can and cannot see.** Your host and the connecting browser derive a shared key from the password (PBKDF2, then a fresh HKDF key per connection) that never reaches the relay, and every message after that is AES-256-GCM end-to-end encrypted. The relay sees your IP, the browser's IP, and encrypted bytes — never the password, the key, or anything your agents say. A wrong password or code fails to decrypt the very first frame ("Wrong password or code") rather than quietly connecting into someone else's session.
 - **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all.
 - **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `mantra --remote` session per IPv4 address at a time — a second one dialing in from behind the same address (the same office, the same home network) is refused until the first disconnects, and Mantra reports that plainly instead of silently taking over.
+- **Behind a proxy.** The relay is dialed through the usual variables: `https_proxy` / `HTTPS_PROXY` for a `wss://` relay, `http_proxy` / `HTTP_PROXY` for `ws://`, `all_proxy` for either (lowercase is read first), `user:pass@` credentials included. `no_proxy` / `NO_PROXY` exempts hosts (`*`, a host or domain suffix, an IPv4 CIDR); a relay on `localhost` or a loopback address is never proxied, whatever the variables say. Only `http://` proxies work — the relay is reached with HTTP `CONNECT`, TLS still runs end to end through the tunnel and the certificate is checked as usual; a `socks5://` or `https://` proxy URL is refused with a hint (an `http://` proxy, or `no_proxy` for the relay host). Behind a TLS-inspecting proxy, or with a self-hosted relay on a private CA, `SSL_CERT_FILE` adds a PEM bundle to the built-in roots, and an untrusted relay certificate points at it. Proxy failures are reported as the proxy's (*refused the CONNECT (HTTP 403)*, *cannot reach the proxy*), not as a dead relay.
 
 </details>
 
 <details>
 <summary><code>--headless</code>: no terminal at all</summary>
 
-`--headless` runs the same engine with no terminal whatsoever — no raw mode, no input thread, nothing drawn — for a machine you only ever reach through the web UI or `--remote`. It needs at least one of `--web`/`--remote` (otherwise nothing would be reachable), a password whenever `--web` is on (a headless machine has nobody at the keyboard to notice a stranger on the loopback port; `--remote` alone generates one), and `ctrl+c` or `SIGTERM` shuts it down cleanly. The web/remote startup lines (URL, link, code, password) print once to stderr, since there's no `/web`/`/remote` overlay to show them in.
+`--headless` runs the same engine with no terminal whatsoever — no raw mode, no input thread, nothing drawn — for a machine you only ever reach through the web UI or `--remote`. It needs at least one of `--web`/`--remote` (otherwise nothing would be reachable), a password whenever `--web` is on (a headless machine has nobody at the keyboard to notice a stranger on the loopback port; `--remote` alone generates one), and `ctrl+c` or `SIGTERM` shuts it down cleanly. The web URL prints once to stderr at start, since there's no `/web`/`/remote` overlay to show it in; the relay's status follows — *waiting for the relay*, connected, reconnected, each error once with its retry delay (again only when the text changes or after a minute) — and the link, code and password print once the relay has actually answered, never before.
 
 </details>
 
