@@ -828,7 +828,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     }
     pl.push(Line::from(Span::styled(" base_url = the provider's API root: Codex reads …/v1/responses + …/v1/models; ClaudeCode uses it as ANTHROPIC_BASE_URL (bare host, no /v1) + …/v1/models for D", theme::faint())));
     pl.push(Line::from(Span::styled(" env_key = name of an env var holding the key · api_key = paste one directly (stored 0600) · either works · D here = discover this provider", theme::faint())));
-    pl.push(Line::from(Span::styled(" a new row (n) is a draft: saved, but t/D send nothing until base_url is real (https, or http to localhost) and its own key is available", theme::faint())));
+    pl.push(Line::from(Span::styled(" a new row (n) is a draft: saved, but t/D send nothing until base_url is real (not the example.com placeholder) and its own key is available", theme::faint())));
     pl.push(Line::from(Span::styled(" kind = Codex | ClaudeCode · auth (ClaudeCode only) = subscription | api_key · +/- on either cycles it", theme::faint())));
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
     f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);

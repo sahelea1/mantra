@@ -408,6 +408,9 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     for e in &st.errors {
         l.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, w.saturating_sub(4))), theme::fg(theme::RED))));
     }
+    for s in &st.skipped {
+        l.push(Line::from(Span::styled(format!(" {} {}", theme::g("‖", "-"), trunc(s, w.saturating_sub(4))), theme::fg(theme::AMBER))));
+    }
     let vis = st.visible();
     let nsel = st.items.iter().filter(|c| c.selected).count();
     let ftxt = st.filter.text();

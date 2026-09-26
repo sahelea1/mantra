@@ -69,6 +69,8 @@ pub struct DiscoverState {
     /// shows exactly where each key goes (P2: placeholder requests must be impossible to miss).
     pub hosts: Vec<(String, String)>,
     pub errors: Vec<String>,
+    /// Drafts that were not asked (`ProviderEntry::draft_reason`) — shown apart from failures.
+    pub skipped: Vec<String>,
     pub sel: usize,
     pub filter: Input,
 }
@@ -961,8 +963,9 @@ impl App {
     pub fn probe_model(&mut self, alias: &str) {
         // A draft provider (placeholder URL, no credential — `Registry::probe_problem`) never
         // gets a request: the row says why instead of a Codex process failing with a key that
-        // isn't there (or, worse, succeeding against the placeholder).
-        if let Some(why) = self.registry.probe_problem(alias) {
+        // isn't there (or, worse, succeeding against the placeholder). Not in demo mode: the
+        // mock backend never touches the network (the same exemption as `model_problem`).
+        if let Some(why) = (!self.demo).then(|| self.registry.probe_problem(alias)).flatten() {
             self.models_ui.status.insert(alias.to_string(), format!("error: {why}"));
             self.toast(format!("not tested — {why}"), Level::Warn);
             return;
@@ -1022,12 +1025,10 @@ impl App {
         let (drafts, net_provs): (Vec<_>, Vec<_>) = provs.iter().filter(|p| p.needs_url()).cloned().partition(|p| p.draft_reason().is_some());
         sources.extend(net_provs.iter().map(|p| p.id.clone()));
         let hosts = net_provs.iter().filter_map(|p| p.host().map(|h| (p.id.clone(), h))).collect();
-        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], sel: 0, filter: Input::default() }));
+        let skipped = drafts.iter().map(|p| format!("{}: skipped (draft) — {}", p.id, p.draft_reason().unwrap_or_default())).collect();
+        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default() }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
             self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
-        }
-        for p in drafts {
-            self.on_discovered(p.id.clone(), Err(format!("skipped (draft) — {}", p.draft_reason().unwrap_or_default())));
         }
         if only.is_none() {
             let cmd = self.hub.codex_cmd.clone();
