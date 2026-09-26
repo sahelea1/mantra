@@ -119,6 +119,12 @@ pub enum Command {
         agent: u32,
         alias: String,
     },
+    SetRoleModel {
+        role: String,
+        alias: String,
+        #[serde(default)]
+        all: bool,
+    },
     SetEffort {
         agent: u32,
         effort: String,
@@ -198,6 +204,7 @@ impl Command {
         "respawn",
         "compact",
         "set_model",
+        "set_role_model",
         "set_effort",
         "step_effort",
         "approve",
@@ -402,6 +409,7 @@ mod tests {
             Command::Respawn { agent: 2 },
             Command::Compact { agent: 2 },
             Command::SetModel { agent: 2, alias: "sol".into() },
+            Command::SetRoleModel { role: "worker".into(), alias: "sol".into(), all: false },
             Command::SetEffort { agent: 2, effort: "high".into() },
             Command::StepEffort { agent: 2, delta: -1 },
             Command::Approve { key: "1:5".into(), decision: "yes".into(), answer: Some("a".into()) },

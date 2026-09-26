@@ -316,7 +316,9 @@
         const key = 'c' + a.id;
         const raw = S().ui.drafts[key] || '';
         let text = raw.trim();
-        if (!text && !force) return;
+        // An empty draft is only ever a flush of what's already queued (Ctrl+Enter with nothing
+        // typed and nothing queued has nothing to do — same rule the server enforces).
+        if (!text && !(force && (a.queued || []).length)) return;
         if (text.startsWith('/') && !text.startsWith('//')) {
             const [name, ...rest] = text.split(/\s+/);
             const c = slashCommands(a).find((x) => x.n === name.toLowerCase());

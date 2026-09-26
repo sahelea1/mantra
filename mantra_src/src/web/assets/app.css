@@ -244,7 +244,7 @@ ul.plain li { margin: 4px 0; }
 .row-empty { display: flex; align-items: center; gap: 8px; padding: 12px 14px; color: var(--dim); font-size: var(--fs-sm); }
 
 .row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 60px; padding: 10px 12px 10px 12px; border-top: 1px solid var(--line); transition: background var(--t); }
-.group-body > .row:first-child, .card > .row:first-child { border-top: 0; }
+.group-body > .row:first-child, .card > .row:first-child, .role-list > .row:first-child { border-top: 0; }
 button.row:hover { background: var(--bg-hover); }
 button.row:active { background: var(--bg-press); }
 .row.active { background: color-mix(in srgb, var(--accent) 9%, transparent); box-shadow: inset 3px 0 0 var(--accent); }

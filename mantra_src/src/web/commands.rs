@@ -95,14 +95,16 @@ impl App {
         match cmd {
             Command::Send { agent, text, force } => {
                 self.agent_ok(agent)?;
+                // One rule for both modes: an empty send is only a no-op flush of whatever is
+                // already queued — with nothing typed and nothing queued, there is nothing to do.
+                if text.trim().is_empty() && self.agents.get(&agent).map(|a| a.queued.is_empty()).unwrap_or(true) {
+                    return Err("nothing queued to send".into());
+                }
                 if !self.hub.has_agent(agent) {
                     return Err("that agent's process has ended (respawn it, or start a new session)".into());
                 }
                 let mode = if force.unwrap_or(false) { Send::Force } else { Send::Queue };
                 let text = text.trim_end().to_string();
-                if text.trim().is_empty() && mode == Send::Queue {
-                    return Err("empty message".into());
-                }
                 if Some(agent) == self.solo {
                     if let Some(sh) = text.strip_prefix('!') {
                         if let Some(a) = self.agents.get_mut(&agent) {
@@ -111,9 +113,6 @@ impl App {
                         self.hub.send(agent, Cmd::Shell { command: sh.trim().to_string() });
                         return ok();
                     }
-                }
-                if text.trim().is_empty() && self.agents.get(&agent).map(|a| a.queued.is_empty()).unwrap_or(true) {
-                    return Err("nothing queued to send".into());
                 }
                 if self.in_run(agent) {
                     let name = self.run.as_ref().map(|r| r.name_of(agent)).unwrap_or_default();
@@ -198,15 +197,60 @@ impl App {
             }
             Command::SetModel { agent, alias } => {
                 self.agent_ok(agent)?;
-                if self.registry.get(&alias).is_none() {
-                    return Err("unknown model".into());
-                }
                 let in_run = self.in_run(agent);
-                self.set_model(agent, &alias);
+                self.set_model(agent, &alias)?;
                 if in_run {
                     self.model_switched_for_run_agent(agent);
                 }
                 ok()
+            }
+            Command::SetRoleModel { role, alias, all } => {
+                let mut pattern = Pattern::load(&self.pattern_name, &self.project).map_err(|e| e.to_string())?;
+                if self.registry.get(&alias).is_none() {
+                    return Err("unknown model".into());
+                }
+                if let Some(p) = self.registry.alias_problem(&alias) {
+                    return Err(p);
+                }
+                let targets: Vec<String> = if all {
+                    pattern.roles.keys().cloned().collect()
+                } else {
+                    if !pattern.roles.contains_key(&role) {
+                        return Err("no such role".into());
+                    }
+                    vec![role]
+                };
+                for name in &targets {
+                    if let Some(r) = pattern.roles.get_mut(name) {
+                        r.model = alias.clone();
+                        r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                    }
+                }
+                let path = pattern.save().map_err(|e| e.to_string())?;
+                if let Some(run) = self.run.as_mut() {
+                    for name in &targets {
+                        if let Some(r) = run.pattern.roles.get_mut(name) {
+                            r.model = alias.clone();
+                            r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                        }
+                    }
+                }
+                let new_backend = self.registry.backend_of(&self.registry.resolve(&alias));
+                let live: Vec<AgentId> = self.agents.iter().filter(|(_, a)| targets.contains(&a.role)).map(|(id, _)| *id).collect();
+                for id in live {
+                    let same_backend = self.agents.get(&id).map(|a| a.backend == new_backend).unwrap_or(false);
+                    if same_backend {
+                        let in_run = self.in_run(id);
+                        if self.set_model(id, &alias).is_ok() && in_run {
+                            self.model_switched_for_run_agent(id);
+                        }
+                    } else if let Some(a) = self.agents.get_mut(&id) {
+                        let name = a.name.clone();
+                        let old = a.model_alias.clone();
+                        a.notice(Level::Warn, format!("{name} keeps {old} until respawned (other backend)"));
+                    }
+                }
+                Ok(json!({"changed": targets, "path": path.display().to_string()}))
             }
             Command::SetEffort { agent, effort } => {
                 self.agent_ok(agent)?;
@@ -509,5 +553,65 @@ mod tests {
         let r = run(&mut app, &mut h, 5, Command::RemoteRotate);
         assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("remote access is off (start with --remote)")));
         assert_eq!(cap("abcdef", 3), "abc\n… truncated (3 more bytes)");
+    }
+
+    #[test]
+    fn send_rejects_whitespace_with_nothing_queued_in_both_modes() {
+        let (mut app, mut h, _rx) = wired();
+        let r = run(&mut app, &mut h, 1, Command::Send { agent: 1, text: "   ".into(), force: None });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("nothing queued to send")), "{r:?}");
+        let r = run(&mut app, &mut h, 2, Command::Send { agent: 1, text: "\t\n".into(), force: Some(true) });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("nothing queued to send")), "{r:?}");
+        // something queued: an empty force flushes it instead of being refused
+        app.agents.get_mut(&1).unwrap().queued = vec!["a".into()];
+        let r = run(&mut app, &mut h, 3, Command::Send { agent: 1, text: "".into(), force: Some(true) });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+    }
+
+    /// A temp `$MANTRA_HOME` for a test that saves a pattern, restored afterwards. Serialized
+    /// against other tests here that do the same (the env var is process-wide).
+    fn with_mantra_home<R>(f: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mantra-test-home-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("MANTRA_HOME").ok();
+        std::env::set_var("MANTRA_HOME", &dir);
+        let r = f();
+        match prev {
+            Some(v) => std::env::set_var("MANTRA_HOME", v),
+            None => std::env::remove_var("MANTRA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn set_role_model_all_writes_every_role_and_reclamps_effort() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.registry.models.push(crate::config::ModelEntry { alias: "capped".into(), model: "capped-model".into(), efforts: vec!["low".into(), "medium".into()], default_effort: "low".into(), ..Default::default() });
+            let mut pattern = Pattern::builtin();
+            pattern.name = "set-role-model-test".into();
+            for role in pattern.roles.values_mut() {
+                role.effort = "high".into();
+            }
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            match &r {
+                ServerMsg::Result(x) => assert!(x.ok, "{x:?}"),
+                other => panic!("{other:?}"),
+            }
+            let saved = Pattern::load(&app.pattern_name, &app.project).unwrap();
+            assert!(!saved.roles.is_empty());
+            for (name, role) in &saved.roles {
+                assert_eq!(role.model, "capped", "role '{name}'");
+                assert_eq!(role.effort, "medium", "role '{name}': high must clamp to this model's ceiling");
+            }
+        });
     }
 }

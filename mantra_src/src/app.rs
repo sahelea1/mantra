@@ -254,6 +254,13 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }))
     } else {
         let mut extra = reg.provider_args();
+        // Mantra's own tools reach the agent as `dynamic_tools` (`SpawnSpec.dynamic_tools`
+        // above); the user's own `~/.codex/config.toml` MCP servers are never on that path, so
+        // the model can only call them with a name the app-server can't route — the log's
+        // "unsupported call: mcp__…". Blanking the table here keeps a Codex agent to the tools
+        // Mantra gave it.
+        extra.push("-c".into());
+        extra.push("mcp_servers={}".into());
         extra.push("-c".into());
         extra.push(format!("model_context_window={cw}"));
         extra.push("-c".into());
@@ -382,9 +389,28 @@ pub struct Ctxt<'a> {
     pub notes: &'a mut Vec<String>,
 }
 
+/// Mirrors `App::sandbox_warning.is_some()` — set once, at startup, by `set_sandbox_warning`.
+/// `role_sandbox` reads it from wherever a role gets spawned (`Ctxt::spawn`/`spawn_resumed`,
+/// `start_solo`), which have no other way to reach the App that isn't already threading a new
+/// field through call sites this work package doesn't own (the TUI's own `Ctxt` construction).
+static SANDBOX_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A role's sandbox request, downgraded for a Codex agent when this host can't create the user
+/// namespaces `bwrap` needs (`SANDBOX_FALLBACK`): every sandbox mode goes through the same
+/// machinery, so keeping `workspace-write` or `read-only` would just trade one `bwrap` failure for
+/// another, while `danger-full-access` skips `bwrap` entirely. Claude Code agents never sandbox
+/// through `bwrap`, so they keep the role's own mode.
+fn role_sandbox(sandbox: &str, backend: crate::config::ProviderKind) -> String {
+    if SANDBOX_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) && backend == crate::config::ProviderKind::Codex {
+        return "danger-full-access".into();
+    }
+    if sandbox.is_empty() { "workspace-write".into() } else { sandbox.into() }
+}
+
 impl Ctx for Ctxt<'_> {
     fn spawn(&mut self, r: SpawnReq) -> AgentId {
-        let sandbox = if r.role.sandbox.is_empty() { "workspace-write".to_string() } else { r.role.sandbox.clone() };
+        let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
+        let sandbox = role_sandbox(&r.role.sandbox, backend);
         spawn_agent(
             self.hub,
             self.agents,
@@ -408,7 +434,8 @@ impl Ctx for Ctxt<'_> {
         )
     }
     fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
-        let sandbox = if r.role.sandbox.is_empty() { "workspace-write".to_string() } else { r.role.sandbox.clone() };
+        let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
+        let sandbox = role_sandbox(&r.role.sandbox, backend);
         spawn_agent(
             self.hub,
             self.agents,
@@ -578,6 +605,8 @@ impl App {
             self.hub.shutdown(old);
             self.agents.remove(&old);
         }
+        let backend = self.registry.backend_of(&self.registry.resolve(&self.settings.default_model));
+        let sandbox = role_sandbox(&self.settings.sandbox, backend);
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -591,7 +620,7 @@ impl App {
                 effort: None,
                 cwd: self.project.clone(),
                 approval: self.settings.approval_mode.clone(),
-                sandbox: self.settings.sandbox.clone(),
+                sandbox,
                 instructions: String::new(),
                 tools: vec![],
                 extra_writable: vec![],
@@ -603,6 +632,11 @@ impl App {
         if let Some(why) = self.model_problem(&self.settings.default_model) {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, &why);
+            }
+        }
+        if self.sandbox_warning.is_some() && backend == crate::config::ProviderKind::Codex {
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.notice(Level::Warn, "sandbox unavailable here: Codex agents run with danger-full-access; git worktrees still keep workers apart");
             }
         }
     }
@@ -725,16 +759,37 @@ impl App {
         self.set_effort(a, &e);
     }
 
-    pub fn set_model(&mut self, a: AgentId, alias: &str) {
-        let Some(ag) = self.agents.get(&a) else { return };
-        let old = self.registry.resolve(&ag.model_alias);
+    /// Switch a live agent's model. Refuses (rather than sending a `Cmd::SetModel` the process
+    /// cannot honour) an alias that isn't in `/models`, one with a `alias_problem` (draft
+    /// provider, missing key…), or one on a different backend than the agent is already running —
+    /// a backend is fixed at spawn, so that switch needs a respawn instead (the caller decides;
+    /// this never sends anything for it, which used to leave the next turn to fail with "the
+    /// requested model could not be resolved" and the watchdog respawning the agent anyway).
+    pub fn set_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
+        let Some(ag) = self.agents.get(&a) else { return Ok(()) };
+        if self.registry.get(alias).is_none() {
+            return Err("unknown model".into());
+        }
+        if let Some(p) = self.registry.alias_problem(alias) {
+            return Err(p);
+        }
         let new = self.registry.resolve(alias);
+        let new_backend = self.registry.backend_of(&new);
+        if new_backend != ag.backend {
+            let name = ag.name.clone();
+            return Err(format!(
+                "{alias} runs on {}; {name} is a {} agent: respawn it with that model instead",
+                crate::web::snapshot::backend_str(new_backend),
+                crate::web::snapshot::backend_str(ag.backend)
+            ));
+        }
+        let old = self.registry.resolve(&ag.model_alias);
         if Some(a) == self.solo && old.provider != new.provider {
             self.settings.default_model = new.alias.clone();
             let _ = self.settings.save();
             self.start_solo();
             self.toast(format!("new session on {} (provider changed)", new.alias), Level::Info);
-            return;
+            return Ok(());
         }
         let effort = new.resolve_effort(&ag.effort);
         self.hub.send(a, Cmd::SetModel(new.model.clone()));
@@ -750,6 +805,7 @@ impl App {
             self.settings.default_model = new.alias.clone();
             let _ = self.settings.save();
         }
+        Ok(())
     }
 
     /// After switching a run agent's model (e.g. from the halt-band `m` picker), persist the
@@ -862,6 +918,7 @@ impl App {
         }
         if let Some(w) = &self.sandbox_warning {
             run.log("⚠", "amber", format!("sandbox: {}", crate::util::trunc(w, 140)));
+            run.log("⚠", "amber", "sandbox unavailable here: Codex agents run with danger-full-access; git worktrees still keep workers apart");
         }
         self.run = Some(run);
         // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
@@ -875,6 +932,7 @@ impl App {
     /// screen exactly where a `bwrap` failure would otherwise be puzzling.
     pub fn set_sandbox_warning(&mut self, why: String) {
         self.sandbox_warning = Some(why);
+        SANDBOX_FALLBACK.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `/runs`: this project's runs, newest first. Runs of other projects are only counted — a
@@ -2043,7 +2101,9 @@ impl App {
                     let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
                     self.overlays.push(Overlay::ModelPicker { sel, target });
                 } else if let Some(a) = target {
-                    self.set_model(a, arg);
+                    if let Err(e) = self.set_model(a, arg) {
+                        self.toast(e, Level::Warn);
+                    }
                 }
             }
             "/effort" => match target {
@@ -2209,6 +2269,29 @@ mod tests {
         prompt_agent(&hub, &mut agents, id, "one more thing".into(), true, Send::Force);
         assert_eq!(agents[&id].queued, vec!["one more thing".to_string()]);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn set_model_refuses_unknown_and_cross_backend_aliases() {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude".into(), kind: crate::config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "claude-model".into(), model: "claude-model".into(), provider: "cc".into(), ..Default::default() });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
+        let id: AgentId = 1;
+        let mut a = Agent::new(id, "worker", "worker", PathBuf::from("."));
+        a.model_alias = "sol".into();
+        a.backend = crate::config::ProviderKind::Codex;
+        app.agents.insert(id, a);
+
+        assert_eq!(app.set_model(id, "no-such-alias"), Err("unknown model".into()));
+        assert_eq!(app.agents[&id].model_alias, "sol");
+
+        let err = app.set_model(id, "claude-model").unwrap_err();
+        assert!(err.contains("claude-code") && err.contains("codex") && err.contains("respawn it"), "{err}");
+        assert_eq!(app.agents[&id].model_alias, "sol", "a refused switch never touches the agent");
     }
 
     #[test]

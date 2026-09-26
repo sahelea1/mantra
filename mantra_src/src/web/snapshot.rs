@@ -92,6 +92,20 @@ pub struct ModelInfo {
     pub problem: Option<String>,
 }
 
+/// A pattern role as the settings picker sees it — enough to show and to re-pick its model.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PatternRoleView {
+    pub name: String,
+    pub kind: String,
+    pub glyph: String,
+    pub color: String,
+    pub model_alias: String,
+    pub effort: String,
+    /// "codex" | "claude-code"
+    pub backend: String,
+    pub sandbox: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AppInfo {
     pub version: String,
@@ -114,6 +128,8 @@ pub struct AppInfo {
     /// "solo" | "stage" | "zoom:<id>" | "studio" | "models"
     pub tui_screen: String,
     pub models: Vec<ModelInfo>,
+    #[serde(default)]
+    pub pattern_roles: Vec<PatternRoleView>,
     pub push_enabled: bool,
     pub tls: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,7 +663,7 @@ fn status_str(s: &Status) -> (&'static str, Option<String>) {
     }
 }
 
-fn backend_str(k: crate::config::ProviderKind) -> &'static str {
+pub(crate) fn backend_str(k: crate::config::ProviderKind) -> &'static str {
     match k {
         crate::config::ProviderKind::Codex => "codex",
         crate::config::ProviderKind::ClaudeCode => "claude-code",
@@ -1037,6 +1053,21 @@ pub fn app_info(app: &App, env: &Env, patterns: &[String]) -> AppInfo {
                 compact_percent: m.effective_compact_percent(),
                 note: m.note.clone(),
                 problem: app.registry.alias_problem(&m.alias),
+            })
+            .collect(),
+        pattern_roles: crate::engine::pattern::Pattern::load(&app.pattern_name, &app.project)
+            .map(|p| p.ordered_roles())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, role)| PatternRoleView {
+                name,
+                kind: role.kind,
+                glyph: role.glyph,
+                color: role.color,
+                backend: backend_str(app.registry.backend_of(&app.registry.resolve(&role.model))).into(),
+                model_alias: role.model,
+                effort: role.effort,
+                sandbox: role.sandbox,
             })
             .collect(),
         push_enabled: env.push,

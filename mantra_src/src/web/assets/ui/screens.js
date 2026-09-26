@@ -284,6 +284,27 @@
         ], { key: 'appearance', icon: 'sun' });
     }
 
+    // Pattern roles and their models (design §6-web-roles). Reads S.app.pattern_roles, which the
+    // server rebuilds from the pattern file on every snapshot — so a save from another tab, or
+    // from this one, shows up here without a page reload.
+    function rolesCard() {
+        const roles = (S().app || {}).pattern_roles || [];
+        if (!roles.length) return null;
+        return card('Roles & models', h('div', { class: 'role-list' }, roles.map((r) => h('button', {
+            type: 'button', key: r.name, class: 'row role-row',
+            onclick: () => M.act.sheet({ kind: 'role-model', role: r.name, all: false }),
+        },
+            P.glyph(r, 'lg'),
+            h('span', { class: 'row-main' },
+                h('span', { class: 'row-title' }, r.name),
+                h('span', { class: 'row-sub' }, r.kind)),
+            h('span', { class: 'chip model' }, h('b', null, r.model_alias), r.effort ? [h('span', { class: 'sep' }, '·'), h('span', null, r.effort)] : null),
+            icon('chevron', 'chev')))), {
+            key: 'roles', icon: 'model',
+            right: P.btn('Set all roles…', () => M.act.sheet({ kind: 'role-model', role: '', all: true }), { sm: true, kind: 'ghost' }),
+        });
+    }
+
     function drawQr(canvas, rows) {
         if (!canvas || !rows || !rows.length) return;
         const n = rows.length, quiet = 4, total = n + quiet * 2;
@@ -387,7 +408,7 @@
     }
 
     function settingsScreen() {
-        return page('settings', [notificationsCard(), appearanceCard(), remoteCard(), certCard(), sessionCard(), aboutCard()], 'narrow');
+        return page('settings', [notificationsCard(), appearanceCard(), rolesCard(), remoteCard(), certCard(), sessionCard(), aboutCard()], 'narrow');
     }
 
     // ── More (phone) ─────────────────────────────────────────────────────────────────────────────

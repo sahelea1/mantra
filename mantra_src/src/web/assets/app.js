@@ -453,6 +453,21 @@
         sh.loading = false;
         changed();
     }
+    // The model list shared by the per-agent and per-role pickers. A model with a `problem`
+    // (draft provider, missing key…) is shown but disabled — picking it would just bounce off
+    // the server's own check.
+    function modelPickList(currentAlias, onPick) {
+        const models = (S.app && S.app.models) || [];
+        if (!models.length) return P.empty('model', 'No models', 'The model registry is empty.');
+        return h('div', { class: 'pick-list' }, models.map((m) => h('button', {
+            type: 'button', key: m.alias, class: 'pick' + (m.alias === currentAlias ? ' on' : '') + (m.problem ? ' problem' : ''),
+            disabled: m.problem ? true : null,
+            onclick: () => onPick(m.alias),
+        }, h('span', { class: 'pick-main' }, h('b', null, m.alias), h('span', { class: 'dim mono sm' }, ' ' + m.model)),
+            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend === 'claude-code' ? 'Claude Code' : null, m.context_window ? F.tokens(m.context_window) + ' ctx' : null, m.note].filter(Boolean).join(' · ')),
+            m.problem ? h('span', { class: 'pick-problem' }, m.problem) : null,
+            m.alias === currentAlias ? icon('check', 'pick-check') : null)));
+    }
     function sheetLayer() {
         const sh = S.ui.sheet;
         if (!sh) return null;
@@ -473,14 +488,18 @@
             case 'model': {
                 if (!a) break;
                 title = 'Model for ' + a.name;
-                const models = (S.app && S.app.models) || [];
-                body = h('div', { class: 'pick-list' }, models.length ? models.map((m) => h('button', {
-                    type: 'button', key: m.alias, class: 'pick' + (m.alias === a.model_alias ? ' on' : '') + (m.problem ? ' problem' : ''),
-                    onclick: () => { closeSheet(); if (m.alias !== a.model_alias) cmd('set_model', { agent: a.id, alias: m.alias }, { ok: a.name + ' → ' + m.alias }); },
-                }, h('span', { class: 'pick-main' }, h('b', null, m.alias), h('span', { class: 'dim mono sm' }, ' ' + m.model)),
-                    h('span', { class: 'pick-sub' }, [m.provider_name, m.backend === 'claude-code' ? 'Claude Code' : null, m.context_window ? F.tokens(m.context_window) + ' ctx' : null, m.note].filter(Boolean).join(' · ')),
-                    m.problem ? h('span', { class: 'pick-problem' }, m.problem) : null,
-                    m.alias === a.model_alias ? icon('check', 'pick-check') : null)) : P.empty('model', 'No models', 'The model registry is empty.'));
+                body = modelPickList(a.model_alias, (alias) => { closeSheet(); if (alias !== a.model_alias) cmd('set_model', { agent: a.id, alias }, { ok: a.name + ' → ' + alias }); });
+                break;
+            }
+            case 'role-model': {
+                const all = !!sh.all;
+                const role = all ? null : (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
+                if (!all && !role) break;
+                title = 'Model for ' + (all ? 'all roles' : role.name);
+                body = modelPickList(all ? null : role.model_alias, (alias) => {
+                    closeSheet();
+                    cmd('set_role_model', { role: sh.role, alias, all }, { ok: (all ? 'all roles' : sh.role) + ' → ' + alias });
+                });
                 break;
             }
             case 'effort': {
