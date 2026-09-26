@@ -261,12 +261,18 @@ pub fn status_snapshot(dir: &Path) -> Option<StatusSnapshot> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut snap = BTreeMap::new();
-    let mut it = text.split('\0').filter(|e| e.len() > 3);
+    // Entries are `XY path\0`; a rename or copy (R/C in either column) is followed by its source
+    // path as an entry of its own, which is skipped here — by position, never by length, or a
+    // short source name would leave the *next* real entry (a worker's file) out of the snapshot.
+    let mut it = text.split('\0').take_while(|e| !e.is_empty());
     while let Some(e) = it.next() {
+        if e.len() < 4 {
+            continue;
+        }
         let (xy, path) = e.split_at(2);
         snap.insert(path[1..].to_string(), xy.to_string());
-        if xy.starts_with('R') || xy.starts_with('C') {
-            it.next(); // the rename/copy source follows as its own entry
+        if xy.contains('R') || xy.contains('C') {
+            it.next();
         }
     }
     Some(snap)
@@ -387,6 +393,28 @@ mod tests {
         assert!(files.contains(&"worker.txt".to_string()), "{files:?}");
         assert!(!files.iter().any(|f| f.starts_with("__pycache__")), "{files:?}");
         assert_eq!(git(&dir, &["show", "HEAD:tracked.txt"]).unwrap(), "one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staged rename whose source name is short ("abc" → "def") used to be dropped by a length
+    /// filter, so the skip meant for the source ate the next entry instead — and a worker's
+    /// untracked file listed right after it went missing from the snapshot, then got "cleaned".
+    #[test]
+    fn a_short_rename_source_does_not_hide_the_next_entry() {
+        let dir = temp_repo("rename");
+        std::fs::write(dir.join("abc"), "x\n").unwrap();
+        git(&dir, &["add", "abc"]).unwrap();
+        commit_all(&dir, "abc").unwrap();
+        git(&dir, &["mv", "abc", "def"]).unwrap();
+        std::fs::write(dir.join("zzz.txt"), "by a worker\n").unwrap();
+        let before = status_snapshot(&dir).unwrap();
+        assert_eq!(before.get("def").map(String::as_str), Some("R "), "{before:?}");
+        assert_eq!(before.get("zzz.txt").map(String::as_str), Some("??"), "{before:?}");
+        assert!(!before.contains_key("abc"), "the rename source is not an entry: {before:?}");
+        let res = run_checks(&dir, &["echo x > scratch.txt".to_string()], Duration::from_secs(10));
+        assert!(res[0].ok);
+        assert_eq!(discard_check_artifacts(&dir, &before), vec!["scratch.txt"]);
+        assert!(dir.join("zzz.txt").exists(), "a worker's file is never deleted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

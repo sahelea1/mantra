@@ -47,7 +47,9 @@ impl Run {
     /// `now` — unless the run is already over, in which case it stays frozen. A state file from
     /// before the clock existed falls back to its wall-clock span (up to `finished_unix` when stamped).
     pub(super) fn restore_clock(&mut self, st: &RunState, now: u64) {
-        let secs = if st.active_secs == 0 { st.finished_unix.unwrap_or(st.updated_unix).saturating_sub(st.started_unix) } else { st.active_secs };
+        // `Some(0)` is a real reading (halted within its first second, say) — only a file without
+        // the field at all falls back, or a run parked for hours right after a halt resumes at hours.
+        let secs = st.active_secs.unwrap_or_else(|| st.finished_unix.unwrap_or(st.updated_unix).saturating_sub(st.started_unix));
         self.set_clock(secs, if self.is_active() { Some(now) } else { None });
     }
 
@@ -293,13 +295,17 @@ mod tests {
     #[test]
     fn restore_clock_carries_active_time_over() {
         let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
-        let st = RunState { started_unix: 100, updated_unix: 160, active_secs: 45, ..Default::default() };
+        let st = RunState { started_unix: 100, updated_unix: 160, active_secs: Some(45), ..Default::default() };
         run.restore_clock(&st, 1000);
         assert_eq!(run.elapsed_at(1010).as_secs(), 55, "saved total plus the new span");
         // an older state file (no clock) falls back to its wall-clock span
         let old = RunState { started_unix: 100, updated_unix: 160, ..Default::default() };
         run.restore_clock(&old, 1000);
         assert_eq!(run.elapsed_at(1000).as_secs(), 60);
+        // a run halted within its first second and left overnight: 0 is a reading, not "no clock"
+        let parked = RunState { started_unix: 100, updated_unix: 30000, active_secs: Some(0), ..Default::default() };
+        run.restore_clock(&parked, 40000);
+        assert_eq!(run.elapsed_at(40003).as_secs(), 3, "the hours it sat halted are not active time");
         // a finished run stays frozen
         run.stage = Stage::Done;
         run.restore_clock(&st, 1000);

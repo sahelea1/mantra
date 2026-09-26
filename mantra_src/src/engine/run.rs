@@ -563,7 +563,7 @@ impl Run {
             pending: self.pending.clone(),
             started_unix: self.started_unix,
             finished_unix: self.finished_unix,
-            active_secs: self.elapsed().as_secs(),
+            active_secs: Some(self.elapsed().as_secs()),
             updated_unix: crate::util::unix_secs(),
             ws: self.ws.clone(),
             handoff: self.handoff.clone(),
