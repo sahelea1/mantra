@@ -343,6 +343,12 @@ const REPLAY_WAIT: Duration = Duration::from_secs(5);
 /// While the relay connection is down clients are kept for a reconnect at most this long: the
 /// relay's idle timeout, after which it has closed them (4410) for certain.
 const MAX_ADRIFT: Duration = Duration::from_secs(90);
+/// A refused client gets its plaintext refusal first and the close only after this: the relay
+/// may deliver a close ahead of frames still queued for that client, which would swallow the
+/// refusal. The browser hangs up by itself as soon as it reads it.
+const REFUSE_GRACE: Duration = Duration::from_secs(1);
+/// Refused clients awaiting that close; beyond this many they are closed at once.
+const MAX_REFUSED: usize = 64;
 
 type Cid = [u8; 16];
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -734,11 +740,13 @@ struct Clients {
     key: [u8; 32],
     out: UnboundedSender<(Cid, Outbound)>,
     map: HashMap<Cid, Client>,
+    /// Refused (already forgotten) clients and when to close them if they haven't left.
+    refused: Vec<(Cid, Instant)>,
 }
 
 impl Clients {
     fn new(web: WebRegistryHandle, tx: UnboundedSender<AppEvent>, key: [u8; 32], out: UnboundedSender<(Cid, Outbound)>) -> Clients {
-        Clients { web, tx, key, out, map: HashMap::new() }
+        Clients { web, tx, key, out, map: HashMap::new(), refused: vec![] }
     }
 
     /// Clients past the hello (what `/remote` shows as connected).
@@ -792,6 +800,10 @@ impl Clients {
                 if strikes.is_blocked(&ip, now) {
                     return vec![close_frame(&cid)];
                 }
+                if let Some(i) = self.refused.iter().position(|(c, _)| *c == cid) {
+                    self.refused.swap_remove(i);
+                    return vec![close_frame(&cid)];
+                }
                 // The relay replays `open` for clients still attached after a host reconnect: the
                 // browser keeps its E2EE session (it never repeats the hello), so do we.
                 if let Some(c) = self.map.get_mut(&cid).filter(|c| c.adrift.is_some()) {
@@ -820,6 +832,7 @@ impl Clients {
                 vec![]
             }
             Some("close") => {
+                self.refused.retain(|(c, _)| *c != cid);
                 self.forget(&cid);
                 vec![]
             }
@@ -846,7 +859,7 @@ impl Clients {
                 .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok());
             let Some(cr) = cr else {
                 strikes.strike(&c.ip.clone(), now);
-                return self.refuse(&cid, "hello");
+                return self.refuse(&cid, "hello", now);
             };
             let hr = crypto::random_bytes::<16>();
             c.cipher = Some(crypto::Cipher::new(&crypto::conn_key(&self.key, &cr, &hr), crypto::DIR_HOST));
@@ -865,7 +878,7 @@ impl Clients {
             // that is what the strike limit throttles. Later it is a broken client.
             if !c.hello_seen {
                 strikes.strike(&c.ip.clone(), now);
-                return self.refuse(&cid, "badkey");
+                return self.refuse(&cid, "badkey", now);
             }
             return self.drop_client(&cid);
         };
@@ -911,6 +924,12 @@ impl Clients {
         for cid in late {
             out.extend(self.drop_client(&cid));
         }
+        self.refused.retain(|(cid, at)| {
+            if *at <= now {
+                out.push(close_frame(cid));
+            }
+            *at > now
+        });
         if ping {
             let ping_json = serde_json::json!({"t": "ping"}).to_string();
             let mut dead = vec![];
@@ -936,10 +955,16 @@ impl Clients {
 
     /// A failed handshake, said once in plaintext (`0x01 {"err":"badkey"|"hello"}`, §10.3) before
     /// the close, so the browser can tell a wrong password from a dropped connection — the relay's
-    /// close code alone can't (it is 4000 for both, or none at all).
-    fn refuse(&mut self, cid: &Cid, why: &str) -> Vec<Frame> {
+    /// close code alone can't (it is 4000 for both, or none at all). The client is forgotten now
+    /// (later frames from it are ignored); the close follows after `REFUSE_GRACE` via `sweep`.
+    fn refuse(&mut self, cid: &Cid, why: &str, now: Instant) -> Vec<Frame> {
         let mut out = vec![bin(cid, &crypto::hello_frame(&serde_json::json!({"err": why}).to_string()))];
-        out.extend(self.drop_client(cid));
+        self.forget(cid);
+        if self.refused.len() >= MAX_REFUSED {
+            out.push(close_frame(cid));
+        } else {
+            self.refused.push((*cid, now + REFUSE_GRACE));
+        }
         out
     }
 
@@ -1146,11 +1171,11 @@ mod tests {
         }
     }
 
-    /// The plaintext refusal a browser gets before its close: `[cid][0x01]{"err":why}`.
+    /// The plaintext refusal a browser gets (its close follows on a later sweep): `[cid][0x01]{"err":why}`.
     fn refused(cid: &Cid, why: &str) -> Vec<Frame> {
         let mut f = cid.to_vec();
         f.extend(crypto::hello_frame(&serde_json::json!({"err": why}).to_string()));
-        vec![Frame::Bin(f), close_frame(cid)]
+        vec![Frame::Bin(f)]
     }
 
     /// Receivers a test keeps alive so the Clients' senders stay connected.
@@ -1220,11 +1245,18 @@ mod tests {
         let r = cl.binary(&b.hello(), &mut st, now);
         b.accept(&r[0], &[2u8; 32]);
         assert_eq!(cl.binary(&b.send(r#"{"t":"hello","protocol":1}"#), &mut st, now), refused(&b.cid, "badkey"));
+        assert!(cl.binary(&b.send(r#"{"t":"ping"}"#), &mut st, now).is_empty(), "a refused client is already forgotten");
+        // the close follows once the grace is over, unless the browser hung up first
+        assert!(cl.sweep(now, false).is_empty());
+        assert_eq!(cl.sweep(now + REFUSE_GRACE, false), vec![close_frame(&b.cid)]);
+        assert!(cl.sweep(now + REFUSE_GRACE * 2, false).is_empty(), "closed once");
         let c = FakeBrowser::new(2);
         cl.control(&c.open(), &mut st, now);
         let mut junk = c.cid.to_vec();
         junk.extend(crypto::hello_frame(r#"{"v":2}"#));
         assert_eq!(cl.binary(&junk, &mut st, now), refused(&c.cid, "hello"));
+        cl.control(&serde_json::json!({"t": "close", "c": hex(&c.cid)}).to_string(), &mut st, now);
+        assert!(cl.sweep(now + REFUSE_GRACE, false).is_empty(), "the browser left by itself: nothing to close");
         // after the protocol hello a broken frame is no key problem: a plain close, no refusal
         let mut d = FakeBrowser::new(3);
         cl.control(&d.open(), &mut st, now);
@@ -1332,11 +1364,15 @@ mod tests {
         assert_eq!(cl.control(&b.open(), &mut st, now), vec![close_frame(&b.cid)], "10 wrong keys → that IP is ignored");
         assert_eq!(reg.count(ConnKind::Relay), 0);
         // anything but a hello first is refused too
-        let other = serde_json::json!({"t": "open", "c": hex(&[7; 16]), "ip": "198.51.100.2"}).to_string();
+        let other = serde_json::json!({"t": "open", "c": hex(&[77; 16]), "ip": "198.51.100.2"}).to_string();
         cl.control(&other, &mut st, now);
-        let mut junk = vec![7u8; 16];
+        let mut junk = vec![77u8; 16];
         junk.extend([crypto::T_DATA, 0, 0]);
-        assert_eq!(cl.binary(&junk, &mut st, now), refused(&[7; 16], "hello"));
+        assert_eq!(cl.binary(&junk, &mut st, now), refused(&[77; 16], "hello"));
+        // every refused client is closed once its grace is over
+        assert_eq!(cl.sweep(now + REFUSE_GRACE, false).len(), STRIKE_LIMIT + 1);
+        assert_eq!(cl.control(&other, &mut st, now), vec![], "a new open after the close starts over");
+        cl.control(&serde_json::json!({"t": "close", "c": hex(&[77; 16])}).to_string(), &mut st, now);
         // a client that never says hello is closed after 10 s
         let mut b = FakeBrowser::new(50);
         b.cid = [50; 16];
