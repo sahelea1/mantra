@@ -519,6 +519,10 @@ async fn session(
             }
         }
         if rotated {
+            // Same concern as `refuse`'s comment (§10.3): the relay could otherwise drop this
+            // whole connection — and with it every attached client — before it has actually
+            // forwarded the notice just queued above.
+            tokio::time::sleep(REFUSE_GRACE).await;
             break 'conn "identity rotated".into();
         }
         inner.set_status(true, clients.ready(), None);
@@ -785,18 +789,22 @@ impl Clients {
     }
 
     /// Every client that finished its hello, told the link was rotated — sealed with the key it
-    /// still knows, so it reads before `rekey` drops it and the relay connection closes (§10.3,
-    /// §10.4). Clients still mid-handshake get nothing (they have no cipher to seal with yet);
-    /// they simply vanish, same as any other drop.
+    /// still knows. A rotate changes the sid too, so there is no later reconnect under this
+    /// identity to defer the close to (unlike `refuse`): the caller sends this, waits out
+    /// `REFUSE_GRACE` so the relay has a moment to actually deliver it, *then* drops the whole
+    /// relay connection — every attached client goes with it (their ordinary 4410). Clients still
+    /// mid-handshake get nothing (no cipher to seal with yet); they simply vanish, same as any
+    /// other drop, once `rekey` forgets them.
     fn rotate_notice(&mut self) -> Vec<Frame> {
         let msg = super::protocol::ServerMsg::Bye { reason: "rotated".into() }.to_json();
-        let mut out = vec![];
-        for (cid, c) in self.map.iter_mut() {
-            if let Some(cipher) = c.cipher.as_mut().filter(|_| c.hello_seen) {
-                out.extend(cipher.seal(msg.as_bytes()).iter().map(|f| bin(cid, f)));
-            }
-        }
-        out
+        self.map
+            .iter_mut()
+            .filter(|(_, c)| c.hello_seen)
+            .flat_map(|(cid, c)| match c.cipher.as_mut() {
+                Some(cipher) => cipher.seal(msg.as_bytes()).into_iter().map(|f| bin(cid, &f)).collect::<Vec<_>>(),
+                None => vec![],
+            })
+            .collect()
     }
 
     /// A different key (rotate): every client belongs to the old identity.
