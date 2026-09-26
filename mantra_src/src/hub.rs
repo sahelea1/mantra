@@ -294,14 +294,21 @@ async fn agent_task(
                     window = Instant::now();
                     restarts = 0;
                 }
-                restarts += 1;
-                // A crash after `Ready` proves the launch path works: the launch budget is per
-                // unbroken streak of failures to come up, not per lifetime.
-                launch_failures = if launch_failure { launch_failures + 1 } else { 0 };
-                let backoff = restart_backoff(if launch_failure { launch_failures } else { restarts }, launch_failure);
+                // Each budget counts its own failures: a crash after `Ready` proves the launch
+                // path works (the launch budget is per unbroken streak of failures to come up),
+                // and a failure to come up does not eat into the crash budget.
+                let attempt = if launch_failure {
+                    launch_failures += 1;
+                    launch_failures
+                } else {
+                    launch_failures = 0;
+                    restarts += 1;
+                    restarts
+                };
+                let backoff = restart_backoff(attempt, launch_failure);
                 let restarting = backoff.is_some();
-                crate::mlog!("agent {id} {}: {reason} (attempt {restarts}, restarting={restarting})", if launch_failure { "failed to launch" } else { "crashed" });
-                let _ = ev.send(HubEvent::Crashed { agent: id, reason, restarting, attempt: restarts });
+                crate::mlog!("agent {id} {}: {reason} (attempt {attempt}, restarting={restarting})", if launch_failure { "failed to launch" } else { "crashed" });
+                let _ = ev.send(HubEvent::Crashed { agent: id, reason, restarting, attempt });
                 if let Some(backoff) = backoff {
                     // Wait out the backoff, but stay responsive to shutdown.
                     let deadline = tokio::time::sleep(backoff);
@@ -608,6 +615,59 @@ mod tests {
         assert_eq!(restart_backoff(MAX_RESTARTS + 1, false), None);
         assert_eq!(restart_backoff(3, false), Some(Duration::from_millis(4000)));
         assert!(restart_backoff(1, false) < restart_backoff(2, false));
+    }
+
+    /// The wiring behind `restart_backoff`: a process that exits before the handshake (Codex
+    /// 0.157.1 without `/proc/self/exe`) is a launch failure, reported with its stderr line,
+    /// retried twice, then parked until the user asks for a restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_that_dies_before_the_handshake_parks_after_three_attempts() {
+        let spec = SpawnSpec {
+            cwd: std::env::temp_dir(),
+            model: "m".into(),
+            provider: "openai".into(),
+            effort: String::new(),
+            approval: "never".into(),
+            sandbox: "read-only".into(),
+            developer_instructions: String::new(),
+            dynamic_tools: vec![],
+            config: Default::default(),
+            extra_args: vec![],
+            resume_thread: None,
+            backend: Backend::Codex,
+            envs: vec![],
+            claude: None,
+        };
+        let cmd: Vec<String> = ["sh", "-c", "echo 'ERROR codex_app_server: cannot read /proc/self/exe (simulated)' >&2; exit 3"].iter().map(|s| s.to_string()).collect();
+        let (ev, mut rx) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        tokio::spawn(agent_task(7, spec, cmd, ev, cmds, Duration::ZERO));
+        async fn next(rx: &mut mpsc::UnboundedReceiver<HubEvent>) -> HubEvent {
+            tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.expect("the agent task answers in time").expect("the agent task is alive")
+        }
+        let mut crashed = vec![];
+        loop {
+            if let HubEvent::Crashed { attempt, restarting, reason, .. } = next(&mut rx).await {
+                crashed.push((attempt, restarting, reason));
+                if !restarting {
+                    break;
+                }
+            }
+        }
+        assert_eq!(crashed.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 2, 3], "{crashed:?}");
+        assert!(crashed[0].1 && crashed[1].1 && !crashed[2].1, "{crashed:?}");
+        for (_, _, reason) in &crashed {
+            assert!(reason.starts_with("handshake failed") && reason.contains("/proc/self/exe"), "{reason}");
+        }
+        // parked: a turn is refused until a restart is asked for
+        ctl.send(Cmd::Turn { text: "hi".into() }).unwrap();
+        match next(&mut rx).await {
+            HubEvent::CmdFailed { what: "turn", error, .. } => assert!(error.contains("restart"), "{error}"),
+            other => panic!("expected the turn to be refused, got {other:?}"),
+        }
+        drop(ctl);
+        assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 7 }));
     }
 
     #[test]

@@ -952,7 +952,8 @@ fn probe_app_server(s: &config::Settings, r: &config::Registry) -> (Result<Strin
                 }
             }
             // Codex before `command/exec` existed: probe the sandbox helper it runs commands with.
-            Err(e) if e.code == -32601 => sandbox_helper_probe(&s.codex_command[0], &cwd),
+            // (The app-server answers an unknown method with -32600 "unknown variant", not -32601.)
+            Err(e) if e.code == -32601 || (e.code == -32600 && e.message.contains("unknown variant")) => sandbox_helper_probe(&s.codex_command[0], &cwd),
             Err(e) => {
                 let tail = rpc::stderr_after_failure(&conn, &mut inc, Duration::from_millis(1500)).await;
                 let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
@@ -1004,6 +1005,10 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
         return (Some(false), format!("`{alias}` uses provider '{}' which is not in /models", m.provider));
     };
     let name = r.provider_name(&p.id);
+    // A placeholder (or malformed) base_url never gets a request: the key would go to example.com.
+    if let Some(why) = p.url_problem() {
+        return (Some(false), format!("{name} for `{alias}`: {why} (/models to fix)"));
+    }
     let key_src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
         format!("${} set", p.env_key.trim())
     } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
@@ -1131,4 +1136,29 @@ fn claude_auth_status(cmd0: &str) -> Option<String> {
     }
     let first = t.lines().next().unwrap_or("").trim().to_string();
     (!first.is_empty()).then_some(first)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    /// The provider row never sends the key to a placeholder: the `n` row with a key configured
+    /// is refused before `GET /models` is built (doctor used to be the one path around the draft rules).
+    #[test]
+    fn doctor_refuses_a_placeholder_provider_before_any_request() {
+        let mut r = config::Registry { models: vec![], providers: vec![] };
+        r.providers.push(config::ProviderEntry { id: "myprovider".into(), base_url: "https://example.com/v1".into(), api_key: Some("sk-1".into()), ..Default::default() });
+        r.models.push(config::ModelEntry { alias: "testing".into(), provider: "myprovider".into(), model: "testing".into(), ..Default::default() });
+        r.models.push(config::ModelEntry { alias: "gpt".into(), model: "gpt-5".into(), ..Default::default() });
+        let s = config::Settings { default_model: "testing".into(), ..Default::default() };
+        let (ok, row) = provider_row(&s, &r);
+        assert_eq!(ok, Some(false));
+        assert!(row.contains("example.com placeholder") && row.contains("/models to fix"), "{row}");
+        // a malformed URL the same way; Codex's own account has nothing to send
+        r.providers[0].base_url = "api.riti.dev/v1".into();
+        let (ok, row) = provider_row(&s, &r);
+        assert!(ok == Some(false) && row.contains("not a URL"), "{row}");
+        let s = config::Settings { default_model: "gpt".into(), ..Default::default() };
+        assert_eq!(provider_row(&s, &r).0, None);
+    }
 }

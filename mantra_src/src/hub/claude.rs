@@ -70,7 +70,7 @@ pub(super) async fn run_claude_process(
 ) -> Exit {
     let cs = match spec.claude.clone() {
         Some(c) => c,
-        None => return Exit::Crashed("internal error: Claude backend spawned without ClaudeSpawn config".into()),
+        None => return Exit::LaunchFailed("internal error: Claude backend spawned without ClaudeSpawn config".into()),
     };
     let Some((prog, base_args)) = claude_cmd.split_first() else {
         return Exit::LaunchFailed("empty claude command".into());
@@ -94,6 +94,9 @@ pub(super) async fn run_claude_process(
         return Exit::LaunchFailed("claude: missing stdio pipes".into());
     };
     let mut stdin = stdin;
+    // An exit before `Ready` (not logged in, a refused flag, a bad gateway) fails the same way
+    // every time: `Exit::LaunchFailed` gets the short budget, a crash after `Ready` the long one.
+    let mut ready = false;
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<LineIn>();
     tokio::spawn(read_lines(stdout, line_tx));
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -220,12 +223,13 @@ pub(super) async fn run_claude_process(
                         for e in tr.on_line(&v, is_restart) {
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
+                                ready = true;
                             }
                             let _ = ev.send(e);
                         }
                         if let Some(reason) = tr.fatal_auth.take() {
                             let _ = child.kill().await;
-                            return Exit::Crashed(reason);
+                            return if ready { Exit::Crashed(reason) } else { Exit::LaunchFailed(reason) };
                         }
                         if tr.restart_pending && !tr.turn_open {
                             let _ = child.kill().await;
@@ -236,7 +240,8 @@ pub(super) async fn run_claude_process(
                         let code = super::reap_exit_code(&mut child).await;
                         let code_s = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
                         let tail = stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join(" / ")).unwrap_or_default();
-                        return Exit::Crashed(if tail.trim().is_empty() { format!("claude exited (code {code_s})") } else { format!("claude exited (code {code_s}): {tail}") });
+                        let reason = if tail.trim().is_empty() { format!("claude exited (code {code_s})") } else { format!("claude exited (code {code_s}): {tail}") };
+                        return if ready { Exit::Crashed(reason) } else { Exit::LaunchFailed(reason) };
                     }
                 }
             }
