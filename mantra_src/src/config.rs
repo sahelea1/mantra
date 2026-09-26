@@ -533,6 +533,42 @@ pub fn claude_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
         .collect()
 }
 
+/// The one line of `codex login status` output that says whether we are logged in. Codex prints
+/// warnings first (`WARNING: proceeding, even though we could not create PATH aliases …`), on the
+/// same stream, so "the first line" used to show the warning instead of the verdict. Shared by
+/// `doctor` (`main.rs`) and `codex_chatgpt_signed_in` below — one filter, not two to keep in sync.
+pub fn login_status_line(out: &str) -> String {
+    let meaningful = |l: &str| {
+        let t = l.trim();
+        let low = t.to_lowercase();
+        !t.is_empty() && !low.starts_with("warning") && !low.starts_with("warn:") && !low.starts_with("error") && !low.contains("bubblewrap")
+    };
+    out.lines().filter(|l| meaningful(l)).last().or_else(|| out.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim().to_string()
+}
+
+/// True when the status line names a ChatGPT subscription rather than an API key ("Logged in
+/// using ChatGPT" vs "Logged in using an API key").
+fn is_chatgpt_login(line: &str) -> bool {
+    let low = line.to_lowercase();
+    low.contains("chatgpt") && !low.contains("api key")
+}
+
+/// Is Codex signed in through a ChatGPT subscription? Runs `<codex> login status` with a 5s hard
+/// cap (a thread + `recv_timeout`, same shape as `main.rs`'s doctor probes — there is no shared
+/// helper for it in this crate to reuse) and classifies the meaningful line. Never panics; a
+/// missing binary, a non-zero exit or a timeout all read as "false" — a fresh install just keeps
+/// the ordinary Codex-account defaults.
+pub fn codex_chatgpt_signed_in(codex_command: &[String]) -> bool {
+    let Some(cmd0) = codex_command.first().cloned() else { return false };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new(&cmd0).args(["login", "status"]).output());
+    });
+    let Ok(Ok(o)) = rx.recv_timeout(std::time::Duration::from_secs(5)) else { return false };
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    is_chatgpt_login(&login_status_line(&text))
+}
+
 impl Registry {
     pub fn defaults() -> Registry {
         let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -737,6 +773,22 @@ impl Registry {
         }
         args
     }
+}
+
+/// The built-in pattern with every `astra` role moved to `sol`: what a fresh install saves as
+/// `mantra-default` when Codex is signed in through a ChatGPT subscription, which has no access to
+/// `astra` (it stays in `models.toml` as a plain alias — nothing defaults to it any more).
+pub fn chatgpt_default_pattern() -> crate::engine::pattern::Pattern {
+    let mut p = crate::engine::pattern::Pattern::builtin();
+    let sol = Registry::defaults().resolve("sol");
+    for role in p.roles.values_mut() {
+        if role.model == "astra" {
+            role.model = "sol".into();
+            role.effort = sol.resolve_effort(&role.effort);
+        }
+    }
+    p.description = format!("{} — ChatGPT subscription models", p.description);
+    p
 }
 
 /// Write via temp file + rename so a crash never leaves a half-written config.
@@ -1022,5 +1074,21 @@ mod tests {
     fn provider_args_never_mention_claude_code_providers() {
         let r = Registry { models: vec![], providers: vec![ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: ProviderKind::ClaudeCode, ..Default::default() }] };
         assert!(r.provider_args().is_empty(), "ClaudeCode providers must not generate Codex model_providers.* args");
+    }
+    #[test]
+    fn chatgpt_login_line_classifier() {
+        assert!(is_chatgpt_login("Logged in using ChatGPT"));
+        assert!(!is_chatgpt_login("Logged in using an API key"));
+        assert!(!is_chatgpt_login("Not logged in"));
+    }
+    #[test]
+    fn chatgpt_default_pattern_moves_astra_roles_to_sol() {
+        let p = chatgpt_default_pattern();
+        assert_eq!(p.name, "mantra-default");
+        assert!(p.description.ends_with(" — ChatGPT subscription models"), "{}", p.description);
+        for (n, r) in &p.roles {
+            assert_ne!(r.model, "astra", "role '{n}' still defaults to astra");
+        }
+        assert!(p.validate().is_ok(), "{:?}", p.validate());
     }
 }

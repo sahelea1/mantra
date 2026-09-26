@@ -71,6 +71,8 @@ The installer verifies a sha256, installs to `~/.local/bin` (override with `MANT
 
 Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
+On a fresh install, if Codex is already signed in with a ChatGPT subscription, Mantra defaults every role to a model that account can actually run — no `astra`, which needs Codex's API access — instead of the ordinary Codex-account defaults. `astra` stays in `models.toml` as a plain alias; it just doesn't start out as anyone's default.
+
 `mantra doctor` probes readiness, not presence — one row and verdict each, the readiness probes capped at 10 s (the `--version` checks at 5 s):
 
 - **codex executable** — `codex --version`
@@ -80,6 +82,8 @@ Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tel
 - then `codex login status` (only a failure when something actually runs on Codex's own account), `claude`, `git`, the terminal, tmux, and each provider's key source
 
 A failing row quotes Codex's own stderr line, exit code included. An agent that fails the same way at launch (not logged in, a refused flag, a bad gateway) is halted after 3 attempts with that error, instead of burning through the crash budget.
+
+When the sandbox can't start at all (no unprivileged user namespaces), Mantra doesn't refuse to run: it warns once, up front, and falls back to running Codex agents with `danger-full-access` until the machine is fixed — no sandbox isolation, but git worktrees still keep workers apart.
 
 ---
 
@@ -131,13 +135,13 @@ Team roles have their own `permission` field in the Studio, `never` by default, 
 
 Press `ctrl+o`, describe the goal, and this happens:
 
-**1. The planner writes a phased plan** and you approve it. Phases run in order; tasks inside a phase run in parallel with declared file scopes. Mantra validates the plan before you ever see it — unique ids, known roles, real prompts, and **no overlapping scopes between parallel tasks** — and sends errors back to the planner to fix.
+**1. The planner writes a phased plan** and you approve it. Phases run in order; tasks inside a phase run in parallel with declared file scopes. Mantra validates the plan before you ever see it — unique ids, known roles, real prompts, and **no overlapping scopes between parallel tasks** — and sends errors back to the planner to fix. An empty project (nothing checked in yet) skips the exploration step — there is nothing to read.
 
 <img src="docs/img/plan-review.png" alt="The plan review overlay: phases, tasks, scopes, acceptance criteria and gate checks" width="920">
 
 **2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together. Above it, from the first phase to the end of the finale, a **manager** watches the whole run: anything that stalls or halts reaches it first, and every few minutes it gets a health digest of the whole team.
 
-**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
+**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. QA only edits when its role's sandbox allows writes — a read-only QA reports what is wrong instead of touching files. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
 
 **4. The finale**: heavy QA → a security sweep → the planner verifying its own plan, able to spawn ad-hoc fixers.
 
@@ -186,7 +190,7 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 | paused by you | you pressed `space` — nothing new starts until you resume | `space` to resume |
 | auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
 | provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
-| environment | a command died in the sandbox (`bwrap`, user namespaces) | fix the machine — `mantra doctor` prints the sysctl |
+| environment | a command died in the sandbox (`bwrap`, user namespaces) — reported once, then Mantra halts right away instead of retrying blind | fix the machine — `mantra doctor` prints the sysctl |
 | gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
 | attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
@@ -252,7 +256,7 @@ The same chain carries halts: **manager → planner → you**. *Gate exhausted* 
 
 <img src="docs/img/picker.png" alt="The model picker: alias, model, which backend it runs through, effort, context window" width="960">
 
-An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent; `+`/`-` adjust its context window right there.
+An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
 
 Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
 
@@ -407,6 +411,8 @@ The same process that draws the TUI can also serve a small, installable web app 
 
 **Installing it as an app.** Over HTTPS, Android/Chrome offers an *Install* button; on iPhone/iPad use Safari's **Share › Add to Home Screen** — iOS only delivers notifications to an installed app, and the UI says so once, in place. Either way you get a full-screen icon, offline shell caching, and a layout that respects the notch and the home indicator.
 
+**Roles & models.** Settings → Roles & models lists every role in the running pattern with its model and effort; change one, or tick *apply to all*, and it is written straight back into the pattern file — the same file the Studio and `ctrl+k` edit.
+
 **Notifications.** Once installed, Settings → Notifications turns on Web Push — implemented by hand, no third-party push service in the middle — for halts, questions, approvals, plan review, a finished run and a finished Solo turn, each toggle separate, with a *Send a test* button. Subscriptions and push keys live in `$MANTRA_HOME/web/push/`, `0600`; turn it off server-wide with `[web] push = false`.
 
 </details>
@@ -505,7 +511,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary>Architecture in one paragraph</summary>
 
-One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` speaks NDJSON, and both are translated into the same internal events, so the engine and UI have no backend-specific branches. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working.
+One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` speaks NDJSON, and both are translated into the same internal events, so the engine and UI have no backend-specific branches. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working. Codex agents Mantra spawns never pick up your own MCP servers — only Mantra's own tools reach them, so a personal MCP setup never changes what a team run can do.
 
 [`DESIGN.md`](DESIGN.md) is the long version: the seam between backends, the MCP bridge, halts, the watchdog, resumable runs, the security model and the testing strategy.
 

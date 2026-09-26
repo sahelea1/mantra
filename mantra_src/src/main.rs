@@ -241,6 +241,9 @@ fn demo_project() -> Result<PathBuf> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
+    // Checked before `Registry::load()` writes the defaults: a fresh install (no models.toml yet)
+    // is the only time it's right to change what a run defaults to.
+    let fresh_install = !config::Registry::path().exists();
     let mut settings = config::Settings::load();
     let mut registry = config::Registry::load();
     // Validate the web flags before anything else starts (a bad address is a usage error).
@@ -298,16 +301,28 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             registry.models.extend(config::claude_default_model_entries("claude"));
         }
     }
+    // Fresh install, Codex signed in with a ChatGPT subscription (which has no access to `astra`):
+    // default every role to a model that account can actually run, once, so the first run doesn't
+    // just fail on the built-in pattern's `astra` roles.
+    if fresh_install && !demo && config::codex_chatgpt_signed_in(&settings.codex_command) {
+        if !engine::pattern::Pattern::path_for("mantra-default").exists() {
+            let _ = config::chatgpt_default_pattern().save();
+        }
+        settings.default_pattern = "mantra-default".into();
+        settings.default_model = "sol".into();
+        let _ = settings.save();
+        mlog!("fresh install: Codex is signed in with ChatGPT; roles default to subscription models (no astra)");
+    }
     // L1: on a Linux box where unprivileged user namespaces are off, every worker command dies
     // in bubblewrap. Say so once, up front — and don't start a run on it without a nod.
     // (MANTRA_SANDBOX_WARNING=<text> forces the notice — stress.sh renders it in demo mode.)
     let sandbox_warning = std::env::var("MANTRA_SANDBOX_WARNING").ok().filter(|w| !w.is_empty()).or_else(|| if demo || cli.snapshot.is_some() { None } else { util::sandbox_probe().err() });
     if let (Some(w), true, false) = (&sandbox_warning, cli.run_goal.is_some() || cli.resume.is_some() || cli.resume_last, cli.no_sandbox_check) {
-        eprintln!("mantra: sandbox check failed — {w}\n");
-        eprint!("start anyway? workers' commands will fail unless the roles use sandbox = \"danger-full-access\" [y/N] ");
+        eprintln!("mantra: sandbox check failed — {w}");
+        eprint!("Codex agents will run WITHOUT the sandbox (danger-full-access; git worktrees still keep workers apart). Continue? [Y/n] ");
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+        if matches!(line.trim().to_lowercase().as_str(), "n" | "no") {
             println!("not started. (mantra --no-sandbox-check skips this question)");
             return Ok(());
         }
@@ -827,15 +842,20 @@ fn doctor() {
     println!("{} provider: {text}", verdict.map(ok).unwrap_or(" "));
     match &sandbox {
         Ok(t) => println!("{} sandbox: {t}", ok(true)),
-        Err(e) => match util::sandbox_probe() {
-            // The kernel knob explains the failure — say so, with the fix.
-            Err(why) if !e.starts_with("skipped") => println!("{} sandbox: {e}\n  {why}", ok(false)),
-            _ => println!("{} sandbox: {e}", ok(false)),
-        },
+        Err(e) if e.starts_with("skipped") => println!("{} sandbox: {e}", ok(false)),
+        Err(e) => {
+            // A real failure (not "skipped"): the kernel knob explains it when it can, and either
+            // way say what Codex agents run with meanwhile (the automatic sandbox fallback).
+            let fallback = "Codex agents run with danger-full-access until this is fixed";
+            match util::sandbox_probe() {
+                Err(why) => println!("{} sandbox: {e}\n  {why}\n  {fallback}", ok(false)),
+                _ => println!("{} sandbox: {e}\n  {fallback}", ok(false)),
+            }
+        }
     }
     if let Ok(o) = std::process::Command::new(&s.codex_command[0]).args(["login", "status"]).output() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        let line = login_status_line(&t);
+        let line = config::login_status_line(&t);
         let needed = codex_account_needed(&s, &r);
         match (o.status.success(), needed.is_empty()) {
             (true, _) => println!("{} login: {line}", ok(true)),
@@ -1049,18 +1069,6 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
         Ok(Err(e)) => (None, format!("{name} for `{alias}`: {key_src} · not verified ({e})")),
         Err(_) => (Some(false), format!("{name} for `{alias}`: {key_src} · {host}/models gave no answer within {}s", PROBE_TIMEOUT.as_secs())),
     }
-}
-
-/// The one line of `codex login status` output that says whether we are logged in. Codex prints
-/// warnings first (`WARNING: proceeding, even though we could not create PATH aliases …`), on the
-/// same stream, so "the first line" used to show the warning instead of the verdict.
-fn login_status_line(out: &str) -> String {
-    let meaningful = |l: &str| {
-        let t = l.trim();
-        let low = t.to_lowercase();
-        !t.is_empty() && !low.starts_with("warning") && !low.starts_with("warn:") && !low.starts_with("error") && !low.contains("bubblewrap")
-    };
-    out.lines().filter(|l| meaningful(l)).last().or_else(|| out.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim().to_string()
 }
 
 /// Who actually needs Codex's own OpenAI login: the Solo default model and the default pattern's
