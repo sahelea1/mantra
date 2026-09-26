@@ -1559,10 +1559,12 @@ mod tests {
         ws.send(Message::Binary(b.hello().into())).await.unwrap();
         b.accept(&Frame::Bin(next_bin(&mut ws).await), &old_key);
         ws.send(Message::Binary(b.send(r#"{"t":"hello","protocol":1}"#).into())).await.unwrap();
-        // drain the encrypted server hello before rotating, so it isn't mistaken for the notice
+        // A `ping` dispatches (and answers) only after the earlier `hello` frame does, since the
+        // host reads them off one ordered stream — so a `pong` back proves `hello_seen` is set.
+        ws.send(Message::Binary(b.send(r#"{"t":"ping"}"#).into())).await.unwrap();
         loop {
             let f = next_bin(&mut ws).await;
-            if b.read(&Frame::Bin(f)).contains(r#""t":"hello""#) {
+            if b.read(&Frame::Bin(f)).contains("pong") {
                 break;
             }
         }
