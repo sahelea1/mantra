@@ -805,21 +805,22 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
         }
-        // `ClaudeCode` + `subscription` needs no key at all (OAuth login) — a red "no key" for it
-        // would be misleading, so only check when a key is actually expected (Codex always;
-        // ClaudeCode only under `api_key`).
-        let needs_key = p.kind != crate::config::ProviderKind::ClaudeCode || p.auth == "api_key";
-        if !needs_key {
-            spans.push(Span::styled(format!(" {} subscription (OAuth login)", theme::g("○", "-")), theme::dim()));
+        // A draft (placeholder/malformed URL, or no credential — `ProviderEntry::draft_reason`)
+        // says why `t`/`D` are off for it; a ready row shows where its key is sent and how it is
+        // held. `ClaudeCode` + `subscription` needs no key at all (OAuth login) — a red "no key"
+        // for it would be misleading, so only a key that is actually expected is reported.
+        if let Some(why) = p.draft_reason() {
+            spans.push(Span::styled(format!(" {} draft — {why}", theme::g("✗", "x")), theme::fg(theme::AMBER)));
         } else {
-            let (key_msg, key_ok) = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
-                ("key set (env)".to_string(), true)
-            } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-                ("key stored in models.toml".to_string(), true)
+            if !p.needs_key() {
+                spans.push(Span::styled(format!(" {} subscription (OAuth login)", theme::g("○", "-")), theme::dim()));
             } else {
-                ("no key".to_string(), false)
-            };
-            spans.push(Span::styled(format!(" {} {key_msg}", if key_ok { theme::g("✓", "ok") } else { theme::g("✗", "x") }), if key_ok { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }));
+                let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
+                spans.push(Span::styled(format!(" {} {key_msg}", theme::g("✓", "ok")), theme::fg(theme::GREEN)));
+            }
+            if let Some(h) = p.host() {
+                spans.push(Span::styled(format!(" {} {h}", theme::g("→", "->")), theme::dim()));
+            }
         }
         let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
         spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
@@ -827,10 +828,23 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     }
     pl.push(Line::from(Span::styled(" base_url = the provider's API root: Codex reads …/v1/responses + …/v1/models; ClaudeCode uses it as ANTHROPIC_BASE_URL (bare host, no /v1) + …/v1/models for D", theme::faint())));
     pl.push(Line::from(Span::styled(" env_key = name of an env var holding the key · api_key = paste one directly (stored 0600) · either works · D here = discover this provider", theme::faint())));
+    pl.push(Line::from(Span::styled(" a new row (n) is a draft: saved, but t/D send nothing until base_url is real (https, or http to localhost) and its own key is available", theme::faint())));
     pl.push(Line::from(Span::styled(" kind = Codex | ClaudeCode · auth (ClaudeCode only) = subscription | api_key · +/- on either cycles it", theme::faint())));
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
     f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);
-    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", "test model"), ("D", "discover models"), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
+    // `t`/`D` name the host the selected row's request goes to, or say they are off for a draft
+    // (the row itself carries the reason).
+    let action = |plain: &str, verb: &str, p: Option<&ProviderEntry>| match p {
+        Some(p) if p.draft_reason().is_some() => format!("{verb} · off (draft)"),
+        Some(p) => p.host().map(|h| format!("{verb} {} {h}", theme::g("→", "->"))).unwrap_or_else(|| plain.to_string()),
+        None => plain.to_string(),
+    };
+    let (t_hint, d_hint) = if app.models_ui.providers {
+        ("test model".to_string(), action("discover models", "discover", app.registry.providers.get(app.models_ui.row)))
+    } else {
+        (action("test model", "test", app.registry.models.get(app.models_ui.row).and_then(|m| app.registry.provider_of(&m.alias))), "discover models".to_string())
+    };
+    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", &t_hint), ("D", &d_hint), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
 }
 
 pub fn models_key(app: &mut App, k: KeyEvent) {
@@ -937,8 +951,10 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('D') | KeyCode::Char('d') => {
             if ui.providers {
-                match app.registry.providers.get(ui.row).map(|p| p.id.clone()) {
-                    Some(id) => app.discover(Some(id)),
+                match app.registry.providers.get(ui.row).map(|p| (p.id.clone(), p.draft_reason())) {
+                    // A draft never goes on the network — say why instead (P2, test report).
+                    Some((id, Some(why))) => app.toast(format!("{id} is a draft, not discovered — {why}"), crate::agent::Level::Warn),
+                    Some((id, None)) => app.discover(Some(id)),
                     None => app.toast("add a provider first (n)", crate::agent::Level::Info),
                 }
             } else {

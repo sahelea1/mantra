@@ -65,6 +65,9 @@ pub enum Overlay {
 pub struct DiscoverState {
     pub items: Vec<crate::discover::Candidate>,
     pub loading: Vec<String>,
+    /// Provider id → destination host of the `/models` request in flight, so the "asking …" line
+    /// shows exactly where each key goes (P2: placeholder requests must be impossible to miss).
+    pub hosts: Vec<(String, String)>,
     pub errors: Vec<String>,
     pub sel: usize,
     pub filter: Input,
@@ -956,6 +959,14 @@ impl App {
     /// role (F4: a model rejecting Codex's `developer` role) fails here, before a real run — not the
     /// job the user is running it for.
     pub fn probe_model(&mut self, alias: &str) {
+        // A draft provider (placeholder URL, no credential — `Registry::probe_problem`) never
+        // gets a request: the row says why instead of a Codex process failing with a key that
+        // isn't there (or, worse, succeeding against the placeholder).
+        if let Some(why) = self.registry.probe_problem(alias) {
+            self.models_ui.status.insert(alias.to_string(), format!("error: {why}"));
+            self.toast(format!("not tested — {why}"), Level::Warn);
+            return;
+        }
         // Every provider today speaks Codex's wire protocol (`kind = ClaudeCode` and its own test
         // path — `--append-system-prompt` — arrive with WP10). Keep the dispatch explicit so that
         // arm can be added here without touching the caller.
@@ -989,7 +1000,9 @@ impl App {
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
-        self.models_ui.status.insert(alias.to_string(), "testing…".into());
+        // Name the destination while the request is out, so the user sees where the key went.
+        let dest = self.registry.provider_of(alias).and_then(|p| p.host()).map(|h| format!(" {} {h}", crate::ui::theme::g("→", "->"))).unwrap_or_default();
+        self.models_ui.status.insert(alias.to_string(), format!("testing{dest}…"));
         prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true, Send::Auto);
     }
 
@@ -1004,11 +1017,17 @@ impl App {
         // (config::CLAUDE_MODELS) are always known locally and answer instantly, with no loading spinner needed. A
         // `base_url` (a third-party gateway) additionally gets queried live, exactly like a Codex
         // custom provider (§10.5).
-        let net_provs: Vec<crate::config::ProviderEntry> = provs.iter().filter(|p| p.kind != crate::config::ProviderKind::ClaudeCode || !p.base_url.trim().is_empty()).cloned().collect();
+        // Drafts (placeholder/malformed URL, or no credential — `ProviderEntry::draft_reason`)
+        // never go on the network: they are listed as skipped instead of queried.
+        let (drafts, net_provs): (Vec<_>, Vec<_>) = provs.iter().filter(|p| p.needs_url()).cloned().partition(|p| p.draft_reason().is_some());
         sources.extend(net_provs.iter().map(|p| p.id.clone()));
-        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, errors: vec![], sel: 0, filter: Input::default() }));
+        let hosts = net_provs.iter().filter_map(|p| p.host().map(|h| (p.id.clone(), h))).collect();
+        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], sel: 0, filter: Input::default() }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
             self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+        }
+        for p in drafts {
+            self.on_discovered(p.id.clone(), Err(format!("skipped (draft) — {}", p.draft_reason().unwrap_or_default())));
         }
         if only.is_none() {
             let cmd = self.hub.codex_cmd.clone();
@@ -1030,6 +1049,8 @@ impl App {
         for p in net_provs {
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
+                // The key is strictly this provider's own (`resolve_key` on the entry being
+                // queried) — never another provider's, never a global one.
                 let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref()).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
                 let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
             });

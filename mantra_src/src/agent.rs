@@ -455,7 +455,12 @@ impl Agent {
             }
             "warning" | "guardianWarning" | "deprecationNotice" => {
                 let msg = p.get("message").or_else(|| p.get("summary")).and_then(|x| x.as_str()).unwrap_or("");
-                if !msg.is_empty() {
+                if msg.contains("Defaulting to fallback metadata") {
+                    // Codex ≥ 0.157 says this for every model tag outside its own catalog (any
+                    // custom provider). Mantra already passes the context window / compaction limit
+                    // itself, so it's expected — one muted line, not an amber alert.
+                    self.notice(Level::Info, fallback_metadata_note(msg));
+                } else if !msg.is_empty() {
                     self.notice(Level::Warn, crate::util::trunc(msg, 400));
                 }
             }
@@ -839,6 +844,13 @@ pub fn classify(info: &Value) -> ErrKind {
     }
 }
 
+/// Codex's "Model metadata for `x` not found. Defaulting to fallback metadata; this can degrade
+/// performance and cause issues." as one short line: the model tag plus what Mantra does about it.
+pub fn fallback_metadata_note(msg: &str) -> String {
+    let tag = msg.split('`').nth(1).unwrap_or("this model");
+    format!("codex has no built-in metadata for `{tag}` — using the context window from models.toml")
+}
+
 /// Providers often return `{"error":{"message":"…"}}` bodies: show just the message.
 pub fn pretty_err(msg: &str) -> String {
     let t = msg.trim();
@@ -919,6 +931,22 @@ fn last_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Codex ≥ 0.157 warns for every custom model tag; Mantra supplies the metadata that matters
+    /// (context window) itself, so the transcript shows one muted info line, not an amber alert.
+    #[test]
+    fn fallback_metadata_warning_is_a_muted_info_line() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "solo", std::path::PathBuf::from("."));
+        a.apply("warning", &json!({"message": "Model metadata for `testing` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}));
+        let it = a.items.last().expect("a notice");
+        assert!(matches!(it.kind, Kind::Notice { level: Level::Info }), "{:?}", it.kind);
+        assert_eq!(it.text, "codex has no built-in metadata for `testing` — using the context window from models.toml");
+        assert!(!it.text.contains('\n'));
+        // other warnings keep their level
+        a.apply("warning", &json!({"message": "something else"}));
+        assert!(matches!(a.items.last().unwrap().kind, Kind::Notice { level: Level::Warn }));
+    }
     #[test]
     fn compaction_turn_is_tracked_and_not_counted_as_work() {
         use super::*;

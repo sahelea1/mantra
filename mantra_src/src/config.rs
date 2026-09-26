@@ -348,6 +348,92 @@ impl ProviderEntry {
         }
         self.api_key.clone().filter(|s| !s.trim().is_empty())
     }
+    /// Whether a key is expected at all: always for Codex; for ClaudeCode only under `api_key`
+    /// (a subscription login lives in `claude` itself).
+    pub fn needs_key(&self) -> bool {
+        self.kind != ProviderKind::ClaudeCode || self.auth == "api_key"
+    }
+    /// Whether Test / Discover would put a request on the network for this provider: every Codex
+    /// provider does; a ClaudeCode one only when a gateway `base_url` is set (otherwise discovery
+    /// answers from the built-in catalog and needs no URL at all).
+    pub fn needs_url(&self) -> bool {
+        self.kind != ProviderKind::ClaudeCode || !self.base_url.trim().is_empty()
+    }
+    /// `host[:port]` a request to `base_url` goes to — shown next to Test / Discover so the user
+    /// sees where the key is sent. `None` when the URL doesn't parse.
+    pub fn host(&self) -> Option<String> {
+        parse_base_url(&self.base_url).map(|u| u.authority)
+    }
+    /// Why Test / Discover are disabled for this provider — it is still a *draft* — or `None`
+    /// when both may run. A draft is saved like any other row; it just never sends a request:
+    /// the `base_url` is the `n` placeholder, malformed, or plain http to a non-local host, or no
+    /// credential is configured (`env_key` unset in the environment and no `api_key` stored).
+    pub fn draft_reason(&self) -> Option<String> {
+        if self.needs_url() {
+            let raw = self.base_url.trim();
+            if raw.is_empty() {
+                return Some("base_url is empty".into());
+            }
+            let Some(u) = parse_base_url(raw) else {
+                return Some(format!("base_url is not a URL: {}", crate::util::trunc(raw, 40)));
+            };
+            if u.is_placeholder() {
+                return Some(format!("base_url is still the {} placeholder", u.host));
+            }
+            if u.scheme == "http" && !u.is_local() {
+                return Some(format!("base_url is plain http to {} — use https", u.authority));
+            }
+        }
+        if self.needs_key() && self.resolve_key().is_none() {
+            let var = self.env_var_name();
+            return Some(format!("no key: ${var} is not set and no api_key is stored"));
+        }
+        None
+    }
+}
+
+/// The parts of a `base_url` that decide whether a request may go out (`ProviderEntry::draft_reason`).
+struct BaseUrl {
+    scheme: String,
+    /// `host[:port]`, as shown to the user.
+    authority: String,
+    /// Lower-cased host without port or IPv6 brackets.
+    host: String,
+}
+
+impl BaseUrl {
+    /// Loopback: plain http is fine here (a local vLLM / llama.cpp / Ollama).
+    fn is_local(&self) -> bool {
+        self.host == "localhost" || self.host.ends_with(".localhost") || self.host.starts_with("127.") || self.host == "::1" || self.host == "0.0.0.0"
+    }
+    /// RFC 2606 reserved names — the `n` placeholder and anything else that can never be a provider.
+    fn is_placeholder(&self) -> bool {
+        let h = self.host.as_str();
+        ["example.com", "example.net", "example.org"].iter().any(|d| h == *d || h.ends_with(&format!(".{d}"))) || h.ends_with(".example") || h.ends_with(".invalid")
+    }
+}
+
+/// Minimal `scheme://host[:port][/path]` parse — enough to know where a request goes without
+/// pulling in a URL crate. `None` for anything that isn't http(s) with a plausible host.
+fn parse_base_url(raw: &str) -> Option<BaseUrl> {
+    let (scheme, rest) = raw.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Never accept credentials embedded in the URL: they'd end up on argv and in logs.
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("").to_string()
+    } else {
+        authority.rsplit_once(':').filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(authority).to_string()
+    };
+    let host = host.to_ascii_lowercase();
+    let plausible = !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'));
+    plausible.then(|| BaseUrl { scheme, authority: authority.to_string(), host })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -546,6 +632,22 @@ impl Registry {
             model: alias.to_string(),
             ..Default::default()
         })
+    }
+
+    /// The custom provider an alias runs on; `None` for Codex's own account or an unknown alias.
+    pub fn provider_of(&self, alias: &str) -> Option<&ProviderEntry> {
+        let m = self.get(alias).filter(|m| m.is_custom_provider())?;
+        self.providers.iter().find(|p| p.id == m.provider)
+    }
+
+    /// Why the `/models` `t` test must not send anything for an alias: everything
+    /// `alias_problem` catches, plus a provider that is still a draft (`ProviderEntry::draft_reason`
+    /// — placeholder URL, plain http, no credential). `None` = go.
+    pub fn probe_problem(&self, alias: &str) -> Option<String> {
+        let Some(p) = self.provider_of(alias) else {
+            return self.alias_problem(alias); // unknown alias/provider, or Codex's own account (fine)
+        };
+        p.draft_reason().map(|why| format!("{alias} via {} — {why} (/models to fix)", self.provider_name(&p.id)))
     }
 
     /// Why an alias cannot run right now: unknown alias, unknown provider, or a custom provider
@@ -766,6 +868,68 @@ mod tests {
         let args = r.provider_args();
         assert!(args.iter().any(|a| a.contains("MANTRA_ZAI_API_KEY")), "the env var name must be registered: {args:?}");
         assert!(!args.iter().any(|a| a.contains("sk-secret-123")), "the raw key must never appear in generated args: {args:?}");
+    }
+    /// The `t` test uses strictly the tested model's own provider entry — its key, its host — and
+    /// refuses to run while that provider is a draft, rather than borrowing another key.
+    #[test]
+    fn probe_uses_only_the_models_own_provider() {
+        let mut r = Registry { models: vec![], providers: vec![] };
+        r.providers.push(ProviderEntry { id: "riti".into(), name: "Riti".into(), base_url: "https://api.riti.dev/v1".into(), api_key: Some("sk-riti".into()), ..Default::default() });
+        r.providers.push(ProviderEntry { id: "myprovider".into(), base_url: "https://example.com/v1".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
+        r.models.push(ModelEntry { alias: "testing".into(), provider: "riti".into(), model: "testing".into(), ..Default::default() });
+        r.models.push(ModelEntry { alias: "draft-model".into(), provider: "myprovider".into(), model: "x".into(), ..Default::default() });
+        r.models.push(ModelEntry { alias: "gpt".into(), model: "gpt-5".into(), ..Default::default() });
+        assert_eq!(r.probe_problem("testing"), None);
+        let p = r.provider_of("testing").expect("riti");
+        assert_eq!((p.id.as_str(), p.resolve_key().as_deref(), p.host().as_deref()), ("riti", Some("sk-riti"), Some("api.riti.dev")));
+        // the draft's model is refused with the URL reason — riti's key is never a fallback
+        let why = r.probe_problem("draft-model").expect("draft is refused");
+        assert!(why.contains("myprovider") && why.contains("placeholder") && !why.contains("riti"), "{why}");
+        assert_eq!(r.provider_of("draft-model").and_then(|p| p.resolve_key()), None);
+        // Codex's own account has no custom provider and nothing to check here
+        assert_eq!(r.provider_of("gpt"), None);
+        assert_eq!(r.probe_problem("gpt"), None);
+        assert!(r.probe_problem("nope").unwrap().contains("not in /models"));
+    }
+    /// P2 (test report): a freshly added provider must never send a request to its placeholder —
+    /// it stays a draft until the URL is real and a credential is configured.
+    #[test]
+    fn draft_until_url_and_credential_are_real() {
+        let key = Some("sk-1".to_string());
+        // the `n` row exactly as studio.rs creates it: placeholder URL, env var that isn't set
+        let p = ProviderEntry { id: "myprovider".into(), base_url: "https://example.com/v1".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() };
+        assert!(p.draft_reason().unwrap().contains("example.com placeholder"), "{:?}", p.draft_reason());
+        assert_eq!(p.host().as_deref(), Some("example.com"), "the destination is still shown for a draft");
+        // a real URL, but no credential yet → still a draft, with the key as the reason
+        let p = ProviderEntry { base_url: "https://api.riti.dev/v1".into(), ..p };
+        let why = p.draft_reason().unwrap();
+        assert!(why.starts_with("no key") && why.contains("MANTRA_TEST_NO_SUCH_VAR"), "{why}");
+        // a stored key completes it
+        let p = ProviderEntry { api_key: key.clone(), ..p };
+        assert_eq!(p.draft_reason(), None);
+        assert_eq!(p.host().as_deref(), Some("api.riti.dev"));
+        // URL shapes
+        let with = |url: &str| ProviderEntry { id: "x".into(), base_url: url.into(), api_key: key.clone(), ..Default::default() };
+        assert_eq!(with("http://localhost:8000/v1").draft_reason(), None, "plain http to loopback is fine");
+        assert_eq!(with("http://127.0.0.1:11434").host().as_deref(), Some("127.0.0.1:11434"));
+        assert!(with("http://api.riti.dev/v1").draft_reason().unwrap().contains("plain http"));
+        assert!(with("https://api.example.org").draft_reason().unwrap().contains("placeholder"));
+        assert!(with("https://gateway.invalid/v1").draft_reason().unwrap().contains("placeholder"));
+        assert!(with("").draft_reason().unwrap().contains("empty"), "Codex providers must name a URL — Codex would otherwise default to api.openai.com");
+        assert!(with("api.riti.dev/v1").draft_reason().unwrap().contains("not a URL"));
+        assert!(with("ftp://api.riti.dev").draft_reason().unwrap().contains("not a URL"));
+        assert!(with("https://user:pw@api.riti.dev").draft_reason().unwrap().contains("not a URL"), "credentials in the URL are refused");
+        assert!(with("https://api riti.dev").draft_reason().unwrap().contains("not a URL"));
+        assert_eq!(with("HTTPS://Api.Riti.dev:8443/v1/").host().as_deref(), Some("Api.Riti.dev:8443"));
+        assert_eq!(with("http://[::1]:8080/v1").draft_reason(), None);
+        // ClaudeCode: a subscription needs neither URL nor key; a gateway URL is still checked
+        let cc = ProviderEntry { id: "claude2".into(), kind: ProviderKind::ClaudeCode, ..Default::default() };
+        assert_eq!(cc.draft_reason(), None);
+        assert_eq!(cc.host(), None);
+        let cc = ProviderEntry { base_url: "https://example.com".into(), ..cc };
+        assert!(cc.draft_reason().unwrap().contains("placeholder"));
+        let cc = ProviderEntry { base_url: String::new(), auth: "api_key".into(), ..cc };
+        assert!(cc.draft_reason().unwrap().starts_with("no key"));
     }
     #[test]
     fn registry_roundtrip() {

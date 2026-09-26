@@ -399,7 +399,11 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     let w = inner.width as usize;
     let mut l: Vec<Line> = vec![];
     if !st.loading.is_empty() {
-        l.push(Line::from(vec![Span::styled(format!(" {} ", anim::spinner()), theme::fg(theme::SAFFRON)), Span::styled(format!("asking {}…", st.loading.join(", ")), theme::muted())]));
+        // Each network source names its destination host ("riti → api.riti.dev"), so it is
+        // visible where every key is being sent.
+        let arrow = theme::g("→", "->");
+        let who: Vec<String> = st.loading.iter().map(|s| match st.hosts.iter().find(|(id, _)| id == s) { Some((_, h)) => format!("{s} {arrow} {h}"), None => s.clone() }).collect();
+        l.push(Line::from(vec![Span::styled(format!(" {} ", anim::spinner()), theme::fg(theme::SAFFRON)), Span::styled(format!("asking {}…", who.join(", ")), theme::muted())]));
     }
     for e in &st.errors {
         l.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, w.saturating_sub(4))), theme::fg(theme::RED))));
