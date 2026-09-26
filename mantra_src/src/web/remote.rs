@@ -30,6 +30,8 @@ pub struct RemoteConfig {
     pub password: Option<String>,
     /// `$MANTRA_HOME/web`.
     pub dir: PathBuf,
+    /// `--headless`: stderr is the only place a person sees the relay status, so it is printed there.
+    pub headless: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -69,11 +71,27 @@ pub struct Inner {
     pub tx: UnboundedSender<AppEvent>,
     dir: PathBuf,
     fixed_password: Option<String>,
+    headless: bool,
     pub state: Mutex<State>,
     /// Bumped whenever the identity changes (rotate) or the key becomes ready: the relay task
     /// (re)connects with the current identity.
     pub generation: tokio::sync::watch::Sender<u64>,
+    announced: Mutex<Announced>,
 }
+
+/// What headless mode has already said on the terminal, so a retry loop doesn't repeat itself.
+#[derive(Default)]
+struct Announced {
+    /// The sid whose link, code and password were printed (printed again after a rotate).
+    sid: Option<String>,
+    /// The last error printed and when: the same text is repeated only once a minute.
+    error: Option<(String, std::time::Instant)>,
+    /// The relay was reached before ("reconnected" rather than "connected").
+    ever_connected: bool,
+}
+
+/// Headless: an unchanged relay error is printed again this often (the log has every retry).
+const REPEAT_ERROR_AFTER: Duration = Duration::from_secs(60);
 
 impl Inner {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -88,15 +106,61 @@ impl Inner {
 
     /// Update what `/remote` and the web UI show; publishes when anything changed.
     pub fn set_status(&self, connected: bool, clients: u32, last_error: Option<String>) {
+        self.status(connected, clients, last_error, None);
+    }
+
+    /// `set_status` with the retry delay `run` decided on; headless mode says it on the terminal.
+    fn status(&self, connected: bool, clients: u32, last_error: Option<String>, retry: Option<Duration>) {
         let mut s = self.lock();
         let changed = s.connected != connected || s.clients != clients || s.last_error != last_error;
+        let came_up = connected && !s.connected;
+        let went_down = !connected && s.connected;
         s.connected = connected;
         s.clients = clients;
         s.last_error = last_error;
+        let say = if self.headless { self.announce(&s, came_up, went_down, retry) } else { vec![] };
         drop(s);
         if changed {
             self.web.refresh();
         }
+        for line in say {
+            eprintln!("mantra remote: {line}");
+        }
+    }
+
+    /// The lines headless mode prints for this status change: connect/reconnect (with the link,
+    /// code and password the first time an identity is up — a link printed before the relay
+    /// answered looks valid but leads nowhere), and errors once each, or once a minute.
+    fn announce(&self, s: &State, came_up: bool, went_down: bool, retry: Option<Duration>) -> Vec<String> {
+        let mut a = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = vec![];
+        if came_up {
+            out.push(if a.ever_connected { "reconnected to the relay".to_string() } else { "connected to the relay".to_string() });
+            a.ever_connected = true;
+            a.error = None;
+            if a.sid.as_deref() != Some(s.sid.as_str()) {
+                if let Some(k) = s.key {
+                    out.push(format!("link {}", link_of(&self.site, &self.relay, &s.sid, &k)));
+                    out.push(format!("code {}", code_of(&s.sid)));
+                    out.push(format!("password {}", s.password));
+                    a.sid = Some(s.sid.clone());
+                }
+            }
+        } else if let Some(e) = &s.last_error {
+            let now = std::time::Instant::now();
+            let again = match &a.error {
+                Some((text, at)) => text != e || now.duration_since(*at) >= REPEAT_ERROR_AFTER,
+                None => true,
+            };
+            if went_down || again {
+                out.push(match retry {
+                    Some(w) => format!("{e} — retrying in {:.1}s", w.as_secs_f32()),
+                    None => e.clone(),
+                });
+                a.error = Some((e.clone(), now));
+            }
+        }
+        out
     }
 
     fn persist(&self) {
@@ -226,8 +290,10 @@ impl Remote {
             tx,
             dir: cfg.dir.clone(),
             fixed_password: cfg.password.clone(),
+            headless: cfg.headless,
             state: Mutex::new(State { sid: id.sid, host_token: id.host_token, password, generated, key: None, connected: false, clients: 0, last_error: None, qr: None }),
             generation: gen_tx,
+            announced: Mutex::new(Announced::default()),
         });
         inner.persist();
         inner.derive_key();
@@ -393,7 +459,7 @@ async fn run(inner: Arc<Inner>) {
         }
         let wait = jittered(backoff);
         crate::mlog!("remote: {} — retrying in {:.1}s", ended.error, wait.as_secs_f32());
-        inner.set_status(false, 0, Some(ended.error));
+        inner.status(false, 0, Some(ended.error), Some(wait));
         backoff = backoff.saturating_mul(2).min(BACKOFF_MAX);
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
@@ -532,22 +598,216 @@ async fn session(
     Ended { healthy: since.elapsed() >= HEALTHY_AFTER, rotated, error }
 }
 
-/// Dial `{relay}/host/{sid}` over IPv4 (the relay refuses hosts on IPv6) with the host token.
+/// Dial `{relay}/host/{sid}` over IPv4 (the relay refuses hosts on IPv6) with the host token —
+/// directly, or through the outbound proxy the environment configures.
 async fn dial(relay: &str, sid: &str, token: &str) -> Result<RelayWs, String> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let target = RelayTarget::parse(relay)?;
+    let proxy = Proxy::from_env(&target)?;
+    if let Some(p) = &proxy {
+        crate::mlog!("remote: connecting through the proxy {}", p.addr());
+    }
+    dial_via(relay, sid, token, &target, proxy.as_ref()).await
+}
+
+async fn dial_via(relay: &str, sid: &str, token: &str, target: &RelayTarget, proxy: Option<&Proxy>) -> Result<RelayWs, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let url = format!("{}/host/{sid}", relay.trim_end_matches('/'));
     let mut req = url.as_str().into_client_request().map_err(|e| format!("bad relay URL {relay}: {e}"))?;
     let auth = format!("Bearer {token}").parse().map_err(|_| "bad host token".to_string())?;
     req.headers_mut().insert("Authorization", auth);
     let connect = async {
-        let tcp = connect_ipv4(&target.host, target.port).await?;
+        let tcp = match proxy {
+            // The proxy resolves the name; if it picks IPv6 the relay says so (`refusal`).
+            Some(p) => connect_via_proxy(p, &target.host, target.port).await?,
+            None => connect_ipv4(&target.host, target.port).await?,
+        };
         let connector = if target.tls { tokio_tungstenite::Connector::Rustls(client_tls()?) } else { tokio_tungstenite::Connector::Plain };
         tokio_tungstenite::client_async_tls_with_config(req, tcp, None, Some(connector)).await.map(|(ws, _)| ws).map_err(describe)
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(r) => r,
-        Err(_) => Err(format!("the relay {} did not answer within {} s", target.host, CONNECT_TIMEOUT.as_secs())),
+        Err(_) => Err(match proxy {
+            Some(p) => format!("the relay {} did not answer within {} s (through the proxy {})", target.host, CONNECT_TIMEOUT.as_secs(), p.addr()),
+            None => format!("the relay {} did not answer within {} s", target.host, CONNECT_TIMEOUT.as_secs()),
+        }),
+    }
+}
+
+/// An HTTP proxy from the environment, used with `CONNECT`: the relay only ever sees the tunnel,
+/// TLS runs end to end through it and the certificate is checked as usual.
+#[derive(Debug, PartialEq, Clone)]
+struct Proxy {
+    host: String,
+    port: u16,
+    /// `user:pass@` from the proxy URL (percent-decoded) → `Proxy-Authorization: Basic`.
+    auth: Option<(String, String)>,
+}
+
+impl Proxy {
+    /// The proxy for `target` per the usual variables: `https_proxy` for wss://, `http_proxy` for
+    /// ws://, `all_proxy` for either, each in lowercase first, then uppercase (as curl reads them);
+    /// `no_proxy` / `NO_PROXY` exempt hosts. `Ok(None)` = connect directly.
+    fn from_env(target: &RelayTarget) -> Result<Option<Proxy>, String> {
+        Proxy::select(target, |k| std::env::var(k).ok())
+    }
+
+    fn select(target: &RelayTarget, var: impl Fn(&str) -> Option<String>) -> Result<Option<Proxy>, String> {
+        let get = |names: [&'static str; 2]| names.into_iter().find_map(|n| var(n).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).map(|v| (n, v)));
+        let scheme = if target.tls { ["https_proxy", "HTTPS_PROXY"] } else { ["http_proxy", "HTTP_PROXY"] };
+        let Some((name, url)) = get(scheme).or_else(|| get(["all_proxy", "ALL_PROXY"])) else { return Ok(None) };
+        if get(["no_proxy", "NO_PROXY"]).is_some_and(|(_, list)| no_proxy_matches(&list, &target.host)) {
+            return Ok(None);
+        }
+        Proxy::parse(name, &url).map(Some)
+    }
+
+    /// `http://[user:pass@]host[:port]`; `name` is the variable it came from (the URL itself is
+    /// not echoed in errors: it may carry a password).
+    fn parse(name: &str, url: &str) -> Result<Proxy, String> {
+        let rest = match url.split_once("://") {
+            Some((s, r)) if s.eq_ignore_ascii_case("http") => r,
+            Some((s, _)) => return Err(format!("{name}: only http:// proxies are supported (reached with CONNECT), not {s}://")),
+            None => url,
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let (auth, hostport) = match authority.rsplit_once('@') {
+            Some((a, h)) => {
+                let (u, p) = a.split_once(':').unwrap_or((a, ""));
+                (Some((pct_decode(u), pct_decode(p))), h)
+            }
+            None => (None, authority),
+        };
+        let (host, port) = match hostport.strip_prefix('[') {
+            Some(v6) => {
+                let (h, after) = v6.split_once(']').ok_or_else(|| format!("{name}: bad proxy address"))?;
+                (h, after.strip_prefix(':'))
+            }
+            None => match hostport.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (hostport, None),
+            },
+        };
+        let port = match port {
+            Some(p) => p.parse::<u16>().map_err(|_| format!("{name}: bad port in the proxy URL"))?,
+            None => 80,
+        };
+        if host.is_empty() {
+            return Err(format!("{name}: no host in the proxy URL"));
+        }
+        Ok(Proxy { host: host.to_string(), port, auth })
+    }
+
+    /// `host:port`, as shown in errors.
+    fn addr(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    /// The request that opens the tunnel to `host:port` (RFC 9110 §9.3.6).
+    fn connect_request(&self, host: &str, port: u16) -> String {
+        let mut r = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some((u, p)) = &self.auth {
+            r.push_str(&format!("Proxy-Authorization: Basic {}\r\n", b64_std(format!("{u}:{p}").as_bytes())));
+        }
+        r.push_str("\r\n");
+        r
+    }
+}
+
+/// `NO_PROXY` as tools generally read it: `*` exempts everything; `example.org` / `.example.org` /
+/// `*.example.org` exempt that host and its subdomains; an IPv4 CIDR (`10.0.0.0/8`) exempts the
+/// addresses in it; a `:port` suffix on an entry is ignored.
+fn no_proxy_matches(list: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let ip = host.parse::<std::net::Ipv4Addr>().ok();
+    list.split(',').map(str::trim).filter(|e| !e.is_empty()).any(|e| {
+        if e == "*" {
+            return true;
+        }
+        let e = e.to_ascii_lowercase();
+        if let (Some(ip), Some((net, bits))) = (ip, e.split_once('/')) {
+            return match (net.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>()) {
+                (Ok(net), Ok(bits)) if bits <= 32 => {
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    u32::from(ip) & mask == u32::from(net) & mask
+                }
+                _ => false,
+            };
+        }
+        let e = match e.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => h,
+            _ => e.as_str(),
+        };
+        let e = e.trim_start_matches('*').trim_start_matches('.');
+        !e.is_empty() && (host == e || host.ends_with(&format!(".{e}")))
+    })
+}
+
+/// `%XX` in a proxy URL's credentials (`p%40ss` → `p@ss`).
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Standard base64 with padding (what `Basic` credentials use).
+fn b64_std(data: &[u8]) -> String {
+    let mut s = crypto::b64url_encode(data).replace('-', "+").replace('_', "/");
+    while s.len() % 4 != 0 {
+        s.push('=');
+    }
+    s
+}
+
+/// Open a tunnel to `host:port` through the proxy; the proxy resolves the name. Failures are the
+/// proxy's, in words that say so (the relay is not even reached).
+async fn connect_via_proxy(proxy: &Proxy, host: &str, port: u16) -> Result<tokio::net::TcpStream, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let unreachable = |e: std::io::Error| format!("cannot reach the proxy {}: {e}", proxy.addr());
+    let mut s = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port)).await.map_err(unreachable)?;
+    let _ = s.set_nodelay(true);
+    s.write_all(proxy.connect_request(host, port).as_bytes()).await.map_err(unreachable)?;
+    // Only the response head is read: on success nothing follows it (the relay's TLS hello waits
+    // for ours), and a refusal's body is of no use.
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = s.read(&mut buf).await.map_err(unreachable)?;
+        if n == 0 {
+            return Err(format!("the proxy {} closed the connection without answering the CONNECT", proxy.addr()));
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 16 * 1024 {
+            return Err(format!("the proxy {} did not answer the CONNECT properly", proxy.addr()));
+        }
+    }
+    let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_string();
+    let status = line.strip_prefix("HTTP/1.").and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
+    match status {
+        Some(200..=299) => Ok(s),
+        Some(407) if proxy.auth.is_some() => Err(format!("the proxy {} rejected the credentials in the proxy URL (HTTP 407)", proxy.addr())),
+        Some(407) => Err(format!("the proxy {} wants authentication (HTTP 407) — put user:pass@ in the proxy URL", proxy.addr())),
+        Some(code) => Err(format!("the proxy {} refused the CONNECT (HTTP {code})", proxy.addr())),
+        None => Err(format!("the proxy {} did not answer the CONNECT properly: {}", proxy.addr(), sanitize(&line))),
     }
 }
 
@@ -603,8 +863,19 @@ async fn connect_ipv4(host: &str, port: u16) -> Result<tokio::net::TcpStream, St
     Err(format!("cannot reach the relay {host}: {last}"))
 }
 
+/// The built-in roots, plus those in `SSL_CERT_FILE` (a PEM bundle) when it is set — a
+/// TLS-inspecting proxy's CA, typically. Validation itself is never relaxed.
 fn client_tls() -> Result<Arc<rustls::ClientConfig>, String> {
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::CertificateDer;
+        let shown = path.to_string_lossy();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&path).and_then(|it| it.collect()).map_err(|e| format!("cannot read SSL_CERT_FILE {shown}: {e}"))?;
+        if roots.add_parsable_certificates(certs).0 == 0 {
+            return Err(format!("SSL_CERT_FILE {shown} holds no usable certificate"));
+        }
+    }
     let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("tls: {e}"))?
@@ -622,7 +893,14 @@ fn describe(e: tokio_tungstenite::tungstenite::Error) -> String {
             let code = resp.headers().get("x-mantra-relay-error").and_then(|v| v.to_str().ok());
             refusal(resp.status().as_u16(), code, &body)
         }
-        other => format!("cannot reach the relay: {other}"),
+        other => {
+            let text = other.to_string();
+            if text.contains("certificate") {
+                format!("the relay's TLS certificate is not trusted ({text}) — behind a TLS-inspecting proxy, point SSL_CERT_FILE at its CA bundle")
+            } else {
+                format!("cannot reach the relay: {text}")
+            }
+        }
     }
 }
 
@@ -1090,7 +1368,7 @@ mod tests {
         let (ctl, _c) = tokio::sync::mpsc::unbounded_channel();
         let reg = WebRegistryHandle::new(ctl);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let cfg = RemoteConfig { relay: "ws://127.0.0.1:9".into(), site: "http://127.0.0.1:9".into(), password: None, dir: dir.clone() };
+        let cfg = RemoteConfig { relay: "ws://127.0.0.1:9".into(), site: "http://127.0.0.1:9".into(), password: None, dir: dir.clone(), headless: false };
         let r = Remote::start(cfg.clone(), reg.clone(), tx.clone());
         assert!(r.ready(std::time::Duration::from_secs(20)).await);
         let a = r.info();
@@ -1466,7 +1744,7 @@ mod tests {
         let addr = refusing_relay("409 Conflict", headers, body).await;
         let (ctl, _c) = tokio::sync::mpsc::unbounded_channel();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: None, dir: dir.clone() }, WebRegistryHandle::new(ctl), tx);
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: None, dir: dir.clone(), headless: false }, WebRegistryHandle::new(ctl), tx);
         let mut seen = None;
         for _ in 0..200 {
             if let Some(e) = r.info().last_error.filter(|e| !e.is_empty()) {
@@ -1494,7 +1772,7 @@ mod tests {
         let (ctl, _ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         let reg = WebRegistryHandle::new(ctl);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone() }, reg.clone(), tx);
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone(), headless: false }, reg.clone(), tx);
         assert!(r.ready(Duration::from_secs(20)).await);
         let key = r.inner().identity().unwrap().2;
         async fn next_bin(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Vec<u8> {
@@ -1551,7 +1829,7 @@ mod tests {
         let (ctl, _ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         let reg = WebRegistryHandle::new(ctl);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone() }, reg.clone(), tx);
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone(), headless: false }, reg.clone(), tx);
         assert!(r.ready(Duration::from_secs(20)).await);
         let old_key = r.inner().identity().unwrap().2;
         async fn next_bin(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Vec<u8> {
@@ -1610,7 +1888,7 @@ mod tests {
         let (ctl, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         let reg = WebRegistryHandle::new(ctl);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone() }, reg.clone(), tx);
+        let r = Remote::start(RemoteConfig { relay: format!("ws://{addr}"), site: format!("http://{addr}"), password: Some("pw".into()), dir: dir.clone(), headless: false }, reg.clone(), tx);
         assert!(r.ready(Duration::from_secs(20)).await);
         let key = r.inner().identity().unwrap().2;
         let (s, _) = l.accept().await.unwrap();
@@ -1674,6 +1952,203 @@ mod tests {
         }
         assert_eq!(reg.count(ConnKind::Relay), 0);
         r.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn proxies_come_from_the_environment() {
+        let env = |vars: &[(&str, &str)]| {
+            let m: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            move |k: &str| m.get(k).cloned()
+        };
+        let p = |h: &str, port| Proxy { host: h.into(), port, auth: None };
+        let wss = RelayTarget::parse("wss://remote.mantra.codes").unwrap();
+        let ws = RelayTarget::parse("ws://relay.lan:8787").unwrap();
+        assert_eq!(Proxy::select(&wss, env(&[])).unwrap(), None, "nothing set: direct");
+        // https_proxy serves wss://, http_proxy serves ws://, all_proxy either; lowercase wins
+        assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://127.0.0.1:35043")])).unwrap(), Some(p("127.0.0.1", 35043)));
+        assert_eq!(Proxy::select(&ws, env(&[("HTTPS_PROXY", "http://127.0.0.1:35043")])).unwrap(), None);
+        assert_eq!(Proxy::select(&ws, env(&[("HTTP_PROXY", "http://proxy.lan")])).unwrap(), Some(p("proxy.lan", 80)));
+        assert_eq!(Proxy::select(&wss, env(&[("ALL_PROXY", "proxy.lan:3128")])).unwrap(), Some(p("proxy.lan", 3128)));
+        assert_eq!(Proxy::select(&wss, env(&[("https_proxy", "http://a:1"), ("HTTPS_PROXY", "http://b:2")])).unwrap(), Some(p("a", 1)));
+        assert_eq!(Proxy::select(&wss, env(&[("https_proxy", "http://a:1"), ("ALL_PROXY", "http://b:2")])).unwrap(), Some(p("a", 1)));
+        assert_eq!(Proxy::select(&wss, env(&[("https_proxy", " "), ("ALL_PROXY", "http://b:2")])).unwrap(), Some(p("b", 2)), "an empty value is unset");
+        // NO_PROXY exempts the relay
+        let sandbox = "localhost,127.0.0.1,10.0.0.0/8,.svc.cluster.local,*.example.org,remote.mantra.codes";
+        assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("NO_PROXY", sandbox)])).unwrap(), None);
+        assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("no_proxy", "*")])).unwrap(), None);
+        assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("NO_PROXY", "mantra.codes:443")])).unwrap(), None);
+        assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("NO_PROXY", "example.org")])).unwrap(), Some(p("a", 1)));
+        // credentials, percent-encoded; a bracketed IPv6 proxy address
+        assert_eq!(Proxy::parse("x", "http://me:p%40ss@proxy.lan:8080/").unwrap(), Proxy { host: "proxy.lan".into(), port: 8080, auth: Some(("me".into(), "p@ss".into())) });
+        assert_eq!(Proxy::parse("x", "http://[::1]:3128").unwrap(), Proxy { host: "::1".into(), port: 3128, auth: None });
+        // only http:// proxies, and the URL (it may hold a password) is not echoed
+        for bad in ["socks5://me:secret@proxy.lan:1080", "https://me:secret@proxy.lan", "http://me:secret@proxy.lan:port", "http://me:secret@"] {
+            let e = Proxy::parse("ALL_PROXY", bad).unwrap_err();
+            assert!(e.starts_with("ALL_PROXY: ") && !e.contains("secret"), "{e}");
+        }
+    }
+
+    #[test]
+    fn no_proxy_entries_match_hosts_and_networks() {
+        assert!(no_proxy_matches("example.org", "example.org"));
+        assert!(no_proxy_matches("example.org", "Relay.Example.org."));
+        assert!(no_proxy_matches(".example.org", "relay.example.org"));
+        assert!(no_proxy_matches("*.example.org", "relay.example.org"));
+        assert!(!no_proxy_matches("example.org", "notexample.org"));
+        assert!(!no_proxy_matches("ample.org", "example.org"));
+        assert!(no_proxy_matches(" foo , *", "anything"));
+        assert!(no_proxy_matches("10.0.0.0/8", "10.20.30.40"));
+        assert!(!no_proxy_matches("10.0.0.0/8", "11.0.0.1"));
+        assert!(no_proxy_matches("172.16.0.0/12", "172.31.255.1"));
+        assert!(!no_proxy_matches("172.16.0.0/12", "172.32.0.1"));
+        assert!(!no_proxy_matches("10.0.0.0/8", "relay.example.org"));
+        assert!(!no_proxy_matches("", "example.org"));
+        assert!(!no_proxy_matches("::1,:,.", "example.org"));
+    }
+
+    #[test]
+    fn connect_requests_carry_the_target_and_credentials() {
+        let p = Proxy { host: "127.0.0.1".into(), port: 3128, auth: None };
+        assert_eq!(p.connect_request("remote.mantra.codes", 443), "CONNECT remote.mantra.codes:443 HTTP/1.1\r\nHost: remote.mantra.codes:443\r\n\r\n");
+        let p = Proxy { auth: Some(("Aladdin".into(), "open sesame".into())), ..p };
+        assert_eq!(p.connect_request("relay.lan", 8787), "CONNECT relay.lan:8787 HTTP/1.1\r\nHost: relay.lan:8787\r\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n\r\n");
+        assert_eq!(b64_std(b""), "");
+        assert_eq!(b64_std(b"a"), "YQ==");
+        assert_eq!(b64_std(&[0xfb, 0xff]), "+/8=");
+        assert_eq!(Proxy { host: "::1".into(), port: 1, auth: None }.addr(), "[::1]:1");
+    }
+
+    /// A fake HTTP proxy: answers every CONNECT with `status` and, on a 200, tunnels to
+    /// `upstream`. Each request head it read goes to `seen`.
+    async fn fake_proxy(status: &'static str, upstream: Option<std::net::SocketAddr>, seen: tokio::sync::mpsc::UnboundedSender<String>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = seen.send(String::from_utf8_lossy(&head).to_string());
+                    s.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+                    if let Some(up) = upstream.filter(|_| status.starts_with("200")) {
+                        let mut u = tokio::net::TcpStream::connect(up).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut s, &mut u).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_is_reached_through_an_http_proxy() {
+        // the fake relay sits behind the fake proxy; the host only ever talks to the proxy
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = l.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+            let mut seen_tx = Some(seen_tx);
+            #[allow(clippy::result_large_err)]
+            let cb = |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                let a = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let _ = seen_tx.take().map(|t| t.send(format!("{} {a}", req.uri().path())));
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(s, cb).await.unwrap();
+            ws.send(Message::Text("hi".into())).await.unwrap();
+            seen_rx.await.unwrap()
+        });
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let proxy_addr = fake_proxy("200 Connection established", Some(relay_addr), seen_tx).await;
+        let proxy = Proxy { host: "127.0.0.1".into(), port: proxy_addr.port(), auth: Some(("me".into(), "pw".into())) };
+        let url = format!("ws://{relay_addr}");
+        let target = RelayTarget::parse(&url).unwrap();
+        let mut ws = dial_via(&url, "sid123", "tok", &target, Some(&proxy)).await.unwrap();
+        let head = seen.recv().await.unwrap();
+        assert!(head.starts_with(&format!("CONNECT {relay_addr} HTTP/1.1\r\nHost: {relay_addr}\r\n")), "{head}");
+        assert!(head.contains("Proxy-Authorization: Basic bWU6cHc=\r\n"), "{head}");
+        // the upgrade went through the tunnel, and frames flow back
+        match ws.next().await.unwrap().unwrap() {
+            Message::Text(t) => assert_eq!(t.as_str(), "hi"),
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(relay.await.unwrap(), "/host/sid123 Bearer tok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_failures_are_named_as_such() {
+        // the relay name is never resolved here: the proxy would, and it never gets that far
+        let url = "wss://relay.example.invalid:8787".to_string();
+        let target = RelayTarget::parse(&url).unwrap();
+        let via = |port| Proxy { host: "127.0.0.1".into(), port, auth: None };
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let refusing = fake_proxy("403 Forbidden", None, seen_tx).await;
+        let e = dial_via(&url, "sid", "tok", &target, Some(&via(refusing.port()))).await.unwrap_err();
+        assert_eq!(e, format!("the proxy {refusing} refused the CONNECT (HTTP 403)"));
+        let (seen_tx, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let wants_auth = fake_proxy("407 Proxy Authentication Required", None, seen_tx).await;
+        let e = dial_via(&url, "sid", "tok", &target, Some(&via(wants_auth.port()))).await.unwrap_err();
+        assert!(e.contains("wants authentication (HTTP 407)"), "{e}");
+        let e = dial_via(&url, "sid", "tok", &target, Some(&Proxy { auth: Some(("a".into(), "b".into())), ..via(wants_auth.port()) })).await.unwrap_err();
+        assert!(e.contains("rejected the credentials"), "{e}");
+        // nobody listening where the proxy should be
+        let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let e = dial_via(&url, "sid", "tok", &target, Some(&via(gone.port()))).await.unwrap_err();
+        assert!(e.starts_with(&format!("cannot reach the proxy {gone}: ")), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn headless_says_each_relay_error_once_and_the_link_after_connecting() {
+        let dir = std::env::temp_dir().join(format!("mantra-remote-headless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ctl, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = Remote::start(RemoteConfig { relay: "ws://127.0.0.1:9".into(), site: "http://127.0.0.1:9".into(), password: None, dir: dir.clone(), headless: true }, WebRegistryHandle::new(ctl), tx);
+        assert!(r.ready(Duration::from_secs(20)).await);
+        // the relay task is stopped: what follows drives the announcements by hand
+        r.shutdown();
+        let inner = r.inner();
+        let set_error = |e: &str| inner.lock().last_error = Some(e.into());
+        set_error("cannot reach the relay: x");
+        let s = inner.lock();
+        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_millis(1500))), vec!["cannot reach the relay: x — retrying in 1.5s"]);
+        assert!(inner.announce(&s, false, false, Some(Duration::from_secs(3))).is_empty(), "the same error again stays quiet");
+        drop(s);
+        set_error("the relay is full right now (too many sessions)");
+        let s = inner.lock();
+        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_secs(3))), vec!["the relay is full right now (too many sessions) — retrying in 3.0s"]);
+        assert!(inner.announce(&s, false, false, None).is_empty());
+        // unchanged, but a minute has passed
+        inner.announced.lock().unwrap().error.as_mut().unwrap().1 -= REPEAT_ERROR_AFTER;
+        assert_eq!(inner.announce(&s, false, false, None), vec!["the relay is full right now (too many sessions)"]);
+        drop(s);
+        // the first connection: the link, code and password follow it
+        let mut s = inner.lock();
+        s.last_error = None;
+        let (sid, password) = (s.sid.clone(), s.password.clone());
+        let out = inner.announce(&s, true, false, None);
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[0], "connected to the relay");
+        assert_eq!(out[1], format!("link {}", link_of("http://127.0.0.1:9", "ws://127.0.0.1:9", &sid, &s.key.unwrap())));
+        assert_eq!(out[2], format!("code {}", code_of(&sid)));
+        assert_eq!(out[3], format!("password {password}"));
+        assert_eq!(inner.announce(&s, true, false, None), vec!["reconnected to the relay"], "the link is printed once per identity");
+        // a drop after a connection is said at once, even with an error seen before
+        s.last_error = Some("the relay is full right now (too many sessions)".into());
+        assert_eq!(inner.announce(&s, false, true, Some(Duration::from_secs(1))).len(), 1);
+        drop(s);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

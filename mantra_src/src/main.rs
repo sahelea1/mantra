@@ -527,7 +527,8 @@ fn restore_terminal(kbd: bool) {
 }
 
 /// Tell the user where the web UI / remote link is. Headless: stderr is the only place, so the
-/// remote password is printed there (once); with a TUI it lives in `/web` and `/remote`.
+/// relay task prints the remote link and password there (once, after the relay is first reached —
+/// see `remote::Inner::announce`); with a TUI it lives in `/web` and `/remote`.
 async fn announce_web(w: &web::Web, headless: bool) {
     let link = w.link();
     if headless {
@@ -541,14 +542,14 @@ async fn announce_web(w: &web::Web, headless: bool) {
         }
     }
     if let Some(r) = &w.remote {
-        let ready = r.ready(Duration::from_secs(10)).await;
         if headless {
-            let info = r.info();
-            if ready {
-                eprintln!("mantra remote: link {}", info.link.unwrap_or_default());
+            // Unless the relay task got there first: a link printed before the relay answered
+            // looks valid but leads nowhere, so it follows the first "connected".
+            if !r.info().connected {
+                eprintln!("mantra remote: waiting for the relay {}…", r.inner().relay);
             }
-            eprintln!("mantra remote: code {}", info.code.unwrap_or_default());
-            eprintln!("mantra remote: password {}", info.password.unwrap_or_default());
+        } else {
+            r.ready(Duration::from_secs(10)).await;
         }
     }
 }

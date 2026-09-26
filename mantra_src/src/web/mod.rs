@@ -458,7 +458,7 @@ impl Web {
             crate::mlog!("web: listening on {}", info.urls.join(" "));
             server = Some(h);
         }
-        let remote = cfg.relay.as_ref().map(|relay| Arc::new(remote::Remote::start(remote::RemoteConfig { relay: relay.clone(), site: cfg.remote_site.clone().unwrap_or_else(|| remote::relay_origin(relay)), password: cfg.password.clone(), dir: cfg.dir.clone() }, reg.clone(), tx.clone())));
+        let remote = cfg.relay.as_ref().map(|relay| Arc::new(remote::Remote::start(remote::RemoteConfig { relay: relay.clone(), site: cfg.remote_site.clone().unwrap_or_else(|| remote::relay_origin(relay)), password: cfg.password.clone(), dir: cfg.dir.clone(), headless: cfg.headless }, reg.clone(), tx.clone())));
         let env = snapshot::Env { tls: info.tls, listen: info.urls.first().cloned(), headless: cfg.headless, push: push_link.is_some() };
         Ok(Web { cfg, reg, ctl_rx, publisher: snapshot::Publisher::new(env), server, remote, push: push_link, vapid_public, info })
     }
