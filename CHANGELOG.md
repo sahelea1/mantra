@@ -2,6 +2,76 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.5.0 — 2026-09-25
+
+Mantra leaves the terminal. `--web` serves the same running session as a small, installable web
+app — chat with every agent, approve or answer from your phone, watch the pulse feed — and
+`--remote` reaches it from anywhere through a relay that is end-to-end encrypted and never sees a
+plaintext byte. `--headless` runs either with no terminal at all.
+
+- **`--web`: an installable web UI, on this machine or your LAN.** Optional `--web [ADDR:PORT]` /
+  `--web-listen ADDR:PORT` (default `127.0.0.1:7777`, loopback needing no password); binding
+  anything else refuses to start without one (`--web-password`, `MANTRA_WEB_PASSWORD` — preferred,
+  flags show up in `ps` — or `[web] password`). The app is a PWA: installable from Chrome's
+  *Install* prompt or iOS's Share › Add to Home Screen, offline shell caching, safe-area-aware
+  layout, and a bottom tab bar on the phone / three columns on desktop, mirroring everything Solo
+  and Mandala already do from the keyboard — send, queue, force-send, approvals, plan review,
+  respawn, model/effort, compact, runs, land, diffs, the pulse feed. New `/web` overlay shows the
+  listener address(es), TLS and password state, and connected browsers.
+- **TLS with a certificate Mantra owns.** `--web-tls` makes a small private certificate authority
+  once (`$MANTRA_HOME/web/tls/`) and signs a leaf for every name the machine currently answers to
+  (localhost, its LAN IPv4, its hostname, plus `[web] sans`), reissuing the leaf — never the CA —
+  only when that set changes or it is close to expiring; `/cert.pem` hands out the CA, so trusting
+  it once on a device covers every certificate this Mantra issues afterwards, even across an IP
+  change. `--web-cert FILE --web-key FILE` uses a certificate you already have.
+- **Web Push, implemented by hand.** RFC 8291 payload encryption and a VAPID JWT (`web/push.rs`,
+  no push-specific dependency — the relay's own `p256`/HKDF/AES-GCM cover it) for halts, questions,
+  approvals, plan review, a finished run and a finished Solo turn, each togglable per device from
+  Settings, with a "send a test" button. Notifications need HTTPS; a device kept on plain HTTP is
+  told so once, plainly.
+- **`--remote`: the same session from anywhere, end-to-end encrypted.** Dials out to a relay
+  (`wss://remote.mantra.codes` by default) so nothing needs a port opened inward. Reached by a
+  link (`https://remote.mantra.codes/s/<sid>#k=…` — the key lives only in the URL fragment, which
+  a browser never sends to a server), a QR code, or a short code + password. No password set →
+  Mantra generates a four-word one (`amber-kite-river-nine`, from a fixed 256-word list) and shows
+  it in the new `/remote` overlay alongside the link, QR and connection state; `r` rotates the
+  whole identity (old link/code/QR stop working at once). The relay only ever forwards
+  AES-256-GCM-encrypted frames between the host and a browser — the key is derived from the
+  password with PBKDF2 and never leaves the two ends, so the relay sees IPs and ciphertext, never a
+  password, a key, or a byte of what an agent says. A wrong password or code fails to decrypt the
+  first frame ("Wrong password or code") instead of connecting into someone else's session.
+- **`--remote-site`, so the relay and the website need not be the same host.** The relay only
+  forwards bytes; the page a remote link opens can be served from anywhere else, by anyone else.
+  `--remote-site URL` (or `[web] remote_site`) names that site explicitly; left unset it defaults
+  to the relay's own origin. Point `--remote` at a self-hosted relay and Mantra depends on
+  `remote.mantra.codes` for nothing.
+- **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `--remote` session per
+  source IPv4 address at a time (a relay policy, `--max-hosts-per-ip`): a second one dialling in
+  from behind the same address is refused (HTTP 409) until the first disconnects, shown as a plain
+  sentence rather than a raw status code, and only ever dialled over IPv4 in the first place (an
+  IPv6-only relay address is rejected before it tries to connect, since the rule is keyed on the
+  IPv4 address the relay observes).
+- **`--headless`.** No terminal at all — no raw mode, no input thread, nothing drawn — for a
+  machine reached only through the web UI or `--remote`; requires at least one of them ("nothing
+  would be reachable" otherwise), and `ctrl+c`/`SIGTERM` shut it down cleanly. The one-time startup
+  lines (URL, link, code, password) print to stderr, since there is no overlay to show them in.
+  `event_loop` now takes an `Option<&mut Terminal<B>>`, so the terminal and headless paths are one
+  function, not two to keep in sync.
+- **`[web]` settings and `$MANTRA_HOME/web/`.** A new `WebSettings` (`listen`, `password`, `tls`,
+  `cert`/`key`, `relay`, `remote_site`, `sans`, `push`, `contact`) mirrors every flag above — flags
+  still win — and everything the web core needs on disk (TLS certificate, push keys and
+  subscriptions, web sessions, the remote identity) lives under `$MANTRA_HOME/web/`, `0600`.
+- **The reference relay stays out of this repository.** It is a separate deliverable (a Docker
+  image), so this binary's compatibility with any relay is defined entirely by the wire protocol,
+  not by shared code.
+- **Tests.** 50 new unit tests (183 total): PBKDF2/HKDF/AES-GCM known-answer and round-trip
+  vectors including tamper detection and fragmentation, every WebSocket protocol message round-
+  tripping, snapshot/delta diffing (upsert/remove, append-vs-full items, pulse by sequence number,
+  plan by version, nothing-changed → no delta), login and its rate limiting, TLS certificate
+  reissue rules, and the relay (identity persistence/rotation, IPv4-only dialling, the
+  one-session-per-IPv4 refusal shown and retried, per-IP handshake throttling, a fake relay
+  carrying a real browser handshake end to end).
+
 ## v0.4.0 — 2026-09-24
 
 The manager: a role whose job is the whole run. Until now every agent owned a slice — a plan, a

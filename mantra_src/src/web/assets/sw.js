@@ -1,11 +1,12 @@
 // Mantra web UI — service worker: offline shell, Web Push, notification clicks. Spec §9.2, §11.1.
 //
+// __MANTRA_SW_VERSION__ below: web/server.rs substitutes it per build (like /config.js); a static bundle (the relay site) `sed`s the same token from its Dockerfile at image build time.
+//
 // Caching is network-first for everything (falling back to the cache when offline) rather than
 // cache-first for assets: the assets are embedded in the Mantra binary and change with it while
 // this file may not, so a cache-first worker would keep serving the old UI after an upgrade.
-// Bump VERSION when the shell's file list changes.
 'use strict';
-const VERSION = 'mantra-shell-0.5.0-1';
+const VERSION = 'mantra-shell-__MANTRA_SW_VERSION__';
 const SHELL = [
     '/', '/manifest.webmanifest', '/assets/app.css',
     '/assets/crypto.js', '/assets/transport.js', '/assets/ui/dom.js', '/assets/ui/fmt.js', '/assets/ui/store.js',

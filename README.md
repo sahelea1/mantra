@@ -5,9 +5,9 @@
 **Run one coding agent — or a whole team of them — from a single terminal.**
 
 Works with **OpenAI Codex** and **Claude Code**, mixed freely, on any model either of them can reach.
-One Rust binary, no server, no web UI, nothing written into your project.
+One Rust binary, nothing written into your project — and, one flag away, an installable web UI and end-to-end encrypted remote access, no server of your own required.
 
-[Install](#install) · [Try it in one minute](#try-it-in-one-minute) · [Solo](#solo-one-agent-done-properly) · [Mandala](#mandala-a-team-that-plans-builds-and-checks) · [Under the hood](#under-the-hood)
+[Install](#install) · [Try it in one minute](#try-it-in-one-minute) · [Solo](#solo-one-agent-done-properly) · [Mandala](#mandala-a-team-that-plans-builds-and-checks) · [Anywhere](#anywhere-the-web-ui-and-remote-access) · [Under the hood](#under-the-hood)
 
 <img src="docs/img/mandala.png" alt="A Mantra run: three workers building one phase in parallel, a gate waiting, the live pulse feed" width="920">
 
@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.4.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.5.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80)
@@ -362,6 +362,84 @@ Or describe what you want and let the **architect agent** edit the pattern while
 
 ---
 
+## Anywhere: the web UI and remote access
+
+```bash
+mantra --web                                          # this machine only — http://127.0.0.1:7777
+mantra --web 0.0.0.0:7777 --web-tls --web-password X  # your phone, on the LAN
+mantra --remote                                       # from anywhere, end-to-end encrypted
+mantra --headless --web --remote                      # the same, with no terminal at all
+```
+
+The same process that draws the TUI can also serve a small, installable web app for it — chat with every agent, approve or answer from your phone, watch the pulse feed, approve a plan — over plain HTTP on `localhost`, HTTPS on your LAN, or from anywhere through a relay that never sees a byte of it unencrypted. Nothing is bound and no cost is paid unless you ask for it.
+
+<details>
+<summary><code>--web</code>: on this machine or your LAN</summary>
+
+`--web` (optionally `--web ADDR:PORT`, or the explicit `--web-listen ADDR:PORT`) starts an HTTP+WebSocket server in the same process, defaulting to `127.0.0.1:7777` — loopback, no password needed, since anyone who can reach it can already run `mantra` itself. Bind anything else (`--web 0.0.0.0:7777` for the LAN) and Mantra refuses to start without a password: `--web-password PW`, the environment variable `MANTRA_WEB_PASSWORD` (preferred — flags show up in `ps`), or `[web] password` in `settings.toml`. `/web` in the TUI shows the exact URL(s), whether TLS and a password are on, and how many browsers are connected right now.
+
+`--web-tls` serves HTTPS with a small private certificate authority Mantra makes for itself the first time (`$MANTRA_HOME/web/tls/`), covering `localhost`, your LAN address and hostname, reissued only when those change or it is close to expiring. `/cert.pem` on the running server hands out that CA — install it *once* per device and every certificate this Mantra ever issues for itself afterwards (even after your IP changes) is already trusted:
+
+| device | steps |
+|---|---|
+| iPhone / iPad | open `/cert.pem` in Safari → *Profile Downloaded* → Settings › Profile Downloaded › Install → Settings › General › About › Certificate Trust Settings → full trust for "mantra on …" |
+| Android | download `/cert.pem` → Settings › Security › Encryption & credentials › Install a certificate › CA certificate (Chrome trusts it after a restart; some other browsers ignore user CAs for service workers — use Chrome) |
+| macOS | open `/cert.pem` in Keychain Access (System keychain) → double-click it → Trust → *Always Trust* |
+| Windows | open `/cert.pem` → Install Certificate → Local Machine → Trusted Root Certification Authorities |
+| Linux (Chrome) | `chrome://settings/certificates` › Authorities › Import |
+| Firefox | `about:preferences#privacy` › Certificates › Authorities › Import |
+
+`--web-cert FILE --web-key FILE` uses a certificate you already have instead. Without TLS the web UI still works on `localhost`, but a phone can't install it as an app or get notifications over plain HTTP.
+
+**Installing it as an app.** Over HTTPS, Android/Chrome offers an *Install* button; on iPhone/iPad use Safari's **Share › Add to Home Screen** — iOS only delivers notifications to an installed app, and the UI says so once, in place. Either way you get a full-screen icon, offline shell caching, and a layout that respects the notch and the home indicator.
+
+**Notifications.** Once installed, Settings → Notifications turns on Web Push — implemented by hand, no third-party push service in the middle — for halts, questions, approvals, plan review, a finished run and a finished Solo turn, each toggle separate, with a *Send a test* button. Subscriptions and push keys live in `$MANTRA_HOME/web/push/`, `0600`; turn it off server-wide with `[web] push = false`.
+
+</details>
+
+<details>
+<summary><code>--remote</code>: the same session from anywhere, end-to-end encrypted</summary>
+
+`--remote` (optionally `--remote wss://your-relay`) dials *out* to a relay — `wss://remote.mantra.codes` by default — so the web UI reaches you from anywhere without opening a port on your machine or trusting the relay with anything: it only ever forwards ciphertext. `/remote` in the TUI shows the link, a QR code, a short code, and the password; `r` rotates the identity (the old link, code and QR stop working immediately).
+
+- **Link** — `https://remote.mantra.codes/s/<sid>#k=<key>`. The key lives only in the URL fragment, which browsers never send to a server; opening it derives the key and connects straight through.
+- **Code + password** — the same session as a short code (grouped in dashes) typed in at remote.mantra.codes, plus the password. For reading aloud, or typing into a device you didn't get the link on.
+- **Password** — set your own, or let Mantra generate a four-word one the first time `--remote` runs (`amber-kite-river-nine`, from a fixed 256-word list) and show it in `/remote`. It also derives the link's key, so changing it — or rotating — invalidates old links and codes.
+- **What the relay can and cannot see.** Your host and the connecting browser derive a shared key from the password (PBKDF2, then a fresh HKDF key per connection) that never reaches the relay, and every message after that is AES-256-GCM end-to-end encrypted. The relay sees your IP, the browser's IP, and encrypted bytes — never the password, the key, or anything your agents say. A wrong password or code fails to decrypt the very first frame ("Wrong password or code") rather than quietly connecting into someone else's session.
+- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all.
+- **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `mantra --remote` session per IPv4 address at a time — a second one dialing in from behind the same address (the same office, the same home network) is refused until the first disconnects, and Mantra reports that plainly instead of silently taking over.
+
+</details>
+
+<details>
+<summary><code>--headless</code>: no terminal at all</summary>
+
+`--headless` runs the same engine with no terminal whatsoever — no raw mode, no input thread, nothing drawn — for a machine you only ever reach through the web UI or `--remote`. It needs at least one of `--web`/`--remote` (otherwise nothing would be reachable), and `ctrl+c` or `SIGTERM` shuts it down cleanly. The web/remote startup lines (URL, link, code, password) print once to stderr, since there's no `/web`/`/remote` overlay to show them in.
+
+</details>
+
+**`[web]` in `settings.toml`** — everything here is also a flag, and a flag always wins:
+
+| key | default | meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:7777` | where `--web` binds |
+| `password` | *(none)* | web UI password; prefer `MANTRA_WEB_PASSWORD` |
+| `tls` | `false` | Mantra's own certificate when true |
+| `cert` / `key` | *(none)* | your own PEM certificate + key (implies TLS) |
+| `relay` | `wss://remote.mantra.codes` | the relay `--remote` dials |
+| `remote_site` | *(the relay's own origin)* | the site remote links open, when it's not the relay's host |
+| `sans` | `[]` | extra DNS names/IPs for the self-signed certificate |
+| `push` | `true` | Web Push notifications |
+| `contact` | `https://mantra.codes` | the VAPID contact used for push |
+
+`$MANTRA_HOME/web/` holds everything this needs — TLS certificate, push keys and subscriptions, sessions, the remote identity — each file `0600`.
+
+<img src="docs/img/web-team-phone.png" alt="The web UI's Team screen on a phone: run status, halt band, the team list" width="300"> <img src="docs/img/web-agent-phone.png" alt="The web UI zoomed into one agent on a phone: transcript, diff, composer" width="300">
+
+<img src="docs/img/web-run-desktop.png" alt="The web UI's three-column desktop layout: team sidebar, agent transcript, plan/pulse/files panel" width="920">
+
+---
+
 ## Keys
 
 <details>
@@ -401,7 +479,7 @@ Or describe what you want and let the **architect agent** edit the pattern while
 <details>
 <summary>Slash commands</summary>
 
-`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/pattern` `/runs` `/plan` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/help` `/quit` — and `!cmd` runs a shell command.
+`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/pattern` `/runs` `/plan` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/web` `/remote` `/help` `/quit` — and `!cmd` runs a shell command.
 
 </details>
 
@@ -429,6 +507,7 @@ One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC o
 | `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs |
 | `~/.mantra/worktrees/<id>/` | per-run worktrees, cleaned up as phases complete |
 | `~/.mantra/logs/mantra.log` | debug log |
+| `~/.mantra/web/` | TLS certificate, Web Push keys/subscriptions, web sessions, remote identity (`--web`/`--remote`; `0600`) |
 
 Nothing is written into your project. A repo may *ship* patterns in `<repo>/.mantra/patterns/`, which Mantra reads but never creates.
 
@@ -455,7 +534,7 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 <details>
 <summary>How this is tested, and what is not covered</summary>
 
-- `cargo build` with zero warnings, 133 unit tests (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, and the Claude gauge against per-call usage), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- `cargo build` with zero warnings, 183 unit tests (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, the Claude gauge against per-call usage, and 50 for the web UI and remote relay: PBKDF2/HKDF/AES-GCM known-answer and round-trip vectors, every protocol message round-tripping, snapshot/delta diffing, TLS certificate reissue rules, login rate-limiting, and the relay — IPv4-only dialling, the one-session-per-IPv4 refusal shown and retried, a fake relay carrying a real browser handshake end to end), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
 - Real runs against live providers with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale (LibertAI, and OpenRouter's `openai/gpt-5.6-luna` through Codex's Responses API), compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
 
@@ -494,6 +573,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.4.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.5.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

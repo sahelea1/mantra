@@ -61,6 +61,38 @@ fn assets() -> &'static HashMap<&'static str, Asset> {
     })
 }
 
+/// A version string for the service worker's cache name: `CARGO_PKG_VERSION` plus a short hash of
+/// `index.html` + `app.js` (the shell's own files change even between released versions in dev).
+/// Distinct per build, stable within one running binary — like the per-asset ETag above.
+fn sw_version() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        let a = assets();
+        let mut bytes = Vec::new();
+        if let Some(idx) = a.get("index.html") {
+            bytes.extend_from_slice(idx.bytes);
+        }
+        if let Some(app) = a.get("app.js") {
+            bytes.extend_from_slice(app.bytes);
+        }
+        format!("{}-{}", env!("CARGO_PKG_VERSION"), &auth::sha256_hex_bytes(&bytes)[..8])
+    })
+}
+
+/// `sw.js` with its `__MANTRA_SW_VERSION__` placeholder substituted at serve time — the same idea
+/// as `/config.js`, just baked into the file instead of a side channel, since a service worker is
+/// fetched and cached on its own path. Computed once; `None` if the bundle has no `sw.js` yet.
+fn sw_asset() -> Option<&'static Asset> {
+    static SW: OnceLock<Option<Asset>> = OnceLock::new();
+    SW.get_or_init(|| {
+        let raw = assets().get("sw.js")?;
+        let body = String::from_utf8_lossy(raw.bytes).replace("__MANTRA_SW_VERSION__", sw_version());
+        let bytes: &'static [u8] = Box::leak(body.into_bytes().into_boxed_slice());
+        Some(Asset { bytes, etag: format!("\"{}\"", &auth::sha256_hex_bytes(bytes)[..32]), ctype: raw.ctype })
+    })
+    .as_ref()
+}
+
 #[derive(Clone)]
 pub struct ServerCtx {
     pub auth: Arc<dyn Authenticator>,
@@ -277,6 +309,11 @@ async fn static_or_spa(method: Method, headers: HeaderMap, uri: axum::http::Uri)
     let path = uri.path();
     let rel = path.trim_start_matches('/');
     let rel = rel.strip_prefix("assets/").unwrap_or(rel);
+    if rel == "sw.js" {
+        if let Some(a) = sw_asset() {
+            return serve_asset(a, &headers, rel);
+        }
+    }
     let all = assets();
     if !rel.is_empty() && !rel.contains("..") {
         if let Some(a) = all.get(rel) {
