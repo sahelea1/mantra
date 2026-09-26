@@ -32,10 +32,15 @@ function never(url) {
     return url.pathname.startsWith('/api/') || url.pathname === '/ws' || url.pathname.startsWith('/c/') || url.pathname.startsWith('/host/') || url.pathname === '/cert.pem';
 }
 
-async function networkFirst(req, fallbackPath) {
+// `timeoutMs` only ever applies to the navigation request: a script or stylesheet must fall back
+// to the cache when `fetch()` itself rejects (offline, DNS failure, …), never merely because it's
+// slow — a timeout race there is how a page ends up with a mix of the old and new bundle after an
+// upgrade (fresh HTML, stale JS pulled from cache while the real fetch was still in flight).
+async function networkFirst(req, fallbackPath, timeoutMs) {
     const cache = await caches.open(VERSION);
     try {
-        const res = await Promise.race([fetch(req), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))]);
+        const p = fetch(req);
+        const res = await (timeoutMs ? Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs))]) : p);
         if (res && res.ok && res.type === 'basic') cache.put(fallbackPath || req, res.clone()).catch(() => { });
         return res;
     } catch (e) {
@@ -51,7 +56,7 @@ self.addEventListener('fetch', (ev) => {
     const url = new URL(req.url);
     if (url.origin !== self.location.origin || never(url)) return;
     // Every SPA route (/, /agent/3, /s/<sid>/run …) is the same index.html.
-    if (req.mode === 'navigate') { ev.respondWith(networkFirst(req, '/')); return; }
+    if (req.mode === 'navigate') { ev.respondWith(networkFirst(req, '/', 6000)); return; }
     ev.respondWith(networkFirst(req));
 });
 
