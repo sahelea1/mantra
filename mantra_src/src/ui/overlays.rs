@@ -564,7 +564,9 @@ pub fn key(app: &mut App, k: KeyEvent) {
                     if let Some(a) = target {
                         let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
                         if app.agents.get(&a).map(|x| x.model_alias != alias).unwrap_or(false) {
-                            app.set_model(a, &alias);
+                            if let Err(e) = app.set_model(a, &alias) {
+                                app.toast(e, crate::agent::Level::Warn);
+                            }
                         }
                         app.step_effort(a, if k.code == KeyCode::Right { 1 } else { -1 });
                     }
@@ -574,7 +576,9 @@ pub fn key(app: &mut App, k: KeyEvent) {
                     let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
                     match target {
                         Some(a) => {
-                            app.set_model(a, &alias);
+                            if let Err(e) = app.set_model(a, &alias) {
+                                app.toast(e, crate::agent::Level::Warn);
+                            }
                             app.model_switched_for_run_agent(a);
                         }
                         None => {
