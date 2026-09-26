@@ -2,7 +2,7 @@
 
 All notable changes to Mantra are recorded here.
 
-## v0.5.0 — 2026-09-25
+## v0.5.0 — 2026-09-26
 
 Mantra leaves the terminal. `--web` serves the same running session as a small, installable web
 app — chat with every agent, approve or answer from your phone, watch the pulse feed — and
@@ -53,7 +53,8 @@ plaintext byte. `--headless` runs either with no terminal at all.
   IPv4 address the relay observes).
 - **`--headless`.** No terminal at all — no raw mode, no input thread, nothing drawn — for a
   machine reached only through the web UI or `--remote`; requires at least one of them ("nothing
-  would be reachable" otherwise), and `ctrl+c`/`SIGTERM` shut it down cleanly. The one-time startup
+  would be reachable" otherwise), a password whenever `--web` is on, and `ctrl+c`/`SIGTERM` shut
+  it down cleanly. The one-time startup
   lines (URL, link, code, password) print to stderr, since there is no overlay to show them in.
   `event_loop` now takes an `Option<&mut Terminal<B>>`, so the terminal and headless paths are one
   function, not two to keep in sync.

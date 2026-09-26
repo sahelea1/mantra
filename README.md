@@ -376,9 +376,9 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary><code>--web</code>: on this machine or your LAN</summary>
 
-`--web` (optionally `--web ADDR:PORT`, or the explicit `--web-listen ADDR:PORT`) starts an HTTP+WebSocket server in the same process, defaulting to `127.0.0.1:7777` — loopback, no password needed, since anyone who can reach it can already run `mantra` itself. Bind anything else (`--web 0.0.0.0:7777` for the LAN) and Mantra refuses to start without a password: `--web-password PW`, the environment variable `MANTRA_WEB_PASSWORD` (preferred — flags show up in `ps`), or `[web] password` in `settings.toml`. `/web` in the TUI shows the exact URL(s), whether TLS and a password are on, and how many browsers are connected right now.
+`--web` (optionally `--web ADDR:PORT`, or the explicit `--web-listen ADDR:PORT`) starts an HTTP+WebSocket server in the same process, defaulting to `127.0.0.1:7777` — loopback, no password needed, since anyone who can reach it can already run `mantra` itself (mind that a port-forward or tunnel to that port — `ssh -L`, `docker -p` — lets its other end in too; Mantra says so once at start). Bind anything else (`--web 0.0.0.0:7777` for the LAN) and Mantra refuses to start without a password: `--web-password PW`, the environment variable `MANTRA_WEB_PASSWORD` (preferred — flags show up in `ps`), or `[web] password` in `settings.toml`. `/web` in the TUI shows the exact URL(s), whether TLS and a password are on, and how many browsers are connected right now.
 
-`--web-tls` serves HTTPS with a small private certificate authority Mantra makes for itself the first time (`$MANTRA_HOME/web/tls/`), covering `localhost`, your LAN address and hostname, reissued only when those change or it is close to expiring. `/cert.pem` on the running server hands out that CA — install it *once* per device and every certificate this Mantra ever issues for itself afterwards (even after your IP changes) is already trusted:
+`--web-tls` serves HTTPS with a small private certificate authority Mantra makes for itself the first time (`$MANTRA_HOME/web/tls/`), covering `localhost`, your LAN address and hostname, reissued only when those change or it is close to expiring. `/cert.pem` on the running server hands out that CA (the web app's Settings › Certificate card has the download button and these same steps) — install it *once* per device and every certificate this Mantra ever issues for itself afterwards (even after your IP changes) is already trusted:
 
 | device | steps |
 |---|---|
@@ -414,7 +414,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary><code>--headless</code>: no terminal at all</summary>
 
-`--headless` runs the same engine with no terminal whatsoever — no raw mode, no input thread, nothing drawn — for a machine you only ever reach through the web UI or `--remote`. It needs at least one of `--web`/`--remote` (otherwise nothing would be reachable), and `ctrl+c` or `SIGTERM` shuts it down cleanly. The web/remote startup lines (URL, link, code, password) print once to stderr, since there's no `/web`/`/remote` overlay to show them in.
+`--headless` runs the same engine with no terminal whatsoever — no raw mode, no input thread, nothing drawn — for a machine you only ever reach through the web UI or `--remote`. It needs at least one of `--web`/`--remote` (otherwise nothing would be reachable), a password whenever `--web` is on (a headless machine has nobody at the keyboard to notice a stranger on the loopback port; `--remote` alone generates one), and `ctrl+c` or `SIGTERM` shuts it down cleanly. The web/remote startup lines (URL, link, code, password) print once to stderr, since there's no `/web`/`/remote` overlay to show them in.
 
 </details>
 
