@@ -71,7 +71,7 @@ The installer verifies a sha256, installs to `~/.local/bin` (override with `MANT
 
 Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
-`mantra doctor` probes readiness, not presence — one row and verdict each, every probe capped at 10 s:
+`mantra doctor` probes readiness, not presence — one row and verdict each, the readiness probes capped at 10 s (the `--version` checks at 5 s):
 
 - **codex executable** — `codex --version`
 - **codex app-server** — launched exactly as an agent launches it (provider args, the default model's key in the environment) and taken through the `initialize` handshake, then shut down cleanly
