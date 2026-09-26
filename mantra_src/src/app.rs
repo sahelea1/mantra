@@ -1266,7 +1266,10 @@ impl App {
             HubEvent::Ready { agent, thread_id, model, resumed } => {
                 let mut was_busy = false;
                 if let Some(a) = self.agents.get_mut(&agent) {
-                    was_busy = a.turn_active || a.awaiting_start;
+                    // A relaunch Mantra asked for lost nothing (the hub replays what it held), so
+                    // it never earns the "continue where you left off" note below.
+                    was_busy = (a.turn_active || a.awaiting_start) && !a.relaunching;
+                    a.relaunching = false;
                     a.thread_id = Some(thread_id);
                     if !model.is_empty() {
                         a.model = model;
@@ -1373,11 +1376,21 @@ impl App {
                 }
             },
             HubEvent::Crashed { agent, reason, restarting, attempt } => {
+                // `attempt == 0` with `restarting` is the hub's relaunch notice (`Exit::Restarting`):
+                // Mantra asked for it, nothing crashed.
+                let relaunch = restarting && attempt == 0;
                 if let Some(a) = self.agents.get_mut(&agent) {
-                    a.status = if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
+                    a.status = if relaunch { Status::Retrying("relaunching".into()) } else if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
                     a.activity = if restarting { "restarting".into() } else { "crashed".into() };
                     let what = if a.backend == crate::config::ProviderKind::ClaudeCode { "claude process" } else { "codex process" };
-                    a.notice(Level::Error, format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                    if relaunch {
+                        // A model/effort change waits for the turn to end and the hub replays any
+                        // held turn itself; only a plain mid-turn restart loses work worth a nudge.
+                        a.relaunching = reason.starts_with("restarting to apply");
+                        a.notice(Level::Info, format!("{what} relaunching: {reason}"));
+                    } else {
+                        a.notice(Level::Error, format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                    }
                 }
                 if self.in_run(agent) {
                     self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));

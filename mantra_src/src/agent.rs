@@ -168,6 +168,10 @@ pub struct Agent {
     /// retry, no "continue where you left off" after a process restart. Cleared the moment any
     /// message is sent to it again (`app::prompt_agent`), which is the user's way of saying carry on.
     pub stopped_by_user: bool,
+    /// The hub is relaunching this agent's process at Mantra's own request (a model/effort change,
+    /// a plain restart): the hub holds and replays any turn sent meanwhile, so the next `Ready`
+    /// must not also send a "continue where you left off" note. Cleared on `Ready`.
+    pub relaunching: bool,
     pub created: Instant,
     pub finished: Option<Instant>,
     pub scroll: usize,
@@ -219,6 +223,7 @@ impl Agent {
             final_message: None,
             queued: vec![],
             stopped_by_user: false,
+            relaunching: false,
             created: Instant::now(),
             finished: None,
             scroll: 0,

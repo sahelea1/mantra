@@ -1963,6 +1963,18 @@ Then summarize in 2-4 lines.",
             // The process is already relaunching on its own (hub.rs's crash-backoff raced this
             // turn before it could even start) — a free retry, not a fault of this attempt's
             // budget, so it must not spend one of `worker_retries`.
+            // A resumed Claude session found unusable (hub/claude.rs's dead-resume detection): the
+            // hub is already relaunching a *fresh* process, which has none of the old thread's
+            // context — so re-brief the agent as a respawn instead of counting a failure or halting.
+            if msg.starts_with("resumed session is unusable") {
+                let name = self.name_of(a);
+                self.log("↻", "amber", format!("{name}: resumed session unusable — respawning with a fresh brief"));
+                self.retry_counts.remove(&a);
+                if let Err(e) = self.respawn(ctx, a, Some("Your previous process lost its session; this is a fresh start with the same task.".into())) {
+                    self.log("!", "amber", format!("{name}: could not respawn ({e})"));
+                }
+                return;
+            }
             if msg == "agent restarting" {
                 let wait = Duration::from_secs(4);
                 let name = self.name_of(a);
@@ -4517,6 +4529,27 @@ mod halt_tests {
         assert!(ctx.prompts.is_empty(), "no backoff retry for a hand-stopped agent: {:?}", ctx.prompts);
         assert!(run.continue_queue.is_empty(), "nothing queued to re-prompt it later");
         assert!(!run.halted());
+    }
+
+    /// A resumed Claude session found unusable (hub/claude.rs's dead-resume detection) surfaces as
+    /// a failed turn while the hub relaunches a *fresh* process with no history: the engine must
+    /// re-brief the agent as a respawn — never spend a retry, never halt on "agent turn failed".
+    #[test]
+    fn a_dead_resumed_session_respawns_the_agent_instead_of_failing_it() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+
+        run.on_turn_done(&mut ctx, planner, "failed", Some("resumed session is unusable - relaunching fresh".into()), None);
+
+        assert!(!run.halted(), "a dead session is never a halt: {:?}", run.halt.as_ref().map(|h| h.message.clone()));
+        let new_planner = run.planner.expect("planner still set");
+        assert_ne!(new_planner, planner, "a fresh agent is briefed, not the one whose session is gone");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:plan]")), "the planner is re-briefed with its planning prompt: {:?}", ctx.prompts);
+        assert!(run.continue_queue.is_empty(), "no [mantra:retry] continuation — the old thread has nothing to continue");
+        assert!(run.retry_counts.get(&planner).is_none(), "not a retry");
     }
 
     #[test]
