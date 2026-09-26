@@ -8,7 +8,7 @@
 use super::protocol::{AgentWithItems, DeltaMsg, SnapshotMsg};
 use crate::agent::{Agent, Item, Kind, Level, Status};
 use crate::app::{App, Approval, Screen};
-use crate::engine::run::{PhaseStep, Run, Stage};
+use crate::engine::run::{HaltReason, PhaseStep, Run, Stage};
 use crate::hub::AgentId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -851,14 +851,30 @@ fn web_hint(hint: &str) -> String {
     h.replace("r respawn ", "Respawn ").replace("r retry", "Retry").replace("m switch model ", "Switch model ").replace("space retries", "Resume retries")
 }
 
+/// An `AttemptsExhausted` halt carries no agent: `spawn_task` refuses the respawn (and escalates)
+/// before a worker exists for this attempt (`run.rs`, `spawn_task`). The message still names the
+/// task ("<id> has used all N attempts — not respawning."), so recover the agent from that task's
+/// most recent worker attempt — the web UI can then still offer "Retry <task>" (`name_of` returns
+/// a worker's task id).
+fn exhausted_task_agent(r: &Run, message: &str) -> Option<AgentId> {
+    let (tid, _) = message.split_once(" has used all ")?;
+    if tid.is_empty() {
+        return None;
+    }
+    r.workers.iter().rev().find(|w| w.task.id == tid).and_then(|w| w.agent)
+}
+
 pub fn run_view(app: &App, r: &Run) -> RunView {
-    let halted = r.halt.as_ref().map(|h| HaltView {
-        reason: r.halt_reason_str().unwrap_or("user").into(),
-        agent: h.agent,
-        agent_name: h.agent.map(|a| r.name_of(a)),
-        message: h.message.clone(),
-        since_at: ms(h.since),
-        hint: web_hint(&r.halt_hint()),
+    let halted = r.halt.as_ref().map(|h| {
+        let agent = h.agent.or_else(|| if h.reason == HaltReason::AttemptsExhausted { exhausted_task_agent(r, &h.message) } else { None });
+        HaltView {
+            reason: r.halt_reason_str().unwrap_or("user").into(),
+            agent,
+            agent_name: agent.map(|a| r.name_of(a)),
+            message: h.message.clone(),
+            since_at: ms(h.since),
+            hint: web_hint(&r.halt_hint()),
+        }
     });
     let question = r.question.as_ref().map(|q| QuestionView { from: q.from, from_name: r.name_of(q.from), text: q.text.clone(), since_at: ms(q.since) });
     let history = r

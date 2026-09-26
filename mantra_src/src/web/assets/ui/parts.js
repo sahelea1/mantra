@@ -17,11 +17,14 @@
     function btn(label, onclick, opts) {
         opts = opts || {};
         const busy = opts.busyKey && S().ui.busy[opts.busyKey];
+        // A busyKey means this button fires a server command (M.act.cmd/request) — same rule the
+        // composer already applies to its send button: nothing to do while there's no connection.
+        const notReady = opts.busyKey && S().conn.state !== 'open';
         return h('button', {
             type: opts.type || 'button',
             class: 'btn' + (opts.kind ? ' ' + opts.kind : '') + (opts.sm ? ' sm' : '') + (opts.cls ? ' ' + opts.cls : '') + (busy ? ' is-busy' : ''),
-            onclick: opts.disabled || busy ? null : onclick,
-            disabled: opts.disabled || busy || null,
+            onclick: opts.disabled || busy || notReady ? null : onclick,
+            disabled: opts.disabled || busy || notReady || null,
             title: opts.title || null,
             'aria-label': opts.aria || (typeof label === 'string' ? null : opts.title) || null,
             key: opts.key,

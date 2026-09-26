@@ -84,29 +84,44 @@ self.addEventListener('push', (ev) => {
     try { n = ev.data ? ev.data.json() : {}; } catch (_) { n = { title: 'Mantra', body: ev.data ? ev.data.text() : '' }; }
     const title = n.title || 'Mantra';
     ev.waitUntil((async () => {
-        const url = (await getBase()) + (n.url || '/');
+        const b = await getBase();
+        const url = b + (n.url || '/');
         const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-        // Someone is looking at Mantra right now: show it in the page instead of the OS tray.
+        // Someone is looking at Mantra right now: tell the page instead of alerting through the
+        // OS tray. Chrome still shows its own "site updated in background" toast for any push
+        // that doesn't call showNotification(), so show one anyway — silent and self-closing —
+        // rather than let the browser show a worse one we don't control.
         const seen = wins.find((w) => w.visibilityState === 'visible' && w.focused);
-        if (seen) { seen.postMessage({ push: Object.assign({}, n, { url }) }); return; }
+        if (seen) seen.postMessage({ push: Object.assign({}, n, { url }) });
+        const tag = n.tag || n.kind || 'mantra';
         await self.registration.showNotification(title, {
             body: n.body || '',
-            tag: n.tag || n.kind || 'mantra',
+            tag,
+            silent: !!seen,
             renotify: n.kind === 'halt' || n.kind === 'question' || n.kind === 'approval',
             icon: '/icons/icon-192.png',
             badge: '/icons/badge-96.png',
             timestamp: n.at || Date.now(),
-            data: { url },
+            data: { url, base: b },
         });
+        if (seen) {
+            // Keep the worker alive for this (waitUntil is still pending) so the close actually runs.
+            await new Promise((r) => setTimeout(r, 1000));
+            for (const note of await self.registration.getNotifications({ tag })) note.close();
+        }
     })());
 });
 
 self.addEventListener('notificationclick', (ev) => {
     ev.notification.close();
-    const url = (ev.notification.data && ev.notification.data.url) || '/';
+    const data = ev.notification.data || {};
+    const url = data.url || '/';
+    const base = data.base || '';
     ev.waitUntil((async () => {
         const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-        const w = wins.find((c) => new URL(c.url).origin === self.location.origin);
+        // The relay site can have several sessions open at once, each same-origin under its own
+        // /s/<sid> base — only a window already on THIS notification's session may be reused.
+        const w = wins.find((c) => new URL(c.url).origin === self.location.origin && new URL(c.url).pathname.startsWith(base));
         if (w) {
             await w.focus();
             w.postMessage({ navigate: url });

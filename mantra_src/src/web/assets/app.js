@@ -20,6 +20,7 @@
     let client = null;
     let base = '';            // '/s/<sid>' in relay mode
     let navDepth = 0;
+    let sheetReturnFocus = null; // element to refocus when the open sheet closes
 
     // ── rendering ────────────────────────────────────────────────────────────────────────────────
     let queued = false;
@@ -77,11 +78,31 @@
         }
     }
     function sheet(sh) {
+        if (sh && !S.ui.sheet) sheetReturnFocus = document.activeElement;
         S.ui.sheet = sh;
         if (sh && sh.kind === 'diff') loadDiff(sh);
         changed();
     }
-    function closeSheet() { S.ui.sheet = null; changed(); }
+    function closeSheet() {
+        S.ui.sheet = null;
+        changed();
+        const el = sheetReturnFocus;
+        sheetReturnFocus = null;
+        if (el && typeof el.focus === 'function') requestAnimationFrame(() => { if (document.contains(el)) el.focus({ preventScroll: true }); });
+    }
+    // Focusable, visible descendants of a sheet, in DOM order (for the initial focus and the Tab trap).
+    function focusables(el) {
+        return Array.from(el.querySelectorAll('button, [href], input, select, textarea, [tabindex]')).filter((x) => !x.disabled && x.tabIndex !== -1 && x.offsetParent !== null);
+    }
+    function trapTab(el, e) {
+        if (e.key !== 'Tab') return;
+        const f = focusables(el);
+        if (!f.length) { e.preventDefault(); return; }
+        const first = f[0], last = f[f.length - 1];
+        if (!f.includes(document.activeElement)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+        else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
 
     function applyPrefs() {
         const el = document.documentElement;
@@ -187,7 +208,7 @@
         const dis = S.ui.banners;
         const insecure = location.protocol === 'http:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
         if (insecure && !dis.insecure) {
-            out.push(banner('insecure', 'alert', ['Notifications and installing need HTTPS. Start Mantra with ', h('code', null, '--web-tls'), ' and install its certificate from ', h('a', { href: '/cert.pem' }, '/cert.pem'), ' on this device.']));
+            out.push(banner('insecure', 'alert', ['Notifications and installing need HTTPS. Restart Mantra with ', h('code', null, '--web-tls'), ', then open the https:// address it prints and install the certificate from Settings › Certificate.']));
         }
         if (S.ui.install && !dis.install) {
             out.push(banner('install', 'download', 'Install Mantra as an app for a full-screen view and notifications.', P.btn('Install', async () => {
@@ -504,7 +525,11 @@
         }
         if (!body) { S.ui.sheet = null; return null; }
         return h('div', { class: 'sheet-layer', key: 'sheet-' + sh.kind, onclick: (e) => { if (e.target === e.currentTarget) closeSheet(); } },
-            h('div', { class: 'sheet ' + cls, role: 'dialog', 'aria-modal': 'true', 'aria-label': title, ref: (el) => requestAnimationFrame(() => { const f = el.querySelector('button.on, button, input'); if (f && wide()) f.focus({ preventScroll: true }); }) },
+            h('div', {
+                class: 'sheet ' + cls, role: 'dialog', 'aria-modal': 'true', 'aria-label': title,
+                ref: (el) => requestAnimationFrame(() => { const f = el.querySelector('button.on, button, input') || focusables(el)[0]; if (f) f.focus({ preventScroll: true }); }),
+                onkeydown: (e) => trapTab(e.currentTarget, e),
+            },
                 h('div', { class: 'sheet-grab', 'aria-hidden': 'true' }),
                 h('div', { class: 'sheet-head' }, h('h2', null, title), P.iconBtn('close', closeSheet, 'Close')),
                 h('div', { class: 'sheet-body' }, body)));

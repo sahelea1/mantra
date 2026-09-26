@@ -63,9 +63,12 @@ async function main() {
     const shots = [];
 
     const newPage = async (phone) => {
+        // deviceScaleFactor pinned to 1 so the PNG's pixel size is exactly the viewport (390×844 /
+        // 1440×900), not iPhone 13's native @3x — the other iPhone 13 traits (touch, mobile UA)
+        // are kept so :hover/coarse-pointer CSS and the mobile layout still behave like a phone.
         const ctx = await b.newContext(phone
-            ? Object.assign({}, devices['iPhone 13'], { viewport: { width: 390, height: 844 }, colorScheme: 'dark', serviceWorkers: 'block' })
-            : { viewport: { width: 1440, height: 900 }, colorScheme: 'dark', serviceWorkers: 'block' });
+            ? Object.assign({}, devices['iPhone 13'], { viewport: { width: 390, height: 844 }, deviceScaleFactor: 1, colorScheme: 'dark', serviceWorkers: 'block' })
+            : { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, colorScheme: 'dark', serviceWorkers: 'block' });
         const p = await ctx.newPage();
         p.on('pageerror', (e) => errs.push('pageerror: ' + e.message));
         p.on('console', (m) => { if (/Service Worker registration blocked/.test(m.text())) return; if (m.type() === 'error' || m.type() === 'warning') errs.push('console.' + m.type() + ': ' + m.text()); });

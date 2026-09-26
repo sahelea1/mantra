@@ -164,16 +164,21 @@
 
     async function loadEarlier(a) {
         const st = scroll[a.id] || (scroll[a.id] = { stick: false, seen: -1 });
-        if (st.el) st.anchor = st.el.scrollHeight - st.el.scrollTop;
         const w = win[a.id] || WINDOW;
         const shownFrom = Math.max(0, a.items.length - w);
-        if (shownFrom > 0) { win[a.id] = w + WINDOW; M.act.changed(); return; }
+        if (shownFrom > 0) {
+            if (st.el) st.anchor = st.el.scrollHeight - st.el.scrollTop;
+            win[a.id] = w + WINDOW; M.act.changed(); return;
+        }
         const before = a.items.length ? a.items[0].ord : a.items_total;
         S().ui.busy['earlier' + a.id] = true;
+        // Not st.anchor yet: the busy-spinner render below would consume it before the items it's
+        // meant to anchor even arrive, jumping the scroll to nowhere. Set it once they're in hand.
         M.act.changed();
         try {
             const m = await M.act.request('fetch_items', { agent: a.id, before, count: WINDOW });
             const n = M.store.prependItems(a.id, m && m.items);
+            if (st.el) st.anchor = st.el.scrollHeight - st.el.scrollTop;
             win[a.id] = w + n;
         } catch (e) {
             M.act.flash('Could not load earlier messages: ' + e.message, 'error');

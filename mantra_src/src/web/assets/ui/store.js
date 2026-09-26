@@ -29,6 +29,7 @@
         toast: null,
         remote: null,
         pulse: [],
+        pulseRun: null,         // run id `S.pulse`'s entries belong to — `n` is only unique per run
         notes: load('notes', []),
         hello: null,
         conn: { state: 'idle', error: null, mode: 'local' },
@@ -86,6 +87,7 @@
         S.toast = m.toast ? Object.assign({ shown: Date.now() }, m.toast) : null;
         S.remote = m.remote || null;
         S.pulse = (m.pulse || []).slice(-MAX_PULSE);
+        S.pulseRun = (m.run && m.run.id) || null;
         S.synced = true;
         S.rev++;
     }
@@ -148,7 +150,14 @@
                 if (fresh && Number(key) !== focusId) S.ui.unread[key] = (S.ui.unread[key] || 0) + fresh;
             }
         }
-        if ('run' in m) S.run = m.run;
+        if ('run' in m) {
+            S.run = m.run;
+            const rid = (m.run && m.run.id) || null;
+            // A new (or ended) run resets pulse numbering — `n` de-dupes only within one run, so
+            // carrying the previous run's max `n` forward would silently drop the new run's lines
+            // (they start again from 1, all `<= last`).
+            if (rid !== S.pulseRun) { S.pulseRun = rid; S.pulse = []; }
+        }
         if ('plan' in m) S.plan = m.plan;
         if (m.pulse && m.pulse.length) {
             const last = S.pulse.length ? S.pulse[S.pulse.length - 1].n : -1;

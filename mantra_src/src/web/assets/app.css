@@ -6,7 +6,7 @@
 :root {
     --saffron: #F2A541; --violet: #9682FA; --teal: #3CCFB4; --cyan: #5ABEF0; --green: #6ED68A;
     --rose: #F2688A; --red: #F05A5A; --amber: #E8C547; --blue: #6E96FF; --gray: #787E8C;
-    --text: #E2E6EC; --muted: #A0A6B2; --dim: #6E7488; --faint: #3E424E;
+    --text: #E2E6EC; --muted: #A0A6B2; --dim: #8A91A3; --faint: #3E424E;
     --bg: #0F1116; --bg-elev: #161922; --bg-card: #1B1F2A; --bg-hover: #232837; --bg-press: #2A3041; --bg-input: #12151C;
     --line: #262B38; --line-strong: #353B4C;
     --accent: var(--saffron); --on-accent: #1D1405;
@@ -35,7 +35,7 @@
     :root:not([data-theme="dark"]) {
         --saffron: #B86A0B; --violet: #6750DB; --teal: #0E8A74; --cyan: #1B7FB6; --green: #2B8E48;
         --rose: #C93465; --red: #CC3333; --amber: #9A7400; --blue: #3A60DE; --gray: #6A7080;
-        --text: #1B1F2A; --muted: #535B6C; --dim: #7C8394; --faint: #C4C9D3;
+        --text: #1B1F2A; --muted: #535B6C; --dim: #666D7E; --faint: #C4C9D3;
         --bg: #F7F8FA; --bg-elev: #FFFFFF; --bg-card: #FFFFFF; --bg-hover: #F0F2F6; --bg-press: #E7EAF0; --bg-input: #FFFFFF;
         --line: #E3E6EC; --line-strong: #D2D6DE; --on-accent: #FFFFFF;
         --shadow: 0 1px 2px rgba(20, 24, 40, .06), 0 6px 20px rgba(20, 24, 40, .07);
@@ -47,7 +47,7 @@
     color-scheme: light;
     --saffron: #B86A0B; --violet: #6750DB; --teal: #0E8A74; --cyan: #1B7FB6; --green: #2B8E48;
     --rose: #C93465; --red: #CC3333; --amber: #9A7400; --blue: #3A60DE; --gray: #6A7080;
-    --text: #1B1F2A; --muted: #535B6C; --dim: #7C8394; --faint: #C4C9D3;
+    --text: #1B1F2A; --muted: #535B6C; --dim: #666D7E; --faint: #C4C9D3;
     --bg: #F7F8FA; --bg-elev: #FFFFFF; --bg-card: #FFFFFF; --bg-hover: #F0F2F6; --bg-press: #E7EAF0; --bg-input: #FFFFFF;
     --line: #E3E6EC; --line-strong: #D2D6DE; --on-accent: #FFFFFF;
     --shadow: 0 1px 2px rgba(20, 24, 40, .06), 0 6px 20px rgba(20, 24, 40, .07);
@@ -426,7 +426,7 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--b
 .seg.halt .seg-bar { background: var(--amber); opacity: 1; }
 .seg.bad .seg-bar { background: var(--red); opacity: 1; }
 .seg.review .seg-bar { background: var(--violet); opacity: 1; animation: pulse-seg 1.8s ease-in-out infinite; }
-.seg-short, .seg-label { font-size: 10px; color: var(--dim); text-align: center; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seg-short, .seg-label { font-size: 11px; color: var(--dim); text-align: center; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg.cur .seg-short, .seg.cur .seg-label { color: var(--accent); }
 .seg.halt .seg-short, .seg.halt .seg-label { color: var(--amber); }
 .seg.review .seg-short, .seg.review .seg-label { color: var(--violet); }
@@ -594,6 +594,7 @@ button.item-head:hover { background: var(--bg-hover); }
 .composer-box { display: flex; align-items: flex-end; gap: 6px; padding: 5px 5px 5px 14px; border-radius: 22px; background: var(--bg-input); border: 1px solid var(--line-strong); transition: border-color var(--t), box-shadow var(--t); }
 .composer-box:focus-within { border-color: color-mix(in srgb, var(--accent) 60%, var(--line-strong)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
 .composer textarea { flex: 1; min-width: 0; resize: none; border: 0; background: transparent; outline: none; padding: 7px 0; max-height: 170px; line-height: 22px; font-size: 15px; }
+@media (pointer: coarse) { .composer textarea { font-size: 16px; } } /* beats the 15px above — no iOS zoom on focus */
 .composer-btns { display: flex; align-items: center; gap: 4px; }
 .composer .send { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--accent); color: var(--on-accent); flex: none; transition: opacity var(--t), transform 80ms; }
 .composer .send:disabled { opacity: .35; }

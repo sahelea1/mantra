@@ -17,7 +17,6 @@
         4404: { error: "Mantra isn't connected to the relay. Start it with `mantra --remote`.", retry: true, slow: true, code: 'nohost' },
         4410: { error: 'Mantra left the relay (it quit or lost its connection). Waiting for it to come back…', retry: true, code: 'hostgone' },
         4429: { error: 'Session full — too many devices are connected to this Mantra right now.', retry: false, code: 'full' },
-        4409: { error: 'Your network already has a Mantra session open through this relay. Close it first (only one session per IP address).', retry: false, code: 'ip' },
         4413: { error: 'A message was too large for the relay.', retry: true, code: 'big' },
         4400: { error: 'The relay rejected a frame.', retry: true, code: 'proto' },
         4000: { error: 'Mantra closed the connection.', retry: true, code: 'closed' },
@@ -255,6 +254,13 @@
                 this.emit('fatal', { code: 'badkey', error: 'Wrong password or code' });
                 return;
             }
+            if (this.bye === 'replaced') {
+                this.bye = null;
+                this.stopped = true;
+                this.setState('failed', 'This session was opened elsewhere');
+                this.emit('fatal', { code: 'replaced', error: 'This session was opened elsewhere' });
+                return;
+            }
             const rc = this.mode === 'relay' ? RELAY_CLOSE[info.code] : null;
             if (rc && !rc.retry) {
                 this.stopped = true;
@@ -271,12 +277,18 @@
                 } catch (_) { /* server unreachable → plain reconnect */ }
             }
             if (this.bye === 'unauthorized') return;
+            const slow = this.bye === 'slow';
             this.attempt += 1;
+            // The server shed us for being too slow to keep up — hammering it right back at 1 s
+            // just repeats the problem (and looked like a silent, unexplained reconnect loop
+            // before this: no rc for local/unmatched codes, and 'slow' isn't 'quit'). Skip ahead
+            // to the backoff attempt 3 would already be at.
+            if (slow) this.attempt = Math.max(this.attempt, 3);
             // 1 s → 30 s with ±30 % jitter so a room full of phones doesn't reconnect in lockstep.
             const baseMs = Math.min(30000, 1000 * Math.pow(2, Math.min(this.attempt - 1, 5))) * (rc && rc.slow ? 2 : 1);
             const wait = Math.round(baseMs * (0.7 + Math.random() * 0.6));
             const offline = navigator.onLine === false;
-            let err = rc ? rc.error : (this.bye === 'quit' ? 'Mantra quit. Waiting for it to start again…' : null);
+            let err = rc ? rc.error : slow ? 'Mantra dropped this connection for falling behind. Reconnecting…' : (this.bye === 'quit' ? 'Mantra quit. Waiting for it to start again…' : null);
             this.bye = null;
             this.setState(offline ? 'offline' : 'reconnecting', err);
             this.retryAt = Date.now() + wait;
