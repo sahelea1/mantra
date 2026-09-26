@@ -349,16 +349,28 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(format!("   {}", p.description), theme::muted())),
         Line::default(),
     ];
-    for (name, r) in p.ordered_roles() {
+    // Columns sized to the widest name/kind in the pattern (+1 so "orchestrator" keeps a gap).
+    let roles = p.ordered_roles();
+    let nw = roles.iter().map(|(n, _)| w_of(n)).max().unwrap_or(0).max(13) + 1;
+    let kw = roles.iter().map(|(_, r)| w_of(&r.kind)).max().unwrap_or(0).max(11) + 1;
+    for (name, r) in roles {
         let m = app.registry.resolve(&r.model);
-        l.push(Line::from(vec![
+        let (used, lowered) = m.resolve_effort_lowered(&r.effort);
+        let mut row = vec![
             Span::styled(format!("   {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
-            Span::styled(format!("{name:<14}"), theme::text()),
-            Span::styled(format!("{:<12}", r.kind), theme::faint()),
+            Span::styled(format!("{name:<nw$}"), theme::text()),
+            Span::styled(format!("{:<kw$}", r.kind), theme::faint()),
             Span::styled(format!("{} · ", m.alias), theme::muted()),
-            Span::styled(r.effort.clone(), theme::fg(effort_color(&r.effort))),
-            Span::styled(format!("   {}", trunc(&r.description, 50)), theme::faint()),
-        ]));
+        ];
+        if lowered {
+            // requested→used: the model doesn't offer the configured effort
+            row.push(Span::styled(format!("{}{}", r.effort, theme::g("→", "->")), theme::faint()));
+            row.push(Span::styled(used.clone(), theme::fg(effort_color(&used))));
+        } else {
+            row.push(Span::styled(r.effort.clone(), theme::fg(effort_color(&r.effort))));
+        }
+        row.push(Span::styled(format!("   {}", trunc(&r.description, 50)), theme::faint()));
+        l.push(Line::from(row));
     }
     l.push(Line::default());
     let chain: Vec<String> = p.flow.finale.iter().map(|s| format!("{} {}", p.role(&s.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default(), s.role)).collect();
@@ -1031,4 +1043,58 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(blk, area);
     let lines: Vec<Line> = a.tail_lines(inner.height as usize).into_iter().map(|l| Line::from(Span::styled(format!("  {}", trunc(&l, (inner.width as usize).saturating_sub(3))), theme::dim()))).collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ModelEntry, Registry, Settings};
+    use crate::hub::Hub;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn welcome_lines(app: &App, w: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, 20)).unwrap();
+        term.draw(|f| welcome(f, f.area(), app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    fn app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
+    }
+
+    /// The live bug: `orchestrator` is exactly as wide as the fixed kind column was, so the row
+    /// came out as "orchestrator  orchestratortesting · high".
+    #[test]
+    fn overview_keeps_a_gap_after_the_widest_kind() {
+        let mut app = app();
+        let orch = Role { kind: "orchestrator".into(), model: "testing".into(), effort: "high".into(), ..app.studio.pattern.roles["manager"].clone() };
+        app.studio.pattern.roles.insert("orchestrator".into(), orch);
+        let lines = welcome_lines(&app, 120);
+        let row = lines.iter().find(|l| l.contains("orchestrator")).expect("orchestrator row");
+        assert!(row.contains("orchestrator testing · high"), "{row:?}");
+        assert!(!row.contains("orchestratortesting"), "{row:?}");
+    }
+
+    /// A role asking for an effort its model doesn't offer shows requested→used.
+    #[test]
+    fn overview_shows_a_lowered_effort() {
+        let mut app = app();
+        let mut reg = Registry::default();
+        reg.models.push(ModelEntry { alias: "lite".into(), model: "lite".into(), efforts: vec!["low".into(), "medium".into(), "high".into()], ..Default::default() });
+        app.registry = reg;
+        let r = app.studio.pattern.roles.get_mut("manager").unwrap();
+        r.model = "lite".into();
+        r.effort = "max".into();
+        let lines = welcome_lines(&app, 120);
+        let row = lines.iter().find(|l| l.contains("lite · ")).expect("manager row");
+        assert!(row.contains("lite · max→high"), "{row:?}");
+    }
 }

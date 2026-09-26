@@ -269,6 +269,16 @@ impl ModelEntry {
             .cloned()
             .unwrap_or_else(|| self.default_effort.clone())
     }
+    /// `resolve_effort` plus whether the request had to be lowered: ("high", true) for "max" on a
+    /// model whose `efforts` stop at high. The clamp is right, but callers surface it once so a
+    /// role configured with an effort its model doesn't offer isn't silently running lighter.
+    pub fn resolve_effort_lowered(&self, want: &str) -> (String, bool) {
+        let used = self.resolve_effort(want);
+        let want = want.trim().to_lowercase();
+        let rank = |e: &str| ALL_EFFORTS.iter().position(|x| *x == e);
+        let lowered = !used.is_empty() && used != want && matches!((rank(&want), rank(&used)), (Some(w), Some(u)) if w > u);
+        (used, lowered)
+    }
     pub fn step_effort(&self, cur: &str, delta: i32) -> String {
         let list = self.efforts();
         if list.is_empty() {
@@ -808,6 +818,18 @@ mod tests {
         assert_eq!(m.resolve_effort("minimal"), "low");
         assert_eq!(m.step_effort("low", 1), "medium");
         assert_eq!(m.step_effort("high", 1), "high");
+    }
+    #[test]
+    fn effort_resolution_reports_a_lowered_request() {
+        let m = ModelEntry { efforts: vec!["low".into(), "medium".into(), "high".into()], ..Default::default() };
+        assert_eq!(m.resolve_effort_lowered("max"), ("high".into(), true));
+        assert_eq!(m.resolve_effort_lowered("xhigh"), ("high".into(), true));
+        assert_eq!(m.resolve_effort_lowered("high"), ("high".into(), false));
+        assert_eq!(m.resolve_effort_lowered("min"), ("low".into(), false), "aliases aren't a downgrade");
+        let luna = Registry::defaults().get("luna").unwrap().clone();
+        assert_eq!(luna.resolve_effort_lowered("max").1, false);
+        let none = ModelEntry { provider: "zai".into(), ..Default::default() };
+        assert_eq!(none.resolve_effort_lowered("max"), (String::new(), false), "no effort setting at all isn't a clamp");
     }
     #[test]
     fn custom_models_without_efforts_send_none() {

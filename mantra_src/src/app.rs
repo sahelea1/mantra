@@ -230,7 +230,8 @@ fn toml_str(s: &str) -> String {
 pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, o: AgentOpts) -> AgentId {
     let id = hub.alloc_id();
     let m = reg.resolve(&o.model_alias);
-    let effort = m.resolve_effort(o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort));
+    let wanted = o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort).to_string();
+    let (effort, lowered) = m.resolve_effort_lowered(&wanted);
     let backend = reg.backend_of(&m);
     // Always tell the backend a context window and compaction limit — an assumed 200k / 85% when
     // the model doesn't have its own, so auto-compaction never relies on a provider's own defaults
@@ -305,9 +306,14 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.model = m.model.clone();
     a.provider = m.provider.clone();
     a.backend = backend;
-    a.effort = effort;
+    a.effort = effort.clone();
     a.ctx_window = Some(cw);
     a.approval = o.approval.clone();
+    if lowered {
+        // The clamp is right (the model has no such setting) — but say so once, or a role
+        // configured for max quietly runs at high.
+        a.notice(Level::Info, format!("effort {wanted} is not offered by {} — using {effort}", m.alias));
+    }
     agents.insert(id, a);
     hub.spawn(id, spec);
     id
@@ -696,11 +702,15 @@ impl App {
     pub fn set_effort(&mut self, a: AgentId, e: &str) {
         let Some(ag) = self.agents.get_mut(&a) else { return };
         let m = self.registry.resolve(&ag.model_alias);
-        let e = m.resolve_effort(e);
+        let (e, lowered) = m.resolve_effort_lowered(e);
         ag.effort = e.clone();
         self.hub.send(a, Cmd::SetEffort(e.clone()));
         let name = ag.name.clone();
-        self.toast(format!("{name}: effort → {e} (next turn)"), Level::Info);
+        if lowered {
+            self.toast(format!("{name}: {} tops out at {e} — effort → {e} (next turn)", m.alias), Level::Info);
+        } else {
+            self.toast(format!("{name}: effort → {e} (next turn)"), Level::Info);
+        }
     }
 
     pub fn step_effort(&mut self, a: AgentId, delta: i32) {

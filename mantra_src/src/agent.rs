@@ -46,12 +46,15 @@ pub struct Item {
     pub done: bool,
     pub version: u64,
     pub expanded: bool,
+    /// When the item was first seen in progress — a command's duration when the backend's
+    /// completion event doesn't carry one (or carries 0).
+    pub started: Option<Instant>,
     pub cache: Option<(u16, u64, bool, Vec<Line<'static>>)>,
 }
 
 impl Item {
     fn new(id: impl Into<String>, kind: Kind, text: impl Into<String>) -> Item {
-        Item { id: id.into(), kind, text: text.into(), done: false, version: 0, expanded: false, cache: None }
+        Item { id: id.into(), kind, text: text.into(), done: false, version: 0, expanded: false, started: None, cache: None }
     }
     fn touch(&mut self) {
         self.version += 1;
@@ -388,6 +391,7 @@ impl Agent {
                 let id = s(p, "itemId");
                 let d = s(p, "delta");
                 let it = self.get_or_insert(&id, Kind::Command { cmd: String::new(), output: String::new(), exit: None, status: "inProgress".into(), dur_ms: None });
+                it.started.get_or_insert_with(Instant::now);
                 if let Kind::Command { output, .. } = &mut it.kind {
                     output.push_str(&d);
                     crate::util::tail_bytes(output, MAX_OUTPUT);
@@ -603,6 +607,13 @@ impl Agent {
                 let agg = item.get("aggregatedOutput").and_then(|x| x.as_str()).map(|x| x.to_string());
                 let short = crate::util::trunc(cmd.lines().next().unwrap_or(""), 60);
                 let it = self.get_or_insert(&id, Kind::Command { cmd: cmd.clone(), output: String::new(), exit: None, status: status.clone(), dur_ms: None });
+                if !done {
+                    it.started.get_or_insert_with(Instant::now);
+                }
+                // The backend's own figure when it has one; else what we timed from item/started;
+                // else nothing — never a made-up "0ms". (Claude Code never sends durationMs, and
+                // Codex sends 0 for commands it didn't time.)
+                let dur = dur.filter(|d| *d > 0).or_else(|| if done { it.started.map(|t| t.elapsed().as_millis() as u64) } else { None });
                 let mut out_for_probe = String::new();
                 if let Kind::Command { cmd: c, output, exit: e, status: st, dur_ms } = &mut it.kind {
                     if !cmd.is_empty() {
@@ -1028,6 +1039,30 @@ mod tests {
         assert_eq!(a.final_message.as_deref(), Some("Hello"));
         assert!(a.files.contains_key("src/x.rs"));
         assert!(matches!(sig[0], Signal::TurnDone { .. }));
+    }
+
+    #[test]
+    fn command_duration_is_timed_from_start_when_the_backend_sends_none() {
+        use super::*;
+        use serde_json::json;
+        let dur_of = |a: &Agent, id: &str| match &a.items.iter().find(|i| i.id == id).unwrap().kind {
+            Kind::Command { dur_ms, .. } => *dur_ms,
+            _ => panic!("not a command"),
+        };
+        let mut a = Agent::new(1, "t", "solo", std::path::PathBuf::from("."));
+        a.apply("turn/started", &json!({"turn": {"id": "t1"}}));
+        a.apply("item/started", &json!({"item": {"type": "commandExecution", "id": "c1", "command": "sleep 1", "status": "inProgress"}}));
+        assert_eq!(dur_of(&a, "c1"), None, "in progress: nothing to show yet");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        a.apply("item/completed", &json!({"item": {"type": "commandExecution", "id": "c1", "command": "sleep 1", "status": "completed", "exitCode": 0, "durationMs": 0}}));
+        assert!(dur_of(&a, "c1").unwrap() >= 250, "timed from item/started, not the backend's 0");
+        // A backend figure wins when there is one.
+        a.apply("item/started", &json!({"item": {"type": "commandExecution", "id": "c2", "command": "ls", "status": "inProgress"}}));
+        a.apply("item/completed", &json!({"item": {"type": "commandExecution", "id": "c2", "command": "ls", "status": "completed", "exitCode": 0, "durationMs": 1234}}));
+        assert_eq!(dur_of(&a, "c2"), Some(1234));
+        // Completed out of nowhere (no start seen, nothing from the backend): no duration, not "0ms".
+        a.apply("item/completed", &json!({"item": {"type": "commandExecution", "id": "c3", "command": "ls", "status": "completed", "exitCode": 0}}));
+        assert_eq!(dur_of(&a, "c3"), None);
     }
 
     #[test]
