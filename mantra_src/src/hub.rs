@@ -72,6 +72,9 @@ pub enum HubEvent {
     Notif { agent: AgentId, method: String, params: Value },
     Request { agent: AgentId, id: Value, method: String, params: Value },
     CmdFailed { agent: AgentId, what: &'static str, error: String, text: Option<String> },
+    /// `attempt: 0` (paired with `restarting: true`) is a relaunch notice, not a crash count: it's
+    /// how `Exit::Restarting` (a self-inflicted relaunch, never a failure) reaches `App` without a
+    /// new event variant every consumer would need to learn.
     Crashed { agent: AgentId, reason: String, restarting: bool, attempt: u32 },
     Exited { agent: AgentId },
     /// A bridge connection arrived for `agent` (WP10.4); `App::on_hub` just forwards the stream to
@@ -277,17 +280,31 @@ async fn agent_task(
     let mut restarts: u32 = 0;
     let mut launch_failures: u32 = 0;
     let mut window = Instant::now();
+    // `Cmd::Turn`/`Cmd::Steer` text held instead of being lost: by the dying process itself (Claude's
+    // `restart_pending`, or a dead-resume detection) or by this loop's own crash-backoff wait below —
+    // either way delivered once the next process reaches `Ready` (see `run_process`/`run_claude_process`).
+    let mut replay: Vec<String> = vec![];
+    // The last `Cmd::Turn` text actually sent to a child, kept only so `prepare_relaunch` can requeue
+    // it on a *fresh* relaunch (the old session is gone, so that turn never got a reply).
+    let mut last_turn: Option<String> = None;
 
     'outer: loop {
         let started = match spec.backend {
-            Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, restarts > 0).await,
-            Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, restarts > 0).await,
+            Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, restarts > 0, &mut replay, &mut last_turn).await,
+            Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
         };
         let launch_failure = matches!(started, Exit::LaunchFailed(_));
         match started {
             Exit::Shutdown => {
                 let _ = ev.send(HubEvent::Exited { agent: id });
                 return;
+            }
+            Exit::Restarting { reason, fresh } => {
+                // Never a failure: no counter, no backoff, no window reset — just go again.
+                crate::mlog!("agent {id}: {reason} (relaunching)");
+                prepare_relaunch(fresh, &mut thread_id, &last_turn, &mut replay);
+                let _ = ev.send(HubEvent::Crashed { agent: id, reason, restarting: true, attempt: 0 });
+                continue 'outer;
             }
             Exit::Crashed(reason) | Exit::LaunchFailed(reason) => {
                 if window.elapsed() > Duration::from_secs(600) {
@@ -322,9 +339,9 @@ async fn agent_task(
                                 Some(Cmd::SetModel(m)) => model = m,
                                 Some(Cmd::SetApproval(a)) => approval = a,
                                 Some(Cmd::Restart) => continue 'outer,
-                                Some(Cmd::Turn { text }) | Some(Cmd::Steer { text }) => {
-                                    let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "agent restarting".into(), text: Some(text) });
-                                }
+                                // Held, not failed: the retry is still coming, so this text still has
+                                // a process to reach — see `replay`'s drain once `Ready` fires again.
+                                Some(Cmd::Turn { text }) | Some(Cmd::Steer { text }) => replay.push(text),
                                 _ => {}
                             }
                         }
@@ -358,9 +375,28 @@ enum Exit {
     Shutdown,
     /// The process died (or was told to restart) after it had reached `Ready`.
     Crashed(String),
+    /// Mantra itself asked for this relaunch — an effort/model change, a plain `Cmd::Restart`, or
+    /// (Claude only) a `--resume`d session found unusable — never a failure: `agent_task` goes
+    /// straight back to `'outer` with none of `Exit::Crashed`'s backoff or counters. `fresh` means
+    /// the old session/thread id must not be resumed (the replacement process starts a new one).
+    Restarting { reason: String, fresh: bool },
     /// The process never reached `Ready`: spawn refused, handshake failed, thread start rejected.
     /// Deterministic in practice, so `agent_task` gives it the short `MAX_LAUNCH_ATTEMPTS` budget.
     LaunchFailed(String),
+}
+
+/// What a relaunch (`Exit::Restarting`) does to state carried across it, before the next launch
+/// attempt: a *fresh* one (the old session is gone — the dead-resume detection in
+/// `hub/claude.rs`) drops `thread_id` so the next launch starts a brand new session, and requeues
+/// the last turn's text since that turn never got a reply; anything else (an effort/model change, a
+/// plain `Cmd::Restart`) resumes the same session and leaves both alone.
+fn prepare_relaunch(fresh: bool, thread_id: &mut Option<String>, last_turn: &Option<String>, replay: &mut Vec<String>) {
+    if fresh {
+        *thread_id = None;
+        if let Some(t) = last_turn {
+            replay.push(t.clone());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +411,8 @@ async fn run_process(
     model: &mut String,
     approval: &mut String,
     is_restart: bool,
+    replay: &mut Vec<String>,
+    last_turn: &mut Option<String>,
 ) -> Exit {
     let (conn, mut inc, mut child) = match rpc::spawn(codex_cmd, &spec.extra_args, &spec.cwd, &spec.envs) {
         Ok(x) => x,
@@ -444,6 +482,13 @@ async fn run_process(
     }
     *thread_id = Some(tid.clone());
     let _ = ev.send(HubEvent::Ready { agent: id, thread_id: tid.clone(), model: model.clone(), resumed: is_restart });
+    // Deliver anything held across the relaunch (a crash-backoff wait, or a Claude restart_pending
+    // hold) now that there's a process again to send it to.
+    for text in replay.drain(..) {
+        let p = turn_params(&tid, &text, effort, model, approval);
+        *last_turn = Some(text.clone());
+        fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
+    }
 
     let mut current_turn: Option<String> = None;
     loop {
@@ -459,6 +504,7 @@ async fn run_process(
                     }
                     Some(Cmd::Turn { text }) => {
                         let p = turn_params(&tid, &text, effort, model, approval);
+                        *last_turn = Some(text.clone());
                         fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
                     }
                     Some(Cmd::Steer { text }) => {
@@ -494,7 +540,7 @@ async fn run_process(
                     }
                     Some(Cmd::Restart) => {
                         let _ = child.kill().await;
-                        return Exit::Crashed("restart requested".into());
+                        return Exit::Restarting { reason: "restart requested".into(), fresh: false };
                     }
                     Some(Cmd::Bridge(_)) => {} // WP10.4 is Claude-only; a stray one here is a bug elsewhere, not fatal
                 }
@@ -615,6 +661,29 @@ mod tests {
         assert_eq!(restart_backoff(MAX_RESTARTS + 1, false), None);
         assert_eq!(restart_backoff(3, false), Some(Duration::from_millis(4000)));
         assert!(restart_backoff(1, false) < restart_backoff(2, false));
+    }
+
+    /// `Exit::Restarting` never reaches `restart_backoff` at all (a separate `match` arm in
+    /// `agent_task` — see the code above), so the only counters-affecting logic worth a unit test
+    /// is what a relaunch does to the carried-over session state: a fresh one drops it and requeues
+    /// the last turn, anything else leaves it alone.
+    #[test]
+    fn a_fresh_relaunch_drops_the_session_and_replays_the_last_turn_a_plain_one_touches_neither() {
+        let mut thread_id = Some("t1".to_string());
+        let mut replay = vec![];
+        prepare_relaunch(false, &mut thread_id, &Some("hello".into()), &mut replay);
+        assert_eq!(thread_id, Some("t1".to_string()), "a plain relaunch (effort/model/Cmd::Restart) keeps resuming the same session");
+        assert!(replay.is_empty());
+
+        prepare_relaunch(true, &mut thread_id, &Some("hello".into()), &mut replay);
+        assert_eq!(thread_id, None, "fresh drops the old session id so the next launch starts a new one");
+        assert_eq!(replay, vec!["hello".to_string()], "the turn that never got a reply is requeued");
+
+        let mut thread_id2 = Some("t2".into());
+        let mut replay2 = vec![];
+        prepare_relaunch(true, &mut thread_id2, &None, &mut replay2);
+        assert_eq!(thread_id2, None);
+        assert!(replay2.is_empty(), "no last turn yet: nothing to replay");
     }
 
     /// The wiring behind `restart_backoff`: a process that exits before the handshake (Codex

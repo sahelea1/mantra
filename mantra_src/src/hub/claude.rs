@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 /// Claude-only spawn configuration, resolved by `app::spawn_agent` from the model's `ProviderEntry`
@@ -54,9 +54,11 @@ pub struct ClaudeSpawn {
     pub mcp_sock: Option<PathBuf>,
 }
 
-/// Runs one `claude` process for the lifetime of a single spawn attempt (a crash or a model/effort
-/// change returns `Exit::Crashed` and `agent_task` restarts it with `--resume`, mirroring
-/// `run_process`'s contract exactly — same `thread_id`-shaped slot doubles as the session id).
+/// Runs one `claude` process for the lifetime of a single spawn attempt (a crash returns
+/// `Exit::Crashed`; a model/effort change, a plain restart, or a dead-resume relaunch returns
+/// `Exit::Restarting` — `agent_task` restarts either one with `--resume`, mirroring `run_process`'s
+/// contract exactly, same `thread_id`-shaped slot doubles as the session id).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_claude_process(
     id: AgentId,
     spec: &SpawnSpec,
@@ -66,7 +68,8 @@ pub(super) async fn run_claude_process(
     session_id: &mut Option<String>,
     effort: &mut String,
     model: &mut String,
-    is_restart: bool,
+    replay: &mut Vec<String>,
+    last_turn: &mut Option<String>,
 ) -> Exit {
     let cs = match spec.claude.clone() {
         Some(c) => c,
@@ -77,7 +80,11 @@ pub(super) async fn run_claude_process(
     };
     let resume_id = session_id.clone();
     let sid = resume_id.clone().unwrap_or_else(crate::util::uuid_v4);
-    let args = build_args(id, spec, &cs, model, effort, &sid, resume_id.is_some(), base_args);
+    // Whether this launch is a `--resume` (not `agent_task`'s crash counter, which a self-inflicted
+    // relaunch — an effort/model change, `Cmd::Restart` — deliberately never bumps): the dead-resume
+    // detection below needs to know *this*, not how many real crashes came before it.
+    let is_restart = resume_id.is_some();
+    let args = build_args(id, spec, &cs, model, effort, &sid, is_restart, base_args);
 
     let mut command = Command::new(prog);
     command.args(&args).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -118,14 +125,26 @@ pub(super) async fn run_claude_process(
                             let _ = write_line(&mut stdin, &control_request("shutdown")).await;
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
-                        let _ = child.kill().await;
+                        stop_child(&mut stdin, &mut child).await;
                         return Exit::Shutdown;
                     }
-                    Some(Cmd::Turn { text }) | Some(Cmd::Steer { text }) => {
+                    Some(Cmd::Turn { text }) => {
+                        // While a restart is pending the child is about to die: anything written to
+                        // its stdin now would never get a reply, so hold it for the next process.
+                        if let Some(text) = hold_or_write(tr.restart_pending, replay, text) {
+                            *last_turn = Some(text.clone());
+                            if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+                                let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
+                            }
+                        }
+                    }
+                    Some(Cmd::Steer { text }) => {
                         // Claude does its own queueing: a line written mid-turn is injected at the
                         // next tool boundary (verified, §10.1) — Turn and Steer are the same wire op.
-                        if write_line(&mut stdin, &user_line(&text)).await.is_err() {
-                            let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
+                        if let Some(text) = hold_or_write(tr.restart_pending, replay, text) {
+                            if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+                                let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
+                            }
                         }
                     }
                     Some(Cmd::Interrupt) => {
@@ -134,8 +153,10 @@ pub(super) async fn run_claude_process(
                         // matching `control_response` — not just any later one — is what arms
                         // `interrupt_pending`. Otherwise a stray/idle-time interrupt (e.g. the
                         // unguarded 'x' keybinding) could bleed into an unrelated later turn's
-                        // completion status. See `Translator::on_line`.
-                        if tr.turn_open {
+                        // completion status. See `Translator::on_line`. A restart already pending
+                        // means this turn's outcome no longer matters — the process dies once it
+                        // closes either way, so interrupting it first buys nothing.
+                        if tr.turn_open && !tr.restart_pending {
                             let reqid = format!("int-{}", crate::util::unix_secs());
                             tr.pending_interrupt_request = Some(reqid.clone());
                             let _ = write_line(&mut stdin, &control_request(&reqid)).await;
@@ -149,16 +170,16 @@ pub(super) async fn run_claude_process(
                     Some(Cmd::SetEffort(e)) => {
                         *effort = e;
                         if !tr.turn_open {
-                            let _ = child.kill().await;
-                            return Exit::Crashed("restarting to apply the new effort".into());
+                            stop_child(&mut stdin, &mut child).await;
+                            return Exit::Restarting { reason: "restarting to apply the new effort".into(), fresh: false };
                         }
                         tr.restart_pending = true; // applied at the next idle moment, never mid-turn
                     }
                     Some(Cmd::SetModel(m)) => {
                         *model = m;
                         if !tr.turn_open {
-                            let _ = child.kill().await;
-                            return Exit::Crashed("restarting to apply the new model".into());
+                            stop_child(&mut stdin, &mut child).await;
+                            return Exit::Restarting { reason: "restarting to apply the new model".into(), fresh: false };
                         }
                         tr.restart_pending = true;
                     }
@@ -167,8 +188,8 @@ pub(super) async fn run_claude_process(
                         // (WP3) lands in a later batch; every Claude agent runs unattended for now.
                     }
                     Some(Cmd::Restart) => {
-                        let _ = child.kill().await;
-                        return Exit::Crashed("restart requested".into());
+                        stop_child(&mut stdin, &mut child).await;
+                        return Exit::Restarting { reason: "restart requested".into(), fresh: false };
                     }
                     Some(Cmd::Respond { id: rid, result }) => {
                         if let Some(call) = rid.as_str().and_then(|s| s.strip_prefix("cc-call-")) {
@@ -224,6 +245,14 @@ pub(super) async fn run_claude_process(
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
                                 ready = true;
+                                // Deliver anything held across the relaunch (a crash-backoff wait, or
+                                // a restart_pending hold below) now that there's a process again.
+                                for text in replay.drain(..) {
+                                    *last_turn = Some(text.clone());
+                                    if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+                                        let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
+                                    }
+                                }
                             }
                             let _ = ev.send(e);
                         }
@@ -231,9 +260,15 @@ pub(super) async fn run_claude_process(
                             let _ = child.kill().await;
                             return if ready { Exit::Crashed(reason) } else { Exit::LaunchFailed(reason) };
                         }
+                        if tr.fresh_restart_pending {
+                            // The dead-resume detection below already reported the turn as failed;
+                            // the session file itself is unusable, so the replacement gets a new one.
+                            stop_child(&mut stdin, &mut child).await;
+                            return Exit::Restarting { reason: "resumed session unusable".into(), fresh: true };
+                        }
                         if tr.restart_pending && !tr.turn_open {
-                            let _ = child.kill().await;
-                            return Exit::Crashed("restarting to apply the new model/effort".into());
+                            stop_child(&mut stdin, &mut child).await;
+                            return Exit::Restarting { reason: "restarting to apply the new model/effort".into(), fresh: false };
                         }
                     }
                     Some(LineIn::Closed) | None => {
@@ -275,6 +310,30 @@ async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, v: &Value) -> std::io::
     w.write_all(v.to_string().as_bytes()).await?;
     w.write_all(b"\n").await?;
     w.flush().await
+}
+
+/// Ends the child gracefully instead of a bare `kill()`: shuts its stdin down (the CLI treats that
+/// as "no more input coming"), gives it up to 1.5s to exit on its own, and only kills it if it
+/// hasn't — a SIGKILL landing right after an interrupted turn is the likely cause of a `--resume`d
+/// session coming back unusable forever (the CLI needs a moment to flush its session file to disk).
+async fn stop_child(stdin: &mut ChildStdin, child: &mut Child) {
+    let _ = stdin.shutdown().await;
+    if tokio::time::timeout(Duration::from_millis(1500), child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+}
+
+/// Decides what to do with one `Cmd::Turn`/`Cmd::Steer`'s text: while a restart is pending the
+/// child is about to die, so writing to its stdin now would just be lost — hold the text in
+/// `replay` instead (delivered once the next process reaches `Ready`) and return `None`. Otherwise
+/// returns the text unchanged, for the caller to write as it always did.
+fn hold_or_write(restart_pending: bool, replay: &mut Vec<String>, text: String) -> Option<String> {
+    if restart_pending {
+        replay.push(text);
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Answers one pending bridge call: `{"call": <n>, "ok": <bool>, "text": <string>}`, per §10.4's
@@ -512,6 +571,11 @@ struct Translator {
     /// A model/effort change arrived mid-turn; restart (picking up the change via `--resume`) as
     /// soon as `turn_open` goes false, per §10.3 ("never mid-turn").
     restart_pending: bool,
+    /// Set by the dead-resume detection in `on_result`: a `--resume`d session whose `result` is the
+    /// CLI's own phantom "interrupted" line for a turn Mantra never asked to interrupt — the session
+    /// file itself is wedged and every further turn would repeat this forever. `run_claude_process`
+    /// stops the child and relaunches fresh (`Exit::Restarting{fresh:true}`) the moment it sees this.
+    fresh_restart_pending: bool,
     /// tool_use id -> what `item/started` used, so the matching `tool_result` lands on the same
     /// `Kind` (`Agent::apply_item` dispatches purely on the `type` string we send, not on any
     /// state carried on the item itself) — and, for a file edit, the path again: `apply_item`
@@ -573,6 +637,7 @@ impl Translator {
             interrupt_pending: false,
             pending_interrupt_request: None,
             restart_pending: false,
+            fresh_restart_pending: false,
             open_tools: HashMap::new(),
             autocompact,
             trust_reported_window,
@@ -633,7 +698,7 @@ impl Translator {
                     }
                 }
             }
-            "result" => self.on_result(v, &mut out),
+            "result" => self.on_result(v, is_restart, &mut out),
             // A tool is still running: no state change, but the agent is alive (watchdog/stall).
             "tool_progress" => out.push(activity(self.agent, None)),
             // Both of these are top-level lines, *not* `system` subtypes (verified against Claude
@@ -837,8 +902,12 @@ impl Translator {
         }
     }
 
-    fn on_result(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
+    fn on_result(&mut self, v: &Value, is_restart: bool, out: &mut Vec<HubEvent>) {
         let interrupted = std::mem::take(&mut self.interrupt_pending);
+        // Whether Mantra itself asked to interrupt this turn — acked already (`interrupted`) or
+        // still waiting on the ack (`pending_interrupt_request`, set only while a turn is open, so
+        // still meaningful here). Read before it's cleared below; the dead-resume check needs it.
+        let mantra_requested_interrupt = interrupted || self.pending_interrupt_request.is_some();
         // A turn whose only assistant content is `thinking`/`redacted_thinking` (no visible text,
         // no tool_use — see `on_assistant`) never calls `ensure_turn_open` itself, so `turn_open`
         // would still be false here. Open it now unconditionally rather than bailing out: every
@@ -866,15 +935,32 @@ impl Translator {
             }
         }
         self.turn_msgs = 0;
-        let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+        // Dead-resume detection: a `--resume`d process whose `result` is the CLI's own phantom
+        // "interrupted" line — no real API call happened (`duration_api_ms` 0 or absent) — for a
+        // turn Mantra never asked to interrupt. The session file itself is wedged (verified: every
+        // later turn of that session repeats this forever), so treat it as a failure and have
+        // `run_claude_process` relaunch fresh instead of resuming it again. Guarded to at most once:
+        // a second occurrence (on the fresh session this becomes) is an ordinary failure.
+        let dead_resume = is_restart
+            && !mantra_requested_interrupt
+            && !self.fresh_restart_pending
+            && v.get("duration_api_ms").and_then(as_u64).unwrap_or(0) == 0
+            && v.get("result").and_then(|x| x.as_str()).unwrap_or("").contains("Request interrupted by user");
+        if dead_resume {
+            self.fresh_restart_pending = true;
+        }
+        let is_error = dead_resume || v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
         let status = if interrupted { "interrupted" } else if is_error { "failed" } else { "completed" };
         let error = if status == "failed" {
-            let msg = v
-                .get("result")
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| v.get("subtype").and_then(|x| x.as_str()).unwrap_or("turn failed").to_string());
+            let msg = if dead_resume {
+                "resumed session is unusable - relaunching fresh".to_string()
+            } else {
+                v.get("result")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.get("subtype").and_then(|x| x.as_str()).unwrap_or("turn failed").to_string())
+            };
             let mut e = json!({"message": msg});
             if let Some(code) = classify_claude_error(v, &msg) {
                 e["codexErrorInfo"] = json!(code);
@@ -1418,5 +1504,80 @@ mod tests {
             _ => None,
         });
         assert_eq!(status, Some("completed"));
+    }
+
+    /// The dead-resume bug: a `--resume`d process whose very first `result` is the CLI's own
+    /// phantom "interrupted" line (no real API call — `duration_api_ms` 0 — for a turn Mantra never
+    /// asked to interrupt) means the session file itself is wedged, not that this one turn failed.
+    /// Only a resumed process is at risk; a fresh one reporting the same shape is a genuine (if
+    /// odd) turn outcome, never a reason to throw the session away.
+    #[test]
+    fn a_resumed_sessions_phantom_interrupted_result_marks_the_session_dead_but_only_when_resumed() {
+        let phantom = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 0, "stop_reason": null, "result": "[Request interrupted by user]"});
+
+        let mut resumed = Translator::new(1, 200_000, false);
+        let out = resumed.on_line(&phantom, true);
+        assert!(resumed.fresh_restart_pending, "a resumed session's phantom result must be recognized as unusable");
+        let turn = out.iter().find_map(|e| match e {
+            HubEvent::Notif { method, params, .. } if method == "turn/completed" => Some(params["turn"].clone()),
+            _ => None,
+        });
+        let turn = turn.expect("the turn must still be reported, as failed");
+        assert_eq!(turn["status"], "failed");
+        assert_eq!(turn["error"]["message"], "resumed session is unusable - relaunching fresh");
+
+        let mut fresh = Translator::new(1, 200_000, false);
+        let out2 = fresh.on_line(&phantom, false);
+        assert!(!fresh.fresh_restart_pending, "the same result on a fresh (never-resumed) process must not be treated as a dead session");
+        let status2 = out2.iter().find_map(|e| match e {
+            HubEvent::Notif { method, params, .. } if method == "turn/completed" => params.pointer("/turn/status").and_then(|s| s.as_str()),
+            _ => None,
+        });
+        assert_eq!(status2, Some("failed"), "still a genuine failure — just not a session-killing one");
+    }
+
+    /// A turn Mantra itself asked to interrupt (the ack came back) still reports "interrupted" —
+    /// dead-resume detection must never override that, or steal the flag for an ordinary interrupt.
+    #[test]
+    fn a_mantra_requested_interrupt_on_a_resumed_session_still_reports_interrupted_and_never_flags_dead() {
+        let mut tr = Translator::new(1, 200_000, false);
+        let assistant = json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hi"}]}});
+        tr.on_line(&assistant, true);
+        let reqid = "int-1";
+        tr.pending_interrupt_request = Some(reqid.to_string()); // as `Cmd::Interrupt` sets it
+        let ack = json!({"type": "control_response", "response": {"subtype": "success", "request_id": reqid}});
+        tr.on_line(&ack, true);
+
+        let result = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 0, "result": "[Request interrupted by user]"});
+        let out = tr.on_line(&result, true);
+        assert!(!tr.fresh_restart_pending, "an interrupt Mantra itself asked for must never be mistaken for a dead session");
+        let status = out.iter().find_map(|e| match e {
+            HubEvent::Notif { method, params, .. } if method == "turn/completed" => params.pointer("/turn/status").and_then(|s| s.as_str()),
+            _ => None,
+        });
+        assert_eq!(status, Some("interrupted"));
+    }
+
+    /// A `result` with a real `duration_api_ms` is a genuine API round trip — never dead-resume
+    /// material, whatever its text says.
+    #[test]
+    fn a_result_with_a_real_duration_never_flags_a_dead_session() {
+        let mut tr = Translator::new(1, 200_000, false);
+        let result = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 1200, "result": "[Request interrupted by user]"});
+        tr.on_line(&result, true);
+        assert!(!tr.fresh_restart_pending, "duration_api_ms > 0 means a real call happened — never a phantom");
+    }
+
+    /// `hold_or_write`'s pure decision, factored out of `run_claude_process`'s `Cmd::Turn`/`Cmd::Steer`
+    /// arms: while a restart is pending, texts are held in `replay` — never written — and come out in
+    /// the order they arrived; once the flag clears, texts pass straight through again.
+    #[test]
+    fn turns_are_held_in_order_while_a_restart_is_pending_and_pass_through_once_it_clears() {
+        let mut replay = vec![];
+        assert_eq!(hold_or_write(true, &mut replay, "a".into()), None);
+        assert_eq!(hold_or_write(true, &mut replay, "b".into()), None);
+        assert_eq!(replay, vec!["a".to_string(), "b".to_string()], "held texts come out in the order they arrived");
+        assert_eq!(hold_or_write(false, &mut replay, "c".into()), Some("c".to_string()), "no restart pending: pass straight through, untouched");
+        assert_eq!(replay, vec!["a".to_string(), "b".to_string()], "a passed-through text is never also held");
     }
 }
