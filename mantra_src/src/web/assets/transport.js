@@ -66,27 +66,31 @@
                 // Decryption is async; chain so frames are processed strictly in order.
                 this.rxChain = this.rxChain.then(() => this.recv(ws, buf)).catch((e) => this.fail(ws, e && e.message === 'badkey' ? 'badkey' : 'proto'));
             };
-            ws.onclose = (ev) => {
-                clearTimeout(this.helloTimer);
-                if (this.ws !== ws) return;
-                // Frames that arrived before the close may still be decrypting; the host's badkey
-                // refusal is one of them, so let the chain settle before judging the close.
-                this.rxChain.then(() => {
-                    if (this.ws !== ws) return;
-                    this.ws = null;
-                    const info = { code: ev.code, reason: ev.reason, opened: this.opened };
-                    // A wrong password/code is known only from the host's plaintext {"err":"badkey"}
-                    // frame or a local decrypt failure (both land in failReason). A close code alone
-                    // never means it: 1005/1006 is also what a dropped mobile connection looks like.
-                    if (this.failReason) info.local = this.failReason;
-                    this.onclose(info);
-                });
-            };
+            ws.onclose = (ev) => this.closed(ws, ev.code, ev.reason);
             ws.onerror = () => { };
+        }
+        // Report the end of `ws`, once. Frames that arrived before it may still be decrypting —
+        // the host's badkey refusal is one of them — so let the chain settle before judging.
+        closed(ws, code, reason) {
+            clearTimeout(this.helloTimer);
+            if (this.ws !== ws) return;
+            this.rxChain.then(() => {
+                if (this.ws !== ws) return;
+                this.ws = null;
+                const info = { code, reason, opened: this.opened };
+                // A wrong password/code is known only from the host's plaintext {"err":"badkey"}
+                // frame or a local decrypt failure (both land in failReason). A close code alone
+                // never means it: 1005/1006 is also what a dropped mobile connection looks like.
+                if (this.failReason) info.local = this.failReason;
+                this.onclose(info);
+            });
         }
         fail(ws, why) {
             this.failReason = this.failReason || why;
             try { ws.close(1000); } catch (_) { }
+            // Our side is done: don't wait for the relay to finish the close handshake (the
+            // reference relay only does once its own timers fire), or we'd sit in CLOSING for a minute.
+            this.closed(ws, 1000, why);
         }
         async recv(ws, buf) {
             if (this.ws !== ws) return;
