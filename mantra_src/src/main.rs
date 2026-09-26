@@ -73,6 +73,8 @@ OPTIONS
   --web-cert F --web-key F HTTPS with your own PEM certificate and key
   --remote-site URL        the website remote links open, when it is not on the relay's host
                            (the link then names its relay: …#k=…&r=wss://relay)
+                           The relay is dialed through https_proxy (an http:// proxy, CONNECT;
+                           no_proxy exempts hosts) and SSL_CERT_FILE adds trusted CA roots
   --headless               no terminal UI (needs --web or --remote, and a password with --web);
                            ctrl+c / SIGTERM stop it
 

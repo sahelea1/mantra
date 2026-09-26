@@ -118,7 +118,7 @@ impl Inner {
         s.connected = connected;
         s.clients = clients;
         s.last_error = last_error;
-        let say = if self.headless { self.announce(&s, came_up, went_down, retry) } else { vec![] };
+        let say = if self.headless { self.announce(&s, came_up, went_down, retry, std::time::Instant::now()) } else { vec![] };
         drop(s);
         if changed {
             self.web.refresh();
@@ -131,7 +131,7 @@ impl Inner {
     /// The lines headless mode prints for this status change: connect/reconnect (with the link,
     /// code and password the first time an identity is up — a link printed before the relay
     /// answered looks valid but leads nowhere), and errors once each, or once a minute.
-    fn announce(&self, s: &State, came_up: bool, went_down: bool, retry: Option<Duration>) -> Vec<String> {
+    fn announce(&self, s: &State, came_up: bool, went_down: bool, retry: Option<Duration>, now: std::time::Instant) -> Vec<String> {
         let mut a = self.announced.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = vec![];
         if came_up {
@@ -147,7 +147,6 @@ impl Inner {
                 }
             }
         } else if let Some(e) = &s.last_error {
-            let now = std::time::Instant::now();
             let again = match &a.error {
                 Some((text, at)) => text != e || now.duration_since(*at) >= REPEAT_ERROR_AFTER,
                 None => true,
@@ -646,12 +645,16 @@ struct Proxy {
 impl Proxy {
     /// The proxy for `target` per the usual variables: `https_proxy` for wss://, `http_proxy` for
     /// ws://, `all_proxy` for either, each in lowercase first, then uppercase (as curl reads them);
-    /// `no_proxy` / `NO_PROXY` exempt hosts. `Ok(None)` = connect directly.
+    /// `no_proxy` / `NO_PROXY` exempt hosts, loopback is always exempt. `Ok(None)` = connect directly.
     fn from_env(target: &RelayTarget) -> Result<Option<Proxy>, String> {
         Proxy::select(target, |k| std::env::var(k).ok())
     }
 
     fn select(target: &RelayTarget, var: impl Fn(&str) -> Option<String>) -> Result<Option<Proxy>, String> {
+        // loopback is never proxied (a local relay, the tests' fake relays), whatever no_proxy says
+        if target.host.eq_ignore_ascii_case("localhost") || target.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+            return Ok(None);
+        }
         let get = |names: [&'static str; 2]| names.into_iter().find_map(|n| var(n).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).map(|v| (n, v)));
         let scheme = if target.tls { ["https_proxy", "HTTPS_PROXY"] } else { ["http_proxy", "HTTP_PROXY"] };
         let Some((name, url)) = get(scheme).or_else(|| get(["all_proxy", "ALL_PROXY"])) else { return Ok(None) };
@@ -666,7 +669,7 @@ impl Proxy {
     fn parse(name: &str, url: &str) -> Result<Proxy, String> {
         let rest = match url.split_once("://") {
             Some((s, r)) if s.eq_ignore_ascii_case("http") => r,
-            Some((s, _)) => return Err(format!("{name}: only http:// proxies are supported (reached with CONNECT), not {s}://")),
+            Some((s, _)) => return Err(format!("{name}: only http:// proxies are supported (reached with CONNECT), not {s}:// — set https_proxy to an http:// proxy, or no_proxy to the relay host to connect directly")),
             None => url,
         };
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -1979,6 +1982,10 @@ mod tests {
         assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("no_proxy", "*")])).unwrap(), None);
         assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("NO_PROXY", "mantra.codes:443")])).unwrap(), None);
         assert_eq!(Proxy::select(&wss, env(&[("HTTPS_PROXY", "http://a:1"), ("NO_PROXY", "example.org")])).unwrap(), Some(p("a", 1)));
+        // loopback stays direct even without a no_proxy entry
+        let local = RelayTarget::parse("ws://127.0.0.1:9").unwrap();
+        assert_eq!(Proxy::select(&local, env(&[("HTTP_PROXY", "http://a:1"), ("ALL_PROXY", "http://a:1")])).unwrap(), None);
+        assert_eq!(Proxy::select(&RelayTarget::parse("wss://LocalHost:9").unwrap(), env(&[("HTTPS_PROXY", "http://a:1")])).unwrap(), None);
         // credentials, percent-encoded; a bracketed IPv6 proxy address
         assert_eq!(Proxy::parse("x", "http://me:p%40ss@proxy.lan:8080/").unwrap(), Proxy { host: "proxy.lan".into(), port: 8080, auth: Some(("me".into(), "p@ss".into())) });
         assert_eq!(Proxy::parse("x", "http://[::1]:3128").unwrap(), Proxy { host: "::1".into(), port: 3128, auth: None });
@@ -2120,34 +2127,34 @@ mod tests {
         // the relay task is stopped: what follows drives the announcements by hand
         r.shutdown();
         let inner = r.inner();
+        let now = std::time::Instant::now();
         let set_error = |e: &str| inner.lock().last_error = Some(e.into());
         set_error("cannot reach the relay: x");
         let s = inner.lock();
-        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_millis(1500))), vec!["cannot reach the relay: x — retrying in 1.5s"]);
-        assert!(inner.announce(&s, false, false, Some(Duration::from_secs(3))).is_empty(), "the same error again stays quiet");
+        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_millis(1500)), now), vec!["cannot reach the relay: x — retrying in 1.5s"]);
+        assert!(inner.announce(&s, false, false, Some(Duration::from_secs(3)), now).is_empty(), "the same error again stays quiet");
         drop(s);
         set_error("the relay is full right now (too many sessions)");
         let s = inner.lock();
-        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_secs(3))), vec!["the relay is full right now (too many sessions) — retrying in 3.0s"]);
-        assert!(inner.announce(&s, false, false, None).is_empty());
+        assert_eq!(inner.announce(&s, false, false, Some(Duration::from_secs(3)), now), vec!["the relay is full right now (too many sessions) — retrying in 3.0s"]);
+        assert!(inner.announce(&s, false, false, None, now).is_empty());
         // unchanged, but a minute has passed
-        inner.announced.lock().unwrap().error.as_mut().unwrap().1 -= REPEAT_ERROR_AFTER;
-        assert_eq!(inner.announce(&s, false, false, None), vec!["the relay is full right now (too many sessions)"]);
+        assert_eq!(inner.announce(&s, false, false, None, now + REPEAT_ERROR_AFTER), vec!["the relay is full right now (too many sessions)"]);
         drop(s);
         // the first connection: the link, code and password follow it
         let mut s = inner.lock();
         s.last_error = None;
         let (sid, password) = (s.sid.clone(), s.password.clone());
-        let out = inner.announce(&s, true, false, None);
+        let out = inner.announce(&s, true, false, None, now);
         assert_eq!(out.len(), 4, "{out:?}");
         assert_eq!(out[0], "connected to the relay");
         assert_eq!(out[1], format!("link {}", link_of("http://127.0.0.1:9", "ws://127.0.0.1:9", &sid, &s.key.unwrap())));
         assert_eq!(out[2], format!("code {}", code_of(&sid)));
         assert_eq!(out[3], format!("password {password}"));
-        assert_eq!(inner.announce(&s, true, false, None), vec!["reconnected to the relay"], "the link is printed once per identity");
+        assert_eq!(inner.announce(&s, true, false, None, now), vec!["reconnected to the relay"], "the link is printed once per identity");
         // a drop after a connection is said at once, even with an error seen before
         s.last_error = Some("the relay is full right now (too many sessions)".into());
-        assert_eq!(inner.announce(&s, false, true, Some(Duration::from_secs(1))).len(), 1);
+        assert_eq!(inner.announce(&s, false, true, Some(Duration::from_secs(1)), now).len(), 1);
         drop(s);
         let _ = std::fs::remove_dir_all(dir);
     }
