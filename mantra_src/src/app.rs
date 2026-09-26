@@ -257,10 +257,13 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         // Mantra's own tools reach the agent as `dynamic_tools` (`SpawnSpec.dynamic_tools`
         // above); the user's own `~/.codex/config.toml` MCP servers are never on that path, so
         // the model can only call them with a name the app-server can't route — the log's
-        // "unsupported call: mcp__…". Blanking the table here keeps a Codex agent to the tools
-        // Mantra gave it.
-        extra.push("-c".into());
-        extra.push("mcp_servers={}".into());
+        // "unsupported call: mcp__…". `-c mcp_servers={}` doesn't clear an already-populated
+        // table (`-c` merges at dotted leaf paths, never replaces a table wholesale), so each of
+        // the user's servers is disabled by name instead.
+        for name in crate::config::codex_user_mcp_server_names() {
+            extra.push("-c".into());
+            extra.push(format!("mcp_servers.{name}.enabled=false"));
+        }
         extra.push("-c".into());
         extra.push(format!("model_context_window={cw}"));
         extra.push("-c".into());
@@ -405,6 +408,15 @@ fn role_sandbox(sandbox: &str, backend: crate::config::ProviderKind) -> String {
         return "danger-full-access".into();
     }
     if sandbox.is_empty() { "workspace-write".into() } else { sandbox.into() }
+}
+
+/// The default test harness runs every `#[test]` as a thread in one shared process, so a test
+/// that trips `SANDBOX_FALLBACK` would otherwise leave it set for every test that runs after it in
+/// the same binary. A test that sets it must reset it (ideally via a guard that restores the prior
+/// value on drop) before returning.
+#[cfg(test)]
+fn reset_sandbox_fallback_for_test() {
+    SANDBOX_FALLBACK.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Ctx for Ctxt<'_> {
@@ -2292,6 +2304,22 @@ mod tests {
         let err = app.set_model(id, "claude-model").unwrap_err();
         assert!(err.contains("claude-code") && err.contains("codex") && err.contains("respawn it"), "{err}");
         assert_eq!(app.agents[&id].model_alias, "sol", "a refused switch never touches the agent");
+    }
+
+    /// `SANDBOX_FALLBACK` is a process-wide static (the `Ctx`/`start_solo` spawn sites have no
+    /// other way to reach `App`) — a test that trips it must reset it, or every test afterward in
+    /// this binary silently spawns Codex agents `danger-full-access`.
+    #[test]
+    fn sandbox_warning_downgrades_codex_to_danger_full_access_only() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true);
+        app.set_sandbox_warning("bwrap: setting up uid map: Permission denied".into());
+        assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "danger-full-access");
+        assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::ClaudeCode), "workspace-write", "Claude never sandboxes through bwrap");
+        reset_sandbox_fallback_for_test();
+        assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "workspace-write");
     }
 
     #[test]

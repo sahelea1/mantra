@@ -142,6 +142,13 @@ pub(super) async fn run_claude_process(
                         // Claude does its own queueing: a line written mid-turn is injected at the
                         // next tool boundary (verified, §10.1) — Turn and Steer are the same wire op.
                         if let Some(text) = hold_or_write(tr.restart_pending, replay, text) {
+                            // Steer only ever adds to an already-open turn, so fold it into
+                            // `last_turn` too: if this turn's result is a dead-resume phantom, the
+                            // fresh relaunch must requeue the steer along with the turn it joined.
+                            *last_turn = Some(match last_turn.take() {
+                                Some(t) => format!("{t}\n\n{text}"),
+                                None => text.clone(),
+                            });
                             if write_line(&mut stdin, &user_line(&text)).await.is_err() {
                                 let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
                             }
@@ -242,9 +249,15 @@ pub(super) async fn run_claude_process(
                             crate::mlog!("claude {id}: {}", crate::util::trunc(&v.to_string(), 200));
                         }
                         for e in tr.on_line(&v, is_restart) {
+                            // Mirrors `run_process` (hub.rs): replay is drained after `Ready` is
+                            // sent, in both backends.
+                            let is_ready = matches!(e, HubEvent::Ready { .. });
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
                                 ready = true;
+                            }
+                            let _ = ev.send(e);
+                            if is_ready {
                                 // Deliver anything held across the relaunch (a crash-backoff wait, or
                                 // a restart_pending hold below) now that there's a process again.
                                 for text in replay.drain(..) {
@@ -254,7 +267,6 @@ pub(super) async fn run_claude_process(
                                     }
                                 }
                             }
-                            let _ = ev.send(e);
                         }
                         if let Some(reason) = tr.fatal_auth.take() {
                             let _ = child.kill().await;

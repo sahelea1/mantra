@@ -575,12 +575,10 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 KeyCode::Enter => {
                     let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
                     match target {
-                        Some(a) => {
-                            if let Err(e) = app.set_model(a, &alias) {
-                                app.toast(e, crate::agent::Level::Warn);
-                            }
-                            app.model_switched_for_run_agent(a);
-                        }
+                        Some(a) => match app.set_model(a, &alias) {
+                            Ok(()) => app.model_switched_for_run_agent(a),
+                            Err(e) => app.toast(e, crate::agent::Level::Warn),
+                        },
                         None => {
                             app.settings.default_model = alias;
                             let _ = app.settings.save();

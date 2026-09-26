@@ -241,9 +241,11 @@ fn demo_project() -> Result<PathBuf> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
-    // Checked before `Registry::load()` writes the defaults: a fresh install (no models.toml yet)
-    // is the only time it's right to change what a run defaults to.
-    let fresh_install = !config::Registry::path().exists();
+    // Checked before `Registry::load()`/`Settings::load()` write their defaults: a fresh install
+    // (no models.toml *and* no settings.toml yet) is the only time it's right to change what a
+    // run defaults to — models.toml missing alone can also mean an established install that just
+    // lost that one file, and must not clobber a user's already-chosen settings.
+    let fresh_install = !config::Registry::path().exists() && !config::home().join("settings.toml").exists();
     let mut settings = config::Settings::load();
     let mut registry = config::Registry::load();
     // Validate the web flags before anything else starts (a bad address is a usage error).
@@ -314,7 +316,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         mlog!("fresh install: Codex is signed in with ChatGPT; roles default to subscription models (no astra)");
     }
     // L1: on a Linux box where unprivileged user namespaces are off, every worker command dies
-    // in bubblewrap. Say so once, up front — and don't start a run on it without a nod.
+    // in bubblewrap. Warn once, up front, and continue automatically (sandbox falls back to
+    // danger-full-access) unless the user types n.
     // (MANTRA_SANDBOX_WARNING=<text> forces the notice — stress.sh renders it in demo mode.)
     let sandbox_warning = std::env::var("MANTRA_SANDBOX_WARNING").ok().filter(|w| !w.is_empty()).or_else(|| if demo || cli.snapshot.is_some() { None } else { util::sandbox_probe().err() });
     if let (Some(w), true, false) = (&sandbox_warning, cli.run_goal.is_some() || cli.resume.is_some() || cli.resume_last, cli.no_sandbox_check) {

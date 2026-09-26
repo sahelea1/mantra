@@ -143,11 +143,16 @@ pub struct Pattern {
     pub settings: PatternSettings,
     pub roles: BTreeMap<String, Role>,
     pub flow: Flow,
+    /// Directory `load()` actually found this pattern in (project-local or `$MANTRA_HOME`) — not
+    /// part of the file itself. `save()` writes back here so a project-local pattern stays the
+    /// file `load()` will read next time, instead of always landing in `$MANTRA_HOME`.
+    #[serde(skip)]
+    pub source_dir: Option<PathBuf>,
 }
 
 impl Default for Pattern {
     fn default() -> Self {
-        Pattern { name: String::new(), description: String::new(), settings: PatternSettings::default(), roles: BTreeMap::new(), flow: Flow::default() }
+        Pattern { name: String::new(), description: String::new(), settings: PatternSettings::default(), roles: BTreeMap::new(), flow: Flow::default(), source_dir: None }
     }
 }
 
@@ -270,7 +275,8 @@ impl Pattern {
     }
 
     pub fn save(&self) -> Result<PathBuf> {
-        let p = Self::path_for(&self.name);
+        let dir = self.source_dir.clone().unwrap_or_else(crate::config::patterns_dir);
+        let p = dir.join(format!("{}.toml", crate::util::slug(&self.name)));
         crate::config::atomic_write(&p, &format!("# Mantra pattern — edit here or in the Studio (ctrl+o → s)\n{}", self.to_toml()))?;
         Ok(p)
     }
@@ -281,7 +287,9 @@ impl Pattern {
         for dir in [project.join(".mantra").join("patterns"), crate::config::patterns_dir()] {
             let p = dir.join(&file);
             if let Ok(s) = std::fs::read_to_string(&p) {
-                return Pattern::from_toml(&s).map_err(|e| anyhow!("{}: {e}", p.display()));
+                let mut pat = Pattern::from_toml(&s).map_err(|e| anyhow!("{}: {e}", p.display()))?;
+                pat.source_dir = Some(dir);
+                return Ok(pat);
             }
         }
         if crate::util::slug(name) == "mantra-default" {

@@ -282,7 +282,7 @@ pub enum HaltReason {
     /// — retrying cannot help; the role's model must change.
     ProviderRejected,
     /// The host environment itself can't run agents (WP12.4/L1): a command an agent ran failed
-    /// naming `bwrap` / user namespaces, so the sandbox cannot start.
+    /// looking like a broken sandbox (`agent::looks_like_broken_sandbox`), so it cannot start.
     Environment,
     GateExhausted,
     AttemptsExhausted,
@@ -1722,6 +1722,13 @@ Then summarize in 2-4 lines.",
         self.gate_report = None;
         self.phase_started = Instant::now();
         let role = self.role(&step.role);
+        // Same sandbox-aware note as `spawn_gate_at_round`: a read-only finale role (the built-in
+        // "planner" finale step included) needs to be told it cannot write, same as any other gate.
+        let sandbox_note = if role.sandbox == "read-only" {
+            "Your role cannot write files: do not try to edit or create anything. Report every needed change precisely (file, what, why) in mantra_gate_report as fail with a fix list; the orchestrator routes it to a worker."
+        } else {
+            "You may edit files to make the result coherent and green (small fixes; anything larger goes into the report as a fix list)."
+        };
         let plan = self.plan.clone().unwrap_or_default();
         let final_checks = if plan.final_checks.is_empty() { "(none defined)".to_string() } else { plan.final_checks.join("\n") };
         let prompt = format!(
@@ -1741,7 +1748,7 @@ Then summarize in 2-4 lines.",
             ctx.spawn(SpawnReq {
                 name: step.role.clone(),
                 role_name: step.role.clone(),
-                instructions: format!("{}\n{}", role.instructions, tools::GATE_PROTOCOL),
+                instructions: format!("{}\n{}\n{sandbox_note}", role.instructions, tools::GATE_PROTOCOL),
                 cwd: self.workspace_dir(),
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
                 effort: None,
@@ -1881,6 +1888,12 @@ Then summarize in 2-4 lines.",
                     match self.gate_agent {
                         // results are recorded while halted; the next round waits for the resume
                         _ if self.halted() => self.defer(Pending::Gate { idx: phase, round: round + 1, note: None }),
+                        Some(_) if self.role(&self.pattern.flow.phase_gate.clone()).sandbox == "read-only" => {
+                            // A read-only gate can't fix a failing check itself — hand it to the
+                            // orchestrator instead of telling this agent to "fix them".
+                            let s = self.check_summary();
+                            self.orch_event(ctx, format!("Phase {} gate checks still fail (gate is read-only, cannot write files):\n{s}\nRoute the fix to a worker.", phase + 1));
+                        }
                         Some(g) => {
                             self.mark_edge(g);
                             let s = self.check_summary();
@@ -2150,6 +2163,10 @@ Then summarize in 2-4 lines.",
                             if self.halted() {
                                 // the report is recorded; the next round waits for the resume
                                 self.defer(Pending::Gate { idx, round: round + 1, note: None });
+                            } else if self.role(&self.pattern.flow.phase_gate.clone()).sandbox == "read-only" {
+                                // It correctly reported what it can't fix itself — don't tell it to
+                                // "keep going" anyway; hand the fix list to the orchestrator instead.
+                                self.orch_event(ctx, format!("Gate round {round} (read-only, cannot write files) did not pass:\n{}\nRoute the fix to a worker.", trunc(&why, 1200)));
                             } else {
                                 self.mark_edge(a);
                                 ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
@@ -2279,9 +2296,10 @@ Then summarize in 2-4 lines.",
         self.orch_event(ctx, format!("TRIPWIRE: {tid} edited files outside its scope ({scope}): {}. Decide whether that's OK; steer it with mantra_prompt if not.", outside.join(", ")));
     }
 
-    /// WP12.4/L1: a command an agent ran failed in a way that names `bwrap`/user namespaces — the
-    /// sandbox itself cannot start, so no agent can run any command. Never spend gate rounds or
-    /// retries on this: halt immediately, on the first occurrence, with the sandbox fix hint.
+    /// WP12.4/L1: a command an agent ran failed in a way that looks like a broken sandbox
+    /// (`agent::looks_like_broken_sandbox`) — it cannot start, so no agent can run any command.
+    /// Never spend gate rounds or retries on this: halt immediately, on the first occurrence, with
+    /// the sandbox fix hint.
     pub fn on_environment_broken(&mut self, ctx: &mut dyn Ctx, a: AgentId, msg: String) {
         if self.halted() {
             return;
@@ -3040,10 +3058,18 @@ Then summarize in 2-4 lines.",
         // The whole plan used to be attached here, which is exactly the huge context a respawn is
         // meant to avoid — the current phase (like `respawn_orchestrator`) plus `mantra_read_phase`
         // for live task states covers what a resuming planner needs; the full plan is one call away.
-        let resume = if self.plan.is_some() {
-            let phase_json = self.current_phase().map(|ph| serde_json::to_string_pretty(ph).unwrap_or_default()).unwrap_or_default();
+        let resume = if let Some(phase) = self.current_phase() {
+            let phase_json = serde_json::to_string_pretty(phase).unwrap_or_default();
             format!(
-                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; ask for the full plan only if you must revise other phases.",
+                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; call mantra_read_plan first if you must revise other phases.",
+                self.plan_version
+            )
+        } else if let Some(plan) = &self.plan {
+            // No active phase (e.g. `Stage::Review`, right after the plan was submitted): there is
+            // no current phase to show, so attach the whole plan instead of an empty block.
+            let plan_json = serde_json::to_string_pretty(plan).unwrap_or_default();
+            format!(
+                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nThe plan:\n```json\n{plan_json}\n```",
                 self.plan_version
             )
         } else {
@@ -3267,6 +3293,10 @@ Then summarize in 2-4 lines.",
                     (format!("{}\n\nTask states: {}", serde_json::to_string_pretty(p).unwrap_or_default(), states.join(", ")), true)
                 }
                 None => ("no phase is active".into(), false),
+            },
+            "mantra_read_plan" => match &self.plan {
+                Some(p) => (serde_json::to_string_pretty(p).unwrap_or_default(), true),
+                None => ("no plan submitted yet".into(), false),
             },
             "mantra_spawn" => {
                 let tid = s("task_id");
@@ -3661,10 +3691,13 @@ mod halt_tests {
         next: AgentId,
         interrupted: Vec<AgentId>,
         prompts: Vec<(AgentId, String)>,
+        /// Every `ctx.spawn`'s instructions, by the id it was given — for tests that check what a
+        /// freshly spawned agent was actually told (`spawn` itself ignores the `SpawnReq`).
+        spawned_instructions: Vec<(AgentId, String)>,
     }
     impl TestCtx {
         fn new() -> TestCtx {
-            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![] }
+            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![] }
         }
         /// Register a fake agent that looks busy (a live turn in progress).
         fn add_busy(&mut self) -> AgentId {
@@ -3725,10 +3758,11 @@ mod halt_tests {
         }
     }
     impl Ctx for TestCtx {
-        fn spawn(&mut self, _r: SpawnReq) -> AgentId {
+        fn spawn(&mut self, r: SpawnReq) -> AgentId {
             let id = self.next;
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
+            self.spawned_instructions.push((id, r.instructions));
             id
         }
         fn prompt(&mut self, a: AgentId, text: String) {
@@ -3986,6 +4020,63 @@ mod halt_tests {
         assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:respawn]")));
     }
 
+    /// `Stage::Review` (right after the plan is submitted) has no current phase for
+    /// `current_phase()` to show — the respawned planner must still get the plan it just wrote,
+    /// not an empty `Current phase:` block it can't recover from.
+    #[test]
+    fn respawn_planner_during_review_attaches_the_plan_not_an_empty_phase() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Review;
+        run.plan = Some(one_task_phase());
+        run.plan_version = 1;
+
+        run.respawn(&mut ctx, planner, None).unwrap();
+
+        let new_planner = run.planner.expect("planner still set after respawn");
+        let prompt = ctx.prompts.iter().find(|(a, t)| *a == new_planner && t.contains("[mantra:respawn]")).map(|(_, t)| t.clone()).expect("planner briefed");
+        assert!(prompt.contains("\"p1\""), "the plan just submitted must be attached, not an empty phase block: {prompt}");
+        assert!(!prompt.contains("Current phase:\n```json\n\n```"), "{prompt}");
+    }
+
+    /// The planner can read the full plan on demand — the tool the respawn prompt now points to
+    /// instead of promising something no tool ever delivered.
+    #[test]
+    fn mantra_read_plan_returns_the_full_plan() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+        assert!(!ok, "{msg}");
+        let mut plan = one_task_phase();
+        plan.phases.push(Phase { id: "p2".into(), name: "two".into(), tasks: vec![Task { id: "t2".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() });
+        run.plan = Some(plan);
+
+        let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+        assert!(ok, "{msg}");
+        assert!(msg.contains("\"p1\"") && msg.contains("\"p2\""), "every phase must be in it, not just the current one: {msg}");
+    }
+
+    /// The finale steps used `spawn_gate_at_round`'s sandbox-aware note too; a read-only finale
+    /// role must be told it cannot write, exactly like a per-phase gate.
+    #[test]
+    fn start_finale_gives_a_read_only_role_the_sandbox_note() {
+        let mut ctx = TestCtx::new();
+        let mut pattern = Pattern::builtin();
+        pattern.roles.get_mut("qa-heavy").unwrap().sandbox = "read-only".into();
+        let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+        run.plan = Some(one_task_phase());
+
+        run.start_finale(&mut ctx, 0);
+
+        let agent = run.finale_agent.expect("a finale agent must be spawned");
+        let instructions = ctx.spawned_instructions.iter().find(|(id, _)| *id == agent).map(|(_, i)| i.clone()).expect("instructions captured");
+        assert!(instructions.contains("Your role cannot write files"), "{instructions}");
+    }
+
     /// A respawned planner used to be handed the whole plan (every phase, every task) — exactly
     /// the huge context a respawn is meant to save. It gets only the current phase now, plus
     /// `mantra_read_phase` for live task states; the full plan is one call away if it needs it.
@@ -4106,6 +4197,31 @@ mod halt_tests {
         run.on_turn_done(&mut ctx, gate, "completed", None, None);
         assert!(run.halted(), "two consecutive identical blockers must halt immediately, not spend the remaining rounds");
         assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
+    }
+
+    /// A read-only gate that correctly reports what it can't fix must not be told to "keep going
+    /// and fix it" anyway — that report goes to the orchestrator instead.
+    #[test]
+    fn read_only_gate_report_fail_routes_to_the_orchestrator() {
+        let mut ctx = TestCtx::new();
+        let mut pattern = Pattern::builtin();
+        let gate_role = pattern.flow.phase_gate.clone();
+        pattern.roles.get_mut(&gate_role).unwrap().sandbox = "read-only".into();
+        let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+        let gate = ctx.add_idle();
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        run.gate_agent = Some(gate);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        ctx.agents.get_mut(&gate).unwrap().final_message = Some("GATE: fail — README needs a usage section".into());
+
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+
+        assert!(!run.halted(), "one report is not two identical blockers");
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("Keep going")), "a read-only gate must not be told to fix it itself: {:?}", ctx.prompts);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("read-only") && t.contains("README needs a usage section")), "the orchestrator must get the fix list instead: {:?}", ctx.prompts);
     }
 
     // v0.3 chain of command -------------------------------------------------------------------
@@ -4263,6 +4379,29 @@ mod halt_tests {
         assert!(run.halted(), "the identical failure twice means nobody is fixing it");
         assert!(run.halt.as_ref().unwrap().message.contains("identically"));
         assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));
+    }
+
+    /// Same as the gate-report case above, but for checks still failing after a read-only gate
+    /// self-reported pass: it still can't fix them itself.
+    #[test]
+    fn read_only_gate_checks_still_failing_routes_to_the_orchestrator() {
+        let mut ctx = TestCtx::new();
+        let mut pattern = no_manager();
+        let gate_role = pattern.flow.phase_gate.clone();
+        pattern.roles.get_mut(&gate_role).unwrap().sandbox = "read-only".into();
+        let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let gate = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![]));
+        assert!(!run.halted());
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("Fix them")), "a read-only gate must not be told to fix the checks itself: {:?}", ctx.prompts);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("read-only") && t.contains("Permission denied")), "the orchestrator must get the fix list instead: {:?}", ctx.prompts);
     }
 
     #[test]

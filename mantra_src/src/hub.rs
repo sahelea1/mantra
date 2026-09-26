@@ -290,7 +290,7 @@ async fn agent_task(
 
     'outer: loop {
         let started = match spec.backend {
-            Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, restarts > 0, &mut replay, &mut last_turn).await,
+            Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
             Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
         };
         let launch_failure = matches!(started, Exit::LaunchFailed(_));
@@ -373,7 +373,8 @@ async fn agent_task(
 
 enum Exit {
     Shutdown,
-    /// The process died (or was told to restart) after it had reached `Ready`.
+    /// The process died unexpectedly (not a self-inflicted relaunch — see `Restarting`) after it
+    /// had reached `Ready`.
     Crashed(String),
     /// Mantra itself asked for this relaunch — an effort/model change, a plain `Cmd::Restart`, or
     /// (Claude only) a `--resume`d session found unusable — never a failure: `agent_task` goes
@@ -410,10 +411,12 @@ async fn run_process(
     effort: &mut String,
     model: &mut String,
     approval: &mut String,
-    is_restart: bool,
     replay: &mut Vec<String>,
     last_turn: &mut Option<String>,
 ) -> Exit {
+    // Mirrors claude.rs: whether this launch actually resumes a thread, independent of the
+    // crash counter (a self-inflicted relaunch never bumps `restarts`).
+    let is_restart = thread_id.is_some();
     let (conn, mut inc, mut child) = match rpc::spawn(codex_cmd, &spec.extra_args, &spec.cwd, &spec.envs) {
         Ok(x) => x,
         Err(e) => return Exit::LaunchFailed(e.to_string()),

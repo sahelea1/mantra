@@ -98,8 +98,9 @@ pub enum Signal {
     TurnDone { status: String, error: Option<String>, kind: Option<ErrKind> },
     FilesChanged(Vec<String>),
     Activity,
-    /// A finished `commandExecution` item's output names `bwrap`/user namespaces (WP12.4/L1): the
-    /// sandbox itself cannot run commands on this host. Carries the offending output, truncated.
+    /// A finished `commandExecution` item's output looks like a broken sandbox (WP12.4/L1, see
+    /// `looks_like_broken_sandbox`): the sandbox itself cannot run commands on this host. Carries
+    /// the offending output, truncated.
     EnvironmentBroken(String),
 }
 

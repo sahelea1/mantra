@@ -569,6 +569,28 @@ pub fn codex_chatgpt_signed_in(codex_command: &[String]) -> bool {
     is_chatgpt_login(&login_status_line(&text))
 }
 
+/// Codex's own config dir: `$CODEX_HOME`, else `~/.codex` — same resolution Codex itself uses.
+fn codex_home() -> PathBuf {
+    if let Ok(h) = std::env::var("CODEX_HOME") {
+        if !h.trim().is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex")
+}
+
+/// Names of every MCP server the user's own `~/.codex/config.toml` declares. A Codex agent Mantra
+/// spawns must not inherit these (it only knows the tools Mantra gave it, so a call routed to one
+/// of the user's servers just fails as "unsupported call") — but `-c mcp_servers={}` is a no-op
+/// against a config.toml that already populates the key (`-c` merges at dotted leaf paths, it does
+/// not replace a table), so each name found here gets its own `-c mcp_servers.<name>.enabled=false`
+/// instead. Never panics; a missing file, unreadable file or bad TOML all read as "none".
+pub fn codex_user_mcp_server_names() -> Vec<String> {
+    let Ok(s) = std::fs::read_to_string(codex_home().join("config.toml")) else { return vec![] };
+    let Ok(v) = s.parse::<toml::Value>() else { return vec![] };
+    v.get("mcp_servers").and_then(|t| t.as_table()).map(|t| t.keys().cloned().collect()).unwrap_or_default()
+}
+
 impl Registry {
     pub fn defaults() -> Registry {
         let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -913,6 +935,38 @@ mod tests {
         assert_eq!(sol.effective_context(), 272_000);
         assert_eq!(sol.effective_compact_percent(), 85);
     }
+    /// A temp `$CODEX_HOME` for a test, restored afterwards. Serialized against other tests here
+    /// that do the same (the env var is process-wide).
+    fn with_codex_home<R>(f: impl FnOnce(&Path) -> R) -> R {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mantra-test-codex-home-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("CODEX_HOME").ok();
+        std::env::set_var("CODEX_HOME", &dir);
+        let r = f(&dir);
+        match prev {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+    #[test]
+    fn codex_user_mcp_servers_read_from_config_toml() {
+        let names = with_codex_home(|dir| {
+            std::fs::write(dir.join("config.toml"), "[mcp_servers.node_repl]\ncommand = \"node\"\n").unwrap();
+            codex_user_mcp_server_names()
+        });
+        assert_eq!(names, vec!["node_repl".to_string()]);
+    }
+    #[test]
+    fn codex_user_mcp_servers_none_when_config_missing() {
+        let names = with_codex_home(|_| codex_user_mcp_server_names());
+        assert!(names.is_empty());
+    }
     #[test]
     fn provider_display_names() {
         let mut r = Registry::defaults();
@@ -1086,8 +1140,10 @@ mod tests {
         let p = chatgpt_default_pattern();
         assert_eq!(p.name, "mantra-default");
         assert!(p.description.ends_with(" — ChatGPT subscription models"), "{}", p.description);
+        let reg = Registry::defaults();
         for (n, r) in &p.roles {
             assert_ne!(r.model, "astra", "role '{n}' still defaults to astra");
+            assert!(!reg.resolve(&r.model).is_custom_provider(), "role '{n}' must resolve to a Codex-account model");
         }
         assert!(p.validate().is_ok(), "{:?}", p.validate());
     }

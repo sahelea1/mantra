@@ -54,6 +54,7 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
         ),
         tool("mantra_prompt", "Send a message to an agent — e.g. answer a finale agent's question. For the orchestrator use mantra_brief_orchestrator.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
         read_phase_tool(),
+        tool("mantra_read_plan", "Read the full plan (every phase), as last submitted — mantra_read_phase only shows the current one. Use before revising a phase you haven't seen in this thread.", json!({}), &[]),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
         tool(
             "mantra_revise_plan",
@@ -264,10 +265,9 @@ mantra-role: worker
   the answer, end your turn without a STATUS line; you'll be woken with the answer.
 - If you are blocked (missing info, impossible task), stop and say so.
 - Environment errors are not yours to fix. If a command fails before it runs (bwrap, user namespaces,
-  the sandbox refusing to start) do not retry, do not work around it (no sudo, no other directory, no
-  disabling anything): report it once with mantra_ask quoting the exact error, then end your turn with
-  STATUS: blocked. A write refused because your role is read-only means the change belongs to a worker:
-  say so, do not retry.
+  the sandbox refusing to start), or a write is refused because your role is read-only (that belongs
+  to a worker), do not retry or work around it: report it once with mantra_ask quoting the exact error,
+  then end your turn with STATUS: blocked.
 - End your final message with exactly:
 STATUS: done | blocked
 SUMMARY: <2-5 lines: what you changed, how you verified it, anything the next agent must know>

@@ -227,7 +227,10 @@ impl App {
                     }
                 }
                 let path = pattern.save().map_err(|e| e.to_string())?;
-                if let Some(run) = self.run.as_mut() {
+                // `self.pattern_name` is the pattern for the *next* run and can differ from the
+                // active run's own (already-loaded) one — only patch live state when they're the
+                // same pattern, or a same-named role in an unrelated pattern gets silently reassigned.
+                if let Some(run) = self.run.as_mut().filter(|r| r.pattern.name == pattern.name) {
                     for name in &targets {
                         if let Some(r) = run.pattern.roles.get_mut(name) {
                             r.model = alias.clone();
@@ -235,9 +238,15 @@ impl App {
                         }
                     }
                 }
+                // An active run on a *different* pattern keeps its own agents untouched too — only
+                // its role names happened to collide with this pattern's.
+                let run_mismatch = self.run.as_ref().map(|r| r.pattern.name != pattern.name).unwrap_or(false);
                 let new_backend = self.registry.backend_of(&self.registry.resolve(&alias));
                 let live: Vec<AgentId> = self.agents.iter().filter(|(_, a)| targets.contains(&a.role)).map(|(id, _)| *id).collect();
                 for id in live {
+                    if run_mismatch && self.in_run(id) {
+                        continue;
+                    }
                     let same_backend = self.agents.get(&id).map(|a| a.backend == new_backend).unwrap_or(false);
                     if same_backend {
                         let in_run = self.in_run(id);
@@ -612,6 +621,63 @@ mod tests {
                 assert_eq!(role.model, "capped", "role '{name}'");
                 assert_eq!(role.effort, "medium", "role '{name}': high must clamp to this model's ceiling");
             }
+        });
+    }
+
+    /// A project-local pattern (`<project>/.mantra/patterns/`) always wins on load — so a save
+    /// must land there too, not in `$MANTRA_HOME`, or the change is invisible next load.
+    #[test]
+    fn set_role_model_saves_back_to_the_project_local_pattern() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.registry.models.push(crate::config::ModelEntry { alias: "capped".into(), model: "capped-model".into(), efforts: vec!["low".into(), "medium".into()], default_effort: "low".into(), ..Default::default() });
+            let project = std::env::temp_dir().join(format!("mantra-test-project-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+            let patterns_dir = project.join(".mantra").join("patterns");
+            std::fs::create_dir_all(&patterns_dir).unwrap();
+            let mut pattern = Pattern::builtin();
+            pattern.name = "set-role-model-test".into();
+            std::fs::write(patterns_dir.join("set-role-model-test.toml"), pattern.to_toml()).unwrap();
+            app.project = project.clone();
+            app.pattern_name = pattern.name.clone();
+
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            match &r {
+                ServerMsg::Result(x) => assert!(x.ok, "{x:?}"),
+                other => panic!("{other:?}"),
+            }
+            let saved = Pattern::load(&app.pattern_name, &app.project).unwrap();
+            for (name, role) in &saved.roles {
+                assert_eq!(role.model, "capped", "role '{name}': project-local load must see the change");
+            }
+            assert!(!crate::config::patterns_dir().join("set-role-model-test.toml").exists(), "must not have been written to $MANTRA_HOME instead");
+            let _ = std::fs::remove_dir_all(&project);
+        });
+    }
+
+    /// `self.pattern_name` (the pattern for the *next* run) can differ from the active run's own,
+    /// already-loaded pattern — a same-named role must not leak the change into that run.
+    #[test]
+    fn set_role_model_does_not_touch_a_run_on_a_different_pattern() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.registry.models.push(crate::config::ModelEntry { alias: "capped".into(), model: "capped-model".into(), efforts: vec!["low".into(), "medium".into()], default_effort: "low".into(), ..Default::default() });
+            let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), Pattern::builtin(), "goal".into());
+            let planner_model_before = run_.pattern.roles.get("planner").unwrap().model.clone();
+            let planner_agent: AgentId = 2;
+            add_agent(&mut app, planner_agent, "planner");
+            run_.planner = Some(planner_agent);
+            app.run = Some(run_);
+            // Same role names as the run's pattern, but a different pattern — this is the one
+            // `self.pattern_name` names, so it's the one `SetRoleModel` edits.
+            let mut other = Pattern::builtin();
+            other.name = "unrelated".into();
+            other.save().unwrap();
+            app.pattern_name = other.name.clone();
+
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["planner"].model, planner_model_before, "the active run's own pattern must be untouched");
+            assert_ne!(app.agents[&planner_agent].model_alias, "capped", "the run's own live agent must be untouched");
         });
     }
 }

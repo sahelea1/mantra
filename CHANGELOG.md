@@ -65,6 +65,31 @@ plaintext byte. `--headless` runs either with no terminal at all.
 - **The reference relay stays out of this repository.** It is a separate deliverable (a Docker
   image), so this binary's compatibility with any relay is defined entirely by the wire protocol,
   not by shared code.
+- **Roles & models from the web UI, with validated switches.** The web settings screen gets a
+  per-role model picker, backed by the pattern file. `ctrl+k`/the web picker's switch is validated
+  against the agent's actual backend first, so it is refused rather than sent to an agent that
+  cannot run it — and whatever a model or effort switch, or a respawn, interrupts, nothing typed is
+  lost: a message queued at the time is held and replayed once the agent is ready again.
+- **A relaunch holds messages instead of failing them.** A self-inflicted restart (an effort/model
+  change, `Cmd::Restart`, or a resumed Claude session found unusable) no longer counts as a crash —
+  no backoff, no counters — and any turn or steer sent during it is held and replayed once the next
+  process is `Ready`, instead of being thrown away.
+- **Environment errors halt once, right away.** A command that dies in the sandbox itself (`bwrap`,
+  user namespaces) is reported once and Mantra halts immediately instead of retrying blind or
+  bouncing the failure between the orchestrator and the planner as if it were transient.
+- **QA respects a read-only role.** A gate agent only edits when its role's sandbox allows writes —
+  a read-only QA reports what is wrong (file, what, why) instead of trying to touch files it can't.
+- **Empty projects skip exploration.** A fresh, empty project (nothing checked in yet) skips the
+  planner's exploration step — there is nothing to read.
+- **Sandbox fallback.** When this host can't create the user namespaces `bwrap` needs, Codex agents
+  fall back to `danger-full-access` automatically (git worktrees still keep workers apart) after one
+  up-front warning, instead of failing every command.
+- **No user MCP servers.** A Codex agent Mantra spawns never picks up your own `~/.codex/config.toml`
+  MCP servers — only Mantra's own tools reach it, so a personal MCP setup never changes what a team
+  run can do.
+- **ChatGPT-subscription default on a fresh install.** If Codex is already signed in with a ChatGPT
+  subscription on a fresh install, every role defaults to a model that subscription can actually run
+  (no `astra`, which needs API access) instead of failing on the ordinary Codex-account defaults.
 - **Tests.** 50 new unit tests (183 total): PBKDF2/HKDF/AES-GCM known-answer and round-trip
   vectors including tamper detection and fragmentation, every WebSocket protocol message round-
   tripping, snapshot/delta diffing (upsert/remove, append-vs-full items, pulse by sequence number,
