@@ -115,20 +115,35 @@ pub enum Stage {
 pub enum Pending {
     /// `start_phase(idx)` — past the last phase this means the finale.
     Phase { idx: usize },
-    /// `start_finale(idx)` — past the last step this completes the run.
-    Finale { idx: usize },
-    /// The gate of phase `idx` at `round`: the gate agent's next round, or a fresh gate agent.
-    Gate { idx: usize, round: u32 },
+    /// `start_finale(idx)` — past the last step this completes the run. `note` is a respawn's
+    /// note for the fresh agent (`respawn_finale` during a halt).
+    Finale {
+        idx: usize,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// The gate of phase `idx` at `round`: the gate agent's next round, or a fresh gate agent
+    /// (`note` as for `Finale`).
+    Gate {
+        idx: usize,
+        round: u32,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// `begin_handoff(idx)` — phase `idx` passed its gate.
     Handoff { idx: usize },
 }
 
+/// What `respawn` reports when it went ahead, and when the pause boundary deferred it.
+pub const RESPAWNED: &str = "respawned with a fresh thread";
+pub const RESPAWN_DEFERRED: &str = "respawn deferred — a fresh thread starts when the run resumes";
+
 impl Pending {
-    fn label(&self) -> String {
+    pub(super) fn label(&self) -> String {
         match self {
             Pending::Phase { idx } => format!("phase {}", idx + 1),
-            Pending::Finale { idx } => format!("finale step {}", idx + 1),
-            Pending::Gate { idx, round } => format!("phase {} gate round {round}", idx + 1),
+            Pending::Finale { idx, .. } => format!("finale step {}", idx + 1),
+            Pending::Gate { idx, round, .. } => format!("phase {} gate round {round}", idx + 1),
             Pending::Handoff { idx } => format!("phase {} handoff", idx + 1),
         }
     }
@@ -685,18 +700,36 @@ impl Run {
         self.log("▶", "green", format!("{} was due while halted — starting it", what.label()));
         match what {
             Pending::Phase { idx } => self.start_phase(ctx, idx),
-            Pending::Finale { idx } => self.start_finale(ctx, idx),
-            Pending::Handoff { idx } => self.begin_handoff(ctx, idx),
-            Pending::Gate { idx, round } => match self.gate_agent {
-                Some(g) => {
-                    self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
-                    self.gate_report = None;
-                    self.mark_edge(g);
-                    let s = self.check_summary();
-                    ctx.prompt(g, format!("[mantra:gate-round {round}] The run resumed. Continue the gate: fix what's left so it passes, then call mantra_gate_report.\nGate checks:\n{s}"));
+            Pending::Finale { idx, note } => {
+                self.start_finale(ctx, idx);
+                if let (Some(n), Some(a)) = (note, self.finale_agent) {
+                    ctx.prompt(a, format!("[mantra:respawn] {n}"));
                 }
-                None => self.spawn_gate_at_round(ctx, idx, round),
-            },
+            }
+            Pending::Handoff { idx } => self.begin_handoff(ctx, idx),
+            Pending::Gate { idx, round, note } => {
+                match self.gate_agent {
+                    Some(g) => {
+                        self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
+                        self.gate_report = None;
+                        self.mark_edge(g);
+                        let s = self.check_summary();
+                        ctx.prompt(g, format!("[mantra:gate-round {round}] The run resumed. Continue the gate: fix what's left so it passes, then call mantra_gate_report.\nGate checks:\n{s}"));
+                    }
+                    None => self.spawn_gate_at_round(ctx, idx, round),
+                }
+                if let (Some(n), Some(g)) = (note, self.gate_agent) {
+                    ctx.prompt(g, format!("[mantra:respawn] {n}"));
+                }
+            }
+        }
+    }
+
+    /// A stage change made during a halt (a plan revision, a stop) outdates the transition the
+    /// pause boundary remembered: forget it, or `resume` would perform it against the new stage.
+    fn drop_pending(&mut self, why: &str) {
+        if let Some(p) = self.pending.take() {
+            self.log("‖", "amber", format!("{} was due — dropped: {why}", p.label()));
         }
     }
 
@@ -708,7 +741,8 @@ impl Run {
             return;
         }
         let Some(o) = self.orchestrator else { return };
-        if paused.contains(&o) || ctx.agent(o).map(|a| a.busy()).unwrap_or(false) {
+        // one waiting on the planner's answer is woken by that answer, not by a kick
+        if paused.contains(&o) || self.waiting_for_answer(o) || ctx.agent(o).map(|a| a.busy()).unwrap_or(false) {
             return;
         }
         let missing: Vec<String> = self.current_phase().map(|p| p.tasks.iter().filter(|t| !self.workers.iter().any(|w| w.task.id == t.id)).map(|t| t.id.clone()).collect()).unwrap_or_default();
@@ -1491,7 +1525,7 @@ Then summarize in 2-4 lines.",
     fn spawn_gate_at_round(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
         let Some(phase) = self.current_phase().cloned() else { return };
         if self.halted() {
-            self.defer(Pending::Gate { idx, round });
+            self.defer(Pending::Gate { idx, round, note: None });
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
@@ -1609,7 +1643,7 @@ Then summarize in 2-4 lines.",
 
     pub(super) fn start_finale(&mut self, ctx: &mut dyn Ctx, k: usize) {
         if self.halted() {
-            self.defer(Pending::Finale { idx: k });
+            self.defer(Pending::Finale { idx: k, note: None });
             return;
         }
         self.workers.retain(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Cancelled));
@@ -1688,6 +1722,7 @@ Then summarize in 2-4 lines.",
         ctx.notify(&format!("Mantra: {why}"));
         self.stage = Stage::Failed(why);
         self.finished_unix = Some(crate::util::unix_secs());
+        self.drop_pending("the run stopped");
         self.save_state();
     }
 
@@ -1774,7 +1809,7 @@ Then summarize in 2-4 lines.",
                     self.gate_report = None;
                     match self.gate_agent {
                         // results are recorded while halted; the next round waits for the resume
-                        _ if self.halted() => self.defer(Pending::Gate { idx: phase, round: round + 1 }),
+                        _ if self.halted() => self.defer(Pending::Gate { idx: phase, round: round + 1, note: None }),
                         Some(g) => {
                             self.mark_edge(g);
                             let s = self.check_summary();
@@ -2011,6 +2046,9 @@ Then summarize in 2-4 lines.",
                         self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
                         self.run_checks(ctx, idx, round);
                     }
+                    // the halt interrupted the round before a report: the resume picks the same
+                    // round back up (`resume_by`), it is not a round that failed
+                    None if self.halted() => self.log("‖", "amber", format!("gate round {round} interrupted by the halt — it goes on when the run resumes")),
                     other => {
                         let why = other.map(|(_, s)| s).unwrap_or_else(|| "no gate report".into());
                         // L4 loop protection (WP12.4/WP6): two consecutive gate reports blocked on
@@ -2027,7 +2065,7 @@ Then summarize in 2-4 lines.",
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
                             if self.halted() {
                                 // the report is recorded; the next round waits for the resume
-                                self.defer(Pending::Gate { idx, round: round + 1 });
+                                self.defer(Pending::Gate { idx, round: round + 1, note: None });
                             } else {
                                 self.mark_edge(a);
                                 ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
@@ -2858,7 +2896,9 @@ Then summarize in 2-4 lines.",
     /// Respawn any run agent in place (WP7.4): the planner, the orchestrator, the phase gate, the
     /// finale agent, or a worker (delegates to `retry_worker`). `note` is an extra line prepended
     /// to the resume prompt (used by the watchdog and by the `r` / `ctrl+r` / `/respawn` UI paths).
-    pub fn respawn(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<(), String> {
+    /// `Ok` says what happened: `RESPAWNED`, or `RESPAWN_DEFERRED` for a gate/finale agent while
+    /// the run is halted (the pause boundary — the fresh agent, note included, starts on resume).
+    pub fn respawn(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<&'static str, String> {
         if let Some(wi) = self.worker_idx(a) {
             // `r` on the task that exhausted its attempts *is* the decision to try once more.
             if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted).unwrap_or(false) {
@@ -2868,28 +2908,28 @@ Then summarize in 2-4 lines.",
             // A note goes *on top of* the task prompt — `retry_worker`'s argument replaces it.
             let prompt = note.map(|n| join_note(Some(n), self.workers[wi].prompt.clone()));
             let msg = self.retry_worker(ctx, a, prompt);
-            return if msg.starts_with("REFUSED") { Err(msg) } else { Ok(()) };
+            return if msg.starts_with("REFUSED") { Err(msg) } else { Ok(RESPAWNED) };
         }
         // The built-in default pattern's last finale step reuses `self.planner` as the finale
         // agent id (`start_finale`), so this ambiguous case must be checked before the plain
         // planner check below — mirrors the disambiguation `on_turn_done` already does.
         if Some(a) == self.finale_agent || (Some(a) == self.planner && matches!(self.stage, Stage::Finale { .. })) {
-            return if self.respawn_finale(ctx, note) { Ok(()) } else { Err("that agent's stage has already moved on".into()) };
+            return self.respawn_finale(ctx, note).ok_or_else(|| "that agent's stage has already moved on".into());
         }
         if Some(a) == self.planner {
             self.respawn_planner(ctx, note);
-            return Ok(());
+            return Ok(RESPAWNED);
         }
         if Some(a) == self.orchestrator {
             self.respawn_orchestrator(ctx, note);
-            return Ok(());
+            return Ok(RESPAWNED);
         }
         if Some(a) == self.manager {
             self.respawn_manager(ctx, note);
-            return Ok(());
+            return Ok(RESPAWNED);
         }
         if Some(a) == self.gate_agent {
-            return if self.respawn_gate(ctx, note) { Ok(()) } else { Err("that agent's stage has already moved on".into()) };
+            return self.respawn_gate(ctx, note).ok_or_else(|| "that agent's stage has already moved on".into());
         }
         Err("that agent is no longer part of the run".into())
     }
@@ -2929,8 +2969,8 @@ Then summarize in 2-4 lines.",
         self.log("↻", "violet", "orchestrator respawned (watchdog/manual)");
     }
 
-    fn respawn_gate(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> bool {
-        let Some(idx) = self.phase_idx() else { return false };
+    fn respawn_gate(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let idx = self.phase_idx()?;
         let round = match self.stage {
             Stage::Phase { step: PhaseStep::Gate { round }, .. } => round,
             _ => 1,
@@ -2939,28 +2979,39 @@ Then summarize in 2-4 lines.",
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
+        if self.halted() {
+            // the pause boundary: the fresh gate agent starts on resume, with the note
+            self.log("↻", "violet", "gate respawn deferred until the run resumes");
+            self.defer(Pending::Gate { idx, round, note });
+            return Some(RESPAWN_DEFERRED);
+        }
         self.spawn_gate_at_round(ctx, idx, round);
         if let (Some(n), Some(g)) = (note, self.gate_agent) {
             ctx.prompt(g, format!("[mantra:respawn] {n}"));
         }
         self.log("↻", "violet", "gate respawned (watchdog/manual)");
-        true
+        Some(RESPAWNED)
     }
 
-    fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> bool {
-        let Stage::Finale { idx } = self.stage else { return false };
+    fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let Stage::Finale { idx } = self.stage else { return None };
         if let Some(old) = self.finale_agent.take() {
             if Some(old) != self.planner {
                 self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
                 ctx.stop(old, true);
             }
         }
+        if self.halted() {
+            self.log("↻", "violet", "finale agent respawn deferred until the run resumes");
+            self.defer(Pending::Finale { idx, note });
+            return Some(RESPAWN_DEFERRED);
+        }
         self.start_finale(ctx, idx);
         if let (Some(n), Some(a)) = (note, self.finale_agent) {
             ctx.prompt(a, format!("[mantra:respawn] {n}"));
         }
         self.log("↻", "violet", "finale agent respawned (watchdog/manual)");
-        true
+        Some(RESPAWNED)
     }
 
     pub fn retry_worker(&mut self, ctx: &mut dyn Ctx, a: AgentId, prompt: Option<String>) -> String {
@@ -3087,7 +3138,7 @@ Then summarize in 2-4 lines.",
                         }
                         let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a);
                         match self.respawn(ctx, t, note) {
-                            Ok(()) => (format!("{n} respawned with a fresh thread{}", if lifted { " — the run resumed" } else { "" }), true),
+                            Ok(what) => (format!("{n} {what}{}", if lifted { " — the run resumed" } else { "" }), true),
                             Err(e) => (e, false),
                         }
                     }
@@ -3164,7 +3215,7 @@ Then summarize in 2-4 lines.",
                                     w.idle_prompts.clear();
                                     self.log("⏰", "amber", format!("{tid}: orchestrator prompted 3× without progress — respawning (watchdog)"));
                                     return match self.respawn(ctx, t, Some("[mantra:watchdog] Respawned after repeated idle prompts without progress.".into())) {
-                                        Ok(()) => (format!("{tid} was stuck (prompted 3× with no progress) — respawned instead of forwarding this message"), true),
+                                        Ok(_) => (format!("{tid} was stuck (prompted 3× with no progress) — respawned instead of forwarding this message"), true),
                                         Err(e) => (e, false),
                                     };
                                 }
@@ -3388,6 +3439,7 @@ Then summarize in 2-4 lines.",
         self.gate_report = None;
         self.last_gate_blocker = None;
         self.last_verify_sig = None;
+        self.drop_pending("the phase went back to building");
         if self.orchestrator.is_none() {
             self.spawn_orchestrator(ctx);
         }
@@ -4821,7 +4873,7 @@ mod halt_tests {
         let agents_before = ctx.next;
         ctx.prompts.clear();
         run.on_turn_done(&mut ctx, finale, "interrupted", None, None);
-        assert_eq!(run.pending, Some(Pending::Finale { idx: 1 }));
+        assert_eq!(run.pending, Some(Pending::Finale { idx: 1, note: None }));
         assert_eq!(run.stage, Stage::Finale { idx: 0 });
         assert_eq!(ctx.next, agents_before);
         assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
@@ -4858,6 +4910,108 @@ mod halt_tests {
         run.toggle_pause(&mut ctx);
         run.toggle_pause(&mut ctx);
         assert!(!ctx.prompts.iter().any(|(a, _)| *a == orch2), "{:?}", ctx.prompts);
+        // one that is waiting on the planner's answer is woken by the answer, not kicked
+        run.workers.clear();
+        run.pending_questions.insert(orch2, "which lexer?".into());
+        run.toggle_pause(&mut ctx);
+        run.toggle_pause(&mut ctx);
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == orch2 && t.contains("[mantra:resume]")), "{:?}", ctx.prompts);
+    }
+
+    /// The stage moved on during the halt (the planner added a task, so the phase went back to
+    /// building): the handoff that was due before is stale and must not run on resume.
+    #[test]
+    fn a_plan_revision_during_the_pause_drops_the_deferred_handoff() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let gate = ctx.add_busy();
+        let w = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.gate_agent = Some(gate);
+        let mut plan = one_task_phase();
+        plan.phases[0].tasks[0].prompt = "build the slugify function".into();
+        run.plan = Some(plan.clone());
+        run.plan_version = 1;
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Done));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+        assert!(ok);
+        run.toggle_pause(&mut ctx);
+        run.on_turn_done(&mut ctx, gate, "interrupted", None, None);
+        assert_eq!(run.pending, Some(Pending::Handoff { idx: 0 }));
+
+        plan.phases[0].tasks.push(Task { id: "t1b".into(), role: "worker-small".into(), prompt: "add the unit tests for slugify".into(), ..Default::default() });
+        let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &json!({"plan": serde_json::to_value(&plan).unwrap(), "reason": "one more"}));
+        assert!(ok && msg.contains("back to building"), "{msg}");
+        assert!(run.halted(), "a user pause is not lifted by a revision");
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating });
+        assert!(run.pending.is_none(), "the handoff is stale: {:?}", run.pending);
+
+        ctx.prompts.clear();
+        run.toggle_pause(&mut ctx);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating }, "the stale handoff must not run");
+        assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("[mantra:handoff]")), "{:?}", ctx.prompts);
+        let (msg, ok) = run.handle_tool(&mut ctx, orch, "mantra_spawn", &json!({"task_id": "t1b"}));
+        assert!(ok, "{msg}");
+    }
+
+    /// A gate respawn during a pause starts nothing (the pause boundary) — and says so, keeping
+    /// the note for the fresh agent that starts on resume.
+    #[test]
+    fn a_gate_respawn_during_the_pause_is_deferred_with_its_note() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let gate = ctx.add_busy();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 2 } };
+        run.toggle_pause(&mut ctx);
+        let agents_before = ctx.next;
+        ctx.prompts.clear();
+        let what = run.respawn(&mut ctx, gate, Some("work file by file".into())).unwrap();
+        assert_eq!(what, RESPAWN_DEFERRED);
+        assert_eq!(ctx.next, agents_before, "no agent may be spawned while paused");
+        assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+        assert_eq!(run.pending, Some(Pending::Gate { idx: 0, round: 2, note: Some("work file by file".into()) }));
+        assert_eq!(run.gate_agent, None);
+
+        run.toggle_pause(&mut ctx);
+        let g2 = run.gate_agent.expect("the fresh gate agent");
+        assert_ne!(g2, gate);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 2 } }, "the round is kept");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == g2 && t.starts_with("[mantra:gate]")), "{:?}", ctx.prompts);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == g2 && t == "[mantra:respawn] work file by file"), "{:?}", ctx.prompts);
+        assert!(run.pending.is_none());
+        // outside a pause it is immediate, as before
+        assert_eq!(run.respawn(&mut ctx, g2, None).unwrap(), RESPAWNED);
+        assert!(run.gate_agent.is_some_and(|g| g != g2));
+    }
+
+    /// A pause that interrupts the gate agent before it reports is not a failed round.
+    #[test]
+    fn a_gate_round_interrupted_by_the_pause_is_not_a_failed_round() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let gate = ctx.add_busy();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        run.toggle_pause(&mut ctx);
+        run.on_turn_done(&mut ctx, gate, "interrupted", None, None);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } }, "the round is not burnt");
+        assert!(run.pending.is_none() && run.last_gate_blocker.is_none());
+        // a second such pause does not trip the identical-blocker halt either
+        run.toggle_pause(&mut ctx);
+        run.toggle_pause(&mut ctx);
+        run.on_turn_done(&mut ctx, gate, "interrupted", None, None);
+        assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::User), "{:?}", run.halt.as_ref().map(|h| &h.message));
+        ctx.prompts.clear();
+        run.toggle_pause(&mut ctx);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("The run resumed")), "{:?}", ctx.prompts);
     }
 
     #[test]

@@ -779,7 +779,7 @@ impl App {
             return;
         }
         match self.with_run(|r, c| r.respawn(c, a, None)) {
-            Some(Ok(())) => self.toast("respawned", Level::Info),
+            Some(Ok(what)) => self.toast(what, Level::Info),
             Some(Err(msg)) => self.toast(msg, Level::Warn),
             None => {}
         }
@@ -1767,7 +1767,7 @@ impl App {
                         self.hub.send(a, Cmd::Restart);
                     } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
                         match res {
-                            Ok(()) => self.toast("respawned", Level::Info),
+                            Ok(what) => self.toast(what, Level::Info),
                             Err(msg) => self.toast(msg, Level::Warn),
                         }
                     }

@@ -186,7 +186,7 @@ impl App {
                     return Err("only run agents can be respawned (use New session for Solo)".into());
                 }
                 match self.with_run(|r, c| r.respawn(c, agent, None)) {
-                    Some(Ok(())) => ok(),
+                    Some(Ok(_)) => ok(),
                     Some(Err(e)) => Err(e),
                     None => Err("no run".into()),
                 }

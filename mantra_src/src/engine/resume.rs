@@ -63,6 +63,9 @@ impl Run {
         // plan again, and a due gate is reached by the merge → checks → gate sequence anyway
         // (which regenerates the check results its prompt needs), so those are dropped here.
         let pending = self.pending.take();
+        if let (Some(p), Stage::Setup | Stage::Planning | Stage::Review) = (&pending, &self.stage) {
+            self.log("‖", "amber", format!("{} was due at the pause — the plan is submitted again instead", p.label()));
+        }
         match self.stage.clone() {
             Stage::Setup => self.start(ctx),
             Stage::Planning => self.resume_planning(ctx, st),
@@ -83,26 +86,31 @@ impl Run {
                 self.restore_workers(st);
                 match pending {
                     Some(p @ (Pending::Phase { .. } | Pending::Finale { .. } | Pending::Handoff { .. })) => self.perform_pending(ctx, p),
-                    _ => match step {
-                        PhaseStep::Orchestrating => self.resume_orchestrating(ctx, idx, st),
-                        PhaseStep::Handoff => {
-                            self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
-                            self.handoff_note_done = true;
-                            self.cleanup_done = true;
-                            self.maybe_next_phase(ctx);
+                    other => {
+                        if let Some(p) = other {
+                            self.log("‖", "amber", format!("{} was due at the pause — re-running merge/checks reaches it instead", p.label()));
                         }
-                        PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } => {
-                            // Every task had finished; merging is idempotent, so start the gate
-                            // sequence from the top.
-                            self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
-                            self.check_phase_done(ctx);
-                            if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
-                                // state.json disagreed with itself (a task isn't done after all) —
-                                // then the phase is simply still being worked on.
-                                self.resume_orchestrating(ctx, idx, st);
+                        match step {
+                            PhaseStep::Orchestrating => self.resume_orchestrating(ctx, idx, st),
+                            PhaseStep::Handoff => {
+                                self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
+                                self.handoff_note_done = true;
+                                self.cleanup_done = true;
+                                self.maybe_next_phase(ctx);
+                            }
+                            PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } => {
+                                // Every task had finished; merging is idempotent, so start the gate
+                                // sequence from the top.
+                                self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+                                self.check_phase_done(ctx);
+                                if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
+                                    // state.json disagreed with itself (a task isn't done after all) —
+                                    // then the phase is simply still being worked on.
+                                    self.resume_orchestrating(ctx, idx, st);
+                                }
                             }
                         }
-                    },
+                    }
                 }
             }
             Stage::Finale { idx } => {
@@ -119,11 +127,10 @@ impl Run {
                     })
                     .collect();
                 // the previous step reported while the run was paused: its successor was due
-                let idx = match pending {
-                    Some(Pending::Finale { idx }) => idx,
-                    _ => idx,
-                };
-                self.start_finale(ctx, idx);
+                match pending {
+                    Some(p @ Pending::Finale { .. }) => self.perform_pending(ctx, p),
+                    _ => self.start_finale(ctx, idx),
+                }
                 for (task, prompt, effort) in redo {
                     self.spawn_task(ctx, task, Some(prompt), effort);
                 }
