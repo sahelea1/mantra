@@ -341,15 +341,17 @@ impl App {
             }
             Command::PushSubscribe { subscription, device, prefs } => {
                 let p = self.web.as_ref().and_then(|l| l.push.clone()).ok_or("push is off (settings.toml [web] push = false)")?;
-                if !subscription.endpoint.starts_with("https://") {
-                    return Err("push endpoints are https URLs".into());
-                }
+                // Cheap and synchronous (scheme + IP-literal classification, no DNS) so this never
+                // blocks the App task; a hostname that turns out to resolve privately is caught
+                // and dropped by the Sender task below (SSRF guard, design §9.2 point 4).
+                super::push::check_endpoint_syntax(&subscription.endpoint)?;
                 let valid_keys = super::crypto::b64url_decode(&subscription.keys.p256dh).map(|k| k.len() == 65).unwrap_or(false) && super::crypto::b64url_decode(&subscription.keys.auth).map(|k| k.len() == 16).unwrap_or(false);
                 if !valid_keys {
                     return Err("bad subscription keys".into());
                 }
+                let endpoint = subscription.endpoint;
                 let sub = super::push::Subscription {
-                    endpoint: subscription.endpoint,
+                    endpoint: endpoint.clone(),
                     p256dh: subscription.keys.p256dh,
                     auth: subscription.keys.auth,
                     device: crate::util::trunc(&device, 80),
@@ -357,9 +359,12 @@ impl App {
                     prefs: prefs.unwrap_or_default(),
                     failures: 0,
                 };
-                let mut store = p.store.lock().unwrap_or_else(|e| e.into_inner());
-                store.upsert(sub);
-                store.save();
+                {
+                    let mut store = p.store.lock().unwrap_or_else(|e| e.into_inner());
+                    store.upsert(sub);
+                    store.save();
+                }
+                p.sender.validate(&endpoint);
                 ok()
             }
             Command::PushUnsubscribe { endpoint } => {
