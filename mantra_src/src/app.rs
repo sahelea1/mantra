@@ -10,7 +10,7 @@ use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -215,6 +215,10 @@ pub struct AgentOpts {
     pub instructions: String,
     pub tools: Vec<Value>,
     pub extra_writable: Vec<PathBuf>,
+    /// Whether a workspace-write agent may use the network (the run pattern's `settings.network`).
+    pub network: bool,
+    /// The pattern's `settings.writable_roots` (`~` unexpanded): writable by a workspace-write agent.
+    pub writable_roots: Vec<String>,
     /// Explicit context-window override (from a halved assumption); `None` uses the model's own
     /// effective context.
     pub context_override: Option<u64>,
@@ -225,6 +229,36 @@ pub struct AgentOpts {
 
 fn toml_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The Codex `-c` overrides for one agent's sandbox. The spawn's own extra roots always go in. A
+/// workspace-write agent also gets the pattern's roots (existing directories, `~` expanded), the
+/// toolchain caches, and the network switch when the pattern allows it. Other modes keep only the
+/// extra roots, as before. The roots are one deduplicated list, emitted once.
+fn sandbox_overrides(sandbox: &str, network: bool, extra: &[PathBuf], pattern: &[String], toolchain: &[PathBuf], home: Option<&Path>) -> Vec<String> {
+    let workspace = sandbox == "workspace-write";
+    let mut roots: Vec<PathBuf> = extra.to_vec();
+    if workspace {
+        roots.extend(pattern.iter().map(|p| crate::util::expand_tilde(p, home)).filter(|p| p.is_dir()));
+        roots.extend(toolchain.iter().cloned());
+    }
+    let mut unique: Vec<PathBuf> = vec![];
+    for r in roots {
+        if !unique.contains(&r) {
+            unique.push(r);
+        }
+    }
+    let mut out = vec![];
+    if !unique.is_empty() {
+        let list: Vec<String> = unique.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
+        out.push("-c".to_string());
+        out.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
+    }
+    if workspace && network {
+        out.push("-c".to_string());
+        out.push("sandbox_workspace_write.network_access=true".to_string());
+    }
+    out
 }
 
 pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, o: AgentOpts) -> AgentId {
@@ -277,11 +311,12 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
             extra.push("-c".into());
             extra.push("model_reasoning_summary=\"none\"".into());
         }
-        if !o.extra_writable.is_empty() {
-            let list: Vec<String> = o.extra_writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
-            extra.push("-c".into());
-            extra.push(format!("sandbox_workspace_write.writable_roots=[{}]", list.join(",")));
-        }
+        // Codex's workspace-write sandbox writes only inside the cwd and has no network unless told to.
+        // `o.sandbox` is already the fallback-adjusted mode (`role_sandbox`), so the toolchain caches
+        // are looked up only for a sandbox that will use them.
+        let toolchain = if o.sandbox == "workspace-write" { crate::util::toolchain_writable_roots() } else { vec![] };
+        let home = dirs::home_dir();
+        extra.extend(sandbox_overrides(&o.sandbox, o.network, &o.extra_writable, &o.writable_roots, &toolchain, home.as_deref()));
         // Deliver a key stored directly in the provider (not just named by env_key) into the
         // child's own environment — never on argv, never logged.
         let envs: Vec<(String, String)> = reg
@@ -440,6 +475,8 @@ impl Ctx for Ctxt<'_> {
                 instructions: r.instructions,
                 tools: r.tools,
                 extra_writable: r.extra_writable,
+                network: r.network,
+                writable_roots: r.writable_roots,
                 context_override: r.context_override,
                 resume_thread: None,
             },
@@ -465,6 +502,8 @@ impl Ctx for Ctxt<'_> {
                 instructions: r.instructions,
                 tools: r.tools,
                 extra_writable: r.extra_writable,
+                network: r.network,
+                writable_roots: r.writable_roots,
                 context_override: r.context_override,
                 resume_thread: Some(thread),
             },
@@ -636,6 +675,8 @@ impl App {
                 instructions: String::new(),
                 tools: vec![],
                 extra_writable: vec![],
+                network: true,
+                writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
             },
@@ -1035,6 +1076,8 @@ impl App {
                 instructions: tools::ARCHITECT_PROMPT.into(),
                 tools: tools::architect_tools(),
                 extra_writable: vec![],
+                network: false,
+                writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
             },
@@ -1084,6 +1127,8 @@ impl App {
                 instructions: "You are a compatibility probe. Developer-role messages like this one must be accepted.".into(),
                 tools: vec![],
                 extra_writable: vec![],
+                network: false,
+                writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
             },
@@ -2333,6 +2378,39 @@ mod tests {
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::ClaudeCode), "workspace-write", "Claude never sandboxes through bwrap");
         reset_sandbox_fallback_for_test();
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "workspace-write");
+    }
+
+    #[test]
+    fn a_workspace_write_agent_gets_one_writable_roots_list_and_network_when_allowed() {
+        let root = std::env::temp_dir().join(format!("mantra-sandbox-overrides-{}", std::process::id()));
+        let home = root.join("home");
+        let cargo = home.join(".cargo");
+        let extra = root.join("git-common");
+        let pattern_root = home.join("pattern-root");
+        for d in [&cargo, &extra, &pattern_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let pattern = vec!["~/.cargo".to_string(), "~/pattern-root".to_string(), "~/not-there".to_string()];
+        let (cargo_s, extra_s, pattern_s) = (cargo.to_string_lossy().into_owned(), extra.to_string_lossy().into_owned(), pattern_root.to_string_lossy().into_owned());
+
+        let args = sandbox_overrides("workspace-write", true, &[extra.clone()], &pattern, &[cargo.clone()], Some(&home));
+        assert!(args.contains(&"sandbox_workspace_write.network_access=true".to_string()), "{args:?}");
+        let lists: Vec<&String> = args.iter().filter(|a| a.starts_with("sandbox_workspace_write.writable_roots=")).collect();
+        assert_eq!(lists.len(), 1, "one list, however many sources feed it: {args:?}");
+        let list = lists[0];
+        assert_eq!(list.matches(cargo_s.as_str()).count(), 1, "~/.cargo is both a pattern root and a toolchain root, listed once: {list}");
+        assert!(list.contains(&pattern_s) && list.contains(&extra_s), "{list}");
+        assert!(!list.contains("not-there"), "a pattern root that does not exist is left out: {list}");
+
+        let read_only = sandbox_overrides("read-only", true, &[extra.clone()], &pattern, &[cargo.clone()], Some(&home));
+        assert!(!read_only.iter().any(|a| a.contains("network_access")), "{read_only:?}");
+        assert!(read_only.iter().any(|a| a.contains(&extra_s)), "the spawn's own roots still go in: {read_only:?}");
+        assert!(!read_only.iter().any(|a| a.contains(&cargo_s)), "toolchain and pattern roots are for workspace-write only: {read_only:?}");
+
+        let no_network = sandbox_overrides("workspace-write", false, &[], &pattern, &[], Some(&home));
+        assert!(!no_network.iter().any(|a| a.contains("network_access")), "{no_network:?}");
+        assert!(no_network.iter().any(|a| a.contains(&pattern_s)), "the pattern's roots do not depend on network: {no_network:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

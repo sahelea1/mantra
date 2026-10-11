@@ -45,6 +45,10 @@ pub struct SpawnReq {
     pub tools: Vec<Value>,
     pub effort: Option<String>,
     pub extra_writable: Vec<PathBuf>,
+    /// Whether a workspace-write agent may use the network: the run pattern's `settings.network`.
+    pub network: bool,
+    /// The run pattern's `settings.writable_roots` (`~` unexpanded), writable by a workspace-write agent.
+    pub writable_roots: Vec<String>,
     /// Explicit context-window override for this spawn (set after a ContextFull halving); `None`
     /// means "use the model's own effective context".
     pub context_override: Option<u64>,
@@ -401,6 +405,14 @@ pub struct Run {
     /// The watchdog woke the manager about an idle agent (ladder step 3). Cleared when the manager
     /// completes a turn; past the deadline the planner gets it as before.
     manager_watchdog: Option<ManagerCase>,
+    /// Agents whose turn ended with `mantra_wait` (or a `mantra_status` with nothing new): a tool
+    /// call they make in that same turn is refused. Runtime-only; cleared when the turn ends.
+    yielded: HashSet<AgentId>,
+    /// Yielded agents already interrupted for a refused tool call this turn, so the interrupt goes
+    /// out once. Runtime-only.
+    yield_interrupted: HashSet<AgentId>,
+    /// The last `mantra_status` text each agent was given this turn. Runtime-only.
+    last_status: HashMap<AgentId, String>,
 }
 
 impl Run {
@@ -466,6 +478,9 @@ impl Run {
             last_health: Instant::now(),
             manager_escalation: None,
             manager_watchdog: None,
+            yielded: HashSet::new(),
+            yield_interrupted: HashSet::new(),
+            last_status: HashMap::new(),
         }
     }
 
@@ -1274,6 +1289,8 @@ Then summarize in 2-4 lines.",
             effort: None,
             extra_writable: vec![],
             context_override: None,
+            network: self.pattern.settings.network,
+            writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
         };
         let id = match resume {
@@ -1475,7 +1492,19 @@ Then summarize in 2-4 lines.",
         let glyph = role.glyph.clone();
         let context_override = w.context_override;
         let resumed = resume.is_some();
-        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable: vec![], context_override };
+        let req = SpawnReq {
+            name,
+            role_name: rname.clone(),
+            role,
+            cwd: dir.clone(),
+            instructions,
+            tools: tools::worker_tools(),
+            effort,
+            extra_writable: vec![],
+            context_override,
+            network: self.pattern.settings.network,
+            writable_roots: self.pattern.settings.writable_roots.clone(),
+        };
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -1623,6 +1652,8 @@ Then summarize in 2-4 lines.",
             effort: None,
             extra_writable: self.integ_writable(),
             context_override: None,
+            network: self.pattern.settings.network,
+            writable_roots: self.pattern.settings.writable_roots.clone(),
             role: role.clone(),
         });
         self.gate_agent = Some(id);
@@ -1754,6 +1785,8 @@ Then summarize in 2-4 lines.",
                 effort: None,
                 extra_writable: self.integ_writable(),
                 context_override: None,
+                network: self.pattern.settings.network,
+                writable_roots: self.pattern.settings.writable_roots.clone(),
                 role: role.clone(),
             })
         };
@@ -1942,6 +1975,13 @@ Then summarize in 2-4 lines.",
     }
 
     pub fn on_turn_done(&mut self, ctx: &mut dyn Ctx, a: AgentId, status: &str, error: Option<String>, kind: Option<ErrKind>) {
+        // A turn that ended after `mantra_wait` is a finished turn, even when the interrupt that
+        // refused a follow-up tool call made it report "interrupted": it is neither logged nor
+        // counted as one. The turn's yield state ends here, before anything else looks at the turn.
+        let was_yielded = self.yielded.remove(&a);
+        self.yield_interrupted.remove(&a);
+        self.last_status.remove(&a);
+        let status = if was_yielded && status == "interrupted" { "completed" } else { status };
         if !self.is_active() {
             return;
         }
@@ -2751,6 +2791,8 @@ Then summarize in 2-4 lines.",
             effort: None,
             extra_writable: vec![],
             context_override: None,
+            network: self.pattern.settings.network,
+            writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
         };
         let id = match resume {
@@ -3012,6 +3054,8 @@ Then summarize in 2-4 lines.",
             effort: None,
             extra_writable: vec![],
             context_override: None,
+            network: self.pattern.settings.network,
+            writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
         });
         self.orchestrator = Some(id);
@@ -3180,6 +3224,14 @@ Then summarize in 2-4 lines.",
     }
 
     fn handle_tool(&mut self, ctx: &mut dyn Ctx, a: AgentId, tool: &str, args: &Value) -> (String, bool) {
+        // A turn that already ended with `mantra_wait` takes no more tools: the first call after the
+        // yield interrupts the turn, and any further call in it is only refused.
+        if self.yielded.contains(&a) {
+            if self.yield_interrupted.insert(a) {
+                ctx.interrupt(a);
+            }
+            return ("Your turn already ended when you called mantra_wait. Do not call any more tools; Mantra wakes you with the next event.".into(), true);
+        }
         let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         let names = |k: &str| -> Vec<String> {
             match args.get(k) {
@@ -3262,7 +3314,17 @@ Then summarize in 2-4 lines.",
                 self.orch_inbox.push(format!("[from the {from}] {m}"));
                 ("delivered — the orchestrator acts on it right after your turn".into(), true)
             }
-            "mantra_status" => (if Some(a) == self.manager { self.overview_text(ctx) } else { self.status_text(ctx) }, true),
+            "mantra_status" => {
+                let text = if Some(a) == self.manager { self.overview_text(ctx) } else { self.status_text(ctx) };
+                if self.last_status.get(&a) == Some(&text) {
+                    // nothing has changed since this turn's last look: the only thing left is to wait
+                    self.yielded.insert(a);
+                    ("No change since your last mantra_status. Call mantra_wait now — Mantra wakes you when something happens.".into(), true)
+                } else {
+                    self.last_status.insert(a, text.clone());
+                    (text, true)
+                }
+            }
             "mantra_journal" => {
                 let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(40).clamp(1, 200) as usize;
                 let t = self.journal_text(n);
@@ -3423,7 +3485,10 @@ Then summarize in 2-4 lines.",
                     }
                 }
             }
-            "mantra_wait" => ("OK — end your turn now. Mantra will wake you with the next event.".into(), true),
+            "mantra_wait" => {
+                self.yielded.insert(a);
+                ("OK — end your turn now. Mantra will wake you with the next event.".into(), true)
+            }
             "mantra_ask" => {
                 let q = s("question");
                 if q.trim().is_empty() {
@@ -5465,5 +5530,75 @@ mod halt_tests {
 
         assert!(run.direct(&mut ctx, "orchestrator", "status?", Send::Auto), "a real message still goes through");
         assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("status?")));
+    }
+
+    // mantra_wait really ends the turn ----------------------------------------------------------
+
+    /// After `mantra_wait` the turn is over: the first tool call in it is refused and interrupts the
+    /// turn, and any later call in the same turn is refused again without a second interrupt.
+    #[test]
+    fn a_tool_call_after_mantra_wait_is_refused_and_interrupts_the_turn_once() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        run.orchestrator = Some(orch);
+
+        let (text, ok) = run.handle_tool(&mut ctx, orch, "mantra_wait", &json!({}));
+        assert!(ok && text.starts_with("OK"), "{text}");
+
+        let (text, ok) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
+        assert!(ok && text.starts_with("Your turn already ended when you called mantra_wait"), "{text}");
+        assert_eq!(ctx.interrupted, vec![orch], "the turn is interrupted at the first refused call");
+
+        let (text, _) = run.handle_tool(&mut ctx, orch, "mantra_wait", &json!({}));
+        assert!(text.starts_with("Your turn already ended"), "{text}");
+        let (text, _) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
+        assert!(text.starts_with("Your turn already ended"), "{text}");
+        assert_eq!(ctx.interrupted, vec![orch], "one interrupt per turn, however many calls follow");
+    }
+
+    /// A yielded turn that ends "interrupted" (by the refusal above) is a finished turn: nothing is
+    /// logged as interrupted, it counts as completed (so the manager's watchdog case closes), and the
+    /// yield is cleared.
+    #[test]
+    fn a_yielded_turn_that_ends_interrupted_counts_as_completed() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let manager = ctx.add_idle();
+        ready(&mut ctx, manager);
+        run.manager = Some(manager);
+        run.manager_watchdog = Some(ManagerCase { deadline: Instant::now(), about: "t1".into(), respawned: false });
+
+        run.handle_tool(&mut ctx, manager, "mantra_wait", &json!({}));
+        run.handle_tool(&mut ctx, manager, "mantra_status", &json!({})); // refused: interrupts the turn
+        run.on_turn_done(&mut ctx, manager, "interrupted", None, None);
+
+        assert!(!run.pulse.iter().any(|p| p.text.contains("interrupted")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        assert!(!run.yielded.contains(&manager), "the yield ends with the turn");
+        assert!(run.manager_watchdog.is_none(), "the turn counts as completed, so the manager's watchdog case closes");
+    }
+
+    /// Two `mantra_status` calls in one turn with nothing changed between them: the second says so and
+    /// asks for `mantra_wait`. A new turn starts from a fresh look, and a change shows up in full.
+    #[test]
+    fn a_repeated_status_with_nothing_new_says_so_and_yields() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        run.orchestrator = Some(orch);
+
+        let (first, _) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
+        assert!(!first.contains("No change"), "{first}");
+        let (second, _) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
+        assert!(second.starts_with("No change since your last mantra_status. Call mantra_wait now"), "{second}");
+        assert!(run.yielded.contains(&orch), "a further call in this turn is refused");
+
+        run.on_turn_done(&mut ctx, orch, "completed", None, None);
+        let worker_agent = ctx.add_busy();
+        run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
+        let (third, _) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
+        assert!(third.contains("t1") && !third.contains("No change"), "{third}");
     }
 }

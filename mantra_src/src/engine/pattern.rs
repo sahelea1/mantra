@@ -76,6 +76,15 @@ pub struct PatternSettings {
     /// health digest — every agent's state, the journal — and is asked whether anything needs
     /// unsticking. 0 turns the digest off (the manager is then woken by escalations only).
     pub manager_minutes: u64,
+    /// Workspace-write agents may use the network (package managers, docs). Codex's sandbox blocks it unless this is on.
+    #[serde(default = "default_true")]
+    pub network: bool,
+    /// Extra directories every workspace-write agent may write (`~` expands to the home dir), on top of the toolchain caches Mantra adds automatically.
+    pub writable_roots: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for PatternSettings {
@@ -94,6 +103,8 @@ impl Default for PatternSettings {
             watchdog_escalate_seconds: 240,
             review_minutes: 3,
             manager_minutes: 5,
+            network: true,
+            writable_roots: vec![],
         }
     }
 }
@@ -339,6 +350,7 @@ watchdog_seconds = 90
 watchdog_escalate_seconds = 240
 review_minutes = 3             # the orchestrator re-reads every worker's recent work this often (0 = off)
 manager_minutes = 5            # the manager gets a run-wide health digest this often (0 = escalations only)
+network = true                 # workspace-write agents may use the network (package managers, docs)
 
 [roles.planner]
 kind = "planner"

@@ -363,9 +363,105 @@ fn exec_bit_problem(_md: &std::fs::Metadata, _path: &Path) -> Option<String> {
     None // no exec bit to inspect; executability is decided by the extension there
 }
 
+/// Directories under the home dir that package managers and build tools keep their caches, state or
+/// SDK config in: a workspace-write agent cannot run them unless these are writable.
+const TOOLCHAIN_HOME_DIRS: &[&str] = &[".cache", ".pub-cache", ".gradle", ".android", ".kotlin", ".m2", ".npm", ".cargo", ".dartServer", ".dart-tool", ".dart", ".flutter", ".flutter-devtools", ".config/flutter"];
+
+/// The directories a workspace-write agent must be able to write to build with this machine's
+/// toolchains: the caches under the home dir, the `PUB_CACHE` / `GRADLE_USER_HOME` / `CARGO_HOME`
+/// overrides, and the Flutter SDK root. Only those that exist, each once, never the home dir itself.
+pub fn toolchain_writable_roots() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    toolchain_roots_with(home.as_deref(), |k| std::env::var_os(k).map(PathBuf::from), &path_var)
+}
+
+/// `toolchain_writable_roots` with its inputs passed in, so the candidate list can be tested.
+fn toolchain_roots_with(home: Option<&Path>, env: impl Fn(&str) -> Option<PathBuf>, path_var: &str) -> Vec<PathBuf> {
+    let mut cands: Vec<PathBuf> = home.map(|h| TOOLCHAIN_HOME_DIRS.iter().map(|d| h.join(d)).collect()).unwrap_or_default();
+    for var in ["PUB_CACHE", "GRADLE_USER_HOME", "CARGO_HOME"] {
+        cands.extend(env(var).filter(|p| !p.as_os_str().is_empty()));
+    }
+    cands.extend(flutter_sdk_root(path_var));
+    let home_canon = home.and_then(|h| h.canonicalize().ok());
+    let mut seen: Vec<PathBuf> = vec![];
+    let mut out = vec![];
+    for p in cands {
+        // canonicalize() is the existence check, and it lets two spellings of one directory count once
+        let Ok(canon) = p.canonicalize() else { continue };
+        if !canon.is_dir() || home_canon.as_ref() == Some(&canon) || seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon);
+        out.push(p);
+    }
+    out
+}
+
+/// `<sdk>` for the first executable `flutter` on PATH at `<sdk>/bin/flutter` (symlinks resolved).
+fn flutter_sdk_root(path_var: &str) -> Option<PathBuf> {
+    let bin = std::env::split_paths(path_var)
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.join("flutter"))
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && exec_bit_problem(&m, p).is_none()).unwrap_or(false))?;
+    let real = bin.canonicalize().ok()?;
+    real.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// `~` and `~/rest` expand to the home dir when there is one; any other path is taken as written.
+pub fn expand_tilde(p: &str, home: Option<&Path>) -> PathBuf {
+    let Some(h) = home else { return PathBuf::from(p) };
+    if p == "~" {
+        return h.to_path_buf();
+    }
+    p.strip_prefix("~/").map(|rest| h.join(rest)).unwrap_or_else(|| PathBuf::from(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn toolchain_roots_are_the_existing_caches_overrides_and_flutter_sdk_each_once() {
+        let root = scratch("toolchain");
+        let home = root.join("home");
+        for d in [".cargo", ".pub-cache", ".config/flutter"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let pub_cache = root.join("elsewhere-pub-cache");
+        std::fs::create_dir_all(&pub_cache).unwrap();
+        let sdk = root.join("flutter-sdk");
+        std::fs::create_dir_all(sdk.join("bin")).unwrap();
+        touch_exec(&sdk.join("bin").join("flutter"));
+        let path_var = path_of(&[&root.join("nothing-here"), &sdk.join("bin")]);
+        let env = |k: &str| match k {
+            "PUB_CACHE" => Some(pub_cache.clone()),
+            "CARGO_HOME" => Some(home.join(".cargo")),
+            _ => None,
+        };
+        let got = toolchain_roots_with(Some(&home), env, &path_var);
+        for want in [home.join(".cargo"), home.join(".pub-cache"), home.join(".config/flutter"), pub_cache.clone()] {
+            assert!(got.contains(&want), "{want:?} is missing from {got:?}");
+        }
+        assert_eq!(got.iter().filter(|p| **p == home.join(".cargo")).count(), 1, "CARGO_HOME and ~/.cargo are one root: {got:?}");
+        assert!(!got.contains(&home.join(".gradle")), "a cache that does not exist is not a root: {got:?}");
+        assert!(!got.contains(&home), "never the home dir itself: {got:?}");
+        assert!(got.contains(&sdk.canonicalize().unwrap()), "<sdk>/bin/flutter gives <sdk> as the root: {got:?}");
+        // without a home dir the caches under it are not candidates, but the env overrides and the SDK still are
+        let bare = toolchain_roots_with(None, env, &path_var);
+        assert!(!bare.contains(&home.join(".pub-cache")) && !bare.contains(&home.join(".config/flutter")), "{bare:?}");
+        assert!(bare.contains(&pub_cache) && bare.contains(&home.join(".cargo")) && bare.contains(&sdk.canonicalize().unwrap()), "{bare:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tilde_expands_to_the_home_dir_only_at_the_front() {
+        let home = Path::new("/home/someone");
+        assert_eq!(expand_tilde("~/.cargo", Some(home)), home.join(".cargo"));
+        assert_eq!(expand_tilde("~", Some(home)), home.to_path_buf());
+        assert_eq!(expand_tilde("/opt/x~y", Some(home)), PathBuf::from("/opt/x~y"));
+        assert_eq!(expand_tilde("~/.cargo", None), PathBuf::from("~/.cargo"));
+    }
+
     #[test]
     fn globs() {
         assert!(glob_match("src/**", "src/a/b.rs"));
