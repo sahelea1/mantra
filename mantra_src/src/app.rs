@@ -239,7 +239,7 @@ fn sandbox_overrides(sandbox: &str, network: bool, extra: &[PathBuf], pattern: &
     let workspace = sandbox == "workspace-write";
     let mut roots: Vec<PathBuf> = extra.to_vec();
     if workspace {
-        roots.extend(pattern.iter().map(|p| crate::util::expand_tilde(p, home)).filter(|p| p.is_dir()));
+        roots.extend(pattern.iter().map(|p| crate::util::expand_tilde(p, home)).filter(|p| crate::util::sandbox_can_own(p)));
         roots.extend(toolchain.iter().cloned());
     }
     let mut unique: Vec<PathBuf> = vec![];

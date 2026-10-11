@@ -2373,7 +2373,8 @@ Then summarize in 2-4 lines.",
             return;
         }
         let who = self.name_of(a);
-        self.halt(ctx, HaltReason::Environment, Some(a), format!("{who}: a command failed — the sandbox can't run commands here ({}). {}", trunc(&msg, 200), crate::util::sandbox_fix_hint()));
+        let hint = crate::util::writable_root_fix_hint(&msg).unwrap_or_else(|| crate::util::sandbox_fix_hint().to_string());
+        self.halt(ctx, HaltReason::Environment, Some(a), format!("{who}: a command failed — the sandbox can't run commands here ({}). {hint}", trunc(&msg, 200)));
     }
 
     pub fn on_crash(&mut self, ctx: &mut dyn Ctx, a: AgentId, reason: &str, restarting: bool) {

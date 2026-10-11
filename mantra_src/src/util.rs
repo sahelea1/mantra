@@ -389,13 +389,43 @@ fn toolchain_roots_with(home: Option<&Path>, env: impl Fn(&str) -> Option<PathBu
     for p in cands {
         // canonicalize() is the existence check, and it lets two spellings of one directory count once
         let Ok(canon) = p.canonicalize() else { continue };
-        if !canon.is_dir() || home_canon.as_ref() == Some(&canon) || seen.contains(&canon) {
+        if !sandbox_can_own(&canon) || home_canon.as_ref() == Some(&canon) || seen.contains(&canon) {
             continue;
         }
         seen.push(canon);
         out.push(p);
     }
     out
+}
+
+/// Can bubblewrap bind this directory writable for the agent? Inside the sandbox's user namespace
+/// the agent is root only over its own uid, so a directory another user owns cannot even take the
+/// `.codex` marker Codex creates in every writable root (`bwrap: Can't mkdir <root>/.codex:
+/// Permission denied`), and the whole sandbox fails to start. Linux only; elsewhere every
+/// directory passes.
+pub fn sandbox_can_own(p: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let me = match std::fs::metadata("/proc/self") {
+            Ok(m) => m.uid(),
+            Err(_) => return true,
+        };
+        return std::fs::metadata(p).map(|m| m.is_dir() && m.uid() == me).unwrap_or(false);
+    }
+    #[allow(unreachable_code)]
+    p.is_dir()
+}
+
+/// The fix hint for a bwrap failure that names a directory it could not set up: a writable root
+/// the user does not own, not a missing user namespace.
+pub fn writable_root_fix_hint(msg: &str) -> Option<String> {
+    let rest = msg.split("Can't mkdir ").nth(1)?;
+    let path = rest.split(':').next()?.trim();
+    let root = path.strip_suffix("/.codex").unwrap_or(path);
+    Some(format!(
+        "bwrap could not set up the writable root {root}: inside the sandbox only directories you own can be bound writable. `chown` it (or a copy of it) to your user, or drop it from the pattern's writable_roots; Mantra skips toolchain directories you do not own."
+    ))
 }
 
 /// `<sdk>` for the first executable `flutter` on PATH at `<sdk>/bin/flutter` (symlinks resolved).
@@ -603,6 +633,24 @@ mod tests {
         let p = f.display().to_string();
         assert_eq!(why, format!("{p} is not executable — chmod +x {p}"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bwrap_mkdir_failure_names_the_writable_root_not_user_namespaces() {
+        let hint = writable_root_fix_hint("bwrap: Can't mkdir /opt/flutter/.codex: Permission denied").unwrap();
+        assert!(hint.contains("writable root /opt/flutter") && !hint.contains("/.codex"), "{hint}");
+        assert!(writable_root_fix_hint("bwrap: setting up uid map: Permission denied").is_none());
+    }
+
+    #[test]
+    fn only_an_existing_directory_can_be_a_sandbox_root() {
+        let root = scratch("own");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(sandbox_can_own(&root));
+        assert!(!sandbox_can_own(&root.join("missing")));
+        std::fs::write(root.join("file"), "x").unwrap();
+        assert!(!sandbox_can_own(&root.join("file")), "a file is not a root");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
