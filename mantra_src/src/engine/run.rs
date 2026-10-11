@@ -1162,6 +1162,22 @@ Then summarize in 2-4 lines.",
         s
     }
 
+    /// What a `mantra_status` reader would act on: stage, worker states, activity, step progress and
+    /// the waiting/paused/stopped flags. Clocks and token counts are left out on purpose.
+    pub(super) fn status_fingerprint(&self, ctx: &dyn Ctx) -> String {
+        let mut s = format!("{:?}|", self.stage);
+        for w in &self.workers {
+            let a = w.agent.and_then(|a| ctx.agent(a));
+            let (act, prog, stopped) = match a {
+                Some(a) => (a.activity.clone(), a.plan_progress(), a.stopped_by_user),
+                None => (String::new(), (0, 0), false),
+            };
+            let waiting = w.agent.map(|a| self.pending_questions.contains_key(&a)).unwrap_or(false);
+            s.push_str(&format!("{}:{:?}:{act}:{prog:?}:{waiting}:{}:{stopped};", w.task.id, w.state, w.paused));
+        }
+        s
+    }
+
     /// Who must be busy right now, and why (WP7.1) — the watchdog's ground truth. An agent not in
     /// this list is never nudged no matter how long it has been idle (e.g. `Stage::Review`, where
     /// nobody is expected to act until the user does).
@@ -3316,12 +3332,15 @@ Then summarize in 2-4 lines.",
             }
             "mantra_status" => {
                 let text = if Some(a) == self.manager { self.overview_text(ctx) } else { self.status_text(ctx) };
-                if self.last_status.get(&a) == Some(&text) {
+                // Compare a fingerprint, not the text: elapsed times and token counts tick every
+                // second, which would let an idle agent poll forever and never see "no change".
+                let key = self.status_fingerprint(ctx);
+                if self.last_status.get(&a) == Some(&key) {
                     // nothing has changed since this turn's last look: the only thing left is to wait
                     self.yielded.insert(a);
                     ("No change since your last mantra_status. Call mantra_wait now — Mantra wakes you when something happens.".into(), true)
                 } else {
-                    self.last_status.insert(a, text.clone());
+                    self.last_status.insert(a, key);
                     (text, true)
                 }
             }
