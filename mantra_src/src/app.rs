@@ -1925,6 +1925,11 @@ impl App {
             match self.screen {
                 Screen::Zoom(_) if self.input.is_empty() => {
                     self.set_screen(Screen::Stage);
+                    // back onto a halted run with the keys live: the zoom header's "esc ▸ e
+                    // details" and the halt band's e / space / m / r then work on the next key
+                    if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
+                        self.canvas_focus = true;
+                    }
                 }
                 _ => {
                     self.input.clear();
@@ -2730,5 +2735,87 @@ mod tests {
         app.screen = Screen::Models;
         app.leave_screen();
         assert_eq!(app.screen, Screen::Stage);
+    }
+
+    /// Every row of a frame of `app` at `w`×`h`, trimmed.
+    fn frame(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    fn halted_app() -> App {
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.title = "Ship the feature flags".into();
+        run.planner = Some(1);
+        run.halt = Some(crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent: Some(1), message: "rejected".into(), full: "rejected".into(), since: Instant::now() });
+        app.agents.insert(1, Agent::new(1, "planner", "planner", PathBuf::new()));
+        app.run = Some(run);
+        app
+    }
+
+    /// A run that halts while zoomed in used to be invisible there: the zoomed header names the
+    /// run and says it is halted, and esc lands on the overview with the band's keys live.
+    #[test]
+    fn a_halt_shows_in_the_zoomed_header_and_esc_makes_its_keys_live() {
+        for w in [120, 80] {
+            let mut app = halted_app();
+            app.screen = Screen::Zoom(1);
+            let top = frame(&mut app, w, 24).remove(0);
+            assert!(top.contains("halted") && top.contains("e details"), "{w}: {top:?}");
+            assert!(top.contains("Ship the feature"), "{w}: {top:?}");
+        }
+        let mut app = halted_app();
+        app.screen = Screen::Zoom(1);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Stage);
+        assert!(app.canvas_focus, "the band's e / space / m / r work on the next key");
+    }
+
+    /// In typing focus the halt band's keys would only type: it says how to reach them instead.
+    #[test]
+    fn the_halt_band_is_honest_about_typing_focus() {
+        let mut app = halted_app();
+        app.screen = Screen::Stage;
+        app.canvas_focus = false;
+        let rows = frame(&mut app, 120, 36);
+        assert!(rows[2].contains("tab for keys") && !rows[2].contains("e details"), "{:?}", rows[2]);
+        app.canvas_focus = true;
+        let rows = frame(&mut app, 120, 36);
+        assert!(rows[2].contains("e details") && !rows[2].contains("tab for keys"), "{:?}", rows[2]);
+    }
+
+    /// Over-scrolling an overlay used to leave the stored offset past the end, so ↑ needed as
+    /// many presses before the view moved: drawing clamps it.
+    #[test]
+    fn overlay_scroll_offsets_are_clamped_when_drawn() {
+        let mut app = halted_app();
+        app.overlays.push(Overlay::Help { scroll: 999 });
+        frame(&mut app, 80, 24);
+        let Some(Overlay::Help { scroll }) = app.overlays.last() else { panic!("help closed") };
+        let max = *scroll;
+        assert!(max > 0 && max < 999, "{max}");
+        let last = frame(&mut app, 80, 24);
+        app.overlays = vec![Overlay::Help { scroll: max - 1 }];
+        assert_ne!(last, frame(&mut app, 80, 24), "one ↑ moves the view");
+        app.overlays = vec![Overlay::Halt { scroll: 999 }];
+        frame(&mut app, 80, 24);
+        assert!(matches!(app.overlays.last(), Some(Overlay::Halt { scroll: 0 })), "a halt that fits does not scroll");
+    }
+
+    /// At 80 columns the model picker keeps effort, context and its whole key line.
+    #[test]
+    fn the_model_picker_fits_80_columns() {
+        let mut app = screen_app();
+        let efforts = vec!["low".to_string(), "medium".into(), "high".into()];
+        app.registry.models.push(crate::config::ModelEntry { alias: "longalias9".into(), model: "a-rather-long-model-identifier".into(), efforts, default_effort: "medium".into(), ..Default::default() });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        let rows = frame(&mut app, 80, 30);
+        let keys = rows.iter().find(|l| l.contains("model ") && l.contains("switch")).expect("key line");
+        assert!(keys.contains("esc"), "{keys:?}");
+        let row = rows.iter().find(|l| l.contains("longalias9")).expect("model row");
+        assert!(row.contains("medium") && row.contains("ctx"), "{row:?}");
     }
 }
