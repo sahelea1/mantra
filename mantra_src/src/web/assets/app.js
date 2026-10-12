@@ -252,13 +252,8 @@
     const BANNER_ROUTES = { team: 1, settings: 1, more: 1 };
     const TITLES = { run: 'Run', pulse: 'Pulse', inbox: 'Inbox', runs: 'Runs', settings: 'Settings', more: 'More' };
 
-    // Where the run is, for the headers: the stage label, and whether it's stopped there (as
-    // `mantra runs` puts it).
-    function runWhere(run) {
-        const st = run.stage || {};
-        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
-        return (st.label || '') + (stopped ? (run.halted.reason === 'user' ? ' · paused' : ' · halted') : '');
-    }
+    // Where the run is, for the headers — the same words as the run card.
+    const runWhere = (run) => P.stageWhere(run);
     function topbar(r) {
         const app = S.app || {};
         const sub = r.name === 'team' ? (S.run ? runWhere(S.run) + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')

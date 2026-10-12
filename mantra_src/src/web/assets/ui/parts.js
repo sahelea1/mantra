@@ -237,11 +237,16 @@
                 full ? h('span', { class: 'seg-label' }, s.label) : h('span', { class: 'seg-short' }, s.short))));
     }
 
+    // Where the run is: the stage label, or — while it's stopped — the stage and that it is
+    // ("phase 1 · halted", not the step it was on when it stopped).
+    function stageWhere(run) {
+        const st = run.stage || {}, label = st.label || '';
+        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
+        return stopped ? (label ? label.split(' · ')[0] + ' · ' : '') + stoppedWord(run.halted) : label;
+    }
     function runSummary(run) {
         const bits = [];
-        // "phase 1 · halted", not the step it was on when it stopped
-        const label = run.stage ? run.stage.label : '';
-        bits.push(run.halted && label ? label.split(' · ')[0] + ' · ' + stoppedWord(run.halted) : label);
+        bits.push(stageWhere(run));
         if (run.elapsed_ms) bits.push(F.durShort(run.elapsed_ms));
         if (run.total_tokens) bits.push(F.tokens(run.total_tokens) + ' tok');
         if (run.busy_count) bits.push(run.busy_count + ' busy');
@@ -448,6 +453,6 @@
     M.parts = {
         glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
-        haltBand, haltPrimary, haltResumeLabel, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
+        haltBand, haltPrimary, haltResumeLabel, stageWhere, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };
 })(window.Mantra = window.Mantra || {});
