@@ -702,8 +702,13 @@ pub fn notification_for(note: &str, app: &crate::app::App) -> Option<Push> {
         return None;
     }
     let p = |kind: &str, title: String, body: String, url: String, high: bool| Some(Push { kind: kind.into(), title, body, url, urgency_high: high });
+    // A halt or a finished run names the run (its title, not its id) after the headline.
+    let named = |head: &str| match app.run.as_ref().map(|r| r.title.trim()).filter(|t| !t.is_empty()) {
+        Some(t) => format!("{head} · {t}"),
+        None => head.to_string(),
+    };
     if let Some(rest) = note.strip_prefix("Mantra needs you:") {
-        return p("halt", "Mantra needs you".into(), rest.trim().into(), "/run".into(), true);
+        return p("halt", named("Mantra needs you"), rest.trim().into(), "/run".into(), true);
     }
     let Some(rest) = note.strip_prefix("Mantra: ") else {
         return p("info", "Mantra".into(), note.into(), "/".into(), false);
@@ -729,7 +734,7 @@ pub fn notification_for(note: &str, app: &crate::app::App) -> Option<Push> {
         return p("review", "Plan ready for review".into(), title, "/run".into(), false);
     }
     if let Some(more) = rest.strip_prefix("run complete") {
-        return p("done", "Run complete".into(), more.trim_start_matches([' ', '—', '-', ':', '·']).trim().into(), "/run".into(), false);
+        return p("done", named("Run complete"), more.trim_start_matches([' ', '—', '-', ':', '·']).trim().into(), "/run".into(), false);
     }
     if let Some(status) = rest.strip_prefix("Solo turn ") {
         let ok = status.trim() == "completed";
@@ -763,6 +768,13 @@ mod tests {
         assert_eq!(notification_for("Mantra: plan ready for review", &app).unwrap().kind, "review");
         let n = notification_for("Mantra: run complete — branch mantra/x", &app).unwrap();
         assert_eq!((n.kind.as_str(), n.body.as_str()), ("done", "branch mantra/x"));
+        let mut run = crate::engine::run::Run::new(std::path::PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.title = "Notes sync".into();
+        app.run = Some(run);
+        let n = notification_for("Mantra: run complete — branch mantra/x", &app).unwrap();
+        assert_eq!((n.title.as_str(), n.body.as_str()), ("Run complete · Notes sync", "branch mantra/x"), "a run is named by its title");
+        assert_eq!(notification_for("Mantra needs you: the gate failed twice", &app).unwrap().title, "Mantra needs you · Notes sync");
+        app.run = None;
         let n = notification_for("Mantra: Solo turn failed", &app).unwrap();
         assert_eq!((n.kind.as_str(), n.title.as_str()), ("turn", "Solo turn failed"));
         assert_eq!(notification_for("Mantra: run failed: boom", &app).unwrap().kind, "failed");
