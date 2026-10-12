@@ -469,8 +469,9 @@
     // `opts.except`: an alias left out; `opts.none`: a first "None" entry (picked as null).
     function modelPickList(currentAlias, onPick, opts) {
         opts = opts || {};
-        const models = ((S.app && S.app.models) || []).filter((m) => m.alias !== opts.except);
-        if (!models.length) return P.empty('model', 'No models', 'The model registry is empty.');
+        const all = (S.app && S.app.models) || [];
+        if (!all.length) return P.empty('model', 'No models', 'The model registry is empty.');
+        const models = all.filter((m) => m.alias !== opts.except);
         const none = opts.none ? h('button', { type: 'button', key: '-none', class: 'pick' + (currentAlias ? '' : ' on'), onclick: () => onPick(null) },
             h('span', { class: 'pick-main' }, h('b', null, 'None')), h('span', { class: 'pick-sub' }, opts.none),
             currentAlias ? null : icon('check', 'pick-check')) : null;
