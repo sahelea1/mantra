@@ -27,9 +27,24 @@ Both interfaces catch up with 0.6.0, and were checked frame by frame (the TUI at
   pattern that does not load is marked and cannot be picked.
 - **Effort `auto` and fallbacks are visible.** `auto` gets its own colour in the TUI and the
   web roles screen, which also shows each role's fallback.
+- **One clear action per halt.** The web hero and halt band offer the same primary button for
+  each halt kind (Resume after a model change; Retry for a gate or a failed turn), the hint
+  names that button, and long "Retry <task>" labels end in … instead of running off a phone.
+  A stopped run reads "phase 1 · halted" / "paused" on its card, headers and agents instead of
+  "working". The browser tab shows the run title.
+- **Fallbacks from the web.** Roles & models can set or clear a role's fallback model
+  (`set_role_fallback`, refused for an unknown alias or the role's own model); `auto` effort
+  is shown muted rather than as an accent on every chip.
+- **The TUI never hides a halt.** The zoomed view's header carries the run title and a
+  `⛔ halted` / `‖ paused` marker (esc lands on the keys that help); in typing focus the band
+  says `tab for keys` instead of advertising keys that would type letters.
+- **80 columns work.** The model picker drops columns before its key line, the welcome tagline
+  wraps at a word, Studio text rows use their full width, and help, halt details, plan and
+  diff clamp their scroll so ↑ moves at once after over-scrolling.
 - **Smaller fixes:** the help overlay scrolls instead of losing its last rows; a word that
   exactly fills a line no longer pushes a stray space onto the next; the fix-round step reads
-  "QA gate · fix r<n>"; the web run card no longer wraps its state label in the sidebar.
+  "QA gate · fix r<n>"; the web run card no longer wraps its state label in the sidebar; the
+  snapshot script language gains `pgdn`.
 
 ## v0.6.0 — 2026-10-12
 
