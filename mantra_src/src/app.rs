@@ -2767,6 +2767,13 @@ mod tests {
             assert!(top.contains("halted") && top.contains("e details"), "{w}: {top:?}");
             assert!(top.contains("Ship the feature"), "{w}: {top:?}");
         }
+        // a long task id is cut so the marker still fits at 80 columns
+        let mut app = halted_app();
+        app.screen = Screen::Zoom(1);
+        let a = app.agents.get_mut(&1).unwrap();
+        (a.name, a.model_alias) = ("p2-session-store-and-auth-middleware-rewrite".into(), "luna".into());
+        let top = frame(&mut app, 80, 24).remove(0);
+        assert!(top.contains("halted") && top.ends_with("e details"), "{top:?}");
         let mut app = halted_app();
         app.screen = Screen::Zoom(1);
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

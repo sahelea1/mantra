@@ -135,7 +135,9 @@ fn zoomed_header(f: &mut Frame, area: Rect, app: &App, a: &Agent) {
         None => (String::new(), "zoomed · esc back to overview "),
     };
     let w = area.width as usize;
-    // the marker never gives way; "zoomed" does, then the title (which gets up to 40 columns)
+    // the marker never gives way; "zoomed" does, then the title (which gets up to 40 columns),
+    // and a long agent name is cut before it
+    let left = trunc(&left, w.saturating_sub(w_of(&stop) + 2));
     let right = if w_of(&left) + w_of(&stop) + w_of(right) + 2 <= w { right } else { "" };
     let tw = w.saturating_sub(w_of(&left) + w_of(&stop) + w_of(right) + 2 + 3).min(40);
     let title = run.map(|r| r.title.as_str()).filter(|t| !t.is_empty() && tw >= 6).map(|t| format!("{} · ", trunc(t, tw))).unwrap_or_default();
