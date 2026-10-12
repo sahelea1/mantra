@@ -2,6 +2,21 @@
 
 All notable changes to Mantra are recorded here.
 
+## Unreleased
+
+- **No-first-token deadline, with a fallback model.** An agent whose active turn produces nothing at
+  all (no tokens, no text, no tool activity — a silent gateway or an endless "Reconnecting… n/5")
+  for `settings.first_token_minutes` (default 4, `0` = off) is restarted once; the second time in a
+  row its role's new optional `fallback = "<alias>"` model takes over, or — without one — the
+  manager is asked. A completed turn clears the count.
+- **Quiet manager digests.** The periodic health digest is skipped when no journal line, worker
+  state or agent state changed since the previous one.
+- **Full halt errors.** The pulse line and the stage band keep the short form; the journal,
+  `state.json` and the manager's escalation get the backend's whole error.
+- **Changing a model never resumes a halted run.** The change applies and a toast says to resume
+  (`space` / Resume). A user pause and a dropped pending transition are now saved at once, and
+  every journal line marks the state for a flush on the next tick.
+
 ## v0.5.0 — 2026-09-26
 
 Mantra leaves the terminal. `--web` serves the same running session as a small, installable web

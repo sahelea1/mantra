@@ -223,6 +223,15 @@ pub enum Expect {
     Managing,
 }
 
+/// What a health digest would have to report on: the journal's length, every worker's state and
+/// every agent's status. Unchanged since the last digest means there is nothing new to say.
+#[derive(Debug, Clone, PartialEq)]
+struct HealthPrint {
+    journal: u64,
+    workers: Vec<(String, &'static str)>,
+    agents: Vec<(AgentId, bool, Status)>,
+}
+
 /// A halt handed to the manager (`flow.manager`) before the planner: when, by when it must have
 /// acted (else the planner gets it), whether it has had its one reminder, and the halt's message
 /// so the planner's escalation can carry the same text.
@@ -298,7 +307,11 @@ pub enum HaltReason {
 pub struct Halt {
     pub reason: HaltReason,
     pub agent: Option<AgentId>,
+    /// The short form: what the pulse line, the stage band and the alert show.
     pub message: String,
+    /// The same halt with nothing cut off (the backend's whole error): what `state.json`, the
+    /// journal and the manager get. Equal to `message` when nothing was shortened.
+    pub full: String,
     pub since: Instant,
 }
 
@@ -400,6 +413,18 @@ pub struct Run {
     manager_inbox: Vec<String>,
     /// When the manager last got a health digest (`settings.manager_minutes`).
     last_health: Instant,
+    /// What the run looked like at the last health digest (`health_fingerprint`), so a quiet
+    /// stretch costs the manager nothing.
+    last_health_print: Option<HealthPrint>,
+    /// Something happened (a journal line was written) since `state.json` was last flushed by
+    /// `flush_state` — the event-driven half of persistence, debounced to the tick cadence.
+    state_dirty: bool,
+    /// Per slot (`first_token_key`): how many times its turn sat through `first_token_minutes`
+    /// without any output since it last completed a turn. The slot, not the `AgentId`, because the
+    /// first strike respawns the agent.
+    first_token_strikes: HashMap<String, u8>,
+    /// Agents already acted on for their current silent spell, so one spell is one strike.
+    first_token_flagged: HashSet<AgentId>,
     /// A halt currently in the manager's hands (see `escalate_to_manager`).
     manager_escalation: Option<ManagerEscalation>,
     /// The watchdog woke the manager about an idle agent (ladder step 3). Cleared when the manager
@@ -476,6 +501,10 @@ impl Run {
             silent_flagged: HashSet::new(),
             manager_inbox: vec![],
             last_health: Instant::now(),
+            last_health_print: None,
+            state_dirty: false,
+            first_token_strikes: HashMap::new(),
+            first_token_flagged: HashSet::new(),
             manager_escalation: None,
             manager_watchdog: None,
             yielded: HashSet::new(),
@@ -493,15 +522,22 @@ impl Run {
         self.pulse_seq += 1;
         let p = Pulse { n: self.pulse_seq, at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
         crate::mlog!("[run {}] {} {}", self.id, p.glyph, p.text);
-        let line = json!({"t": crate::util::unix_secs(), "glyph": p.glyph, "text": p.text}).to_string();
+        self.journal_line(&p.glyph, &p.text);
+        self.pulse.push_back(p);
+        while self.pulse.len() > 300 {
+            self.pulse.pop_front();
+        }
+        self.state_dirty = true;
+    }
+
+    /// Append one line to `journal.jsonl` only (no pulse entry): for text too long for the feed
+    /// but worth keeping whole, like the backend's complete error behind a halt.
+    fn journal_line(&self, glyph: &str, text: &str) {
+        let line = json!({"t": crate::util::unix_secs(), "glyph": glyph, "text": text}).to_string();
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl")) {
             use std::io::Write;
             let _ = writeln!(f, "{line}");
-        }
-        self.pulse.push_back(p);
-        while self.pulse.len() > 300 {
-            self.pulse.pop_front();
         }
     }
 
@@ -574,7 +610,7 @@ impl Run {
             pattern: self.pattern.name.clone(),
             plan_version: self.plan_version,
             stage: self.stage.clone(),
-            halted: self.halt.as_ref().map(|h| h.message.clone()),
+            halted: self.halt.as_ref().map(|h| h.full.clone()),
             pending: self.pending.clone(),
             started_unix: self.started_unix,
             finished_unix: self.finished_unix,
@@ -647,9 +683,18 @@ impl Run {
         self.halt.is_some()
     }
 
-    /// Halt the run: interrupt whatever is busy, remember why, journal and alert. Every failure
-    /// the run cannot handle by itself goes through here instead of a bare pause flag.
+    /// `halt_full` with a message that needs no shortening.
+    #[cfg(test)]
     fn halt(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String) {
+        self.halt_full(ctx, reason, agent, message.clone(), message);
+    }
+
+    /// Halt the run: interrupt whatever is busy, remember why, journal and alert. Every failure
+    /// the run cannot handle by itself goes through here instead of a bare pause flag. The
+    /// message comes in two lengths: `message` for the pulse line, the band and the alert; `full`
+    /// — the backend's whole error, nothing cut off — for the journal, `state.json` and whoever
+    /// the halt is escalated to.
+    fn halt_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
         for a in self.all_agents() {
             // The manager is not part of the work being stopped — it is who gets told about the
             // halt next, mid-turn or not (a steer into its running turn is exactly right), and it
@@ -672,16 +717,19 @@ impl Run {
             }
         }
         self.log("⛔", "red", format!("halted: {message}"));
+        if full != message {
+            self.journal_line("⛔", &format!("halted (full): {}", crate::util::strip_ansi(&full)));
+        }
         self.alerts.push(message.clone());
         ctx.notify(&format!("Mantra needs you: {message}"));
-        self.halt = Some(Halt { reason, agent, message, since: Instant::now() });
+        self.halt = Some(Halt { reason, agent, message, full, since: Instant::now() });
         self.clock_stop();
         self.save_state();
     }
 
     /// Un-halt: re-prompt every agent that was interrupted for this, and pick the run back up
-    /// wherever it left off. Used by `toggle_pause`'s resume path and by `m` (switch model) on a
-    /// `ProviderRejected` halt.
+    /// wherever it left off. Always an explicit act — `space` / Resume, a retry, or the
+    /// manager/planner acting on an escalation; changing a model never calls it.
     pub fn resume(&mut self, ctx: &mut dyn Ctx) {
         self.resume_by(ctx, None);
     }
@@ -786,6 +834,7 @@ impl Run {
     fn drop_pending(&mut self, why: &str) {
         if let Some(p) = self.pending.take() {
             self.log("‖", "amber", format!("{} was due — dropped: {why}", p.label()));
+            self.save_state();
         }
     }
 
@@ -814,10 +863,17 @@ impl Run {
     /// (gate exhausted, attempts exhausted) is handed to the planner with everything it needs to
     /// decide — revise the phase, give the stuck agent a hint and resume, or ask the user.
     fn halt_and_escalate(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String) {
+        self.halt_and_escalate_full(ctx, reason, agent, message.clone(), message);
+    }
+
+    /// `halt_and_escalate` with the untruncated text (see `halt_full`): the escalation prompt
+    /// carries `full`, so the manager or planner reads the real error.
+    fn halt_and_escalate_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
         if self.halted() {
             return;
         }
-        self.halt(ctx, reason, agent, message.clone());
+        self.halt_full(ctx, reason, agent, message, full.clone());
+        let message = full;
         // With a manager in the pattern it is first in line — it has the operational tools
         // (hint, retry, respawn, resume) and hands a plan problem up itself. Without one, or if
         // it does not act in time (`manager_tick`), the planner gets it as before.
@@ -833,10 +889,16 @@ impl Run {
     /// else is asked: the planner may be the failing agent itself. The manager is never its own
     /// case here (its failures drop it, see `on_turn_done`).
     fn halt_turn_failed(&mut self, ctx: &mut dyn Ctx, agent: Option<AgentId>, message: String) {
+        self.halt_turn_failed_full(ctx, agent, message.clone(), message);
+    }
+
+    /// `halt_turn_failed` with the untruncated text (see `halt_full`).
+    fn halt_turn_failed_full(&mut self, ctx: &mut dyn Ctx, agent: Option<AgentId>, message: String, full: String) {
         if self.halted() {
             return;
         }
-        self.halt(ctx, HaltReason::AgentTurnFailed, agent, message.clone());
+        self.halt_full(ctx, HaltReason::AgentTurnFailed, agent, message, full.clone());
+        let message = full;
         if self.has_manager() && agent != self.manager {
             self.escalate_to_manager(ctx, message, false);
         }
@@ -1420,12 +1482,16 @@ Then summarize in 2-4 lines.",
         let attempt = self.workers.iter().filter(|w| w.task.id == task.id).map(|w| w.attempt).max().unwrap_or(0) + 1;
         let cap = self.max_attempts();
         if attempt > cap {
-            let last = self.workers.iter().rev().find(|w| w.task.id == task.id).map(|w| match &w.state {
-                WState::Failed(m) => format!(" Last failure: {}.", trunc(m, 160)),
-                _ => String::new(),
-            }).unwrap_or_default();
-            let msg = format!("{} has used all {cap} attempts — not respawning.{last}", task.id);
-            self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, None, msg.clone());
+            let failure = self.workers.iter().rev().find(|w| w.task.id == task.id).and_then(|w| match &w.state {
+                WState::Failed(m) => Some(m.clone()),
+                _ => None,
+            });
+            // the pulse line and the band keep the short form; the journal, `state.json` and the
+            // escalation get the whole last failure
+            let tail = |m: Option<String>| m.map(|m| format!(" Last failure: {m}.")).unwrap_or_default();
+            let msg = format!("{} has used all {cap} attempts — not respawning.{}", task.id, tail(failure.as_ref().map(|m| trunc(m, 160))));
+            let full = format!("{} has used all {cap} attempts — not respawning.{}", task.id, tail(failure));
+            self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, None, msg.clone(), full);
             return format!("REFUSED: {msg}");
         }
         let queued = running >= self.pattern.settings.max_parallel;
@@ -1928,7 +1994,14 @@ Then summarize in 2-4 lines.",
                     let sig = failing_sig(&self.checks);
                     if self.last_verify_sig.as_deref() == Some(sig.as_str()) {
                         let gate = self.gate_agent;
-                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, gate, format!("phase {} gate: the same check(s) fail identically after two gate rounds — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
+                        let cmds = failing_cmds(&self.checks);
+                        self.halt_and_escalate_full(
+                            ctx,
+                            HaltReason::GateExhausted,
+                            gate,
+                            format!("phase {} gate: the same check(s) fail identically after two gate rounds — {}", phase + 1, trunc(&cmds, 80)),
+                            format!("phase {} gate: the same check(s) fail identically after two gate rounds — {cmds}", phase + 1),
+                        );
                         return;
                     }
                     self.last_verify_sig = Some(sig);
@@ -1953,7 +2026,14 @@ Then summarize in 2-4 lines.",
                     }
                 } else {
                     let gate = self.gate_agent;
-                    self.halt_and_escalate(ctx, HaltReason::GateExhausted, gate, format!("phase {} gate still failing after {} rounds: {}", phase + 1, round, trunc(&failing_cmds(&self.checks), 80)));
+                    let cmds = failing_cmds(&self.checks);
+                    self.halt_and_escalate_full(
+                        ctx,
+                        HaltReason::GateExhausted,
+                        gate,
+                        format!("phase {} gate still failing after {} rounds: {}", phase + 1, round, trunc(&cmds, 80)),
+                        format!("phase {} gate still failing after {} rounds: {cmds}", phase + 1, round),
+                    );
                 }
             }
             (JobTag::Cleanup { phase }, JobOut::Text(r)) => {
@@ -2105,17 +2185,19 @@ Then summarize in 2-4 lines.",
                     }
                 }
                 let n = self.name_of(a);
-                let detail = if reason == HaltReason::ProviderRejected {
+                // The pulse line keeps the short form; the journal, `state.json` and the escalation
+                // get the backend's whole error.
+                let (detail, full) = if reason == HaltReason::ProviderRejected {
                     let (alias, provider) = ctx.agent(a).map(|ag| (ag.model_alias.clone(), ag.provider.clone())).unwrap_or_default();
                     let role = self.role_name_of(a).unwrap_or_default();
-                    format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120))
+                    (format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120)), format!("{n} [{role}] ({alias} via {provider}): {msg}"))
                 } else {
-                    format!("{n}: {}", trunc(&msg, 120))
+                    (format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"))
                 };
                 if reason == HaltReason::AgentTurnFailed {
-                    self.halt_turn_failed(ctx, Some(a), detail);
+                    self.halt_turn_failed_full(ctx, Some(a), detail, full);
                 } else if !self.halted() {
-                    self.halt(ctx, reason, Some(a), detail);
+                    self.halt_full(ctx, reason, Some(a), detail, full);
                 }
                 self.retry_counts.remove(&a);
                 return;
@@ -2125,6 +2207,9 @@ Then summarize in 2-4 lines.",
             self.retry_counts.remove(&a);
             if let Some(tag) = self.watchdog_role_tag(a) {
                 self.turn_fail_retried.remove(&tag);
+            }
+            if let Some(key) = self.first_token_key(a) {
+                self.first_token_strikes.remove(&key);
             }
         }
 
@@ -2223,7 +2308,13 @@ Then summarize in 2-4 lines.",
                         let repeated = !sig.is_empty() && self.last_gate_blocker.as_deref() == Some(sig.as_str());
                         self.last_gate_blocker = Some(sig);
                         if repeated {
-                            self.halt_and_escalate(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate stuck on the same blocker twice: {}", idx + 1, trunc(&why, 80)));
+                            self.halt_and_escalate_full(
+                                ctx,
+                                HaltReason::GateExhausted,
+                                Some(a),
+                                format!("phase {} gate stuck on the same blocker twice: {}", idx + 1, trunc(&why, 80)),
+                                format!("phase {} gate stuck on the same blocker twice: {why}", idx + 1),
+                            );
                         } else if round < self.pattern.settings.gate_max_rounds {
                             self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: round + 1 } };
                             self.gate_report = None;
@@ -2240,7 +2331,13 @@ Then summarize in 2-4 lines.",
                                 ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
                             }
                         } else {
-                            self.halt_and_escalate(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)));
+                            self.halt_and_escalate_full(
+                                ctx,
+                                HaltReason::GateExhausted,
+                                Some(a),
+                                format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)),
+                                format!("phase {} gate not passed after {round} rounds: {why}", idx + 1),
+                            );
                         }
                     }
                 }
@@ -2374,7 +2471,13 @@ Then summarize in 2-4 lines.",
         }
         let who = self.name_of(a);
         let hint = crate::util::writable_root_fix_hint(&msg).unwrap_or_else(|| crate::util::sandbox_fix_hint().to_string());
-        self.halt(ctx, HaltReason::Environment, Some(a), format!("{who}: a command failed — the sandbox can't run commands here ({}). {hint}", trunc(&msg, 200)));
+        self.halt_full(
+            ctx,
+            HaltReason::Environment,
+            Some(a),
+            format!("{who}: a command failed — the sandbox can't run commands here ({}). {hint}", trunc(&msg, 200)),
+            format!("{who}: a command failed — the sandbox can't run commands here ({msg}). {hint}"),
+        );
     }
 
     pub fn on_crash(&mut self, ctx: &mut dyn Ctx, a: AgentId, reason: &str, restarting: bool) {
@@ -2419,6 +2522,12 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.last_tick = Instant::now();
+        // Persistence is event-driven: every journal line marks the state dirty, and this flush —
+        // at most once per tick, which is the debounce — writes it out, halted or not.
+        if self.state_dirty {
+            self.state_dirty = false;
+            self.save_state();
+        }
         if !self.is_active() {
             return;
         }
@@ -2550,6 +2659,7 @@ Then summarize in 2-4 lines.",
                 self.wake_planner_for_idle(ctx, &about);
             }
         }
+        self.first_token_tick(ctx);
         let ws_secs = self.pattern.settings.watchdog_seconds.max(1);
         let es_secs = self.pattern.settings.watchdog_escalate_seconds.max(ws_secs + 1);
         // The stall tripwire in `tick` only walks `self.workers`, and the ladder below only ever
@@ -2607,6 +2717,106 @@ Then summarize in 2-4 lines.",
         for (a, expect, stage, idle) in actions {
             self.watchdog_act(ctx, a, expect, stage, idle);
         }
+    }
+
+    /// The no-first-token deadline (`settings.first_token_minutes`). The ladder above only sees
+    /// idle agents and the stall line only busy-but-quiet ones, but a gateway that takes the turn
+    /// and never answers — or loops on "Reconnecting… n/5" — keeps moving `last_event` with its
+    /// own retry notices. What it never does is produce output, which `Agent::first_token_wait`
+    /// measures: an active turn with no tokens, text or tool activity since it began.
+    fn first_token_tick(&mut self, ctx: &mut dyn Ctx) {
+        let mins = self.pattern.settings.first_token_minutes;
+        if mins == 0 {
+            return;
+        }
+        let limit = Duration::from_secs(mins * 60);
+        let live = self.all_agents();
+        let mut over = vec![];
+        for a in &live {
+            match ctx.agent(*a).and_then(|x| x.first_token_wait()) {
+                // one silent spell is one strike, however many ticks it lasts
+                Some(w) if w >= limit => {
+                    if self.first_token_flagged.insert(*a) {
+                        over.push((*a, w));
+                    }
+                }
+                _ => {
+                    self.first_token_flagged.remove(a);
+                }
+            }
+        }
+        self.first_token_flagged.retain(|a| live.contains(a));
+        for (a, waited) in over {
+            self.on_first_token_deadline(ctx, a, waited);
+        }
+    }
+
+    /// The slot an agent fills, which — unlike its `AgentId` — survives the respawn the first
+    /// strike causes.
+    fn first_token_key(&self, a: AgentId) -> Option<String> {
+        self.watchdog_role_tag(a).or_else(|| self.workers.iter().find(|w| w.agent == Some(a)).map(|w| format!("worker:{}", w.task.id)))
+    }
+
+    /// An agent sat through the deadline with nothing back. First time in a row for its slot: a
+    /// fresh process and thread, told to carry on (the interrupt-and-resend). Second time: the
+    /// role's `fallback` model if it has one, else the manager is asked (or, with nobody above
+    /// to ask, the run halts for the user). A completed turn clears the slot's count.
+    fn on_first_token_deadline(&mut self, ctx: &mut dyn Ctx, a: AgentId, waited: Duration) {
+        let Some(key) = self.first_token_key(a) else { return };
+        let name = self.name_of(a);
+        let strikes = {
+            let n = self.first_token_strikes.entry(key.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let quiet = fmt_dur(waited);
+        if strikes == 1 {
+            self.log("↻", "amber", format!("{name}: no output for {quiet} — restarting its turn (first-token deadline)"));
+            let note = format!("[mantra:watchdog] Your previous turn produced no output for {quiet} (the model connection looked stalled) and was restarted. Continue where you left off.");
+            if let Err(e) = self.respawn(ctx, a, Some(note)) {
+                self.log("!", "amber", format!("{name}: could not restart ({e})"));
+            }
+            return;
+        }
+        let role_name = self.role_name_of(a);
+        let running = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
+        let fallback = role_name
+            .as_ref()
+            .and_then(|r| self.pattern.role(r))
+            .and_then(|r| r.fallback.clone().filter(|f| !f.trim().is_empty() && *f != r.model && *f != running));
+        if let (Some(alias), Some(role_name)) = (fallback, role_name) {
+            self.log("↻", "amber", format!("{name}: no output twice — falling back to {alias}"));
+            if let Some(r) = self.pattern.roles.get_mut(&role_name) {
+                r.model = alias;
+            }
+            // a resume rebuilds the pattern from this file, so it must carry the switch
+            let _ = std::fs::write(self.dir.join("pattern.toml"), self.pattern.to_toml());
+            // the new model gets its own restart-then-escalate cycle
+            self.first_token_strikes.remove(&key);
+            let note = format!("[mantra:watchdog] Your previous model produced no output for {quiet}, twice in a row; you are its replacement. Continue where you left off.");
+            if let Err(e) = self.respawn(ctx, a, Some(note)) {
+                self.log("!", "amber", format!("{name}: could not respawn on the fallback ({e})"));
+            }
+            self.save_state();
+            return;
+        }
+        // The manager is a supervisor, not a step of the run: a fresh one, never a halt.
+        if Some(a) == self.manager {
+            self.log("↻", "amber", format!("manager: no output for {quiet} again — respawning it (first-token deadline)"));
+            self.respawn_manager(ctx, Some(format!("[mantra:watchdog] The previous manager produced no output for {quiet}, twice in a row. Pick up where it left off.")));
+            return;
+        }
+        let es = self.pattern.settings.watchdog_escalate_seconds.max(1);
+        if self.has_manager() && self.manager_watchdog.is_none() {
+            if let Some(m) = self.ensure_manager(ctx) {
+                self.log("⏰", "amber", format!("{name}: no output for {quiet} twice — waking the manager (first-token deadline)"));
+                self.mark_edge(m);
+                ctx.prompt(m, format!("[mantra:watchdog] {name}'s turn has produced no output (no tokens, no text) for {quiet}, twice in a row, even after a restart: the model gateway behind it is probably down or looping on reconnects. Find out (mantra_log {name}, mantra_journal) and get it moving: mantra_respawn, mantra_retry, or mantra_brief_orchestrator. If you do nothing within {es}s the planner is woken instead."));
+                self.manager_watchdog = Some(ManagerCase { deadline: Instant::now() + Duration::from_secs(es), about: name, respawned: false });
+                return;
+            }
+        }
+        self.halt_turn_failed(ctx, Some(a), format!("{name}: no output for {quiet}, twice in a row — the model gateway may be down (set a `fallback` model for its role, or respawn it)"));
     }
 
     fn watchdog_act(&mut self, ctx: &mut dyn Ctx, a: AgentId, expect: Expect, stage: u8, idle: Duration) {
@@ -2721,8 +2931,9 @@ Then summarize in 2-4 lines.",
             }
         }
         self.log("‖", "amber", "run paused");
-        self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), since: Instant::now() });
+        self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), full: "paused by you".into(), since: Instant::now() });
         self.clock_stop();
+        self.save_state();
     }
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
@@ -2909,7 +3120,7 @@ Then summarize in 2-4 lines.",
     pub(super) fn overview_text(&self, ctx: &dyn Ctx) -> String {
         let mut s = format!("Stage: {} · running for {}\n", super::state::stage_label(&self.stage), fmt_dur(self.elapsed()));
         if let Some(h) = &self.halt {
-            s.push_str(&format!("HALTED ({}) for {}: {}\n", reason_label(h.reason), fmt_dur(h.since.elapsed()), h.message));
+            s.push_str(&format!("HALTED ({}) for {}: {}\n", reason_label(h.reason), fmt_dur(h.since.elapsed()), h.full));
         }
         if let Some(q) = &self.question {
             s.push_str(&format!("Open question to the user from the {}: {}\n", self.name_of(q.from), trunc(&q.text, 160)));
@@ -3003,8 +3214,11 @@ Then summarize in 2-4 lines.",
     }
 
     /// Every `settings.manager_minutes` while building or in the finale, the manager gets the run
-    /// overview and is asked whether anything needs unsticking. Skipped (not postponed) while a
-    /// halt is open — the escalation already has its attention.
+    /// overview and is asked whether anything needs unsticking — but only if something happened
+    /// since the last digest (a journal line, a worker or agent changing state): an unchanged run
+    /// has nothing new to say, and each digest costs the manager a whole turn. A quiet interval is
+    /// skipped silently and re-checked every tick, so the first change after it gets its digest.
+    /// Skipped (not postponed) while a halt is open — the escalation already has its attention.
     fn health_tick(&mut self, ctx: &mut dyn Ctx) {
         let every = self.pattern.settings.manager_minutes;
         if every == 0 || self.halted() || !matches!(self.stage, Stage::Phase { .. } | Stage::Finale { .. }) {
@@ -3016,9 +3230,25 @@ Then summarize in 2-4 lines.",
         if self.manager.and_then(|m| ctx.agent(m)).map(|a| a.busy() || a.thread_id.is_none()).unwrap_or(false) {
             return; // mid-turn: try again next tick (no manager at all: the wake below spawns one)
         }
+        let print = self.health_fingerprint(ctx);
+        if self.last_health_print.as_ref() == Some(&print) {
+            return;
+        }
         self.last_health = Instant::now();
         self.log("◈", "blue", "manager health check");
+        // Taken after the line above, so the digest's own journal entry is not "a change".
+        self.last_health_print = Some(HealthPrint { journal: self.pulse_seq, ..print });
         self.manager_event(ctx, format!("[mantra:health] Periodic health check (every {every} min). Is the run healthy — is everyone who should be working working, is anyone stuck, looping, failing repeatedly or drifting from the goal? Intervene only where something is actually off (at most one message per agent); otherwise just call mantra_wait."));
+    }
+
+    /// What `health_tick` compares between digests. The manager itself is left out: its own turns
+    /// flip its status all the time and say nothing about the run.
+    fn health_fingerprint(&self, ctx: &dyn Ctx) -> HealthPrint {
+        HealthPrint {
+            journal: self.pulse_seq,
+            workers: self.workers.iter().map(|w| (w.task.id.clone(), worker_state_str(&w.state))).collect(),
+            agents: self.all_agents().into_iter().filter(|a| Some(*a) != self.manager).filter_map(|a| ctx.agent(a).map(|x| (a, x.busy(), x.status.clone()))).collect(),
+        }
     }
 
     /// The manager restarting an agent during an escalated halt *is* its decision to go on: lift
@@ -3535,7 +3765,7 @@ Then summarize in 2-4 lines.",
                 let note = s("note");
                 let Some(h) = &self.halt else { return ("the run is not halted".into(), false) };
                 if !matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) {
-                    return (format!("this halt ({}) needs the user, not a resume", h.message), false);
+                    return (format!("this halt ({}) needs the user, not a resume", h.full), false);
                 }
                 let (reason, target) = (h.reason, h.agent);
                 if reason == HaltReason::AttemptsExhausted {
@@ -3791,10 +4021,14 @@ mod halt_tests {
         /// Every `ctx.spawn`'s instructions, by the id it was given — for tests that check what a
         /// freshly spawned agent was actually told (`spawn` itself ignores the `SpawnReq`).
         spawned_instructions: Vec<(AgentId, String)>,
+        /// Every `ctx.spawn`'s role model alias, by the id it was given.
+        spawned_models: Vec<(AgentId, String)>,
+        /// What `ctx.notify` was told, in order.
+        notified: Vec<String>,
     }
     impl TestCtx {
         fn new() -> TestCtx {
-            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![] }
+            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawned_models: vec![], notified: vec![] }
         }
         /// Register a fake agent that looks busy (a live turn in progress).
         fn add_busy(&mut self) -> AgentId {
@@ -3860,6 +4094,7 @@ mod halt_tests {
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
             self.spawned_instructions.push((id, r.instructions));
+            self.spawned_models.push((id, r.role.model));
             id
         }
         fn prompt(&mut self, a: AgentId, text: String) {
@@ -3884,7 +4119,9 @@ mod halt_tests {
             self.agents.get(&a)
         }
         fn job(&mut self, _tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {}
-        fn notify(&mut self, _text: &str) {}
+        fn notify(&mut self, text: &str) {
+            self.notified.push(text.to_string());
+        }
     }
 
     #[test]
@@ -5620,5 +5857,356 @@ mod halt_tests {
         run.workers.push(mk_worker("t1", "worker-small", worker_agent, WState::Running));
         let (third, _) = run.handle_tool(&mut ctx, orch, "mantra_status", &json!({}));
         assert!(third.contains("t1") && !third.contains("No change"), "{third}");
+    }
+
+    // First-token deadline ---------------------------------------------------------------------
+
+    /// A fresh scratch run directory (journal, state and pattern files land here, not in `~/.mantra`).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mantra-run-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Make `a` look like it has an active turn that has produced nothing for `secs`.
+    fn go_silent(ctx: &mut TestCtx, a: AgentId, secs: u64) {
+        let ag = ctx.agents.get_mut(&a).unwrap();
+        ag.turn_active = true;
+        ag.status = Status::Busy;
+        ag.thread_id = Some(format!("thread-{a}"));
+        ag.turn_wait_since = Some(Instant::now() - Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn first_token_deadline_restarts_once_then_falls_back_to_the_roles_model() {
+        let dir = scratch_dir("fallback");
+        let mut ctx = TestCtx::new();
+        let mut pat = no_manager();
+        pat.roles.get_mut("planner").unwrap().fallback = Some("luna".into());
+        let primary = pat.roles["planner"].model.clone();
+        let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+        run.dir = dir.clone();
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+
+        // under the 4-minute default: nothing happens, however silent it is
+        go_silent(&mut ctx, planner, 3 * 60);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(planner), "3 minutes is inside the deadline");
+        assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+
+        // first strike: the turn is restarted on a fresh process, same model
+        go_silent(&mut ctx, planner, 4 * 60 + 5);
+        run.watchdog_tick(&mut ctx);
+        let second = run.planner.unwrap();
+        assert_ne!(second, planner, "the silent planner is replaced");
+        assert_eq!(ctx.spawned_models.last().unwrap().1, primary, "the first restart stays on the same model");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == second && t.contains("produced no output") && t.contains("restarted")), "{:?}", ctx.prompts);
+        assert!(run.pulse.iter().any(|p| p.text.contains("planner: no output for") && p.text.contains("restarting")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        assert!(!run.halted());
+
+        // the very next tick does not strike again: the new agent has no silent spell yet
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(second));
+
+        // second strike on the same slot: the role's fallback takes over, and the log says so
+        go_silent(&mut ctx, second, 4 * 60 + 5);
+        run.watchdog_tick(&mut ctx);
+        let third = run.planner.unwrap();
+        assert_ne!(third, second);
+        assert_eq!(ctx.spawned_models.last().unwrap().1, "luna", "respawned on the fallback alias");
+        assert!(run.pulse.iter().any(|p| p.glyph == "↻" && p.text == "planner: no output twice — falling back to luna"), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        assert_eq!(run.pattern.roles["planner"].model, "luna", "later spawns of the role stay on it");
+        let saved = std::fs::read_to_string(dir.join("pattern.toml")).unwrap();
+        assert!(saved.contains("model = \"luna\""), "a resume must see the switch: {saved}");
+        assert!(!run.halted());
+
+        // the fallback gets its own restart; if it is silent too there is nobody left to fall back to
+        go_silent(&mut ctx, third, 4 * 60 + 5);
+        run.watchdog_tick(&mut ctx);
+        let fourth = run.planner.unwrap();
+        assert_ne!(fourth, third, "the new model is restarted once before anything else");
+        assert!(!run.halted());
+        go_silent(&mut ctx, fourth, 4 * 60 + 5);
+        run.watchdog_tick(&mut ctx);
+        assert!(run.halted(), "no fallback left and no manager: the run halts for the user");
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::AgentTurnFailed);
+        assert!(run.halt.as_ref().unwrap().message.contains("twice in a row"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_token_deadline_without_a_fallback_escalates_to_the_manager() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        assert!(run.pattern.roles["planner"].fallback.is_none());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+
+        go_silent(&mut ctx, planner, 5 * 60);
+        run.watchdog_tick(&mut ctx);
+        let second = run.planner.unwrap();
+        assert_ne!(second, planner, "first strike restarts");
+        assert!(run.manager.is_none() && !run.halted());
+
+        ctx.prompts.clear();
+        go_silent(&mut ctx, second, 5 * 60);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(second), "no fallback: the silent agent is left for the manager to deal with");
+        let manager = run.manager.expect("the manager is woken");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:watchdog]") && t.contains("planner") && t.contains("no output")), "{:?}", ctx.prompts);
+        assert!(run.manager_watchdog.is_some(), "a case is open, with the usual deadline");
+        assert!(!run.halted(), "an escalation, not a halt");
+
+        // one silent spell is one strike: the next ticks add nothing
+        let n = ctx.prompts.len();
+        run.watchdog_tick(&mut ctx);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(ctx.prompts.len(), n, "{:?}", ctx.prompts);
+    }
+
+    #[test]
+    fn first_token_deadline_is_only_for_active_silent_turns() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+
+        // already produced something (the wait was cleared by the first output): never a strike
+        go_silent(&mut ctx, planner, 30 * 60);
+        ctx.agents.get_mut(&planner).unwrap().turn_wait_since = None;
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(planner), "a turn that has spoken is not silent, however long it runs");
+
+        // waiting on an approval is expected silence
+        go_silent(&mut ctx, planner, 30 * 60);
+        ctx.agents.get_mut(&planner).unwrap().status = Status::Waiting;
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(planner));
+
+        // no active turn: the idle ladder owns it, not this deadline
+        go_silent(&mut ctx, planner, 30 * 60);
+        {
+            let ag = ctx.agents.get_mut(&planner).unwrap();
+            ag.turn_active = false;
+            ag.awaiting_start = false;
+        }
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(planner));
+
+        // switched off
+        run.pattern.settings.first_token_minutes = 0;
+        go_silent(&mut ctx, planner, 30 * 60);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.planner, Some(planner), "first_token_minutes = 0 turns the deadline off");
+        assert!(!run.halted());
+    }
+
+    #[test]
+    fn a_completed_turn_clears_the_first_token_strikes_and_workers_are_keyed_by_task() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        go_silent(&mut ctx, planner, 5 * 60);
+        run.watchdog_tick(&mut ctx);
+        assert_eq!(run.first_token_strikes.get("planner"), Some(&1));
+        let second = run.planner.unwrap();
+        run.on_turn_done(&mut ctx, second, "completed", None, None);
+        assert!(run.first_token_strikes.is_empty(), "a turn that finished means the gateway answered");
+
+        let w = ctx.add_busy();
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        assert_eq!(run.first_token_key(w).as_deref(), Some("worker:t1"), "a worker's slot is its task, which survives the respawn");
+    }
+
+    // Quiet manager digests --------------------------------------------------------------------
+
+    #[test]
+    fn health_digest_is_skipped_when_nothing_changed_since_the_last_one() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_busy();
+        let w = ctx.add_busy();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        let manager = run.ensure_manager(&mut ctx).unwrap();
+        ready(&mut ctx, manager);
+        let digests = |ctx: &TestCtx| ctx.prompts.iter().filter(|(a, t)| *a == manager && t.contains("[mantra:health]")).count();
+        let rearm = |run: &mut Run| {
+            run.last_health = Instant::now() - Duration::from_secs(6 * 60);
+            run.last_tick = Instant::now() - Duration::from_secs(2);
+        };
+
+        // the first digest has nothing to compare with
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 1);
+
+        // nothing happened: the interval elapses, no digest, no journal line, no manager turn
+        ctx.prompts.clear();
+        let seq = run.pulse_seq;
+        for _ in 0..3 {
+            rearm(&mut run);
+            run.tick(&mut ctx);
+        }
+        assert_eq!(digests(&ctx), 0, "an unchanged run costs the manager nothing: {:?}", ctx.prompts);
+        assert_eq!(run.pulse_seq, seq, "and logs nothing about the skipped digest");
+
+        // a journal entry
+        run.log("✓", "green", "something happened");
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 1, "a journal entry earns a digest");
+
+        // a worker changing state
+        ctx.prompts.clear();
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 0);
+        run.workers[0].state = WState::Done;
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 1, "a worker state change earns a digest");
+
+        // an agent changing state
+        ctx.prompts.clear();
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 0);
+        ctx.agents.get_mut(&orch).unwrap().turn_active = false;
+        ctx.agents.get_mut(&orch).unwrap().status = Status::Idle;
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 1, "an agent state change earns a digest");
+
+        // the manager's own comings and goings are not news
+        ctx.prompts.clear();
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 0);
+        ctx.agents.get_mut(&manager).unwrap().status = Status::Busy;
+        rearm(&mut run);
+        run.tick(&mut ctx);
+        assert_eq!(digests(&ctx), 0, "{:?}", ctx.prompts);
+    }
+
+    // Full error text --------------------------------------------------------------------------
+
+    #[test]
+    fn halt_keeps_the_full_error_in_the_journal_and_state_but_the_short_form_on_the_pulse() {
+        let dir = scratch_dir("fullerr");
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = dir.clone();
+        let gate = ctx.add_busy();
+        run.gate_agent = Some(gate);
+        let err = format!("gateway said: {}END", "upstream connect error or disconnect/reset before headers; ".repeat(12));
+        assert!(err.chars().count() > 400);
+
+        // the first failure of a gate gets its free respawn; the second halts
+        run.on_turn_done(&mut ctx, gate, "failed", Some(err.clone()), Some(ErrKind::Other));
+        assert!(!run.halted());
+        let gate2 = run.gate_agent.unwrap();
+        run.on_turn_done(&mut ctx, gate2, "failed", Some(err.clone()), Some(ErrKind::Other));
+        let h = run.halt.as_ref().expect("halted");
+        assert!(h.full.contains(&err), "the halt record keeps the whole error");
+        assert!(h.message.ends_with('…') && h.message.chars().count() < err.chars().count(), "the band and the pulse keep the short form: {}", h.message);
+
+        let pulse = run.pulse.iter().find(|p| p.glyph == "⛔").expect("a halted line").text.clone();
+        assert!(pulse.ends_with('…') && !pulse.contains("END"), "pulse: {pulse}");
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert!(journal.lines().any(|l| l.contains("halted (full)") && l.contains(&err)), "the journal has the whole text");
+        let saved = RunState::load(&dir).unwrap();
+        assert_eq!(saved.halted.as_deref(), Some(h.full.as_str()), "state.json carries the full message");
+        assert!(run.overview_text(&ctx).contains(&err), "and so does what the manager reads");
+        assert!(ctx.notified.iter().all(|n| !n.contains("END")), "the desktop notification stays short");
+
+        // the sandbox halt keeps the whole command error too
+        let dir2 = scratch_dir("fullenv");
+        let mut env = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        env.dir = dir2.clone();
+        let w = ctx.add_busy();
+        env.on_environment_broken(&mut ctx, w, format!("bwrap: {}TAIL", "no permissions to create a new namespace; ".repeat(10)));
+        let eh = env.halt.as_ref().unwrap();
+        assert!(eh.full.contains("TAIL") && !eh.message.contains("TAIL"), "{} / {}", eh.message, eh.full);
+        assert!(std::fs::read_to_string(dir2.join("journal.jsonl")).unwrap().contains("TAIL"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn a_short_halt_message_is_not_journalled_twice() {
+        let dir = scratch_dir("shorterr");
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = dir.clone();
+        run.halt(&mut ctx, HaltReason::GateExhausted, None, "phase 1 gate not passed".into());
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        assert_eq!(journal.lines().filter(|l| l.contains("phase 1 gate not passed")).count(), 1, "{journal}");
+        assert_eq!(run.halt.as_ref().unwrap().full, "phase 1 gate not passed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Persistence ------------------------------------------------------------------------------
+
+    #[test]
+    fn state_is_saved_on_a_user_pause_a_dropped_pending_and_by_the_tick_after_any_journal_line() {
+        let dir = scratch_dir("persist");
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = dir.clone();
+
+        // a user pause is a halt like any other: a crash right after it must reload as paused
+        run.toggle_pause(&mut ctx);
+        assert_eq!(RunState::load(&dir).unwrap().halted.as_deref(), Some("paused by you"));
+        run.toggle_pause(&mut ctx);
+        assert_eq!(RunState::load(&dir).unwrap().halted, None);
+
+        // a transition the pause boundary dropped must not come back on the next resume
+        run.pending = Some(Pending::Phase { idx: 1 });
+        run.save_state();
+        assert!(RunState::load(&dir).unwrap().pending.is_some());
+        run.drop_pending("the plan changed");
+        assert!(RunState::load(&dir).unwrap().pending.is_none());
+
+        // everything else that journals is flushed by the next tick (once, not per line)
+        run.stage = Stage::Planning;
+        run.log("☰", "saffron", "plan v1");
+        assert_eq!(RunState::load(&dir).unwrap().stage, Stage::Setup, "not written per line");
+        run.last_tick = Instant::now() - Duration::from_secs(2);
+        run.tick(&mut ctx);
+        assert_eq!(RunState::load(&dir).unwrap().stage, Stage::Planning, "the tick flushed it");
+        assert!(!run.state_dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attempts_exhausted_halt_keeps_the_workers_whole_last_failure() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("attempts");
+        let w = ctx.add_idle();
+        let err = format!("upstream said: {}END", "connection reset by the gateway; ".repeat(15));
+        let mut worker = mk_worker("t1", "worker-small", w, WState::Failed(err.clone()));
+        worker.attempt = run.max_attempts();
+        run.workers.push(worker);
+        let task = Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() };
+        let out = run.spawn_task(&mut ctx, task, None, None);
+        assert!(out.starts_with("REFUSED"), "{out}");
+        let h = run.halt.as_ref().expect("halted");
+        assert_eq!(h.reason, HaltReason::AttemptsExhausted);
+        assert!(h.full.contains(&err) && h.full.starts_with("t1 has used all "), "{}", h.full);
+        assert!(!h.message.contains("END") && h.message.starts_with("t1 has used all "), "the short form keeps the task-id prefix the web view parses: {}", h.message);
+        assert_eq!(RunState::load(&run.dir).unwrap().halted.as_deref(), Some(h.full.as_str()));
+        let _ = std::fs::remove_dir_all(&run.dir);
     }
 }

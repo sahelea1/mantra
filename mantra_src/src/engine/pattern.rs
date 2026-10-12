@@ -27,6 +27,10 @@ pub struct Role {
     pub instructions: String,
     /// Tripwire when an agent of this role uses more tokens than this.
     pub max_tokens: Option<u64>,
+    /// Model alias to fall back to when an agent of this role twice sits through
+    /// `settings.first_token_minutes` with no output at all (a gateway that accepts the turn and
+    /// never answers). Unset: the second time goes to the manager like any other watchdog case.
+    pub fallback: Option<String>,
 }
 
 impl Default for Role {
@@ -42,6 +46,7 @@ impl Default for Role {
             description: String::new(),
             instructions: String::new(),
             max_tokens: None,
+            fallback: None,
         }
     }
 }
@@ -76,6 +81,10 @@ pub struct PatternSettings {
     /// health digest — every agent's state, the journal — and is asked whether anything needs
     /// unsticking. 0 turns the digest off (the manager is then woken by escalations only).
     pub manager_minutes: u64,
+    /// Minutes an agent's active turn may produce nothing at all (no tokens, no text — a silent
+    /// gateway or an endless "Reconnecting… n/5") before it is restarted once; the second time the
+    /// role's `fallback` model takes over, or the manager is asked. 0 turns the deadline off.
+    pub first_token_minutes: u64,
     /// Workspace-write agents may use the network (package managers, docs). Codex's sandbox blocks it unless this is on.
     #[serde(default = "default_true")]
     pub network: bool,
@@ -105,6 +114,7 @@ impl Default for PatternSettings {
             manager_minutes: 5,
             network: true,
             writable_roots: vec![],
+            first_token_minutes: 4,
         }
     }
 }
@@ -351,6 +361,7 @@ watchdog_escalate_seconds = 240
 review_minutes = 3             # the orchestrator re-reads every worker's recent work this often (0 = off)
 manager_minutes = 5            # the manager gets a run-wide health digest this often (0 = escalations only)
 network = true                 # workspace-write agents may use the network (package managers, docs)
+first_token_minutes = 4        # an agent whose turn yields no output this long is restarted, then falls back / escalates (0 = off)
 
 [roles.planner]
 kind = "planner"
@@ -545,6 +556,22 @@ mod tests {
         let p = Pattern::from_toml(&old).unwrap();
         assert_eq!(p.settings.watchdog_seconds, 90);
         assert_eq!(p.settings.watchdog_escalate_seconds, 240);
+    }
+
+    #[test]
+    fn first_token_deadline_and_fallback_default_for_old_patterns() {
+        let old = DEFAULT_PATTERN.replace("first_token_minutes = 4", "");
+        assert!(!old.contains("first_token_minutes"), "the fixture must actually be missing the field");
+        let p = Pattern::from_toml(&old).unwrap();
+        assert_eq!(p.settings.first_token_minutes, 4, "the default applies");
+        assert!(p.roles.values().all(|r| r.fallback.is_none()), "no role has a fallback unless it names one");
+        // a fallback round-trips through the TOML the Studio writes
+        let mut with = Pattern::builtin();
+        with.roles.get_mut("planner").unwrap().fallback = Some("sol".into());
+        let back = Pattern::from_toml(&with.to_toml()).unwrap();
+        assert_eq!(back.roles["planner"].fallback.as_deref(), Some("sol"));
+        let zero = DEFAULT_PATTERN.replace("first_token_minutes = 4", "first_token_minutes = 0");
+        assert_eq!(Pattern::from_toml(&zero).unwrap().settings.first_token_minutes, 0, "0 = off");
     }
 
     #[test]
