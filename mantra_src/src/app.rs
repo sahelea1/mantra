@@ -50,8 +50,11 @@ pub enum Overlay {
     Diff { agent: AgentId, file: usize, scroll: usize },
     Inbox { sel: usize },
     Plan { scroll: usize },
+    /// `e` on a halted stage: the halt's whole message (the band shows one line of it).
+    Halt { scroll: usize },
     Edit { title: String, input: Input, target: EditTarget },
-    Patterns { sel: usize, list: Vec<String> },
+    /// `/pattern`: every pattern new runs can use, read once when the picker opens.
+    Patterns { sel: usize, list: Vec<PatternChoice> },
     Discover(DiscoverState),
     /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
     Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
@@ -59,6 +62,42 @@ pub enum Overlay {
     Web,
     /// `/remote`: the relay link, code, password and QR (`r` rotates).
     Remote,
+}
+
+/// One row of the `/pattern` picker.
+pub struct PatternChoice {
+    pub name: String,
+    /// "default", "built-in", "edited" (a file shadows a built-in) or "yours".
+    pub tag: &'static str,
+    /// The pattern's description, or why its file does not load.
+    pub about: Result<String, String>,
+}
+
+impl PatternChoice {
+    /// Every pattern `Pattern::list` finds (the built-ins first, `mantra-default` leading), loaded
+    /// once for its description and to tell a built-in from a file.
+    pub fn all(project: &std::path::Path) -> Vec<PatternChoice> {
+        Pattern::list(project)
+            .into_iter()
+            .map(|name| {
+                let loaded = Pattern::load(&name, project);
+                let builtin = Pattern::builtin_named(&name).is_some();
+                let from_file = loaded.as_ref().map(|p| p.source_dir.is_some()).unwrap_or(true);
+                let tag = match (builtin, from_file) {
+                    (true, false) if name == crate::engine::pattern::NAME_DEFAULT => "default",
+                    (true, false) => "built-in",
+                    (true, true) => "edited",
+                    (false, _) => "yours",
+                };
+                // the reason, without the file's path in front of it (the row already names it)
+                let why = |e: anyhow::Error| {
+                    let e = e.to_string();
+                    e.split_once(".toml: ").map(|(_, why)| why.to_string()).unwrap_or(e)
+                };
+                PatternChoice { about: loaded.map(|p| p.description).map_err(why), name, tag }
+            })
+            .collect()
+    }
 }
 
 /// The model-discovery picker.
@@ -1678,7 +1717,7 @@ impl App {
 
     fn scroll(&mut self, delta: i32) {
         match self.overlays.last_mut() {
-            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) => {
+            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) | Some(Overlay::Halt { scroll }) => {
                 *scroll = (*scroll as i32 - delta).max(0) as usize;
                 return;
             }
@@ -1766,7 +1805,7 @@ impl App {
             self.overlays.push(Overlay::Help);
             return;
         }
-        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. })) {
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. }) | Some(Overlay::Halt { .. })) {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
         }
@@ -1931,6 +1970,7 @@ impl App {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
             KeyCode::Char('p') => self.overlays.push(Overlay::Plan { scroll: 0 }),
+            KeyCode::Char('e') if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) => self.overlays.push(Overlay::Halt { scroll: 0 }),
             KeyCode::Char('a') => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
                     self.with_run(|r, c| r.approve_plan(c));
@@ -2252,8 +2292,8 @@ impl App {
             }
             "/pattern" => {
                 if arg.is_empty() {
-                    let list = Pattern::list(&self.project);
-                    let sel = list.iter().position(|p| *p == self.pattern_name).unwrap_or(0);
+                    let list = PatternChoice::all(&self.project);
+                    let sel = list.iter().position(|p| p.name == self.pattern_name).unwrap_or(0);
                     self.overlays.push(Overlay::Patterns { sel, list });
                 } else {
                     self.pattern_name = arg.to_string();
@@ -2299,6 +2339,19 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/pattern` lists the built-ins first, `mantra-default` leading and marked as the default,
+    /// each with the one-line description the picker shows.
+    #[test]
+    fn the_pattern_picker_leads_with_the_default_builtin() {
+        let list = PatternChoice::all(Path::new("/nonexistent"));
+        let names: Vec<&str> = list.iter().take(4).map(|p| p.name.as_str()).collect();
+        assert_eq!(names, Pattern::names());
+        // "edited" when this machine's ~/.mantra/patterns shadows one with a file
+        assert!(["default", "edited"].contains(&list[0].tag), "{}", list[0].tag);
+        assert!(list[1..4].iter().all(|p| ["built-in", "edited"].contains(&p.tag)));
+        assert!(list[..4].iter().all(|p| p.about.as_ref().map(|d| !d.is_empty()).unwrap_or(false)));
+    }
 
     fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
         let mut agents = BTreeMap::new();

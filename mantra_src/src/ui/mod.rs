@@ -213,6 +213,8 @@ pub fn effort_color(e: &str) -> (u8, u8, u8) {
         "xhigh" => theme::VIOLET,
         "max" => theme::SAFFRON,
         "ultra" => theme::ROSE,
+        // not a level: Mantra picks one per spawn
+        crate::engine::pattern::EFFORT_AUTO => theme::CYAN,
         _ => theme::TEXT,
     }
 }
