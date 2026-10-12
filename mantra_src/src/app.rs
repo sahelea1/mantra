@@ -1385,7 +1385,7 @@ impl App {
     }
 
     /// A new halt about one agent selects that agent on the stage, once: the band's
-    /// "m switch model for <agent> · r retry" then acts on the agent it names, not on whatever
+    /// "m switch model for <agent>" (and `r`) then act on the agent it names, not on whatever
     /// was selected before. Moving the selection afterwards is left alone.
     fn select_halted_agent(&mut self) {
         let Some(h) = self.run.as_ref().and_then(|r| r.halt.as_ref()) else { return };

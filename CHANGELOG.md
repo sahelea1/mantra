@@ -37,7 +37,8 @@ Both interfaces catch up with 0.6.0, and were checked frame by frame (the TUI at
   is shown muted rather than as an accent on every chip.
 - **The TUI never hides a halt.** The zoomed view's header carries the run title and a
   `⛔ halted` / `‖ paused` marker (esc lands on the keys that help); in typing focus the band
-  says `tab for keys` instead of advertising keys that would type letters.
+  says `tab for keys` instead of advertising keys that would type letters. A provider or
+  environment halt says `space resumes` instead of offering `r`, which a halted run refuses.
 - **80 columns work.** The model picker drops columns before its key line, the welcome tagline
   wraps at a word, Studio text rows use their full width, and help, halt details, plan and
   diff clamp their scroll so ↑ moves at once after over-scrolling.

@@ -251,7 +251,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         let keys = match (h.reason, h.agent.and_then(|a| app.agents.get(&a))) {
             // the engine's hint for this one can be a long paragraph (the details have it): the
             // band keeps to the keys, and says a model change alone does not resume
-            (HaltReason::ProviderRejected, Some(a)) => format!("m switch model for {}, then space resumes · r retry", a.name),
+            (HaltReason::ProviderRejected, Some(a)) => format!("m switch model for {}, then space resumes", a.name),
             _ => r.halt_hint(),
         };
         let head = format!(" {} halted {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()));

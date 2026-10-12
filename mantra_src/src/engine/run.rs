@@ -1101,10 +1101,10 @@ Then summarize in 2-4 lines.",
                 if h.message.to_lowercase().contains("message role") {
                     format!("this provider rejects Codex's developer messages — use it through Claude Code (kind = claude-code) or m switch model for {who}")
                 } else {
-                    format!("m switch model for {who} · r retry")
+                    format!("m switch model for {who}, then space resumes")
                 }
             }
-            HaltReason::Environment => "fix the environment (see the message above), then r retry".into(),
+            HaltReason::Environment => "fix the environment (see the message above), then space resumes".into(),
             HaltReason::GateExhausted => "the planner has been asked to sort it out · or type feedback · space retries the gate".into(),
             HaltReason::AttemptsExhausted => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the task".into());
