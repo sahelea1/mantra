@@ -273,6 +273,9 @@ impl App {
                     if self.registry.get(a).is_none() {
                         return Err("unknown model".into());
                     }
+                    if let Some(p) = self.registry.alias_problem(a) {
+                        return Err(p);
+                    }
                     if *a == r.model {
                         return Err("a fallback must be another model than the role's own".into());
                     }
