@@ -250,10 +250,17 @@
     const BANNER_ROUTES = { team: 1, settings: 1, more: 1 };
     const TITLES = { run: 'Run', pulse: 'Pulse', inbox: 'Inbox', runs: 'Runs', settings: 'Settings', more: 'More' };
 
+    // Where the run is, for the headers: the stage label, and whether it's stopped there (as
+    // `mantra runs` puts it).
+    function runWhere(run) {
+        const st = run.stage || {};
+        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
+        return (st.label || '') + (stopped ? (run.halted.reason === 'user' ? ' · paused' : ' · halted') : '');
+    }
     function topbar(r) {
         const app = S.app || {};
-        const sub = r.name === 'team' ? (S.run ? S.run.stage.label + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
-            : r.name === 'run' && S.run ? S.run.stage.label : r.name === 'pulse' && S.run ? S.run.stage.label : '';
+        const sub = r.name === 'team' ? (S.run ? runWhere(S.run) + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
+            : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
         const backTo = { pulse: '/more', runs: '/more', settings: '/more' }[r.name];
         return h('header', { class: 'topbar', key: 'topbar' },
             backTo ? P.iconBtn('back', () => back(backTo), 'Back', { cls: 'back' }) : h('img', { class: 'topbar-logo', src: '/icons/icon.svg', alt: '', width: 28, height: 28 }),
@@ -325,7 +332,7 @@
         const app = S.app || {};
         const title = r.name === 'team' ? 'Overview' : TITLES[r.name];
         // The run's title is the hero right below; the header carries where the run is.
-        const sub = r.name === 'team' ? (app.project || '') : (r.name === 'run' || r.name === 'pulse') && S.run ? S.run.stage.label : '';
+        const sub = r.name === 'team' ? (app.project || '') : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
         return h('header', { class: 'main-head', key: 'mh' },
             h('h1', null, title), sub ? h('span', { class: 'main-sub' + (r.name === 'team' ? ' mono' : '') }, sub) : null, h('span', { class: 'spacer' }),
             r.name === 'runs' ? P.btn('Refresh', () => SC.loadRuns(), { sm: true, kind: 'ghost', icon: 'refresh' }) : null,
@@ -445,7 +452,7 @@
     // A model change never resumes a halted run (resuming is always explicit): the toast says so.
     function modelOk(text) {
         const hv = S.run && S.run.halted;
-        return hv ? text + ' · still halted — ' + P.haltResumeLabel(hv) + ' to continue' : text;
+        return hv ? text + ' · still ' + (hv.reason === 'user' ? 'paused' : 'halted') + ' — ' + P.haltResumeLabel(hv) + ' to continue' : text;
     }
     async function loadDiff(sh) {
         sh.loading = true; sh.error = null;

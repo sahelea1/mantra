@@ -21,6 +21,8 @@ const ITEM_WINDOW: u64 = 300;
 const SNAPSHOT_ITEMS: usize = 150;
 /// Pulse lines in a full snapshot.
 const SNAPSHOT_PULSE: usize = 100;
+/// Columns of a halt's full text the halt band can expand to.
+const HALT_FULL_MAX: usize = 8000;
 
 // ───────────────────────────── time ─────────────────────────────
 
@@ -909,7 +911,9 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
             agent,
             agent_name: agent.map(|a| r.name_of(a)),
             message: h.message.clone(),
-            full: (h.full != h.message).then(|| h.full.clone()),
+            // Plain text (stderr may be colourized) and capped: the run view is resent on every
+            // change, and the journal keeps the whole of it anyway.
+            full: (!h.full.is_empty() && h.full != h.message).then(|| crate::util::trunc(&crate::util::strip_ansi(&h.full), HALT_FULL_MAX)),
             since_at: ms(h.since),
             hint: web_hint(&r.halt_hint()),
         }
@@ -1510,6 +1514,9 @@ pub(crate) mod tests {
         let json = serde_json::to_value(run_view(&app, &run)).unwrap();
         assert_eq!(json["halted"]["message"], "400 bad request …");
         assert_eq!(json["halted"]["full"], "400 bad request: the whole body");
+        run.halt = Some(halt("400 bad request …", &format!("\u{1b}[31m400\u{1b}[0m {}", "x".repeat(20_000))));
+        let full = serde_json::to_value(run_view(&app, &run)).unwrap()["halted"]["full"].as_str().unwrap().to_string();
+        assert!(full.starts_with("400 x") && full.ends_with('…') && full.chars().count() == HALT_FULL_MAX, "plain and capped");
         run.halt = Some(halt("paused by you", "paused by you"));
         let json = serde_json::to_value(run_view(&app, &run)).unwrap();
         assert!(json["halted"].get("full").is_none(), "{json}");

@@ -311,12 +311,16 @@
         const wantsFeedback = hv.reason === 'gate_exhausted' || hv.reason === 'attempts_exhausted';
         // The whole text, when the message is a shortened form of it (HaltView.full).
         const full = hv.full && hv.full !== hv.message ? hv.full : null;
-        const open = !!(full && s.ui.expanded['halt-full']);
-        const toggleFull = () => { s.ui.expanded['halt-full'] = !open; M.act.changed(); };
+        // Per halt, so the next one starts collapsed.
+        const fk = 'halt-full-' + hv.since_at;
+        const open = !!(full && s.ui.expanded[fk]);
+        const toggleFull = () => { s.ui.expanded[fk] = !open; M.act.changed(); };
         return h('div', { class: 'band halt', key: 'halt', role: 'alert' },
             h('div', { class: 'band-head' }, h('span', { class: 'band-ico' }, '⛔'), h('b', null, HALT_TITLE[hv.reason] || 'Halted'), h('span', { class: 'band-age' }, F.ago(hv.since_at))),
             open ? h('pre', { class: 'band-full' }, full) : hv.message ? h('div', { class: 'band-msg' }, F.trunc(hv.message, 400)) : null,
-            full ? h('button', { type: 'button', class: 'link sm band-more', 'aria-expanded': String(open), onclick: toggleFull }, h('span', null, open ? 'Show less' : 'Show the full error'), icon(open ? 'up' : 'down', 'chev')) : null,
+            full ? h('div', { class: 'band-more-row' },
+                h('button', { type: 'button', class: 'link sm band-more', 'aria-expanded': String(open), onclick: toggleFull }, h('span', null, open ? 'Show less' : 'Show the full error'), icon(open ? 'up' : 'down', 'chev')),
+                open ? h('button', { type: 'button', class: 'link sm band-more', onclick: () => M.act.copy(full) }, icon('copy', 'chev'), h('span', null, 'Copy')) : null) : null,
             hv.hint ? h('div', { class: 'band-hint' }, hv.hint) : null,
             hv.reason !== 'user' ? h('div', { class: 'band-note' }, 'Changing a model doesn’t resume the run — press ' + haltResumeLabel(hv) + ' when you’re ready.') : null,
             h('div', { class: 'band-actions' }, acts),

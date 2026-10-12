@@ -50,9 +50,14 @@
         const s = S();
         const ids = (s.app && s.app.unfinished_runs) || [];
         if (!ids.length) return null;
-        // The snapshot names unfinished runs by id; their titles come from the runs list.
-        if (!s.ui.runs && s.conn.state === 'open') { s.ui.runs = { loading: true }; setTimeout(loadRuns, 0); }
+        // The snapshot names unfinished runs by id; their titles come from the runs list, asked for
+        // again (at most every 15 s) while it lacks one of them — a run closed since, say.
         const rows = (s.ui.runs && s.ui.runs.list) || [];
+        const missing = !s.ui.runs || ids.some((id) => !rows.some((x) => x.id === id));
+        if (missing && s.conn.state === 'open' && !(s.ui.runs && s.ui.runs.loading) && Date.now() - (s.ui.runsAsked || 0) > 15000) {
+            s.ui.runsAsked = Date.now();
+            setTimeout(loadRuns, 0);
+        }
         return card('Unfinished runs', [
             h('div', { class: 'list' }, ids.map((id) => {
                 const title = (rows.find((x) => x.id === id) || {}).title;
