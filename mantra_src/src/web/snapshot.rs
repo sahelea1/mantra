@@ -884,8 +884,10 @@ fn stage_view(s: &Stage) -> StageView {
 /// The TUI's key names in the halt hint, turned into the web UI's button names. A provider or
 /// environment halt is lifted with Resume, which re-runs the stopped turn (a worker cannot be
 /// respawned while the run is halted), so the web band offers Resume, not Retry, for those.
+/// A gate or turn retry is that band's "Retry gate" / "Retry turn" button, not a Resume.
 fn web_hint(hint: &str, reason: &HaltReason) -> String {
-    let mut h = hint.replace("space ", "Resume ").replace("then space", "then Resume");
+    let h = hint.replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again");
+    let mut h = h.replace("space ", "Resume ").replace("then space", "then Resume");
     if matches!(reason, HaltReason::ProviderRejected | HaltReason::Environment) {
         h = h.replace(" · r retry", ", then Resume").replace("then r retry", "then Resume");
     }
@@ -1553,6 +1555,11 @@ pub(crate) mod tests {
         assert_eq!(web_hint("fix the environment (see the message above), then r retry", &HaltReason::Environment), "fix the environment (see the message above), then Resume");
         assert_eq!(web_hint("r retry t2 · type feedback for the planner", &HaltReason::AttemptsExhausted), "Retry t2 · type feedback for the planner");
         assert_eq!(web_hint("space resume", &HaltReason::User), "Resume");
+        assert_eq!(web_hint("r respawn orchestrator · space retries the turn", &HaltReason::AgentTurnFailed), "Respawn orchestrator · Retry turn runs it again");
+        assert_eq!(
+            web_hint("the planner has been asked to sort it out · or type feedback · space retries the gate", &HaltReason::GateExhausted),
+            "the planner has been asked to sort it out · or type feedback · Retry gate runs it again"
+        );
     }
 
     #[test]

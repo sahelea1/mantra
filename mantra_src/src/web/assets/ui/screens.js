@@ -264,7 +264,8 @@
                     h('div', { class: 'run-row-top' },
                         h('strong', null, x.title || x.id),
                         x.open ? h('span', { class: 'pill sm tone-busy' }, h('i', { class: 'dot' }), 'open') : x.unfinished ? h('span', { class: 'pill sm tone-wait' }, h('i', { class: 'dot' }), 'unfinished') : null,
-                        h('span', { class: 'dim' }, x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
+                        // the open run in the live words of its card ("phase 1 · paused"), not the list's snapshot
+                        h('span', { class: 'dim' }, x.open && s.run ? P.stageWhere(s.run) : x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
                     h('div', { class: 'run-row-brief' }, h('code', { class: 'mono dim' }, x.id), x.brief ? h('span', { class: 'dim' }, ' · ' + F.trunc(x.brief, 120)) : null),
                     x.error ? h('div', { class: 'run-row-err' }, x.error) : null),
                 h('div', { class: 'run-row-acts' },
