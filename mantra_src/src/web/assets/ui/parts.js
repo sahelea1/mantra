@@ -87,7 +87,11 @@
         }
         if (w && w.state === 'done') return { text: 'done', tone: 'done' };
         if (w && w.state === 'failed') return { text: 'failed', tone: 'bad' };
-        if (a.expected) return { text: 'expected to work · idle ' + F.durShort(now - a.last_event_at), tone: 'wait' };
+        if (a.expected) {
+            // not expected to work while the run is stopped: it waits for the resume
+            const hv = S().run && S().run.halted;
+            return { text: (hv ? stoppedWord(hv) : 'expected to work') + ' · idle ' + F.durShort(now - a.last_event_at), tone: 'wait' };
+        }
         return { text: 'idle ' + F.durShort(now - (a.last_event_at || now)), tone: 'idle' };
     }
     function statusPill(a, now) {
