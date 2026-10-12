@@ -28,7 +28,13 @@ impl Run {
     pub fn from_state(st: &RunState, pattern: Pattern, plan: Option<Plan>, dir: PathBuf) -> Run {
         let mut run = Run::new(st.project.clone(), pattern, st.brief.clone());
         run.id = st.id.clone();
-        run.title = st.display_title();
+        // A state saved before the plan came in (or by an older Mantra) is named after the goal;
+        // once there is a plan, its title is the better name.
+        let named_by_goal = st.title.trim().is_empty() || st.title == super::run::title_from_goal(&st.brief);
+        run.title = match plan.as_ref().map(|p| super::run::tidy_title(&p.title)).filter(|t| !t.is_empty()) {
+            Some(t) if named_by_goal => t,
+            _ => st.display_title(),
+        };
         run.gate_notes = st.gate_notes.clone();
         run.dir = dir;
         run.stage = st.stage.clone();
@@ -468,6 +474,21 @@ mod tests {
         assert!(run.want_review);
         assert!(ctx.spawned.is_empty());
         assert_eq!(run.stage, Stage::Review);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_goal_named_state_takes_the_plan_title_on_resume() {
+        let dir = tmp("title");
+        let mut st = state(&dir, Stage::Review, vec![], vec![]);
+        let mut p = plan();
+        p.title = "  Notes   sync ".into();
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), Some(p.clone()), dir.join("run")).title, "Notes sync", "an older state without a title");
+        st.title = super::super::run::title_from_goal(&st.brief);
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), Some(p.clone()), dir.join("run")).title, "Notes sync", "a title that was only the goal's first words");
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), None, dir.join("run")).title, "brief", "no plan yet: the goal still names it");
+        st.title = "Notes sync v2".into();
+        assert_eq!(Run::from_state(&st, Pattern::builtin(), Some(p), dir.join("run")).title, "Notes sync v2", "a real saved title is kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

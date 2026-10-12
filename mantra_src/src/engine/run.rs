@@ -1207,7 +1207,7 @@ Then summarize in 2-4 lines.",
     /// The plan came in (or was revised): its title becomes the run's name, and the sessions of the
     /// agents already running are renamed to match.
     fn retitle(&mut self, ctx: &mut dyn Ctx, title: &str) {
-        let title = trunc(title.split_whitespace().collect::<Vec<_>>().join(" ").trim(), 60);
+        let title = tidy_title(title);
         if title.is_empty() || title == self.title {
             return;
         }
@@ -4445,6 +4445,11 @@ Then summarize in 2-4 lines.",
             ("forwarded to the orchestrator — the answer arrives as a [from the orchestrator] message. If you cannot continue without it, end your turn now (no STATUS line); you will be woken with the answer.".into(), true)
         }
     }
+}
+
+/// A plan title as a run name: one line, single spaces, at most 60 characters.
+pub fn tidy_title(title: &str) -> String {
+    trunc(title.split_whitespace().collect::<Vec<_>>().join(" ").trim(), 60)
 }
 
 /// A run's name for people before it has a plan: the goal's first six words.
