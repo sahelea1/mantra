@@ -258,14 +258,19 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let w = area.width as usize;
         let band = |t: &str| Line::from(Span::styled(format!("{:<w$}", trunc(t, w)), st));
+        // While typing these keys would only type: the band says how to reach them (tab keeps
+        // the draft; the footer calls it "navigate") instead of promising what they do.
+        let live = app.canvas_focus;
+        let open = if live { "e details" } else { "tab for keys" };
         let lines = if area.height >= 2 {
             // the hint, cut where it must be, and `e` pinned to the right edge so it always shows
-            let more = format!("  e details{}", theme::g(" ▸", " >"));
+            let more = format!("  {open}{}", theme::g(" ▸", " >"));
             let left = trunc(&format!("   {} {keys}", theme::g("↳", "->")), w.saturating_sub(w_of(&more) + 1));
             let gap = w.saturating_sub(w_of(&left) + w_of(&more) + 1);
-            vec![band(&format!("{head} · {}", h.message)), Line::from(vec![Span::styled(left, theme::bold(theme::fg(theme::AMBER))), Span::raw(" ".repeat(gap)), Span::styled(more, theme::bold(theme::accent()))])]
+            let kst = if live { theme::bold(theme::fg(theme::AMBER)) } else { theme::fg(theme::AMBER) };
+            vec![band(&format!("{head} · {}", h.message)), Line::from(vec![Span::styled(left, kst), Span::raw(" ".repeat(gap)), Span::styled(more, theme::bold(theme::accent()))])]
         } else {
-            vec![band(&format!("{head} · e details · {keys} · {}", h.message))]
+            vec![band(&format!("{head} · {open} · {keys} · {}", h.message))]
         };
         f.render_widget(Paragraph::new(lines), area);
         return;
@@ -388,12 +393,16 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     let mut l = vec![
         Line::default(),
         Line::from(Span::styled(format!("   {}  M A N D A L A", theme::g("✦", "*")), theme::bold(theme::fg(theme::VIOLET)))),
-        Line::from(Span::styled("   describe what to build; a whole team of agents plans it, builds it in parallel phases, and checks it", theme::dim())),
+    ];
+    // the tagline wraps at a word on a narrow terminal (80 columns cut it mid-word)
+    let pad = || vec![Span::raw("   ")];
+    l.extend(md::wrap(vec![Span::styled("describe what to build; a whole team of agents plans it, builds it in parallel phases, and checks it", theme::dim())], (area.width as usize).saturating_sub(1), pad(), pad()));
+    l.extend([
         Line::default(),
         Line::from(Span::styled(format!("   pattern  {}", p.name), theme::bold(theme::text()))),
         Line::from(Span::styled(format!("   {}", trunc(&p.description, (area.width as usize).saturating_sub(4))), theme::muted())),
         Line::default(),
-    ];
+    ]);
     // Columns sized to the widest name/kind in the pattern (+1 so "orchestrator" keeps a gap).
     let roles = p.ordered_roles();
     let nw = roles.iter().map(|(n, _)| w_of(n)).max().unwrap_or(0).max(13) + 1;

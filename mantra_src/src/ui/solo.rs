@@ -2,7 +2,7 @@
 
 use super::{theme, *};
 use crate::app::App;
-use crate::engine::run::WState;
+use crate::engine::run::{HaltReason, WState};
 use crate::hub::AgentId;
 use ratatui::layout::{Constraint, Direction, Layout};
 
@@ -22,7 +22,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     // keeps its plain brand+breadcrumb header.
     match (zoom, id.and_then(|a| app.agents.get(&a))) {
         (Some(_), Some(a)) => {
-            zoomed_header(f, rows[0], a);
+            zoomed_header(f, rows[0], app, a);
             super::draw_screen_flash(f, rows[0], app, theme::named(&a.color));
         }
         (Some(_), None) => header(f, rows[0], vec![Span::styled(format!(" {} mandala {} zoomed", theme::g("›", ">"), theme::g("›", ">")), theme::faint())], vec![]),
@@ -112,8 +112,9 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
 }
 
 /// Zoomed-in header: a solid band tinted with the agent's role colour so the two views — overview
-/// and zoom — are never mistaken for each other, even mid-scroll.
-fn zoomed_header(f: &mut Frame, area: Rect, a: &Agent) {
+/// and zoom — are never mistaken for each other, even mid-scroll. It names the run the agent works
+/// for and says when that run is halted or paused: the band that explains it is on the overview.
+fn zoomed_header(f: &mut Frame, area: Rect, app: &App, a: &Agent) {
     let base = theme::named(&a.color);
     let band = Style::default().bg(theme::mix(theme::FAINT, base, 0.25));
     let text_st = band.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
@@ -125,9 +126,24 @@ fn zoomed_header(f: &mut Frame, area: Rect, a: &Agent) {
     if !a.effort.is_empty() {
         left.push_str(&format!(" · {}", a.effort));
     }
-    let right = "zoomed · esc back to overview ";
-    let gap = (area.width as usize).saturating_sub(w_of(&left) + w_of(right)).max(2);
-    let line = Line::from(vec![Span::styled(left, text_st), Span::styled(" ".repeat(gap), dim_st), Span::styled(right, dim_st)]);
+    let run = app.run.as_ref().filter(|r| r.all_agents().contains(&a.id));
+    let (stop, right) = match run.and_then(|r| r.halt.as_ref()) {
+        // esc lands on the overview with its keys live, so these work next; the tint and the
+        // spine already say "zoomed"
+        Some(h) if matches!(h.reason, HaltReason::User) => (format!("{} paused · esc ▸ space resumes ", theme::g("‖", "=")), ""),
+        Some(_) => (format!("{} halted · esc ▸ e details ", theme::g("⛔", "X")), ""),
+        None => (String::new(), "zoomed · esc back to overview "),
+    };
+    let w = area.width as usize;
+    // the marker never gives way; "zoomed" does, then the title (which gets up to 40 columns),
+    // and a long agent name is cut before it
+    let left = trunc(&left, w.saturating_sub(w_of(&stop) + 2));
+    let right = if w_of(&left) + w_of(&stop) + w_of(right) + 2 <= w { right } else { "" };
+    let tw = w.saturating_sub(w_of(&left) + w_of(&stop) + w_of(right) + 2 + 3).min(40);
+    let title = run.map(|r| r.title.as_str()).filter(|t| !t.is_empty() && tw >= 6).map(|t| format!("{} · ", trunc(t, tw))).unwrap_or_default();
+    let gap = w.saturating_sub(w_of(&left) + w_of(&title) + w_of(&stop) + w_of(right)).max(2);
+    let stop_st = band.fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD);
+    let line = Line::from(vec![Span::styled(left, text_st), Span::styled(" ".repeat(gap), dim_st), Span::styled(title, band.fg(theme::c(theme::TEXT))), Span::styled(stop, stop_st), Span::styled(right, dim_st)]);
     // `.style(band)` fills the whole row's background first, so the tint stays solid even where
     // no span reaches (a narrow terminal, or the trailing cell after `right`).
     f.render_widget(Paragraph::new(line).style(band), area);

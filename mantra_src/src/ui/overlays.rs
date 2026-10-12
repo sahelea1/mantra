@@ -9,19 +9,26 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub fn draw(f: &mut Frame, app: &mut App) {
     let n = app.overlays.len();
     for i in 0..n {
-        draw_one(f, app, i);
+        // The scrolling ones say how far they can scroll: the stored offset is clamped to it, so
+        // ↑ after over-scrolling (or a shrunk terminal) moves the view on the first press.
+        if let Some(max) = draw_one(f, app, i) {
+            if let Overlay::Help { scroll } | Overlay::Diff { scroll, .. } | Overlay::Plan { scroll } | Overlay::Halt { scroll } = &mut app.overlays[i] {
+                *scroll = (*scroll).min(max);
+            }
+        }
     }
 }
 
-fn draw_one(f: &mut Frame, app: &App, i: usize) {
+/// Draws overlay `i`; a scrolling one returns its largest useful scroll offset.
+fn draw_one(f: &mut Frame, app: &App, i: usize) -> Option<usize> {
     let area = f.area();
     match &app.overlays[i] {
-        Overlay::Help { scroll } => help(f, area, *scroll),
+        Overlay::Help { scroll } => return Some(help(f, area, *scroll)),
         Overlay::ModelPicker { sel, target } => model_picker(f, area, app, *sel, *target),
-        Overlay::Diff { agent, file, scroll } => diff(f, area, app, *agent, *file, *scroll),
+        Overlay::Diff { agent, file, scroll } => return diff(f, area, app, *agent, *file, *scroll),
         Overlay::Inbox { sel } => inbox(f, area, app, *sel),
-        Overlay::Plan { scroll } => plan(f, area, app, *scroll),
-        Overlay::Halt { scroll } => halt(f, area, app, *scroll),
+        Overlay::Plan { scroll } => return Some(plan(f, area, app, *scroll)),
+        Overlay::Halt { scroll } => return halt(f, area, app, *scroll),
         Overlay::Edit { title, input, target } => edit(f, area, title, input, target),
         Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
         Overlay::Discover(st) => discover(f, area, st),
@@ -29,6 +36,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) {
         Overlay::Web => web(f, area, app),
         Overlay::Remote => remote(f, area, app),
     }
+    None
 }
 
 /// Wrapped lines of `text` in `width` columns, each styled `st` (the link is ~110 chars).
@@ -160,7 +168,7 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
 }
 
-fn help(f: &mut Frame, area: Rect, scroll: usize) {
+fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
     let w = 104u16.min(area.width.saturating_sub(2));
     // keys in a column as wide as the longest one; descriptions wrap under themselves, a
     // column short of the border
@@ -216,11 +224,12 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) {
     // the list outgrows a 36-row terminal: it scrolls, the footer stays put
     let vh = inner.height.saturating_sub(1) as usize;
     let more = l.len() > vh;
-    let scroll = scroll.min(l.len().saturating_sub(vh));
-    let view: Vec<Line> = l.into_iter().skip(scroll).take(vh).collect();
+    let max = l.len().saturating_sub(vh);
+    let view: Vec<Line> = l.into_iter().skip(scroll.min(max)).take(vh).collect();
     f.render_widget(Paragraph::new(view), Rect { height: vh as u16, ..inner });
     let hint = if more { " ↑↓ scroll · esc close " } else { " esc close " };
     f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
+    max
 }
 
 /// Which runtime a provider's models run through (WP10): `codex app-server` or `claude -p`.
@@ -234,9 +243,13 @@ fn backend_glyph(reg: &crate::config::Registry, provider: &str) -> &'static str 
 fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option<crate::hub::AgentId>) {
     let rows = app.registry.models.len() as u16;
     // Wide enough for every column (alias … note … "also via"); `centered` clamps it down on
-    // narrower terminals, where the trailing note/duplicate columns simply get cut.
+    // narrower terminals. There the notes go first, then (below ~100 columns) the effort bar, and
+    // the model id and provider columns narrow, so effort, context and "current" still show.
     let r = centered(area, 132, rows + 7);
     f.render_widget(Clear, r);
+    let iw = r.width.saturating_sub(2) as usize;
+    let notes = iw >= 107;
+    let narrow = iw < 98;
     let cur = target.and_then(|a| app.agents.get(&a));
     let mut l = vec![Line::from(Span::styled(format!("  for: {}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
     for (i, m) in app.registry.models.iter().enumerate() {
@@ -244,39 +257,50 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
         let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
         let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
-        let via = format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider));
+        let via = if narrow { app.registry.provider_name(&m.provider) } else { format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider)) };
         // Two aliases can point at the same model id through different providers — the provider
         // column above already distinguishes them; call it out too so it isn't missed.
         let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
         let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
-        l.push(Line::from(vec![
+        let (mw, vw) = if narrow { (14, 15) } else { (18, 27) };
+        let mut row = vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
             // width + 1: a 10-char alias must not touch the model id next to it
             Span::styled(format!("{:<11}", trunc(&m.alias, 10)), st),
-            Span::styled(format!("{:<18}", trunc(&m.model, 17)), theme::muted()),
-            Span::styled(format!(" {:<27}", trunc(&via, 26)), theme::dim()),
+            Span::styled(format!("{:<mw$}", trunc(&m.model, mw - 1)), theme::muted()),
+            Span::styled(format!(" {:<vw$}", trunc(&via, vw - 1)), theme::dim()),
             Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
-            Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))),
-            Span::styled(format!(" {:<12}", ctx), theme::dim()),
-            Span::styled(if is_cur { format!(" {} current", theme::g("●", "*")) } else { format!(" {}", trunc(&m.note, 18)) }, if is_cur { theme::fg(theme::GREEN) } else { theme::faint() }),
-            Span::styled(trunc(&dup, 26), theme::faint()),
-        ]));
+        ];
+        if !narrow {
+            row.push(Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))));
+        }
+        row.push(Span::styled(format!(" {:<12}", ctx), theme::dim()));
+        if is_cur {
+            row.push(Span::styled(format!(" {} current", theme::g("●", "*")), theme::fg(theme::GREEN)));
+        } else if notes {
+            row.push(Span::styled(format!(" {}", trunc(&m.note, 18)), theme::faint()));
+        }
+        if notes {
+            row.push(Span::styled(trunc(&dup, 26), theme::faint()));
+        }
+        l.push(Line::from(row));
     }
     l.push(Line::default());
-    l.push(Line::from(Span::styled("  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc", theme::faint())));
+    let keys = if narrow { "  ↑↓ model · ←→ effort · ⏎ switch · +/- c ctx · e edit models · esc" } else { "  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc" };
+    l.push(Line::from(Span::styled(keys, theme::faint())));
     f.render_widget(Paragraph::new(l).block(block("model & effort", theme::SAFFRON)), r);
 }
 
-fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: usize, scroll: usize) {
+fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: usize, scroll: usize) -> Option<usize> {
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     f.render_widget(Clear, r);
-    let Some(a) = app.agents.get(&agent) else { return };
+    let Some(a) = app.agents.get(&agent) else { return None };
     let blk = block(&format!("changes · {}", a.name), theme::AMBER);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     if a.files.is_empty() {
         f.render_widget(Paragraph::new(Span::styled("  no changes yet", theme::dim())), inner);
-        return;
+        return Some(0);
     }
     let list_w = 34.min(inner.width / 3);
     let files: Vec<(&String, &crate::agent::FileStat)> = a.files.iter().collect();
@@ -300,7 +324,9 @@ fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: 
     let w = di.width as usize;
     let mut old_n = 0usize;
     let mut new_n = 0usize;
-    for l in stat.diff.lines().skip(scroll) {
+    // the offset counts the diff's own lines: the last screenful (under the path) is as far as it goes
+    let max = stat.diff.lines().count().saturating_sub((di.height as usize).saturating_sub(2));
+    for l in stat.diff.lines().skip(scroll.min(max)) {
         if l.starts_with("diff --git") || l.starts_with("index ") || l.starts_with("---") || l.starts_with("+++") || l.starts_with("new file") {
             continue;
         }
@@ -333,6 +359,7 @@ fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: 
     f.render_widget(Paragraph::new(lines), di);
     let hint = " ↑↓ scroll · tab/←→ file · esc close ";
     f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: r.x + 2, y: r.y + r.height.saturating_sub(1), width: (w_of(hint) as u16).min(r.width.saturating_sub(4)), height: 1 });
+    Some(max)
 }
 
 fn inbox(f: &mut Frame, area: Rect, app: &App, sel: usize) {
@@ -363,7 +390,7 @@ fn inbox(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     f.render_widget(Paragraph::new(l).block(block("inbox", theme::AMBER)), r);
 }
 
-fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
+fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> usize {
     let r = Rect { x: area.x + 3, y: area.y + 1, width: area.width.saturating_sub(6), height: area.height.saturating_sub(2) };
     f.render_widget(Clear, r);
     let review = app.run.as_ref().map(|x| x.stage == Stage::Review).unwrap_or(false);
@@ -377,15 +404,17 @@ fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
     };
     let lines = md::render(&body, inner.width.saturating_sub(2) as usize, theme::text());
     let h = inner.height.saturating_sub(1) as usize;
-    let view: Vec<Line> = lines.into_iter().skip(scroll).take(h).collect();
+    let max = lines.len().saturating_sub(h);
+    let view: Vec<Line> = lines.into_iter().skip(scroll.min(max)).take(h).collect();
     f.render_widget(Paragraph::new(view), Rect { x: inner.x + 1, width: inner.width.saturating_sub(1), height: h as u16, ..inner });
     let hint = if review { " a approve & build · f give feedback · ↑↓ scroll · esc " } else { " ↑↓ scroll · esc " };
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
+    max
 }
 
 /// The halt in full: the band cuts the message to one line, the backend's error can be long.
-fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
-    let Some(run) = app.run.as_ref() else { return };
+fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
+    let Some(run) = app.run.as_ref() else { return None };
     let w = 100u16.min(area.width.saturating_sub(2));
     let tw = w.saturating_sub(4) as usize;
     let mut l: Vec<Line<'static>> = vec![];
@@ -420,11 +449,12 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
     f.render_widget(blk, r);
     let h = inner.height.saturating_sub(1) as usize;
     let more = if l.len() > h { " · ↑↓ scroll" } else { "" };
-    let scroll = scroll.min(l.len().saturating_sub(h));
-    let view: Vec<Line> = l.into_iter().skip(scroll).take(h).collect();
+    let max = l.len().saturating_sub(h);
+    let view: Vec<Line> = l.into_iter().skip(scroll.min(max)).take(h).collect();
     f.render_widget(Paragraph::new(view), Rect { height: h as u16, ..inner });
     let hint = if run.halt.is_some() { format!(" space resume · m model{more} · esc ") } else { " esc ".into() };
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
+    Some(max)
 }
 
 fn is_multiline(t: &EditTarget) -> bool {

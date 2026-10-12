@@ -485,7 +485,11 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         let v = get_value(app, &entry, fname);
         let is = i == fsel && app.studio.focus == 1;
         let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
-        let fw = if is { fw_all.saturating_sub(4) } else { fw_all };
+        // free text has nothing to step through: ⏎ opens the editor
+        let text_only = ["description", "instructions", "writable_roots"].contains(&fname.as_str()) || fname.ends_with(".task");
+        let arrows = if !is { String::new() } else if text_only { format!(" {}", theme::g("⏎", "<enter>")) } else { format!(" {}", theme::g("◂ ▸", "< >")) };
+        // the value gets what the marker after it leaves (` ⏎` is narrower than ` ◂ ▸`)
+        let fw = fw_all.saturating_sub(w_of(&arrows));
         let shown = if fname == "instructions" || fname.ends_with(".task") {
             let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
             format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
@@ -497,9 +501,6 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
             "color" => theme::fg(theme::named(&v)),
             _ => theme::text(),
         };
-        // free text has nothing to step through: ⏎ opens the editor
-        let text_only = ["description", "instructions", "writable_roots"].contains(&fname.as_str()) || fname.ends_with(".task");
-        let arrows = if !is { String::new() } else if text_only { format!(" {}", theme::g("⏎", "<enter>")) } else { format!(" {}", theme::g("◂ ▸", "< >")) };
         if i == fsel {
             sel_line = fl.len();
         }
@@ -542,7 +543,8 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         pl.push(arrow("writes the phased plan"));
         if let Some(m) = p.manager_role() {
             let mut v = rg(m);
-            v.push(Span::styled(" supervises the whole run", theme::faint()));
+            // short enough to stay on the role's line in the 120-column preview
+            v.push(Span::styled(" oversees the run", theme::faint()));
             pl.push(row(v));
             pl.push(arrow("unsticks agents, resolves halts"));
         }

@@ -779,6 +779,7 @@ async fn snapshot(mut app: App, mut rx: mpsc::UnboundedReceiver<AppEvent>, scrip
                     "right" => KeyCode::Right,
                     "space" => KeyCode::Char(' '),
                     "pgup" => KeyCode::PageUp,
+                    "pgdn" => KeyCode::PageDown,
                     s => KeyCode::Char(s.chars().next().unwrap_or(' ')),
                 };
                 app.on_event(AppEvent::Term(Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE })));
