@@ -1,0 +1,424 @@
+# Mantra model registry.
+# Each [[model]] gets a short alias you use in patterns and pickers.
+# context_window / auto_compact_percent are passed to Codex per agent.
+# Custom providers must speak the OpenAI *Responses* API (Codex requirement).
+# Example (Z.ai GLM through a Responses-compatible gateway):
+#
+# [[provider]]
+# id = "zai"
+# name = "Z.ai"
+# base_url = "https://your-gateway.example/v1"
+# env_key = "ZAI_API_KEY"
+#
+# [[model]]
+# alias = "glm"
+# provider = "zai"
+# model = "glm-5.2"
+# default_effort = "high"
+# efforts = ["low", "medium", "high", "max"]
+
+[[model]]
+alias = "astra"
+provider = "openai"
+model = "gpt-6-astra"
+context_window = 272000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+]
+note = "most capable — planning & hard problems"
+
+[[model]]
+alias = "sol"
+provider = "openai"
+model = "gpt-5.6-sol"
+context_window = 272000
+auto_compact_percent = 85
+default_effort = "medium"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+]
+note = "frontier agentic coding"
+
+[[model]]
+alias = "terra"
+provider = "openai"
+model = "gpt-5.6-terra"
+context_window = 272000
+auto_compact_percent = 85
+default_effort = "medium"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+]
+note = "balanced everyday coding"
+
+[[model]]
+alias = "luna"
+provider = "openai"
+model = "gpt-5.6-luna"
+context_window = 272000
+auto_compact_percent = 85
+default_effort = "medium"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = "fast & affordable workers"
+
+[[model]]
+alias = "opus46"
+provider = "claude"
+model = "claude-opus-4-6"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "opus48"
+provider = "claude"
+model = "claude-opus-4-8"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "opus5"
+provider = "claude"
+model = "claude-opus-5"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "sonnet5"
+provider = "claude"
+model = "claude-sonnet-5"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "fable5"
+provider = "claude"
+model = "claude-fable-5"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "fable51"
+provider = "claude"
+model = "claude-fable-5-1"
+context_window = 1000000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = ""
+
+[[model]]
+alias = "haiku45"
+provider = "claude"
+model = "claude-haiku-4-5-20251001"
+context_window = 200000
+auto_compact_percent = 85
+default_effort = "high"
+efforts = [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+note = "fast & cheap"
+
+[[provider]]
+id = "claude"
+name = "Claude Code"
+base_url = ""
+env_key = ""
+kind = "claude-code"
+auth = "subscription"
+
+# ── riti gateway (Synthetic + LibertAI models) ──
+[[provider]]
+id = "riti"
+name = "riti (Synthetic / LibertAI)"
+base_url = "https://inference.riti.dev/v1"
+env_key = "RITI_API_KEY"
+kind = "codex"
+auth = "subscription"
+
+[[model]]
+alias = "kimi"
+provider = "riti"
+model = "synthetic/hf:moonshotai/Kimi-K3"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Kimi K3 via Synthetic — most capable, agentic"
+
+[[model]]
+alias = "glm-syn"
+provider = "riti"
+model = "synthetic/hf:zai-org/GLM-5.3"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 via Synthetic"
+
+[[model]]
+alias = "glm-flash-syn"
+provider = "riti"
+model = "synthetic/hf:zai-org/GLM-5.3-Flash"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 Flash via Synthetic"
+
+[[model]]
+alias = "deepseek-syn"
+provider = "riti"
+model = "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "low"
+efforts = ["low","high","xhigh","max"]
+note = "DeepSeek V4.1 Flash via Synthetic"
+
+[[model]]
+alias = "qwen27-syn"
+provider = "riti"
+model = "synthetic/hf:Qwen/Qwen3.8-27B"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.8 27B via Synthetic"
+
+[[model]]
+alias = "gpt-oss"
+provider = "riti"
+model = "synthetic/hf:openai/gpt-oss-120b"
+context_window = 131072
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "gpt-oss-120b via Synthetic"
+
+[[model]]
+alias = "nemotron"
+provider = "riti"
+model = "synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Nemotron 3 Super via Synthetic"
+
+[[model]]
+alias = "glm47-flash"
+provider = "riti"
+model = "synthetic/hf:zai-org/GLM-4.7-Flash"
+context_window = 196608
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-4.7 Flash via Synthetic"
+
+[[model]]
+alias = "syn-large"
+provider = "riti"
+model = "synthetic/syn:large:text"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Synthetic large text"
+
+[[model]]
+alias = "syn-small"
+provider = "riti"
+model = "synthetic/syn:small:text"
+context_window = 196608
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Synthetic small text"
+
+[[model]]
+alias = "glm"
+provider = "riti"
+model = "libertai-io-v2/glm-5.3"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 via LibertAI"
+
+[[model]]
+alias = "glm-think"
+provider = "riti"
+model = "libertai-io-v2/glm-5.3-thinking"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 thinking via LibertAI"
+
+[[model]]
+alias = "glm-flash"
+provider = "riti"
+model = "libertai-io-v2/glm-5.3-flash"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 Flash via LibertAI"
+
+[[model]]
+alias = "glm-flash-think"
+provider = "riti"
+model = "libertai-io-v2/glm-5.3-flash-thinking"
+context_window = 524288
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "GLM-5.3 Flash thinking via LibertAI"
+
+[[model]]
+alias = "deepseek"
+provider = "riti"
+model = "libertai-io-v2/deepseek-v4.1-flash"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "low"
+efforts = ["low","high","xhigh","max"]
+note = "DeepSeek V4.1 Flash via LibertAI"
+
+[[model]]
+alias = "deepseek-think"
+provider = "riti"
+model = "libertai-io-v2/deepseek-v4.1-flash-thinking"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "low"
+efforts = ["low","high","xhigh","max"]
+note = "DeepSeek V4.1 Flash thinking via LibertAI"
+
+[[model]]
+alias = "qwen122"
+provider = "riti"
+model = "libertai-io-v2/qwen3.5-122b-a10b"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.5 122B via LibertAI"
+
+[[model]]
+alias = "qwen122-think"
+provider = "riti"
+model = "libertai-io-v2/qwen3.5-122b-a10b-thinking"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.5 122B thinking via LibertAI"
+
+[[model]]
+alias = "qwen35"
+provider = "riti"
+model = "libertai-io-v2/qwen3.6-35b-a3b"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.6 35B-A3B via LibertAI"
+
+[[model]]
+alias = "qwen27"
+provider = "riti"
+model = "libertai-io-v2/qwen3.8-27b"
+context_window = 262144
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.8 27B via LibertAI"
+
+[[model]]
+alias = "qwen27-tee"
+provider = "riti"
+model = "libertai-io-v2/qwen3.8-27b-tee"
+context_window = 1000000
+auto_compact_percent = 80
+default_effort = "medium"
+efforts = ["low", "medium", "high"]
+note = "Qwen3.8 27B (TEE, 1M ctx) via LibertAI"

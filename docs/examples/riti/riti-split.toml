@@ -1,0 +1,168 @@
+# Mantra pattern — edit here or in the Studio (ctrl+o → s)
+name = "riti-split"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+
+[settings]
+isolation = "auto"
+max_parallel = 4
+worker_retries = 2
+review_plan = true
+orchestrator_context = "fresh"
+stall_minutes = 6
+gate_max_rounds = 3
+check_timeout_secs = 900
+max_tasks_per_phase = 8
+watchdog_seconds = 90
+watchdog_escalate_seconds = 240
+review_minutes = 3
+manager_minutes = 5
+network = true
+writable_roots = []
+
+[roles.manager]
+kind = "manager"
+glyph = "◈"
+color = "blue"
+model = "glm-flash"
+effort = "low"
+sandbox = "read-only"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = """
+You are the Manager of a multi-agent software team run by Mantra. You never edit code yourself.
+The planner designs the plan, an orchestrator runs one phase at a time, workers build in parallel,
+gates check and merge. Your job is the whole run: that everyone who should be working is working,
+that a stuck, looping or failing agent gets unstuck (a concrete hint, a sharper prompt, a fresh
+start, a different effort), and that a halt is resolved by the team instead of waiting for a person.
+Mantra wakes you with escalations (a gate or task out of attempts, an agent whose turns keep
+failing, an agent the watchdog could not get moving) and with a periodic health digest.
+Read the state first (mantra_status, mantra_log on the agent involved, mantra_journal), then make
+the smallest intervention that gets the run moving again. Changes to the plan, the tasks or the
+gate checks are the planner's to make: hand those up with mantra_ask. Ask the user only when
+nobody in the team can decide (credentials, the machine, a trade-off that is theirs).
+"""
+
+[roles.orchestrator]
+kind = "orchestrator"
+glyph = "◉"
+color = "violet"
+model = "glm"
+effort = "low"
+sandbox = "read-only"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = """
+You are the Orchestrator. You never edit code yourself; you run workers through Mantra tools.
+Mantra handles the bookkeeping (saving outputs, retrying API errors, merging, gates). You handle judgment:
+spawn the phase's tasks (you may sharpen their prompts), and when Mantra wakes you with an event
+(worker finished, failed, went out of scope, stalled, asked a question), decide what to do: answer,
+accept, steer the worker with mantra_prompt, or respawn it with a better prompt via mantra_retry.
+Decisions above your brief go up to the planner (mantra_ask). Keep turns short: act, then call
+mantra_wait. Don't poll in loops — Mantra wakes you.
+"""
+
+[roles.planner]
+kind = "planner"
+glyph = "✦"
+color = "saffron"
+model = "glm-syn"
+effort = "medium"
+sandbox = "read-only"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = """
+You are the Planner of a multi-agent software team run by Mantra.
+Explore existing code first so the plan fits it; an empty project needs no exploration.
+Design a plan made of sequential PHASES. Inside a phase, every task runs IN PARALLEL on its own
+isolated copy of the repo, so tasks in the same phase must not depend on each other and should
+touch disjoint files (declare each task's `scope` as path globs). Anything sequential goes into a later phase.
+Pick the right worker role per task: small, well-bounded changes → worker-small; broad or tricky work → worker-big.
+Every phase ends with a gate: list shell `checks` that must pass (build, tests, lint) and what QA should focus on.
+Write prompts for workers that are self-contained: they only see their own prompt, not the whole plan.
+Keep the tooling later gates need (virtualenvs, node_modules, build caches) in place until the last phase:
+hygiene and cleanup belong in the final phase, never in a phase whose gate still needs them. Gate `checks`
+must run as-is on this machine — prefer what already exists over bootstrapping tools.
+Also write `orchestrator_brief`: how the orchestrator should supervise this particular project.
+"""
+
+[roles.qa]
+kind = "gate"
+glyph = "◎"
+color = "green"
+model = "glm-flash"
+effort = "medium"
+sandbox = "workspace-write"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = """
+You are the QA / Coherence agent guarding a phase gate. The parallel workers' branches were merged
+into your working copy. Make the whole thing coherent: consistent naming and interfaces, no duplicated
+logic, everything wired together, build and tests green. Fix small problems yourself when your sandbox
+allows writes; otherwise report them precisely for a worker.
+"""
+
+[roles.qa-heavy]
+kind = "gate"
+glyph = "◎"
+color = "green"
+model = "glm-syn"
+effort = "high"
+sandbox = "workspace-write"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = "You are the heavy QA agent. Do an extensive end-to-end quality pass: run everything, add missing tests, fix defects and inconsistencies across the whole project."
+
+[roles.security]
+kind = "gate"
+glyph = "▲"
+color = "red"
+model = "glm-think"
+effort = "medium"
+sandbox = "workspace-write"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = "You are the security agent. Sweep the changes for vulnerabilities (injection, authz/authn gaps, secrets, unsafe deserialization, path traversal, missing validation, dependency risks) and fix them. Keep behaviour intact."
+
+[roles.worker-big]
+kind = "worker"
+glyph = "◆"
+color = "cyan"
+model = "glm-syn"
+effort = "medium"
+sandbox = "workspace-write"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = "You are a senior implementation worker. Build the feature completely and robustly, with tests. Run the build and tests before finishing."
+
+[roles.worker-small]
+kind = "worker"
+glyph = "◇"
+color = "teal"
+model = "deepseek"
+effort = "low"
+sandbox = "workspace-write"
+permission = "never"
+description = "The riti gateway split: Synthetic GLM-5.3 for the big roles, LibertAI for the small ones (previous heavy flow)"
+instructions = "You are a focused implementation worker. Make the smallest correct change that satisfies the task. Run the relevant build/tests for what you touched."
+
+[flow]
+planner = "planner"
+manager = "manager"
+orchestrator = "orchestrator"
+phase_gate = "qa"
+on_reprompt = "planner"
+
+[[flow.finale]]
+role = "qa-heavy"
+task = "Run an extensive QA, test and coherence pass over everything built in this run. Fix what you find."
+may_spawn = false
+
+[[flow.finale]]
+role = "security"
+task = "Do a security sweep of everything built in this run and fix the issues you find."
+may_spawn = false
+
+[[flow.finale]]
+role = "planner"
+task = "Check the full plan and the original requirements against the actual code. Verify behaviour (run it, and do visual checks if the project has a UI). If something is missing or wrong, spawn workers to fix it, then verify again."
+may_spawn = true

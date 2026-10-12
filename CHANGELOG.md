@@ -2,7 +2,24 @@
 
 All notable changes to Mantra are recorded here.
 
-## Unreleased
+## v0.6.0 — 2026-10-12
+
+- **Agents that wait really stop.** `mantra_wait` ends the turn: any further tool call in it is
+  refused and the turn interrupted once; a repeated `mantra_status` with nothing new (stage, worker
+  states, activity — not the clocks) answers "no change, wait". An orchestrator used to loop on
+  the two and burn half a million tokens in three minutes.
+- **Sandboxed agents can build.** Workspace-write agents get the network (`settings.network`,
+  on by default), the toolchain caches (`~/.pub-cache`, `~/.gradle`, `~/.cargo`, `~/.npm`, the
+  Flutter SDK on PATH, …) and the pattern's `writable_roots`. Cache directories a tool on PATH will
+  want are created ahead of time, and only directories the user owns are bound (inside the
+  sandbox's user namespace another user's directory cannot take Codex's marker and bwrap dies).
+  A bwrap failure on such a root names the root instead of blaming user namespaces.
+- **Fix workers on the integration copy run unsandboxed.** Codex keeps every `.git` read-only
+  in workspace-write, so a fix worker could not unstage a file or merge; the worktree still
+  isolates it. An agent's own "I cannot … in this sandbox" question is a question, not a dead
+  machine.
+- **Example gateway config** in `docs/examples/riti`: a `models.toml` for one OpenAI-compatible
+  gateway fronting two model families, and the patterns the Android app build ran with.
 
 Mantra should produce coherent code by default without taking unnecessarily long or burning
 tokens. A real three-file task cost 760k tokens: the QA gate alone spent 197k re-reading

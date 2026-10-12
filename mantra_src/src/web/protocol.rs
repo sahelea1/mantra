@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn every_server_message_round_trips() {
-        round_server(ServerMsg::Hello(HelloMsg { protocol: 1, version: "0.5.0".into(), mode: "local".into(), conn: "3".into(), vapid: Some("BAAA".into()), tls: true, push: true }));
+        round_server(ServerMsg::Hello(HelloMsg { protocol: 1, version: "0.6.0".into(), mode: "local".into(), conn: "3".into(), vapid: Some("BAAA".into()), tls: true, push: true }));
         round_server(ServerMsg::Items(ItemsMsg { req: 1, agent: 2, items: vec![crate::web::snapshot::tests::item(4)], first: 0, total: 9 }));
         round_server(ServerMsg::ok(3, json!({"a": 1})));
         round_server(ServerMsg::err(3, "no such agent"));
