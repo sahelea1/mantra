@@ -881,9 +881,16 @@ fn stage_view(s: &Stage) -> StageView {
     v
 }
 
-/// The TUI's key names in the halt hint, turned into the web UI's button names.
-fn web_hint(hint: &str) -> String {
-    let mut h = hint.replace("space ", "Resume ").replace("then space", "then Resume");
+/// The TUI's key names in the halt hint, turned into the web UI's button names. A provider or
+/// environment halt is lifted with Resume, which re-runs the stopped turn (a worker cannot be
+/// respawned while the run is halted), so the web band offers Resume, not Retry, for those.
+/// A gate or turn retry is that band's "Retry gate" / "Retry turn" button, not a Resume.
+fn web_hint(hint: &str, reason: &HaltReason) -> String {
+    let h = hint.replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again");
+    let mut h = h.replace("space ", "Resume ").replace("then space", "then Resume");
+    if matches!(reason, HaltReason::ProviderRejected | HaltReason::Environment) {
+        h = h.replace(" · r retry", ", then Resume").replace("then r retry", "then Resume");
+    }
     if h == "space resume" || h == "Resume resume" {
         h = "Resume".into();
     }
@@ -915,7 +922,7 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
             // change, and the journal keeps the whole of it anyway.
             full: (!h.full.is_empty() && h.full != h.message).then(|| crate::util::trunc(&crate::util::strip_ansi(&h.full), HALT_FULL_MAX)),
             since_at: ms(h.since),
-            hint: web_hint(&r.halt_hint()),
+            hint: web_hint(&r.halt_hint(), &h.reason),
         }
     });
     let question = r.question.as_ref().map(|q| QuestionView { from: q.from, from_name: r.name_of(q.from), text: q.text.clone(), since_at: ms(q.since) });
@@ -1373,6 +1380,26 @@ pub(crate) mod tests {
         ItemView { ord, id: format!("i{ord}"), kind: "agent".into(), text: "hello".into(), done: false, v: 1, cmd: None, output: None, exit: None, status: None, dur_ms: None, changes: None, tool: None, query: None, level: None, from: None, to: None }
     }
 
+    /// A temp `$MANTRA_HOME` for a test that saves a pattern, restored afterwards. Serialized
+    /// against every other test that does the same (the env var is process-wide).
+    pub(crate) fn with_mantra_home<R>(f: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mantra-test-home-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("MANTRA_HOME").ok();
+        std::env::set_var("MANTRA_HOME", &dir);
+        let r = f();
+        match prev {
+            Some(v) => std::env::set_var("MANTRA_HOME", v),
+            None => std::env::remove_var("MANTRA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
     pub(crate) fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1523,7 +1550,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_provider_or_environment_halt_hint_names_resume_and_an_exhausted_task_keeps_retry() {
+        assert_eq!(web_hint("m switch model for w1 · r retry", &HaltReason::ProviderRejected), "Switch model for w1, then Resume");
+        assert_eq!(web_hint("fix the environment (see the message above), then r retry", &HaltReason::Environment), "fix the environment (see the message above), then Resume");
+        assert_eq!(web_hint("r retry t2 · type feedback for the planner", &HaltReason::AttemptsExhausted), "Retry t2 · type feedback for the planner");
+        assert_eq!(web_hint("space resume", &HaltReason::User), "Resume");
+        assert_eq!(web_hint("r respawn orchestrator · space retries the turn", &HaltReason::AgentTurnFailed), "Respawn orchestrator · Retry turn runs it again");
+        assert_eq!(
+            web_hint("the planner has been asked to sort it out · or type feedback · space retries the gate", &HaltReason::GateExhausted),
+            "the planner has been asked to sort it out · or type feedback · Retry gate runs it again"
+        );
+    }
+
+    #[test]
     fn the_pattern_picker_lists_the_builtins_first_with_descriptions_and_roles_carry_their_fallback() {
+        // the global patterns dir is `$MANTRA_HOME/patterns`: an empty one, not this machine's
+        with_mantra_home(the_pattern_picker_lists_the_builtins_first_body);
+    }
+
+    fn the_pattern_picker_lists_the_builtins_first_body() {
         let dir = std::env::temp_dir().join(format!("mantra-patlist-{}", std::process::id()));
         let pats = dir.join(".mantra").join("patterns");
         std::fs::create_dir_all(&pats).unwrap();
@@ -1533,7 +1578,7 @@ pub(crate) mod tests {
         std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
         let list = pattern_list(&dir);
         let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(&names[..4], &Pattern::names()[..], "built-ins first, default leading");
+        assert_eq!(names, [&Pattern::names()[..], &["my-split"][..]].concat(), "built-ins first, default leading, then the user's own");
         assert!(list[..4].iter().all(|p| p.builtin && !p.description.is_empty()));
         let mine = list.iter().find(|p| p.name == "my-split").expect("the user's own pattern is listed");
         assert_eq!((mine.description.as_str(), mine.builtin), ("my own", false));

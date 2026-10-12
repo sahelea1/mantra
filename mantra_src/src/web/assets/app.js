@@ -176,7 +176,9 @@
     }
     function updateTitle() {
         const n = attention();
-        const name = (S.app && S.app.project_name) || 'Mantra';
+        // an open run is called by its title; otherwise the project
+        const run = S.run;
+        const name = run ? F.trunc(run.title || run.brief || run.id, 60) : (S.app && S.app.project_name) || 'Mantra';
         const t = (n ? '(' + n + ') ' : '') + name + ' · Mantra';
         if (document.title !== t) document.title = t;
         if (navigator.setAppBadge) { try { n ? navigator.setAppBadge(n) : navigator.clearAppBadge(); } catch (_) { } }
@@ -250,13 +252,8 @@
     const BANNER_ROUTES = { team: 1, settings: 1, more: 1 };
     const TITLES = { run: 'Run', pulse: 'Pulse', inbox: 'Inbox', runs: 'Runs', settings: 'Settings', more: 'More' };
 
-    // Where the run is, for the headers: the stage label, and whether it's stopped there (as
-    // `mantra runs` puts it).
-    function runWhere(run) {
-        const st = run.stage || {};
-        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
-        return (st.label || '') + (stopped ? (run.halted.reason === 'user' ? ' · paused' : ' · halted') : '');
-    }
+    // Where the run is, for the headers — the same words as the run card.
+    const runWhere = (run) => P.stageWhere(run);
     function topbar(r) {
         const app = S.app || {};
         const sub = r.name === 'team' ? (S.run ? runWhere(S.run) + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
@@ -469,10 +466,16 @@
     // The model list shared by the per-agent and per-role pickers. A model with a `problem`
     // (draft provider, missing key…) is shown but disabled — picking it would just bounce off
     // the server's own check.
-    function modelPickList(currentAlias, onPick) {
-        const models = (S.app && S.app.models) || [];
-        if (!models.length) return P.empty('model', 'No models', 'The model registry is empty.');
-        return h('div', { class: 'pick-list' }, models.map((m) => h('button', {
+    // `opts.except`: an alias left out; `opts.none`: a first "None" entry (picked as null).
+    function modelPickList(currentAlias, onPick, opts) {
+        opts = opts || {};
+        const all = (S.app && S.app.models) || [];
+        if (!all.length) return P.empty('model', 'No models', 'The model registry is empty.');
+        const models = all.filter((m) => m.alias !== opts.except);
+        const none = opts.none ? h('button', { type: 'button', key: '-none', class: 'pick' + (currentAlias ? '' : ' on'), onclick: () => onPick(null) },
+            h('span', { class: 'pick-main' }, h('b', null, 'None')), h('span', { class: 'pick-sub' }, opts.none),
+            currentAlias ? null : icon('check', 'pick-check')) : null;
+        return h('div', { class: 'pick-list' }, none, models.map((m) => h('button', {
             type: 'button', key: m.alias, class: 'pick' + (m.alias === currentAlias ? ' on' : '') + (m.problem ? ' problem' : ''),
             disabled: m.problem ? true : null,
             onclick: () => onPick(m.alias),
@@ -509,10 +512,26 @@
                 const role = all ? null : (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
                 if (!all && !role) break;
                 title = 'Model for ' + (all ? 'all roles' : role.name);
-                body = modelPickList(all ? null : role.model_alias, (alias) => {
+                body = [
+                    // the fallback is per role: its own sheet, one tap away (above the long model list)
+                    all ? null : h('div', { class: 'pick-list', key: 'fb', style: { marginBottom: '14px' } }, h('button', { type: 'button', class: 'pick', onclick: () => sheet({ kind: 'role-fallback', role: role.name }) },
+                        h('span', { class: 'pick-main' }, h('b', null, 'Fallback model'), h('span', { class: 'dim sm' }, ' ' + (role.fallback || 'none'))),
+                        h('span', { class: 'pick-sub' }, 'Takes over when ' + role.model_alias + ' gives no first token in time'),
+                        icon('chevron', 'pick-check'))),
+                    modelPickList(all ? null : role.model_alias, (alias) => {
+                        closeSheet();
+                        cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
+                    })];
+                break;
+            }
+            case 'role-fallback': {
+                const role = (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
+                if (!role) break;
+                title = 'Fallback for ' + role.name;
+                body = modelPickList(role.fallback || null, (alias) => {
                     closeSheet();
-                    cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
-                });
+                    if (alias !== (role.fallback || null)) cmd('set_role_fallback', { role: role.name, alias }, { ok: alias ? role.name + ' falls back to ' + alias : role.name + ': no fallback' });
+                }, { except: role.model_alias, none: 'The manager is asked instead' });
                 break;
             }
             case 'effort': {
@@ -575,11 +594,12 @@
     function paletteItems(q) {
         const items = [];
         for (const a of M.store.agentList()) items.push({ key: 'a' + a.id, label: a.worker ? a.worker.task_id : a.name, sub: P.status(a).text, glyph: a, run: () => nav('/agent/' + a.id) });
+        const haltItem = (p) => ({ key: 'pause', label: p.label === 'Resume' ? 'Resume run' : p.label, icon: p.icon, run: p.run });
         const go = [['/', 'Overview', 'team'], ['/run', 'Run', 'run'], ['/inbox', 'Inbox', 'inbox'], ['/pulse', 'Pulse', 'pulse'], ['/runs', 'Runs', 'runs'], ['/settings', 'Settings', 'settings']];
         for (const [p, l, i] of go) items.push({ key: 'go' + p, label: 'Go to ' + l, icon: i, run: () => nav(p) });
         const run = S.run;
         if (run && run.stage.kind === 'review') items.push({ key: 'approve', label: 'Approve plan', icon: 'check', run: () => cmd('plan_approve', {}, { ok: 'Plan approved' }) });
-        if (run && run.stage.kind !== 'done') items.push({ key: 'pause', label: run.halted ? 'Resume run' : 'Pause run', icon: run.halted ? 'play' : 'pause', run: () => cmd('pause_resume', {}) });
+        if (run && run.stage.kind !== 'done') items.push(run.halted ? haltItem(P.haltPrimary(run.halted)) : { key: 'pause', label: 'Pause run', icon: 'pause', run: () => cmd('pause_resume', {}) });
         if (run && run.landable) items.push({ key: 'land', label: 'Land run', icon: 'land', run: () => sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => cmd('land', {}, { ok: 'Landing…' }) }) });
         items.push({ key: 'solo', label: 'New Solo session', icon: 'plus', run: () => cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && nav('/agent/' + d.agent)) });
         items.push({ key: 'theme', label: 'Toggle dark / light', icon: 'sun', run: () => { const dark = S.ui.theme === 'dark' || (S.ui.theme === 'system' && mqDark.matches); M.store.setPref('theme', dark ? 'light' : 'dark'); applyPrefs(); } });

@@ -125,6 +125,13 @@ pub enum Command {
         #[serde(default)]
         all: bool,
     },
+    /// A role's fallback model (`Role.fallback`) in the next run's pattern, saved like
+    /// `set_role_model`: another alias than the role's own model, or none (`alias` null/absent).
+    SetRoleFallback {
+        role: String,
+        #[serde(default)]
+        alias: Option<String>,
+    },
     SetEffort {
         agent: u32,
         effort: String,
@@ -205,6 +212,7 @@ impl Command {
         "compact",
         "set_model",
         "set_role_model",
+        "set_role_fallback",
         "set_effort",
         "step_effort",
         "approve",
@@ -410,6 +418,8 @@ mod tests {
             Command::Compact { agent: 2 },
             Command::SetModel { agent: 2, alias: "sol".into() },
             Command::SetRoleModel { role: "worker".into(), alias: "sol".into(), all: false },
+            Command::SetRoleFallback { role: "worker".into(), alias: Some("luna".into()) },
+            Command::SetRoleFallback { role: "worker".into(), alias: None },
             Command::SetEffort { agent: 2, effort: "high".into() },
             Command::StepEffort { agent: 2, delta: -1 },
             Command::Approve { key: "1:5".into(), decision: "yes".into(), answer: Some("a".into()) },

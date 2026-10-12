@@ -118,6 +118,7 @@
         ], { key: 'plan', cls: 'plan' });
     }
 
+    function heroResume(p) { return P.btn(p.label, p.run, { sm: true, icon: p.icon, busyKey: p.busyKey, kind: 'primary' }); }
     function runScreen() {
         const s = S();
         if (!s.synced) return page('run', [P.loading(P.waitText())]);
@@ -135,7 +136,7 @@
             h('div', { class: 'run-hero-top' },
                 h('span', { class: 'run-hero-id' }, h('span', { class: 'mono dim' }, run.id), h('span', { class: 'dim' }, ' · ' + run.pattern)),
                 run.landable ? P.btn('Land', () => M.act.sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => M.act.cmd('land', {}, { ok: 'Landing…' }) }), { kind: 'primary', icon: 'land', sm: true }) : null,
-                st.kind !== 'done' && st.kind !== 'failed' ? P.btn(run.halted ? 'Resume' : 'Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: run.halted ? 'play' : 'pause', busyKey: 'resume', kind: run.halted ? 'primary' : null }) : null),
+                st.kind === 'done' || st.kind === 'failed' ? null : run.halted ? heroResume(P.haltPrimary(run.halted)) : P.btn('Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: 'pause', busyKey: 'resume' })),
             h('h1', { class: 'run-title' }, run.title || run.brief),
             run.title && run.title !== run.brief ? h('div', { class: 'run-brief dim' }, F.trunc(run.brief, 200)) : null,
             P.stageRail(run, plan, true),
@@ -263,7 +264,8 @@
                     h('div', { class: 'run-row-top' },
                         h('strong', null, x.title || x.id),
                         x.open ? h('span', { class: 'pill sm tone-busy' }, h('i', { class: 'dot' }), 'open') : x.unfinished ? h('span', { class: 'pill sm tone-wait' }, h('i', { class: 'dot' }), 'unfinished') : null,
-                        h('span', { class: 'dim' }, x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
+                        // the open run in the live words of its card ("phase 1 · paused"), not the list's snapshot
+                        h('span', { class: 'dim' }, x.open && s.run ? P.stageWhere(s.run) : x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
                     h('div', { class: 'run-row-brief' }, h('code', { class: 'mono dim' }, x.id), x.brief ? h('span', { class: 'dim' }, ' · ' + F.trunc(x.brief, 120)) : null),
                     x.error ? h('div', { class: 'run-row-err' }, x.error) : null),
                 h('div', { class: 'run-row-acts' },

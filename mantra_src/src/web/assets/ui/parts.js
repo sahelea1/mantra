@@ -87,7 +87,11 @@
         }
         if (w && w.state === 'done') return { text: 'done', tone: 'done' };
         if (w && w.state === 'failed') return { text: 'failed', tone: 'bad' };
-        if (a.expected) return { text: 'expected to work · idle ' + F.durShort(now - a.last_event_at), tone: 'wait' };
+        if (a.expected) {
+            // not expected to work while the run is stopped: it waits for the resume
+            const hv = S().run && S().run.halted;
+            return { text: (hv ? stoppedWord(hv) : 'expected to work') + ' · idle ' + F.durShort(now - a.last_event_at), tone: 'wait' };
+        }
         return { text: 'idle ' + F.durShort(now - (a.last_event_at || now)), tone: 'idle' };
     }
     function statusPill(a, now) {
@@ -99,7 +103,13 @@
         queued: { text: 'queued', tone: 'dim' }, preparing: { text: 'preparing', tone: 'dim' }, running: { text: 'running', tone: 'busy' },
         retrying: { text: 'retrying', tone: 'wait' }, done: { text: 'done', tone: 'done' }, failed: { text: 'failed', tone: 'bad' }, cancelled: { text: 'cancelled', tone: 'dim' },
     };
-    function wstate(w) { return WSTATE[w.state] || { text: w.state, tone: 'dim' }; }
+    // A task that was working when the run stopped is stopped too, not "running".
+    function wstate(w) {
+        const hv = S().run && S().run.halted;
+        if (hv && (w.state === 'running' || w.state === 'retrying' || w.state === 'preparing')) return { text: stoppedWord(hv), tone: 'wait' };
+        return WSTATE[w.state] || { text: w.state, tone: 'dim' };
+    }
+    function stoppedWord(hv) { return hv.reason === 'user' ? 'paused' : 'halted'; }
 
     // Group agents the way the Stage screen does: leadership, the phase's workers, gate/finale.
     const LEAD = { planner: 0, manager: 1, orchestrator: 2, architect: 3 };
@@ -231,9 +241,16 @@
                 full ? h('span', { class: 'seg-label' }, s.label) : h('span', { class: 'seg-short' }, s.short))));
     }
 
+    // Where the run is: the stage label, or — while it's stopped — the stage and that it is
+    // ("phase 1 · halted", not the step it was on when it stopped).
+    function stageWhere(run) {
+        const st = run.stage || {}, label = st.label || '';
+        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
+        return stopped ? (label ? label.split(' · ')[0] + ' · ' : '') + stoppedWord(run.halted) : label;
+    }
     function runSummary(run) {
         const bits = [];
-        bits.push(run.stage ? run.stage.label : '');
+        bits.push(stageWhere(run));
         if (run.elapsed_ms) bits.push(F.durShort(run.elapsed_ms));
         if (run.total_tokens) bits.push(F.tokens(run.total_tokens) + ' tok');
         if (run.busy_count) bits.push(run.busy_count + ' busy');
@@ -248,7 +265,7 @@
         const kindTone = run.halted ? 'halt' : st.kind === 'done' ? 'done' : st.kind === 'failed' ? 'bad' : run.want_review ? 'review' : 'live';
         return h('button', { type: 'button', key: 'runcard', class: 'card run-card tone-' + kindTone + (opts.compact ? ' compact' : ''), onclick: () => M.act.nav('/run') },
             h('div', { class: 'run-card-top' },
-                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? (run.halted.reason === 'user' ? 'paused' : 'halted') : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
+                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? stoppedWord(run.halted) : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
                 h('span', { class: 'run-id', title: run.id + ' · ' + run.pattern }, run.id)),
             h('div', { class: 'run-name' }, F.trunc(run.title || run.brief, opts.compact ? 90 : 160)),
             !opts.compact && run.title && run.title !== run.brief ? h('div', { class: 'run-goal' }, F.trunc(run.brief, 200)) : null,
@@ -261,22 +278,37 @@
         user: 'Paused by you', auth: 'Sign-in problem', usage_limit: 'Usage limit reached', provider_rejected: 'The provider rejected a request',
         environment: 'Environment problem', gate_exhausted: 'The gate keeps failing', attempts_exhausted: 'A task ran out of attempts', agent_turn_failed: 'An agent turn failed',
     };
+    // The one action that gets a halted run going again — what the run hero, the halt band and
+    // the "still halted" toasts all name. Resume re-runs the stopped turn (with the agent's model
+    // as it is now); a task out of attempts is retried with one more, which also lifts the halt.
+    function haltPrimary(hv) {
+        const A = M.act;
+        const who = hv.agent !== undefined && hv.agent !== null ? hv.agent : null;
+        const resume = (label, icon, ok) => ({ label, icon, busyKey: 'resume', run: () => A.cmd('pause_resume', {}, { busyKey: 'resume', ok }) });
+        switch (hv.reason) {
+            case 'gate_exhausted': return resume('Retry gate', 'refresh', 'Retrying the gate');
+            case 'agent_turn_failed': return resume('Retry turn', 'refresh', 'Retrying the turn');
+            case 'attempts_exhausted':
+                if (who !== null) {
+                    const name = hv.agent_name || 'the task';
+                    return { label: 'Retry ' + name, icon: 'refresh', busyKey: 'respawn' + who, run: () => A.cmd('respawn', { agent: who }, { busyKey: 'respawn' + who, ok: 'Retrying ' + name }) };
+                }
+        }
+        return resume('Resume', 'play', 'Run resumed');
+    }
     function haltActions(hv) {
         const A = M.act;
         const who = hv.agent !== undefined && hv.agent !== null ? hv.agent : null;
         const whoName = hv.agent_name || 'the agent';
-        const resume = btn('Resume', () => A.cmd('pause_resume', {}, { busyKey: 'resume' }), { kind: 'primary', icon: 'play', busyKey: 'resume', key: 'resume' });
-        const respawn = (label) => who !== null ? btn(label, () => A.cmd('respawn', { agent: who }, { busyKey: 'respawn' + who, ok: 'Respawning ' + whoName }), { busyKey: 'respawn' + who, icon: 'respawn', key: 'respawn' }) : null;
-        const model = who !== null ? btn('Switch model', () => A.sheet({ kind: 'model', agent: who }), { icon: 'model', key: 'model' }) : null;
+        const p = haltPrimary(hv);
+        const primary = btn(p.label, p.run, { kind: 'primary', icon: p.icon, busyKey: p.busyKey, key: 'primary' });
+        if (who === null) return [primary];
         switch (hv.reason) {
-            case 'user': case 'auth': case 'usage_limit': return [resume];
-            case 'provider_rejected': return [model, respawn('Retry')];
-            case 'environment': return [respawn('Retry'), who === null ? resume : null];
-            case 'gate_exhausted': return [btn('Retry gate', () => A.cmd('pause_resume', {}, { busyKey: 'resume' }), { kind: 'primary', icon: 'refresh', busyKey: 'resume', key: 'resume' })];
-            case 'attempts_exhausted': return [respawn('Retry ' + whoName)];
-            case 'agent_turn_failed': return [respawn('Respawn ' + whoName), btn('Retry turn', () => A.cmd('pause_resume', {}, { busyKey: 'resume' }), { busyKey: 'resume', icon: 'refresh', key: 'retry' })];
+            // switch first, then resume: the order the hint reads
+            case 'provider_rejected': return [btn('Switch model', () => A.sheet({ kind: 'model', agent: who }), { icon: 'model', key: 'model' }), primary];
+            case 'agent_turn_failed': return [primary, btn('Respawn ' + whoName, () => A.cmd('respawn', { agent: who }, { busyKey: 'respawn' + who, ok: 'Respawning ' + whoName }), { busyKey: 'respawn' + who, icon: 'respawn', key: 'respawn' })];
         }
-        return [resume];
+        return [primary];
     }
     function feedbackField(key, placeholder, label) {
         const s = S();
@@ -291,23 +323,12 @@
             btn(label || 'Send', null, { type: 'submit', kind: 'primary', busyKey: key, disabled: !val.trim() }));
     }
     // The haltActions button that un-halts the run — what a model change still waits for.
-    function haltResumeLabel(hv) {
-        const who = hv.agent !== undefined && hv.agent !== null;
-        switch (hv.reason) {
-            case 'provider_rejected': case 'environment': return who ? 'Retry' : 'Resume';
-            case 'gate_exhausted': return 'Retry gate';
-            case 'attempts_exhausted': return who ? 'Retry ' + (hv.agent_name || 'the agent') : 'Resume';
-            case 'agent_turn_failed': return 'Retry turn';
-        }
-        return 'Resume';
-    }
+    function haltResumeLabel(hv) { return haltPrimary(hv).label; }
     function haltBand(run) {
         const hv = run.halted;
         if (!hv) return null;
         const s = S();
-        // A halt without an agent has nothing to respawn: Resume is what's left.
-        const acts = haltActions(hv).filter(Boolean);
-        if (!acts.length) acts.push(...haltActions({ reason: 'user' }));
+        const acts = haltActions(hv);
         const wantsFeedback = hv.reason === 'gate_exhausted' || hv.reason === 'attempts_exhausted';
         // The whole text, when the message is a shortened form of it (HaltView.full).
         const full = hv.full && hv.full !== hv.message ? hv.full : null;
@@ -321,7 +342,8 @@
             full ? h('div', { class: 'band-more-row' },
                 h('button', { type: 'button', class: 'link sm band-more', 'aria-expanded': String(open), onclick: toggleFull }, h('span', null, open ? 'Show less' : 'Show the full error'), icon(open ? 'up' : 'down', 'chev')),
                 open ? h('button', { type: 'button', class: 'link sm band-more', onclick: () => M.act.copy(full) }, icon('copy', 'chev'), h('span', null, 'Copy')) : null) : null,
-            hv.hint ? h('div', { class: 'band-hint' }, hv.hint) : null,
+            // a hint that is only the button's own name (a pause: "Resume") would just repeat it
+            hv.hint && hv.hint !== haltResumeLabel(hv) ? h('div', { class: 'band-hint' }, hv.hint) : null,
             hv.reason !== 'user' ? h('div', { class: 'band-note' }, 'Changing a model doesn’t resume the run — press ' + haltResumeLabel(hv) + ' when you’re ready.') : null,
             h('div', { class: 'band-actions' }, acts),
             wantsFeedback ? feedbackField('halt-feedback', 'Feedback for the planner…', 'Send') : null);
@@ -436,6 +458,6 @@
     M.parts = {
         glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
-        haltBand, haltResumeLabel, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
+        haltBand, haltPrimary, haltResumeLabel, stageWhere, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };
 })(window.Mantra = window.Mantra || {});
