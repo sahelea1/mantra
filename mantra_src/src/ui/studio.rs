@@ -553,7 +553,12 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
             ws.extend(rg(&w));
             ws.push(Span::raw("  "));
         }
-        pl.push(row(ws));
+        // side by side while they fit, else one worker role per row
+        if Line::from(ws.clone()).width() + 1 <= cols[2].width.saturating_sub(2) as usize {
+            pl.push(row(ws));
+        } else {
+            pl.extend(p.worker_roles().iter().map(|w| row(rg(w))));
+        }
         pl.push(arrow(if p.settings.isolation == "shared" { "checks" } else { "merge + checks" }));
         pl.push(row(rg(&p.flow.phase_gate)));
         if !p.flow.finale.is_empty() {
@@ -572,6 +577,13 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         for e in errs.iter().take(6) {
             pl.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, 42)), theme::fg(theme::RED))));
         }
+        // a row wider than the column (the manager's note, three or more worker roles) wraps
+        // under itself instead of being cut at the border
+        let pw = cols[2].width.saturating_sub(2) as usize;
+        let pl: Vec<Line> = pl
+            .into_iter()
+            .flat_map(|l| if l.width() <= pw { vec![l] } else { md::wrap(l.spans, pw, vec![], vec![Span::raw("   ")]) })
+            .collect();
         f.render_widget(Paragraph::new(pl).block(block("flow", theme::FAINT)), cols[2]);
     }
 
