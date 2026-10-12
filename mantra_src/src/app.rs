@@ -45,13 +45,16 @@ pub enum EditTarget {
 }
 
 pub enum Overlay {
-    Help,
+    Help { scroll: usize },
     ModelPicker { sel: usize, target: Option<AgentId> },
     Diff { agent: AgentId, file: usize, scroll: usize },
     Inbox { sel: usize },
     Plan { scroll: usize },
+    /// `e` on a halted stage: the halt's whole message (the band shows one line of it).
+    Halt { scroll: usize },
     Edit { title: String, input: Input, target: EditTarget },
-    Patterns { sel: usize, list: Vec<String> },
+    /// `/pattern`: every pattern new runs can use, read once when the picker opens.
+    Patterns { sel: usize, list: Vec<PatternChoice> },
     Discover(DiscoverState),
     /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
     Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
@@ -59,6 +62,43 @@ pub enum Overlay {
     Web,
     /// `/remote`: the relay link, code, password and QR (`r` rotates).
     Remote,
+}
+
+/// One row of the `/pattern` picker.
+pub struct PatternChoice {
+    pub name: String,
+    /// "default", "built-in", "edited" (a file shadows a built-in) or "yours".
+    pub tag: &'static str,
+    /// The pattern's description, or why its file does not load.
+    pub about: Result<String, String>,
+}
+
+impl PatternChoice {
+    /// Every pattern `Pattern::list` finds (the built-ins first, `mantra-default` leading), loaded
+    /// once for its description and to tell a built-in from a file.
+    pub fn all(project: &std::path::Path) -> Vec<PatternChoice> {
+        Pattern::list(project)
+            .into_iter()
+            .map(|name| {
+                let loaded = Pattern::load(&name, project);
+                let builtin = Pattern::builtin_named(&name).is_some();
+                let from_file = loaded.as_ref().map(|p| p.source_dir.is_some()).unwrap_or(true);
+                let tag = match (builtin, from_file) {
+                    (true, false) if name == crate::engine::pattern::NAME_DEFAULT => "default",
+                    (true, false) => "built-in",
+                    (true, true) => "edited",
+                    (false, _) => "yours",
+                };
+                // the reason, without the file's path in front of it (the row already names it)
+                let why = |e: anyhow::Error| {
+                    let e = e.to_string();
+                    let why = e.split_once(".toml: ").map(|(_, why)| why).unwrap_or(&e);
+                    why.lines().next().unwrap_or_default().to_string()
+                };
+                PatternChoice { about: loaded.map(|p| p.description).map_err(why), name, tag }
+            })
+            .collect()
+    }
 }
 
 /// The model-discovery picker.
@@ -166,6 +206,9 @@ pub struct App {
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
     pub sel: usize,
+    /// When the halt the stage selection last jumped to began: a new halt about one agent
+    /// selects it once, so the band's `m` / `r` act on the agent it names.
+    halt_seen: Option<Instant>,
     pub canvas_focus: bool,
     pub verbose: bool,
     pub side_panel: bool,
@@ -606,6 +649,7 @@ impl App {
             approvals: vec![],
             toast: None,
             sel: 0,
+            halt_seen: None,
             canvas_focus: false,
             verbose: false,
             pulse_panel: true,
@@ -1331,13 +1375,28 @@ impl App {
             }
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
-        if let Some(r) = &self.run {
+        if self.run.is_some() {
             let n = self.stage_nodes().len();
             if n > 0 && self.sel >= n {
                 self.sel = n - 1;
             }
-            let _ = r;
+            self.select_halted_agent();
         }
+    }
+
+    /// A new halt about one agent selects that agent on the stage, once: the band's
+    /// "m switch model for <agent> · r retry" then acts on the agent it names, not on whatever
+    /// was selected before. Moving the selection afterwards is left alone.
+    fn select_halted_agent(&mut self) {
+        let Some(h) = self.run.as_ref().and_then(|r| r.halt.as_ref()) else { return };
+        if self.halt_seen == Some(h.since) {
+            return;
+        }
+        let (since, agent) = (h.since, h.agent);
+        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == a)) {
+            self.sel = i;
+        }
+        self.halt_seen = Some(since);
     }
 
     fn on_hub(&mut self, ev: HubEvent) {
@@ -1678,7 +1737,7 @@ impl App {
 
     fn scroll(&mut self, delta: i32) {
         match self.overlays.last_mut() {
-            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) => {
+            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) | Some(Overlay::Halt { scroll }) | Some(Overlay::Help { scroll }) => {
                 *scroll = (*scroll as i32 - delta).max(0) as usize;
                 return;
             }
@@ -1763,10 +1822,10 @@ impl App {
             return;
         }
         if k.code == KeyCode::F(1) {
-            self.overlays.push(Overlay::Help);
+            self.overlays.push(Overlay::Help { scroll: 0 });
             return;
         }
-        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. })) {
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. }) | Some(Overlay::Halt { .. }) | Some(Overlay::Help { .. })) {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
         }
@@ -1877,7 +1936,7 @@ impl App {
             return;
         }
         if k.code == KeyCode::Char('?') && self.input.is_empty() {
-            self.overlays.push(Overlay::Help);
+            self.overlays.push(Overlay::Help { scroll: 0 });
             return;
         }
         match self.input.key(k) {
@@ -1931,6 +1990,7 @@ impl App {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
             KeyCode::Char('p') => self.overlays.push(Overlay::Plan { scroll: 0 }),
+            KeyCode::Char('e') if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) => self.overlays.push(Overlay::Halt { scroll: 0 }),
             KeyCode::Char('a') => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
                     self.with_run(|r, c| r.approve_plan(c));
@@ -1986,7 +2046,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.open_studio(),
-            KeyCode::Char('?') => self.overlays.push(Overlay::Help),
+            KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
             KeyCode::Char('/') | KeyCode::Char('@') => {
                 self.canvas_focus = false;
                 if let KeyCode::Char(c) = k.code {
@@ -2202,7 +2262,7 @@ impl App {
         let target = self.focus_agent();
         match cmd {
             "/quit" | "/exit" | "/q" => self.quit = true,
-            "/help" => self.overlays.push(Overlay::Help),
+            "/help" => self.overlays.push(Overlay::Help { scroll: 0 }),
             "/model" => {
                 if arg.is_empty() {
                     let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
@@ -2252,8 +2312,8 @@ impl App {
             }
             "/pattern" => {
                 if arg.is_empty() {
-                    let list = Pattern::list(&self.project);
-                    let sel = list.iter().position(|p| *p == self.pattern_name).unwrap_or(0);
+                    let list = PatternChoice::all(&self.project);
+                    let sel = list.iter().position(|p| p.name == self.pattern_name).unwrap_or(0);
                     self.overlays.push(Overlay::Patterns { sel, list });
                 } else {
                     self.pattern_name = arg.to_string();
@@ -2299,6 +2359,19 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/pattern` lists the built-ins first, `mantra-default` leading and marked as the default,
+    /// each with the one-line description the picker shows.
+    #[test]
+    fn the_pattern_picker_leads_with_the_default_builtin() {
+        let list = PatternChoice::all(Path::new("/nonexistent"));
+        let names: Vec<&str> = list.iter().take(4).map(|p| p.name.as_str()).collect();
+        assert_eq!(names, Pattern::names());
+        // "edited" when this machine's ~/.mantra/patterns shadows one with a file
+        assert!(["default", "edited"].contains(&list[0].tag), "{}", list[0].tag);
+        assert!(list[1..4].iter().all(|p| ["built-in", "edited"].contains(&p.tag)));
+        assert!(list[..4].iter().all(|p| p.about.as_ref().map(|d| !d.is_empty()).unwrap_or(false)));
+    }
 
     fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
         let mut agents = BTreeMap::new();
@@ -2557,6 +2630,31 @@ mod tests {
         app.run = Some(run);
         assert!(!app.animating(), "a paused run is not an animation");
         assert!(app.clocks_visible(), "but its clocks still tick");
+    }
+
+    /// A halt about one agent selects it once, so the band's `m` / `r` reach the agent it
+    /// names; the user moving the selection afterwards is not undone, and a new halt moves it again.
+    #[test]
+    fn a_halt_selects_the_agent_it_names_once() {
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.orchestrator = Some(3);
+        let halt = |agent| crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent, message: "rejected".into(), full: "rejected".into(), since: Instant::now() };
+        run.halt = Some(halt(Some(3)));
+        app.run = Some(run);
+        app.select_halted_agent();
+        assert_eq!(app.stage_nodes()[app.sel], 3, "the halted agent is selected");
+        app.sel = 0;
+        app.select_halted_agent();
+        assert_eq!(app.sel, 0, "the same halt does not pull the selection back");
+        app.run.as_mut().unwrap().halt = Some(halt(None));
+        app.select_halted_agent();
+        assert_eq!(app.sel, 0, "a halt about no one agent leaves the selection");
+        std::thread::sleep(Duration::from_millis(2));
+        app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
+        app.select_halted_agent();
+        assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the

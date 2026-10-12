@@ -5,7 +5,7 @@ use crate::agent::Agent;
 use crate::app::App;
 use crate::engine::pattern::Role;
 use crate::engine::plan::Task;
-use crate::engine::run::{PhaseStep, Run, Stage, WState, Worker};
+use crate::engine::run::{HaltReason, PhaseStep, Run, Stage, WState, Worker};
 use crate::hub::AgentId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
@@ -196,14 +196,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     }
     match &app.run {
         Some(r) => {
-            // the run's title, with the id as a faint second crumb where there is room
-            crumbs.push(Span::styled(format!("  {}", trunc(&r.title, if area.width < 110 { 24 } else { 40 })), theme::text()));
-            if area.width >= 130 {
-                crumbs.push(Span::styled(format!("  {}", trunc(&r.id, 30)), theme::faint()));
-            }
-            crumbs.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
             if app.demo {
-                crumbs.insert(2, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
+                crumbs.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
             let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
@@ -212,6 +206,33 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
+            // The run's title gets the room the rest leaves (up to 40 columns), with the id as a
+            // faint crumb where there is plenty; on a narrow terminal "› overview" and the pattern
+            // give way first, so the title is never the crumb that disappears.
+            let mut tail = vec![];
+            if area.width >= 130 {
+                tail.push(Span::styled(format!("  {}", trunc(&r.id, 30)), theme::faint()));
+            }
+            tail.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
+            let sum = |v: &[Span<'static>]| v.iter().map(|s| w_of(&s.content)).sum::<usize>();
+            // " ✦ mantra" + the title's own two-space gap + header()'s margin and a two-space gap
+            // before the right side, like the one between crumbs
+            let room = |crumbs: &[Span<'static>], tail: &[Span<'static>], right: &[Span<'static>]| (area.width as usize).saturating_sub(9 + 2 + 3 + sum(crumbs) + sum(tail) + sum(right));
+            if room(&crumbs, &tail, &right) < 24 {
+                tail.clear();
+            }
+            if room(&crumbs, &tail, &right) < 24 {
+                crumbs.remove(1);
+            }
+            if room(&crumbs, &tail, &right) < 16 {
+                // the token count is the least of what the right side says
+                right.retain(|s| !s.content.contains('Σ'));
+            }
+            let tw = room(&crumbs, &tail, &right).min(40);
+            if tw >= 6 {
+                crumbs.push(Span::styled(format!("  {}", trunc(&r.title, tw)), theme::text()));
+            }
+            crumbs.extend(tail);
         }
         None => {
             crumbs.push(Span::styled(format!("  pattern {} {}", theme::g("◈", "#"), app.pattern_name), theme::dim()));
@@ -225,11 +246,28 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     if let Some(h) = &r.halt {
-        let hint = r.halt_hint();
-        let text = format!(" {} halted {} · {} · {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()), h.message, hint);
+        // What fixes it must never be cut off by a long message: it gets the second line, or the
+        // front of the only one. `e` opens the whole message.
+        let keys = match (h.reason, h.agent.and_then(|a| app.agents.get(&a))) {
+            // the engine's hint for this one can be a long paragraph (the details have it): the
+            // band keeps to the keys, and says a model change alone does not resume
+            (HaltReason::ProviderRejected, Some(a)) => format!("m switch model for {}, then space resumes · r retry", a.name),
+            _ => r.halt_hint(),
+        };
+        let head = format!(" {} halted {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()));
         let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
-        f.render_widget(Paragraph::new(vec![line]), area);
+        let w = area.width as usize;
+        let band = |t: &str| Line::from(Span::styled(format!("{:<w$}", trunc(t, w)), st));
+        let lines = if area.height >= 2 {
+            // the hint, cut where it must be, and `e` pinned to the right edge so it always shows
+            let more = format!("  e details{}", theme::g(" ▸", " >"));
+            let left = trunc(&format!("   {} {keys}", theme::g("↳", "->")), w.saturating_sub(w_of(&more) + 1));
+            let gap = w.saturating_sub(w_of(&left) + w_of(&more) + 1);
+            vec![band(&format!("{head} · {}", h.message)), Line::from(vec![Span::styled(left, theme::bold(theme::fg(theme::AMBER))), Span::raw(" ".repeat(gap)), Span::styled(more, theme::bold(theme::accent()))])]
+        } else {
+            vec![band(&format!("{head} · e details · {keys} · {}", h.message))]
+        };
+        f.render_widget(Paragraph::new(lines), area);
         return;
     }
     if let Some(q) = &r.question {
@@ -314,8 +352,9 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
             PhaseStep::Merging => "merging worker branches".into(),
             PhaseStep::Checks { round } => format!("running gate checks{}", if *round > 0 { " (verify)" } else { "" }),
             PhaseStep::Gate { round } => format!("QA gate · round {round}"),
-            PhaseStep::Fix { round: 0 } => "fix worker merging the conflicting branches".into(),
-            PhaseStep::Fix { round } => format!("fix worker on what QA round {round} found"),
+            // named like the worker on the canvas (`fix-<round>`) and the web's "fix r<round>"
+            PhaseStep::Fix { round: 0 } => "merge fix · fix-0 merges the conflicting branches".into(),
+            PhaseStep::Fix { round } => format!("QA gate · fix r{round} · fix-{round} repairs what QA round {round} found"),
             PhaseStep::Handoff => "handoff → next phase".into(),
         };
         lines.push(Line::from(Span::styled(format!("   {s}"), theme::faint())));
@@ -352,13 +391,14 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled("   describe what to build; a whole team of agents plans it, builds it in parallel phases, and checks it", theme::dim())),
         Line::default(),
         Line::from(Span::styled(format!("   pattern  {}", p.name), theme::bold(theme::text()))),
-        Line::from(Span::styled(format!("   {}", p.description), theme::muted())),
+        Line::from(Span::styled(format!("   {}", trunc(&p.description, (area.width as usize).saturating_sub(4))), theme::muted())),
         Line::default(),
     ];
     // Columns sized to the widest name/kind in the pattern (+1 so "orchestrator" keeps a gap).
     let roles = p.ordered_roles();
     let nw = roles.iter().map(|(n, _)| w_of(n)).max().unwrap_or(0).max(13) + 1;
     let kw = roles.iter().map(|(_, r)| w_of(&r.kind)).max().unwrap_or(0).max(11) + 1;
+    let mut rows = vec![];
     for (name, r) in roles {
         let m = app.registry.resolve(&r.model);
         let (used, lowered) = m.resolve_effort_lowered(&r.effort);
@@ -375,7 +415,16 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         } else {
             row.push(Span::styled(r.effort.clone(), theme::fg(effort_color(&r.effort))));
         }
-        row.push(Span::styled(format!("   {}", trunc(&r.description, 50)), theme::faint()));
+        rows.push((row, r.description.clone()));
+    }
+    // descriptions start in one column, however long each role's "model · effort" is
+    let rw = |row: &[Span<'static>]| row.iter().map(|s| w_of(&s.content)).sum::<usize>();
+    let mw = rows.iter().map(|(row, _)| rw(row)).max().unwrap_or(0);
+    // cut with an ellipsis where the terminal ends, not mid-word at its edge
+    let dw = (area.width as usize).saturating_sub(mw + 4).min(50);
+    for (mut row, d) in rows {
+        row.push(Span::raw(" ".repeat(mw - rw(&row))));
+        row.push(Span::styled(format!("   {}", trunc(&d, dw)), theme::faint()));
         l.push(Line::from(row));
     }
     l.push(Line::default());
@@ -1088,6 +1137,21 @@ mod tests {
         let row = lines.iter().find(|l| l.contains("orchestrator")).expect("orchestrator row");
         assert!(row.contains("orchestrator testing · high"), "{row:?}");
         assert!(!row.contains("orchestratortesting"), "{row:?}");
+    }
+
+    /// Role descriptions start in one column however long each "model · effort" is (a short
+    /// alias used to pull its description left of the others').
+    #[test]
+    fn overview_descriptions_share_one_column() {
+        let app = app();
+        let lines = welcome_lines(&app, 140);
+        let mut cols = vec![];
+        for r in app.studio.pattern.roles.values() {
+            let d = trunc(&r.description, 50);
+            let row = lines.iter().find(|l| l.contains(&d)).unwrap_or_else(|| panic!("no row for {d:?}"));
+            cols.push(row[..row.find(&d).unwrap()].chars().count());
+        }
+        assert!(cols.len() > 2 && cols.windows(2).all(|w| w[0] == w[1]), "{cols:?}");
     }
 
     /// A role asking for an effort its model doesn't offer shows requested→used.

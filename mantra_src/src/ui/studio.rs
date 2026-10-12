@@ -18,8 +18,8 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "sandbox", "permission", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "max_tokens", "description", "instructions"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -85,6 +85,8 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
             let s = &p.settings;
             match field {
                 "isolation" => s.isolation.clone(),
+                "network" => if s.network { "on".into() } else { "off".into() },
+                "writable_roots" => if s.writable_roots.is_empty() { "none".into() } else { s.writable_roots.join(", ") },
                 "max_parallel" => s.max_parallel.to_string(),
                 "worker_retries" => s.worker_retries.to_string(),
                 "review_plan" => s.review_plan.to_string(),
@@ -138,6 +140,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                     }
                 }
                 "effort" => r.effort.clone(),
+                "fallback" => r.fallback.clone().unwrap_or_else(|| "none".into()),
                 "sandbox" => r.sandbox.clone(),
                 "permission" => r.permission.clone(),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
@@ -180,6 +183,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
             let s = &mut p.settings;
             match field {
                 "isolation" => s.isolation = cycle(&["auto", "worktree", "shared"], &s.isolation, d),
+                "network" => s.network = !s.network,
                 "max_parallel" => step_u(&mut s.max_parallel, 1),
                 "worker_retries" => s.worker_retries = (s.worker_retries as i32 + d).max(0) as u32,
                 "review_plan" => s.review_plan = !s.review_plan,
@@ -247,6 +251,13 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     effs.insert(0, EFFORT_AUTO.to_string());
                     r.effort = cycle(&effs, &r.effort, d);
                 }
+                "fallback" => {
+                    // "" (none) leads the list, then every model alias but the role's own.
+                    let mut opts = vec![String::new()];
+                    opts.extend(aliases.iter().filter(|a| **a != r.model).cloned());
+                    let next = cycle(&opts, r.fallback.as_deref().unwrap_or(""), d);
+                    r.fallback = if next.is_empty() { None } else { Some(next) };
+                }
                 "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
                 "permission" => r.permission = cycle(PERMISSIONS, &r.permission, d),
                 "max_tokens" => {
@@ -271,6 +282,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     "glyph" => r.glyph = text.chars().next().map(|c| c.to_string()).unwrap_or_default(),
                     "model" => r.model = text.to_string(),
                     "effort" => r.effort = text.to_string(),
+                    "fallback" => r.fallback = parse_fallback(text),
                     "max_tokens" => r.max_tokens = text.replace(['_', ','], "").parse().ok(),
                     _ => {}
                 }
@@ -297,6 +309,9 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 }
                 ("review_minutes", Some(v)) => s.review_minutes = v.min(240),
                 ("review_minutes", None) if text.trim().eq_ignore_ascii_case("off") => s.review_minutes = 0,
+                ("manager_minutes", Some(v)) => s.manager_minutes = v.min(240),
+                ("manager_minutes", None) if text.trim().to_ascii_lowercase().starts_with("off") => s.manager_minutes = 0,
+                ("writable_roots", _) => s.writable_roots = parse_roots(text),
                 ("first_token_minutes", Some(v)) => s.first_token_minutes = v.min(240),
                 ("first_token_minutes", None) if text.trim().eq_ignore_ascii_case("off") => s.first_token_minutes = 0,
                 _ => {}
@@ -369,6 +384,24 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
     }
 }
 
+/// A role's fallback model from the editor: an alias, or nothing for "none" / an empty field.
+fn parse_fallback(t: &str) -> Option<String> {
+    let t = t.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// `writable_roots` from the editor: comma- or line-separated paths; "none" (or nothing) clears it.
+fn parse_roots(t: &str) -> Vec<String> {
+    if t.trim().eq_ignore_ascii_case("none") {
+        return vec![];
+    }
+    t.split([',', '\n']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
 fn parse_tokens(t: &str) -> Option<u64> {
     let t = t.trim().to_lowercase().replace([',', '_'], "");
     if t.is_empty() || t == "none" || t == "default" {
@@ -387,7 +420,9 @@ fn parse_tokens(t: &str) -> Option<u64> {
 
 pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(8), Constraint::Length(9), Constraint::Length(1)]).split(area);
+    // the architect gives up rows first on a short terminal, so the fields keep their room
+    let arch_h = if area.height < 30 { 5 } else { 9 };
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(8), Constraint::Length(arch_h), Constraint::Length(1)]).split(area);
     let errs = app.studio.pattern.validate().err().unwrap_or_default();
     app.studio.errors = errs.clone();
     let mut crumbs = vec![Span::styled(format!("  {} studio  ", theme::g("›", ">")), theme::faint()), Span::styled(app.studio.pattern.name.clone(), theme::bold(theme::fg(theme::VIOLET)))];
@@ -399,7 +434,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
 
     let wide = rows[1].width >= 120;
     let cols = if wide {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(36), Constraint::Min(40), Constraint::Length(46)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(34), Constraint::Min(40), Constraint::Length(44)]).split(rows[1])
     } else {
         Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
     };
@@ -434,16 +469,23 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let entry = es[sel].clone();
     let fs = fields(app, &entry);
     let fsel = app.studio.field.min(fs.len().saturating_sub(1));
-    let fw = cols[1].width.saturating_sub(22) as usize;
+    // name column as wide as the longest name (settings has a 25-char one); the value column gets
+    // the box's inner width less the " ▶" + name prefix, and on the selected row the arrows too
+    let nw = fs.iter().map(|f| w_of(f)).max().unwrap_or(0).max(19) + 1;
+    let fw_all = (cols[1].width as usize).saturating_sub(2 + 2 + nw);
     let mut fl = vec![];
     if let Some(r) = app.studio.pattern.roles.get(&entry) {
-        fl.push(Line::from(vec![Span::styled(format!(" {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(entry.clone(), theme::bold(theme::text())), Span::styled(format!("  {}", r.description), theme::dim())]));
+        let dw = (cols[1].width as usize).saturating_sub(7 + w_of(&entry));
+        fl.push(Line::from(vec![Span::styled(format!(" {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(entry.clone(), theme::bold(theme::text())), Span::styled(format!("  {}", trunc(&r.description, dw)), theme::dim())]));
         fl.push(Line::default());
     }
+    // the selected field's line and the last line of its hint, which the scroll keeps in view
+    let (mut sel_line, mut sel_end) = (0, 0);
     for (i, fname) in fs.iter().enumerate() {
         let v = get_value(app, &entry, fname);
         let is = i == fsel && app.studio.focus == 1;
         let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
+        let fw = if is { fw_all.saturating_sub(4) } else { fw_all };
         let shown = if fname == "instructions" || fname.ends_with(".task") {
             let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
             format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
@@ -455,16 +497,30 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
             "color" => theme::fg(theme::named(&v)),
             _ => theme::text(),
         };
-        let arrows = if is { format!(" {}", theme::g("◂ ▸", "< >")) } else { String::new() };
-        fl.push(Line::from(vec![Span::styled(format!(" {}{:<20}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
-    }
-    if app.studio.focus == 1 && fs.get(fsel).map(|s| s.as_str()) == Some("permission") {
-        fl.push(Line::from(Span::styled(" off = the agent never asks (default for Mandala). Turn on only for roles you want to approve by hand; requests land in the inbox (ctrl+g).", theme::faint())));
+        // free text has nothing to step through: ⏎ opens the editor
+        let text_only = ["description", "instructions", "writable_roots"].contains(&fname.as_str()) || fname.ends_with(".task");
+        let arrows = if !is { String::new() } else if text_only { format!(" {}", theme::g("⏎", "<enter>")) } else { format!(" {}", theme::g("◂ ▸", "< >")) };
+        if i == fsel {
+            sel_line = fl.len();
+        }
+        fl.push(Line::from(vec![Span::styled(format!(" {}{:<nw$}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
+        // what the focused field means, right under it
+        if let Some(h) = field_hint(fname).filter(|_| is) {
+            let pad = || vec![Span::raw("   ")];
+            fl.extend(md::wrap(vec![Span::styled(h, theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
+        }
+        if i == fsel {
+            sel_end = fl.len() - 1;
+        }
     }
     fl.push(Line::default());
-    fl.push(Line::from(Span::styled(" ←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())));
+    let pad = || vec![Span::raw(" ")];
+    fl.extend(md::wrap(vec![Span::styled("←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
     let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
-    f.render_widget(Paragraph::new(fl).block(block(&entry, fcol)), cols[1]);
+    // A list longer than the box (settings on a short terminal) scrolls to keep the selection in view.
+    let fh = cols[1].height.saturating_sub(2) as usize;
+    let scroll = (sel_end + 1).saturating_sub(fh).min(sel_line) as u16;
+    f.render_widget(Paragraph::new(fl).scroll((scroll, 0)).block(block(&entry, fcol)), cols[1]);
 
     // flow preview + validation
     if wide {
@@ -497,7 +553,12 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
             ws.extend(rg(&w));
             ws.push(Span::raw("  "));
         }
-        pl.push(row(ws));
+        // side by side while they fit, else one worker role per row
+        if Line::from(ws.clone()).width() + 1 <= cols[2].width.saturating_sub(2) as usize {
+            pl.push(row(ws));
+        } else {
+            pl.extend(p.worker_roles().iter().map(|w| row(rg(w))));
+        }
         pl.push(arrow(if p.settings.isolation == "shared" { "checks" } else { "merge + checks" }));
         pl.push(row(rg(&p.flow.phase_gate)));
         if !p.flow.finale.is_empty() {
@@ -516,6 +577,13 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         for e in errs.iter().take(6) {
             pl.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, 42)), theme::fg(theme::RED))));
         }
+        // a row wider than the column (the manager's note, three or more worker roles) wraps
+        // under itself instead of being cut at the border
+        let pw = cols[2].width.saturating_sub(2) as usize;
+        let pl: Vec<Line> = pl
+            .into_iter()
+            .flat_map(|l| if l.width() <= pw { vec![l] } else { md::wrap(l.spans, pw, vec![], vec![Span::raw("   ")]) })
+            .collect();
         f.render_widget(Paragraph::new(pl).block(block("flow", theme::FAINT)), cols[2]);
     }
 
@@ -547,6 +615,19 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         f.set_cursor_position((ir.x + 2 + cc as u16, ir.y));
     }
     footer(f, rows[3], &[("tab", "focus"), ("↑↓", "select"), ("←→", "change"), ("⏎", "edit"), ("ctrl+s", "save"), ("esc", "back")]);
+}
+
+/// One line on what the focused field means, for the fields that need more than their name.
+fn field_hint(field: &str) -> Option<&'static str> {
+    Some(match field {
+        "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small workers, high for finale steps.",
+        "fallback" => "The model that takes over when this role's model twice produces nothing within first_token_minutes. none = the manager is asked instead.",
+        "permission" => "never = the agent never asks (the default). on-request / untrusted: you approve by hand; requests land in the inbox (ctrl+g).",
+        "network" => "on = workspace-write agents may use the network (package managers, docs).",
+        "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
+        "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
+        _ => return None,
+    })
 }
 
 pub fn studio_key(app: &mut App, k: KeyEvent) {
@@ -634,6 +715,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 return;
             }
             let target = match entry.as_str() {
+                "⚙ settings" if ["isolation", "network", "review_plan", "orchestrator_context"].contains(&fname.as_str()) => return nudge(app, &entry, &fname, 1),
                 "⚙ settings" => EditTarget::Setting(fname.clone()),
                 "⇢ flow" if fname.starts_with("finale[") => {
                     let i: usize = fname[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -645,14 +727,16 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 }
                 "⇢ flow" => return nudge(app, &entry, &fname, 1),
                 role => {
-                    if ["kind", "color", "sandbox", "permission", "effort", "model"].contains(&fname.as_str()) {
+                    if ["kind", "color", "sandbox", "permission", "effort", "model", "fallback"].contains(&fname.as_str()) {
                         return nudge(app, &entry, &fname, 1);
                     }
                     EditTarget::RoleField(role.to_string(), fname.clone())
                 }
             };
             let mut input = Input::default();
-            input.set(&get_value(app, &entry, &fname));
+            // "none" is how an empty value reads, not text to edit around
+            let v = get_value(app, &entry, &fname);
+            input.set(if v == "none" && ["max_tokens", "writable_roots"].contains(&fname.as_str()) { "" } else { &v });
             app.overlays.push(Overlay::Edit { title: format!("{entry} · {fname}"), input, target });
         }
         KeyCode::Char('n') => app.overlays.push(Overlay::Edit { title: "new role name".into(), input: Input::default(), target: EditTarget::NewRole }),
@@ -976,6 +1060,83 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every field the editor lists shows something: a name added to `ROLE_FIELDS` /
+    /// `SETTING_FIELDS` without its `get_value` arm would otherwise read as an empty, dead row.
+    #[test]
+    fn every_listed_field_has_a_value() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        for f in SETTING_FIELDS {
+            assert!(!get_value(&app, "⚙ settings", f).is_empty(), "settings field {f} shows nothing");
+        }
+        for f in ROLE_FIELDS {
+            assert!(!get_value(&app, "planner", f).is_empty(), "role field {f} shows nothing");
+        }
+    }
+
+    /// The fallback model cycles none → every other alias → none, and the editor's "none" clears it.
+    #[test]
+    fn the_fallback_cycles_through_none_and_the_other_models() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        let own = app.studio.pattern.roles["planner"].model.clone();
+        assert_eq!(get_value(&app, "planner", "fallback"), "none");
+        let n = app.registry.models.iter().filter(|m| m.alias != own).count();
+        let mut seen = vec![];
+        for _ in 0..n {
+            nudge(&mut app, "planner", "fallback", 1);
+            let fb = app.studio.pattern.roles["planner"].fallback.clone().expect("a model after none");
+            assert_ne!(fb, own, "a role never falls back to its own model");
+            seen.push(fb);
+        }
+        assert_eq!(seen.len(), n);
+        nudge(&mut app, "planner", "fallback", 1);
+        assert_eq!(app.studio.pattern.roles["planner"].fallback, None, "the cycle wraps back to none");
+        nudge(&mut app, "planner", "fallback", -1);
+        assert_eq!(app.studio.pattern.roles["planner"].fallback.as_ref(), seen.last(), "and steps back the other way");
+        apply_edit(&mut app, &EditTarget::RoleField("planner".into(), "fallback".into()), " none ");
+        assert_eq!(app.studio.pattern.roles["planner"].fallback, None);
+        apply_edit(&mut app, &EditTarget::RoleField("planner".into(), "fallback".into()), "luna");
+        assert_eq!(app.studio.pattern.roles["planner"].fallback.as_deref(), Some("luna"));
+    }
+
+    /// `network` toggles; `writable_roots` takes a comma/line list, and "none" or nothing clears it.
+    #[test]
+    fn network_toggles_and_writable_roots_parse() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert!(app.studio.pattern.settings.network);
+        assert_eq!(get_value(&app, "⚙ settings", "network"), "on");
+        nudge(&mut app, "⚙ settings", "network", 1);
+        assert!(!app.studio.pattern.settings.network);
+        assert_eq!(get_value(&app, "⚙ settings", "network"), "off");
+        nudge(&mut app, "⚙ settings", "network", -1);
+        assert!(app.studio.pattern.settings.network);
+
+        let roots = EditTarget::Setting("writable_roots".into());
+        assert_eq!(get_value(&app, "⚙ settings", "writable_roots"), "none");
+        apply_edit(&mut app, &roots, "~/.gradle, /opt/sdk\n ~/cache ,, ");
+        assert_eq!(app.studio.pattern.settings.writable_roots, vec!["~/.gradle", "/opt/sdk", "~/cache"]);
+        assert_eq!(get_value(&app, "⚙ settings", "writable_roots"), "~/.gradle, /opt/sdk, ~/cache");
+        apply_edit(&mut app, &roots, "None");
+        assert!(app.studio.pattern.settings.writable_roots.is_empty());
+        apply_edit(&mut app, &roots, "/x");
+        apply_edit(&mut app, &roots, "  ");
+        assert!(app.studio.pattern.settings.writable_roots.is_empty(), "an emptied field clears the list");
+    }
+
+    /// `manager_minutes` is editable as text like `review_minutes`, including its own "off" display.
+    #[test]
+    fn manager_minutes_accepts_numbers_and_its_off_label() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        let t = EditTarget::Setting("manager_minutes".into());
+        apply_edit(&mut app, &t, "7");
+        assert_eq!(app.studio.pattern.settings.manager_minutes, 7);
+        apply_edit(&mut app, &t, "off (escalations only)");
+        assert_eq!(app.studio.pattern.settings.manager_minutes, 0);
+    }
 
     /// `auto` leads the effort list, and changing a role's model must not bake it into a level.
     #[test]

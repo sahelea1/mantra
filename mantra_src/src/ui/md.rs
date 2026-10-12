@@ -140,6 +140,13 @@ pub fn wrap(spans: Vec<Span<'static>>, width: usize, first: Vec<Span<'static>>, 
                 continue;
             }
         }
+        if w + tw > avail && w + trimmed_w <= avail {
+            // the word fits but its trailing space does not: drop the space, not the word (a
+            // hard break here used to start the next line with a stray space)
+            line.push(Span::styled(tok.trim_end().to_string(), st));
+            w += trimmed_w;
+            continue;
+        }
         if w + tw > avail && tw > avail.saturating_sub(w) {
             // hard-break a long token
             let mut chunk = String::new();
@@ -183,6 +190,14 @@ mod tests {
             let joined: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect::<String>().replace(' ', "").replace('•', "");
             assert_eq!(joined, text.replace(' ', ""), "no text lost at width {w}");
         }
+    }
+    /// A word that fills the line exactly keeps its space to itself: the next line starts with
+    /// the next word, not with a stray space.
+    #[test]
+    fn a_word_that_fills_the_line_does_not_push_its_space_down() {
+        let lines = wrap(vec![Span::raw("aaaa bbbb cc")], 6, vec![Span::raw("  ")], vec![Span::raw("  ")]);
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect()).collect();
+        assert_eq!(text, vec!["  aaaa", "  bbbb", "  cc"]);
     }
     #[test]
     fn render_handles_everything_at_tiny_widths() {

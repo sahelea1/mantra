@@ -1,8 +1,8 @@
 //! Modal overlays.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, Screen};
-use crate::engine::run::Stage;
+use crate::app::{App, EditTarget, Overlay, PatternChoice, Screen};
+use crate::engine::run::{HaltReason, Stage};
 use crate::ui::input::Act;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -16,11 +16,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_one(f: &mut Frame, app: &App, i: usize) {
     let area = f.area();
     match &app.overlays[i] {
-        Overlay::Help => help(f, area),
+        Overlay::Help { scroll } => help(f, area, *scroll),
         Overlay::ModelPicker { sel, target } => model_picker(f, area, app, *sel, *target),
         Overlay::Diff { agent, file, scroll } => diff(f, area, app, *agent, *file, *scroll),
         Overlay::Inbox { sel } => inbox(f, area, app, *sel),
         Overlay::Plan { scroll } => plan(f, area, app, *scroll),
+        Overlay::Halt { scroll } => halt(f, area, app, *scroll),
         Overlay::Edit { title, input, target } => edit(f, area, title, input, target),
         Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
         Overlay::Discover(st) => discover(f, area, st),
@@ -159,12 +160,15 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
 }
 
-fn help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 86, 32);
-    f.render_widget(Clear, r);
-    let k = |a: &str, b: &str| Line::from(vec![Span::styled(format!("  {a:<16}"), theme::bold(theme::accent())), Span::styled(b.to_string(), theme::text())]);
-    let h = |t: &str| Line::from(Span::styled(format!(" {t}"), theme::bold(theme::fg(theme::VIOLET))));
-    let mut l = vec![
+fn help(f: &mut Frame, area: Rect, scroll: usize) {
+    let w = 104u16.min(area.width.saturating_sub(2));
+    // keys in a column as wide as the longest one; descriptions wrap under themselves, a
+    // column short of the border
+    let tw = w.saturating_sub(3) as usize;
+    let k = |a: &str, b: &str| md::wrap(vec![Span::styled(b.to_string(), theme::text())], tw, vec![Span::styled(format!("  {a:<21}"), theme::bold(theme::accent()))], vec![Span::raw(" ".repeat(23))]);
+    let h = |t: &str| vec![Line::from(Span::styled(format!(" {t}"), theme::bold(theme::fg(theme::VIOLET))))];
+    let gap = || vec![Line::default()];
+    let l: Vec<Line<'static>> = [
         h("everywhere"),
         k("ctrl+o", "switch Solo ⇄ Mandala"),
         k("ctrl+k", "model picker (←→ effort)"),
@@ -178,33 +182,45 @@ fn help(f: &mut Frame, area: Rect) {
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
         k("pgup / pgdn", "scroll (mouse wheel too)"),
         k("/", "commands (tab completes) · ! runs a shell command"),
-        Line::default(),
+        gap(),
         h("solo"),
         k("⏎ / alt+⏎", "send / newline (or end a line with \\)"),
         k("esc", "clear the input (never interrupts)"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
-        Line::default(),
+        gap(),
         h("busy-agent chat (solo, zoom, @name)"),
         k("⏎", "queue a message behind the current turn (shown as a chip above the input)"),
         k("ctrl+f", "force-send: deliver the queue + input into the running turn right now"),
         k("backspace", "on an empty input, pops the last queued message back in to edit"),
         k("ctrl+x", "on an empty input, discards the whole queue"),
-        Line::default(),
+        gap(),
         h("mandala stage"),
         k("tab", "toggle between typing and navigating the canvas"),
         k("←→↑↓ · alt+←→ · 1-9", "select an agent · jump straight to the nth and zoom in"),
         k("⏎", "zoom into the selected agent (esc to come back to the overview)"),
-        k("space", "pause / resume the whole run"),
+        k("space", "pause / resume the whole run; a halted run resumes only on space, also after m"),
+        k("e", "on a halted run: the whole message and what fixes it"),
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
-        k("m", "switch model for the selected agent (fixes a halted ProviderRejected)"),
+        k("m", "switch model for the selected agent (fixes a halt where the provider rejected it)"),
         k("p · a", "plan · approve plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
         k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
-    ];
-    l.push(Line::default());
-    l.push(Line::from(Span::styled("  esc to close", theme::faint())));
-    f.render_widget(Paragraph::new(l).block(block("keys", theme::SAFFRON)), r);
+    ]
+    .concat();
+    let r = centered(area, w, l.len() as u16 + 3);
+    f.render_widget(Clear, r);
+    let blk = block("keys", theme::SAFFRON);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    // the list outgrows a 36-row terminal: it scrolls, the footer stays put
+    let vh = inner.height.saturating_sub(1) as usize;
+    let more = l.len() > vh;
+    let scroll = scroll.min(l.len().saturating_sub(vh));
+    let view: Vec<Line> = l.into_iter().skip(scroll).take(vh).collect();
+    f.render_widget(Paragraph::new(view), Rect { height: vh as u16, ..inner });
+    let hint = if more { " ↑↓ scroll · esc close " } else { " esc close " };
+    f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
 }
 
 /// Which runtime a provider's models run through (WP10): `codex app-server` or `claude -p`.
@@ -367,6 +383,50 @@ fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
 }
 
+/// The halt in full: the band cuts the message to one line, the backend's error can be long.
+fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
+    let Some(run) = app.run.as_ref() else { return };
+    let w = 100u16.min(area.width.saturating_sub(2));
+    let tw = w.saturating_sub(4) as usize;
+    let mut l: Vec<Line<'static>> = vec![];
+    match &run.halt {
+        Some(h) => {
+            let why = match h.reason {
+                HaltReason::User => "paused by you",
+                HaltReason::Auth => "the provider refused the credentials",
+                HaltReason::UsageLimit => "a usage limit was hit",
+                HaltReason::ProviderRejected => "the provider rejected this model for the role",
+                HaltReason::Environment => "this machine can't run the agents",
+                HaltReason::GateExhausted => "the phase gate ran out of rounds",
+                HaltReason::AttemptsExhausted => "a task ran out of attempts",
+                HaltReason::AgentTurnFailed => "an agent's turn kept failing",
+            };
+            l.push(Line::from(vec![Span::styled(format!(" {} halted {} · ", theme::g("⛔", "X"), fmt_dur(h.since.elapsed())), theme::bold(theme::fg(theme::AMBER))), Span::styled(why, theme::text())]));
+            l.push(Line::default());
+            let pad = || vec![Span::raw(" ")];
+            for para in h.full.lines() {
+                l.extend(md::wrap(vec![Span::styled(para.to_string(), theme::text())], tw, pad(), pad()));
+            }
+            l.push(Line::default());
+            l.extend(md::wrap(vec![Span::styled(run.halt_hint(), theme::bold(theme::accent()))], tw, vec![Span::styled(" what now  ", theme::faint())], vec![Span::raw("           ")]));
+            l.extend(md::wrap(vec![Span::styled("a model change (m) takes effect at the next spawn but does not resume the run: press space when you are ready.", theme::muted())], tw, vec![Span::raw("           ")], vec![Span::raw("           ")]));
+        }
+        None => l.push(Line::from(Span::styled(" the run is no longer halted", theme::fg(theme::GREEN)))),
+    }
+    let r = centered(area, w, l.len() as u16 + 3);
+    f.render_widget(Clear, r);
+    let blk = block("halt", theme::AMBER);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    let h = inner.height.saturating_sub(1) as usize;
+    let more = if l.len() > h { " · ↑↓ scroll" } else { "" };
+    let scroll = scroll.min(l.len().saturating_sub(h));
+    let view: Vec<Line> = l.into_iter().skip(scroll).take(h).collect();
+    f.render_widget(Paragraph::new(view), Rect { height: h as u16, ..inner });
+    let hint = if run.halt.is_some() { format!(" space resume · m model{more} · esc ") } else { " esc ".into() };
+    f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
+}
+
 fn is_multiline(t: &EditTarget) -> bool {
     matches!(t, EditTarget::RoleField(_, f) if f == "instructions" || f == "description") || matches!(t, EditTarget::FlowStep(_, f) if f == "task")
 }
@@ -464,15 +524,36 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     f.render_widget(Paragraph::new(foot), Rect { y: inner.y + inner.height.saturating_sub(2), height: 2.min(inner.height), ..inner });
 }
 
-fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[String]) {
-    let r = centered(area, 60, list.len() as u16 + 5);
+fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoice]) {
+    let r = centered(area, 110, list.len() as u16 + 5);
     f.render_widget(Clear, r);
+    let iw = r.width.saturating_sub(2) as usize;
+    let nw = list.iter().map(|p| w_of(&p.name)).max().unwrap_or(0).max(14) + 2;
+    let active = format!("  {} active", theme::g("●", "*"));
     let mut l: Vec<Line> = list
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let st = if i == sel { theme::bold(theme::accent()) } else { theme::text() };
-            Line::from(vec![Span::styled(format!(" {} {p}", if i == sel { theme::g("▶", ">") } else { " " }), st), Span::styled(if *p == app.pattern_name { "  (active)".to_string() } else { String::new() }, theme::fg(theme::GREEN))])
+            let is = i == sel;
+            let on = p.name == app.pattern_name;
+            let st = if is { theme::bold(theme::accent()) } else { theme::bold(theme::text()) };
+            let tag_st = match p.tag {
+                "default" => theme::fg(theme::GREEN),
+                "yours" | "edited" => theme::fg(theme::VIOLET),
+                _ => theme::faint(),
+            };
+            // the description takes what the name, the tag and the active mark leave
+            let dw = iw.saturating_sub(3 + nw + 10 + 1 + if on { w_of(&active) } else { 0 });
+            let (about, about_st) = match &p.about {
+                Ok(d) => (trunc(d, dw), theme::muted()),
+                Err(e) => (trunc(&format!("{} does not load: {e}", theme::g("⚠", "!")), dw), theme::fg(theme::RED)),
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} {:<nw$}", if is { theme::g("▶", ">") } else { " " }, p.name), st),
+                Span::styled(format!("{:<10}", p.tag), tag_st),
+                Span::styled(about, about_st),
+                Span::styled(if on { active.clone() } else { String::new() }, theme::fg(theme::GREEN)),
+            ])
         })
         .collect();
     l.push(Line::default());
@@ -529,7 +610,13 @@ pub fn key(app: &mut App, k: KeyEvent) {
     let Some(top) = app.overlays.pop() else { return };
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let keep = match top {
-        Overlay::Help => None,
+        Overlay::Help { scroll } => match k.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(Overlay::Help { scroll: scroll.saturating_sub(1) }),
+            KeyCode::Down | KeyCode::Char('j') => Some(Overlay::Help { scroll: scroll + 1 }),
+            KeyCode::PageUp => Some(Overlay::Help { scroll: scroll.saturating_sub(10) }),
+            KeyCode::PageDown => Some(Overlay::Help { scroll: scroll + 10 }),
+            _ => None,
+        },
         Overlay::Web => match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
             _ => Some(Overlay::Web),
@@ -697,6 +784,35 @@ pub fn key(app: &mut App, k: KeyEvent) {
             }
             _ => Some(Overlay::Plan { scroll }),
         },
+        Overlay::Halt { scroll } => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => None,
+            KeyCode::Up | KeyCode::Char('k') => Some(Overlay::Halt { scroll: scroll.saturating_sub(1) }),
+            KeyCode::Down | KeyCode::Char('j') => Some(Overlay::Halt { scroll: scroll + 1 }),
+            KeyCode::PageUp => Some(Overlay::Halt { scroll: scroll.saturating_sub(10) }),
+            KeyCode::PageDown => Some(Overlay::Halt { scroll: scroll + 10 }),
+            KeyCode::Char(' ') => {
+                if app.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
+                    app.with_run(|r, c| r.toggle_pause(c));
+                }
+                None
+            }
+            // the model picker for the agent the halt is about (the fix for a rejected model)
+            KeyCode::Char('m') => {
+                let a = app.run.as_ref().and_then(|r| r.halt.as_ref()).and_then(|h| h.agent);
+                match a {
+                    Some(a) => {
+                        let cur = app.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
+                        let sel = app.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
+                        Some(Overlay::ModelPicker { sel, target: Some(a) })
+                    }
+                    None => {
+                        app.toast("this halt is not about one agent — select one on the stage and press m", crate::agent::Level::Info);
+                        Some(Overlay::Halt { scroll })
+                    }
+                }
+            }
+            _ => Some(Overlay::Halt { scroll }),
+        },
         Overlay::Edit { title, mut input, target } => {
             let ml = is_multiline(&target);
             if k.code == KeyCode::Esc {
@@ -783,8 +899,14 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 sel = (sel + 1).min(list.len().saturating_sub(1));
                 Some(Overlay::Patterns { sel, list })
             }
+            // a pattern whose file does not load would only fail the next run (and the studio
+            // cannot open it): say so, stay here
+            KeyCode::Enter | KeyCode::Char('e') if list.get(sel).map(|p| p.about.is_err()).unwrap_or(false) => {
+                app.toast(format!("{} does not load — fix its .toml file first", list[sel].name), crate::agent::Level::Warn);
+                Some(Overlay::Patterns { sel, list })
+            }
             KeyCode::Enter => {
-                if let Some(p) = list.get(sel) {
+                if let Some(p) = list.get(sel).map(|p| &p.name) {
                     app.pattern_name = p.clone();
                     app.studio.dirty = false;
                     if let Ok(pt) = crate::engine::pattern::Pattern::load(p, &app.project) {
@@ -795,7 +917,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 None
             }
             KeyCode::Char('e') => {
-                if let Some(p) = list.get(sel) {
+                if let Some(p) = list.get(sel).map(|p| &p.name) {
                     app.pattern_name = p.clone();
                     app.studio.dirty = false;
                     app.open_studio();
