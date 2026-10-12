@@ -196,7 +196,7 @@ impl Run {
         // The orchestrator's old process (and its context) is gone: always a fresh one, briefed
         // with the current state below.
         let o = self.spawn_orchestrator(ctx);
-        let unfinished: Vec<usize> = self.workers.iter().enumerate().filter(|(_, w)| matches!(w.state, WState::Queued | WState::Preparing | WState::Running | WState::Retrying(_))).map(|(i, _)| i).collect();
+        let unfinished: Vec<usize> = self.workers.iter().enumerate().filter(|(_, w)| matches!(w.state, WState::Queued | WState::Preparing | WState::Running | WState::Retrying(_)) || (w.transient && matches!(w.state, WState::Failed(_)))).map(|(i, _)| i).collect();
         let mut attached = 0;
         let mut respawned = 0;
         for wi in unfinished {
@@ -204,9 +204,17 @@ impl Run {
             let slot = format!("worker:{}#{}", w.task.id, w.attempt);
             let thread = st.agents.iter().find(|a| a.slot == slot).and_then(|a| a.thread_id.clone());
             let dir = w.wt.clone().filter(|d| d.is_dir());
-            match (w.state == WState::Running, dir, thread) {
+            // a worker the gateway outage killed is not the worker's fault: it goes back to its
+            // thread and worktree like a running one, and a fresh start costs no attempt
+            let outage = w.transient && matches!(w.state, WState::Failed(_));
+            match (w.state == WState::Running || outage, dir, thread) {
                 (true, Some(dir), Some(t)) => {
                     let branch = w.branch.clone();
+                    if outage {
+                        let tid = w.task.id.clone();
+                        self.workers[wi].transient = false;
+                        self.log("↻", "violet", format!("respawning {tid} after the gateway outage"));
+                    }
                     self.launch_worker_with(ctx, wi, dir, branch, Some(t));
                     attached += 1;
                 }
@@ -214,6 +222,11 @@ impl Run {
                     let task = w.task.clone();
                     let prompt = w.prompt.clone();
                     let effort = w.effort.clone();
+                    if outage {
+                        self.extra_attempts += 1;
+                        self.log("↻", "violet", format!("respawning {} after the gateway outage", task.id));
+                    }
+                    self.workers[wi].transient = false;
                     self.workers[wi].state = WState::Cancelled;
                     self.spawn_task(ctx, task, Some(prompt), effort);
                     respawned += 1;
@@ -281,6 +294,7 @@ impl Run {
                     budget_flagged: false,
                     context_override: None,
                     idle_prompts: vec![],
+                    transient: w.transient && w.state == "failed",
                 }
             })
             .collect();

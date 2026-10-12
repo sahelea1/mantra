@@ -547,6 +547,7 @@ mod tests {
             budget_flagged: false,
             context_override: None,
             idle_prompts: vec![],
+            transient: false,
         });
         app.run = Some(run_);
         assert_eq!(app.auto_effort_for(1), "low", "a small worker");

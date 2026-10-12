@@ -927,6 +927,68 @@ pub fn pretty_err(msg: &str) -> String {
     t.to_string()
 }
 
+/// Text of a gateway/backend outage rather than of a request that is wrong: a 5xx, "upstream
+/// provider returned an error", "all upstream candidates", a reset or timed-out connection.
+/// `m` is lower-cased by the caller.
+fn transport_text(m: &str) -> bool {
+    const WORDS: &[&str] = &["timed out", "timeout", "disconnected", "upstream", "bad gateway", "service unavailable", "gateway time", "internal server error", "overloaded", "connection reset", "connection refused", "connection closed", "connection error", "broken pipe", "error sending request", "temporarily unavailable"];
+    if WORDS.iter().any(|w| m.contains(w)) {
+        return true;
+    }
+    // a bare 5xx status, not a digit run inside a larger number
+    let b = m.as_bytes();
+    (0..b.len().saturating_sub(2)).any(|i| {
+        b[i] == b'5'
+            && b[i + 1].is_ascii_digit()
+            && b[i + 2].is_ascii_digit()
+            && (i == 0 || !b[i - 1].is_ascii_digit())
+            && b.get(i + 3).map(|c| !c.is_ascii_digit()).unwrap_or(true)
+            && matches!(&m[i..i + 3], "500" | "502" | "503" | "504" | "520" | "521" | "522" | "523" | "524")
+    })
+}
+
+/// Is this failed turn the model gateway's outage (not the agent's fault, not worth an attempt)?
+/// Codex's own classification wins; otherwise the text decides, except for errors that are
+/// plainly something else (credentials, quota, a full context, a rejected effort).
+pub fn is_transport_error(kind: Option<ErrKind>, msg: &str) -> bool {
+    match kind {
+        Some(ErrKind::Transient) => true,
+        Some(ErrKind::Auth | ErrKind::UsageLimit | ErrKind::ContextFull) => false,
+        _ => !rejects_effort(msg) && transport_text(&msg.to_lowercase()),
+    }
+}
+
+fn rejects_effort(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("reasoning_effort") || m.contains("effort must be")
+}
+
+/// A 400 that names the reasoning effort ("reasoning_effort must be low, high, xhigh, max"): the
+/// values it allows, as far as the message lists them (empty when it only names the parameter).
+/// `None` for any other error.
+pub fn effort_rejection(msg: &str) -> Option<Vec<String>> {
+    if !rejects_effort(msg) {
+        return None;
+    }
+    let m = msg.to_lowercase();
+    let tail = m.find("must be").map(|i| &m[i + "must be".len()..]).unwrap_or("");
+    let mut out: Vec<String> = vec![];
+    for w in tail.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()) {
+        if crate::config::ALL_EFFORTS.contains(&w) && !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// The allowed effort nearest to `want` on the ladder (`config::ALL_EFFORTS`), the lower one on a
+/// tie. `None` when nothing is allowed or `want` is not on the ladder.
+pub fn nearest_effort(want: &str, allowed: &[String]) -> Option<String> {
+    let rank = |e: &str| crate::config::ALL_EFFORTS.iter().position(|x| *x == e);
+    let w = rank(&want.trim().to_lowercase())? as i32;
+    allowed.iter().filter_map(|a| rank(a).map(|r| (r as i32, a))).min_by_key(|(r, _)| ((r - w).abs(), *r)).map(|(_, a)| a.clone())
+}
+
 /// Use the message when Codex doesn't classify the error (e.g. HTTP 401/403 from a proxy).
 pub fn refine(k: ErrKind, msg: &str) -> ErrKind {
     if k != ErrKind::Other {
@@ -935,7 +997,7 @@ pub fn refine(k: ErrKind, msg: &str) -> ErrKind {
     let m = msg.to_lowercase();
     if m.contains("401") || m.contains("403") || m.contains("forbidden") || m.contains("unauthorized") || m.contains("api key") {
         ErrKind::Auth
-    } else if m.contains("429") || m.contains("502") || m.contains("503") || m.contains("timed out") || m.contains("disconnected") {
+    } else if m.contains("429") || transport_text(&m) {
         ErrKind::Transient
     } else if m.contains("400") || m.contains("422") || m.contains("unexpected message role") || m.contains("unsupported") || m.contains("invalid_request_error") {
         ErrKind::ProviderRejected
@@ -1102,12 +1164,40 @@ mod tests {
     }
 
     #[test]
+    fn gateway_outages_are_told_from_rejected_requests() {
+        use super::*;
+        assert!(is_transport_error(None, "unexpected status 503 Service Unavailable"));
+        assert!(is_transport_error(Some(ErrKind::ProviderRejected), "all upstream candidates failed"));
+        assert!(is_transport_error(Some(ErrKind::Transient), "anything"));
+        assert!(!is_transport_error(Some(ErrKind::Auth), "401 upstream"));
+        assert!(!is_transport_error(None, "unexpected status 400: reasoning_effort must be low, high"));
+        assert!(!is_transport_error(None, "Unexpected message role."));
+    }
+
+    #[test]
+    fn a_rejected_effort_is_parsed_and_mapped_to_the_nearest_allowed_one() {
+        use super::*;
+        let m = "unexpected status 400: DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max";
+        let allowed = effort_rejection(m).expect("an effort error");
+        assert_eq!(allowed, ["low", "high", "xhigh", "max"]);
+        assert_eq!(nearest_effort("medium", &allowed).as_deref(), Some("low"), "a tie goes to the lower one");
+        assert_eq!(nearest_effort("high", &allowed).as_deref(), Some("high"));
+        assert_eq!(nearest_effort("ultra", &allowed).as_deref(), Some("max"));
+        assert_eq!(effort_rejection("reasoning_effort is invalid"), Some(vec![]));
+        assert_eq!(effort_rejection("bad request"), None);
+        assert_eq!(nearest_effort("medium", &[]), None);
+    }
+
+    #[test]
     fn refines_unclassified_errors() {
         use super::*;
         assert_eq!(refine(ErrKind::Other, "unexpected status 403 Forbidden: Host not in allowlist"), ErrKind::Auth);
         assert_eq!(refine(ErrKind::Other, "stream disconnected before completion"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Transient, "403"), ErrKind::Transient);
         assert_eq!(refine(ErrKind::Other, "something odd"), ErrKind::Other);
+        assert_eq!(refine(ErrKind::Other, "unexpected status 502 Bad Gateway: upstream provider returned an error"), ErrKind::Transient);
+        assert_eq!(refine(ErrKind::Other, "connection reset by peer"), ErrKind::Transient);
+        assert_eq!(refine(ErrKind::Other, "used 15000 tokens"), ErrKind::Other, "a 5xx is a whole number, not a digit run");
         assert_eq!(refine(ErrKind::Other, "Unexpected message role."), ErrKind::ProviderRejected);
         assert_eq!(refine(ErrKind::Other, "unexpected status 422: invalid_request_error"), ErrKind::ProviderRejected);
     }

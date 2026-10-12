@@ -232,6 +232,9 @@ pub struct Worker {
     /// no `completed` turn in between means the orchestrator is stuck nagging a dead worker —
     /// respawn it instead of forwarding another prompt.
     pub idle_prompts: Vec<Instant>,
+    /// The worker is `Failed` because the model gateway was down, not because of anything it did:
+    /// the next resume respawns it (same worktree), and it costs no attempt.
+    pub transient: bool,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -429,7 +432,7 @@ pub struct Run {
     last_verify_sig: Option<String>,
     /// Attempts granted on top of `worker_retries + 3` by the planner (`mantra_resume_run`) or the
     /// user (`r`) after an `AttemptsExhausted` halt, so "try once more" is actually possible.
-    extra_attempts: u32,
+    pub(super) extra_attempts: u32,
     /// A halt was escalated to the planner and it hasn't acted yet (`escalate_to_planner`).
     escalation_open: bool,
     orch_inbox: Vec<String>,
@@ -474,6 +477,13 @@ pub struct Run {
     first_token_strikes: HashMap<String, u8>,
     /// Agents already acted on for their current silent spell, so one spell is one strike.
     first_token_flagged: HashSet<AgentId>,
+    /// When each agent last failed a turn on the model gateway (a transport error, see
+    /// `agent::is_transport_error`) — what tells a dead gateway from one agent's bad luck.
+    transport_errs: HashMap<AgentId, Instant>,
+    /// Per worker: consecutive gateway failures retried without costing an attempt.
+    gateway_streak: HashMap<AgentId, u32>,
+    /// Agents whose rejected reasoning effort was already remapped once (one retry, not a loop).
+    effort_retried: HashSet<AgentId>,
     /// A halt currently in the manager's hands (see `escalate_to_manager`).
     manager_escalation: Option<ManagerEscalation>,
     /// The watchdog woke the manager about an idle agent (ladder step 3). Cleared when the manager
@@ -563,6 +573,9 @@ impl Run {
             state_dirty: false,
             first_token_strikes: HashMap::new(),
             first_token_flagged: HashSet::new(),
+            transport_errs: HashMap::new(),
+            gateway_streak: HashMap::new(),
+            effort_retried: HashSet::new(),
             manager_escalation: None,
             manager_watchdog: None,
             yielded: HashSet::new(),
@@ -651,6 +664,7 @@ impl Run {
                     prompt: w.prompt.clone(),
                     effort: w.effort.clone(),
                     report,
+                    transient: w.transient,
                 }
             })
             .collect();
@@ -797,7 +811,7 @@ impl Run {
     /// `resume`, with the agent that caused it (the planner acting on an escalation) left out of
     /// the "continue where you left off" re-prompts — it is mid-turn and knows.
     pub fn resume_by(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>) {
-        self.resume_core(ctx, except, true);
+        self.resume_core(ctx, except, true, true);
     }
 
     /// Lift a halt so that a restart of `target` (a retry, a respawn) can go ahead. When that
@@ -808,10 +822,12 @@ impl Run {
         let in_gate = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
         let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc).unwrap_or(false);
         let replaces = in_gate && (Some(target) == self.gate_agent || fix_worker);
-        self.resume_core(ctx, except, !replaces);
+        self.resume_core(ctx, except, !replaces, false);
     }
 
-    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool) {
+    /// `respawn`: also put the workers the gateway outage failed back to work (not for a restart of
+    /// one specific agent, which is its own answer).
+    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool, respawn: bool) {
         if self.halt.is_none() {
             return;
         }
@@ -825,6 +841,9 @@ impl Run {
         self.log("▶", "green", "run resumed");
         self.save_state();
         let t0 = Instant::now();
+        if respawn {
+            self.respawn_after_outage(ctx);
+        }
         let pending = self.pending.take();
         if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. }))) = (pickup, &pending) {
             // the restart that follows replaces the very agent this was waiting to start
@@ -1638,6 +1657,7 @@ Then summarize in 2-4 lines.",
             context_override,
             budget_flagged: false,
             idle_prompts: vec![],
+            transient: false,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued (max_parallel = {})", self.pattern.settings.max_parallel));
@@ -2408,6 +2428,24 @@ Then summarize in 2-4 lines.",
                 }
                 return;
             }
+            // The model rejected the requested reasoning effort and says which ones it offers: the
+            // nearest allowed one is set and the turn retried — once, so a model that rejects
+            // that too falls through to the ordinary handling below.
+            if let Some(allowed) = crate::agent::effort_rejection(&msg) {
+                if self.remap_effort(ctx, a, &allowed) {
+                    return;
+                }
+            }
+            // A dead or flaky gateway is nobody's fault: it never costs an attempt, so it is
+            // handled here, before the counted retry ladder.
+            let kind = if crate::agent::is_transport_error(kind, &msg) { Some(ErrKind::Transient) } else { kind };
+            if kind == Some(ErrKind::Transient) {
+                self.transport_errs.insert(a, Instant::now());
+                if let Some(wi) = self.worker_idx(a) {
+                    self.on_gateway_failure(ctx, wi, &msg);
+                    return;
+                }
+            }
             if msg == "agent restarting" {
                 let wait = Duration::from_secs(4);
                 let name = self.name_of(a);
@@ -2488,6 +2526,10 @@ Then summarize in 2-4 lines.",
                     let (alias, provider) = ctx.agent(a).map(|ag| (ag.model_alias.clone(), ag.provider.clone())).unwrap_or_default();
                     let role = self.role_name_of(a).unwrap_or_default();
                     (format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120)), format!("{n} [{role}] ({alias} via {provider}): {msg}"))
+                } else if reason == HaltReason::AgentTurnFailed && kind == Some(ErrKind::Transient) && self.gateway_down(ctx, a) {
+                    // every agent that was working failed on the transport within the minute
+                    let hint = "the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically";
+                    (format!("{n}: {} — {hint}", trunc(&msg, 120)), format!("{n}: {msg} — {hint}"))
                 } else {
                     (format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"))
                 };
@@ -2502,6 +2544,9 @@ Then summarize in 2-4 lines.",
             // worker with a non-retryable error or out of retries: falls through → reported to the orchestrator
         } else if status == "completed" {
             self.retry_counts.remove(&a);
+            self.gateway_streak.remove(&a);
+            self.effort_retried.remove(&a);
+            self.transport_errs.remove(&a);
             if let Some(tag) = self.watchdog_role_tag(a) {
                 self.turn_fail_retried.remove(&tag);
             }
@@ -2686,6 +2731,104 @@ Then summarize in 2-4 lines.",
             // reprompt handled — forward any queued orchestrator notes
             self.wake_orch(ctx);
         }
+    }
+
+    /// How many gateway failures in a row a worker rides out on its own before its failure is
+    /// reported (and, in the meantime, none of them costs an attempt).
+    const GATEWAY_RETRIES: u32 = 10;
+
+    /// A worker's turn failed on the model gateway (HTTP 5xx, "upstream provider returned an
+    /// error", a reset connection, …) — an outage, not something the worker did. It never spends
+    /// one of `worker_retries`: while the run is going it retries with a short backoff; when the
+    /// run is halted (or the outage outlasts the backoff) it is marked failed *because of the
+    /// gateway*, and the next resume respawns it (`respawn_after_outage`).
+    fn on_gateway_failure(&mut self, ctx: &mut dyn Ctx, wi: usize, msg: &str) {
+        let (a, tid) = match (self.workers[wi].agent, self.workers[wi].paused, &self.workers[wi].state) {
+            (Some(a), false, s) if *s != WState::Cancelled => (a, self.workers[wi].task.id.clone()),
+            _ => return,
+        };
+        if self.halted() {
+            self.workers[wi].state = WState::Failed(msg.to_string());
+            self.workers[wi].transient = true;
+            self.log("✗", "red", format!("{tid} failed on the model gateway: {} — it is respawned when the run resumes", trunc(msg, 60)));
+            self.save_state();
+            return;
+        }
+        let n = {
+            let n = self.gateway_streak.entry(a).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n <= Self::GATEWAY_RETRIES {
+            let wait = Duration::from_secs((4 * n as u64).min(30));
+            self.workers[wi].state = WState::Retrying(Instant::now() + wait);
+            self.log("↻", "amber", format!("{tid}: gateway error ({}) → retrying in {}s — not counted as an attempt", trunc(msg, 50), wait.as_secs()));
+            self.continue_queue.push((a, Instant::now() + wait, format!("[mantra:retry] Your previous turn failed on the model gateway ({msg}) — not your fault. Continue exactly where you left off.")));
+            return;
+        }
+        // the outage outlasted the backoff: report it, but a resume (or a retry) is still free
+        self.gateway_streak.remove(&a);
+        self.workers[wi].transient = true;
+        self.on_worker_done(ctx, wi, "failed", Some(msg.to_string()));
+    }
+
+    /// `resume`: every worker whose last failure was the gateway's goes back to work in its own
+    /// worktree. The live agent is simply told to carry on; one whose process is gone is started
+    /// again — for free, that outage was not an attempt.
+    fn respawn_after_outage(&mut self, ctx: &mut dyn Ctx) {
+        let down: Vec<usize> = self.workers.iter().enumerate().filter(|(_, w)| w.transient && !w.adhoc && matches!(w.state, WState::Failed(_))).map(|(i, _)| i).collect();
+        for wi in down {
+            let tid = self.workers[wi].task.id.clone();
+            self.log("↻", "violet", format!("respawning {tid} after the gateway outage"));
+            self.workers[wi].transient = false;
+            let alive = self.workers[wi].agent.filter(|a| ctx.agent(*a).map(|x| !matches!(x.status, Status::Crashed(_) | Status::Stopped)).unwrap_or(false));
+            match alive {
+                Some(a) => {
+                    self.gateway_streak.remove(&a);
+                    self.workers[wi].state = WState::Running;
+                    self.workers[wi].finished = None;
+                    self.mark_edge(a);
+                    ctx.prompt(a, format!("[mantra:resume] The model gateway was down and your last turn failed; the run is resuming now. Your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}", self.workers[wi].prompt));
+                }
+                None => {
+                    let (task, prompt, effort) = (self.workers[wi].task.clone(), self.workers[wi].prompt.clone(), self.workers[wi].effort.clone());
+                    self.extra_attempts += 1;
+                    self.workers[wi].state = WState::Cancelled;
+                    self.spawn_task(ctx, task, Some(prompt), effort);
+                }
+            }
+        }
+    }
+
+    /// Did every agent that is working fail on the gateway within the last minute (and `a` too)?
+    /// Then it is the gateway, not an agent.
+    fn gateway_down(&self, ctx: &dyn Ctx, a: AgentId) -> bool {
+        let recent = |x: &AgentId| self.transport_errs.get(x).map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false);
+        recent(&a) && self.all_agents().iter().all(|x| *x == a || recent(x) || !ctx.agent(*x).map(|g| g.busy()).unwrap_or(false))
+    }
+
+    /// The model refused the requested reasoning effort and named the values it takes: set the
+    /// nearest allowed one on the agent and retry its turn, once. `false` when nothing could be
+    /// parsed (or it was already tried), and the failure is handled as before.
+    fn remap_effort(&mut self, ctx: &mut dyn Ctx, a: AgentId, allowed: &[String]) -> bool {
+        let Some((want, alias)) = ctx.agent(a).map(|x| (x.effort.clone(), x.model_alias.clone())) else { return false };
+        let Some(pick) = crate::agent::nearest_effort(&want, allowed).filter(|p| *p != want) else { return false };
+        if !self.effort_retried.insert(a) {
+            return false;
+        }
+        let used = match ctx.set_effort(a, &pick) {
+            u if u.is_empty() => pick,
+            u => u,
+        };
+        let name = self.name_of(a);
+        self.log("⚙", "amber", format!("{name}: effort {want} is not offered by {alias} — using {used}"));
+        let wait = Duration::from_secs(1);
+        if let Some(wi) = self.worker_idx(a) {
+            self.workers[wi].effort = Some(used.clone());
+            self.workers[wi].state = WState::Retrying(Instant::now() + wait);
+        }
+        self.continue_queue.push((a, Instant::now() + wait, format!("[mantra:retry] Your previous turn was rejected: the model does not offer that reasoning effort; it now runs at {used}. Continue exactly where you left off.")));
+        true
     }
 
     fn on_worker_done(&mut self, ctx: &mut dyn Ctx, wi: usize, status: &str, error: Option<String>) {
@@ -3790,6 +3933,10 @@ Then summarize in 2-4 lines.",
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
+        // a worker the gateway outage failed did not use up an attempt
+        if std::mem::take(&mut self.workers[wi].transient) {
+            self.extra_attempts += 1;
+        }
         self.workers[wi].state = WState::Cancelled;
         let effort = self.workers[wi].effort.clone();
         let p = prompt.or(Some(self.workers[wi].prompt.clone()));
@@ -4508,6 +4655,7 @@ mod halt_tests {
             budget_flagged: false,
             context_override: None,
             idle_prompts: vec![],
+            transient: false,
         }
     }
     impl Ctx for TestCtx {
@@ -7117,7 +7265,7 @@ mod halt_tests {
         run.dir = dir.clone();
         let gate = ctx.add_busy();
         run.gate_agent = Some(gate);
-        let err = format!("gateway said: {}END", "upstream connect error or disconnect/reset before headers; ".repeat(12));
+        let err = format!("harness said: {}END", "the model produced a reply the harness cannot parse; ".repeat(12));
         assert!(err.chars().count() > 400);
 
         // the first failure of a gate gets its free respawn; the second halts
@@ -7216,5 +7364,135 @@ mod halt_tests {
         assert!(!h.message.contains("END") && h.message.starts_with("t1 has used all "), "the short form keeps the task-id prefix the web view parses: {}", h.message);
         assert_eq!(RunState::load(&run.dir).unwrap().halted.as_deref(), Some(h.full.as_str()));
         let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    fn pulse_texts(run: &Run) -> Vec<String> {
+        run.pulse.iter().map(|p| p.text.clone()).collect()
+    }
+
+    #[test]
+    fn a_gateway_outage_retries_a_worker_without_costing_an_attempt() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let w = ctx.add_idle();
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        for _ in 0..(run.pattern.settings.worker_retries + 5) {
+            run.on_turn_done(&mut ctx, w, "failed", Some("unexpected status 502 Bad Gateway: upstream provider returned an error".into()), Some(ErrKind::Other));
+            assert!(matches!(run.workers[0].state, WState::Retrying(_)), "{:?}", run.workers[0].state);
+        }
+        assert!(!run.halted());
+        assert_eq!(run.workers[0].attempt, 1);
+        assert!(run.retry_counts.get(&w).is_none(), "the counted ladder was never touched");
+        assert_eq!(run.continue_queue.len() as u32, run.pattern.settings.worker_retries + 5);
+        assert!(run.continue_queue.iter().all(|(a, _, m)| *a == w && m.contains("not your fault")));
+    }
+
+    #[test]
+    fn workers_failed_by_a_dead_gateway_respawn_on_resume() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let orch = ctx.add_idle();
+        let w = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        run.workers[0].prompt = "build the thing".into();
+        run.halt(&mut ctx, HaltReason::AgentTurnFailed, Some(orch), "orchestrator: HTTP 503".into());
+        // the worker's own turn dies on the gateway while the run is halted
+        run.on_turn_done(&mut ctx, w, "failed", Some("503 Service Unavailable".into()), Some(ErrKind::Transient));
+        assert!(matches!(run.workers[0].state, WState::Failed(_)) && run.workers[0].transient);
+        assert!(run.continue_queue.is_empty(), "nothing retries into a dead gateway while halted");
+        // a restart keeps the flag on disk
+        run.dir = scratch_dir("outage");
+        run.save_state();
+        let saved = RunState::load(&run.dir).unwrap();
+        assert!(saved.workers[0].transient && saved.workers[0].state == "failed");
+        let _ = std::fs::remove_dir_all(&run.dir);
+
+        run.toggle_pause(&mut ctx);
+        assert!(!run.halted());
+        assert_eq!(run.workers[0].state, WState::Running);
+        assert!(!run.workers[0].transient);
+        assert_eq!(run.workers[0].agent, Some(w), "the same agent, in the same worktree, carries on");
+        assert_eq!(run.workers[0].attempt, 1);
+        let prompts: Vec<&String> = ctx.prompts.iter().filter(|(a, _)| *a == w).map(|(_, t)| t).collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].starts_with("[mantra:resume]") && prompts[0].contains("Continue exactly where you left off") && prompts[0].contains("build the thing"));
+        assert!(pulse_texts(&run).iter().any(|t| t == "respawning t1 after the gateway outage"), "{:?}", pulse_texts(&run));
+    }
+
+    #[test]
+    fn retrying_a_gateway_failed_worker_does_not_spend_an_attempt() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let w = ctx.add_idle();
+        let before = run.max_attempts();
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Failed("502".into())));
+        run.workers[0].transient = true;
+        run.retry_worker(&mut ctx, w, None);
+        assert_eq!(run.max_attempts(), before + 1);
+    }
+
+    #[test]
+    fn a_rejected_effort_is_remapped_and_the_turn_retried_once() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let w = ctx.add_idle();
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        {
+            let ag = ctx.agents.get_mut(&w).unwrap();
+            ag.effort = "medium".into();
+            ag.model_alias = "deepseek".into();
+        }
+        let err = "unexpected status 400: DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max";
+        run.on_turn_done(&mut ctx, w, "failed", Some(err.into()), Some(ErrKind::ProviderRejected));
+        assert_eq!(ctx.efforts_set, vec![(w, "low".to_string())], "medium sits between low and high: the lower one wins the tie");
+        assert!(!run.halted());
+        assert_eq!(run.continue_queue.len(), 1);
+        assert!(pulse_texts(&run).iter().any(|t| t == "a: effort medium is not offered by deepseek — using low" || t.ends_with("effort medium is not offered by deepseek — using low")), "{:?}", pulse_texts(&run));
+        // a model that rejects the new one too is the ordinary 400 again
+        ctx.agents.get_mut(&w).unwrap().effort = "low".into();
+        run.on_turn_done(&mut ctx, w, "failed", Some(err.into()), Some(ErrKind::ProviderRejected));
+        assert_eq!(ctx.efforts_set.len(), 1);
+        assert!(run.halted() && run.halt.as_ref().unwrap().reason == HaltReason::ProviderRejected);
+    }
+
+    #[test]
+    fn an_effort_error_that_lists_nothing_falls_through() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let w = ctx.add_idle();
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        run.on_turn_done(&mut ctx, w, "failed", Some("unexpected status 400: invalid reasoning_effort".into()), Some(ErrKind::ProviderRejected));
+        assert!(ctx.efforts_set.is_empty());
+        assert!(run.halted() && run.halt.as_ref().unwrap().reason == HaltReason::ProviderRejected);
+    }
+
+    #[test]
+    fn the_halt_for_a_dead_gateway_says_what_to_do() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        let w = ctx.add_busy();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        run.turn_fail_retried.insert("planner".into());
+        run.retry_counts.insert(planner, 99);
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        // a busy agent that has not failed: that is not "the gateway is down"
+        run.on_turn_done(&mut ctx, planner, "failed", Some("502 Bad Gateway".into()), Some(ErrKind::Transient));
+        assert!(run.halted());
+        assert!(!run.halt.as_ref().unwrap().message.contains("gateway looks down"), "{}", run.halt.as_ref().unwrap().message);
+
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        run.turn_fail_retried.insert("planner".into());
+        run.retry_counts.insert(planner, 99);
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        run.transport_errs.insert(w, Instant::now());
+        run.on_turn_done(&mut ctx, planner, "failed", Some("502 Bad Gateway".into()), Some(ErrKind::Transient));
+        let h = run.halt.as_ref().expect("halted");
+        assert!(h.message.ends_with("the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically"), "{}", h.message);
+        assert!(h.full.ends_with("failed workers are respawned automatically"));
     }
 }

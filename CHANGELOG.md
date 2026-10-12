@@ -18,6 +18,14 @@ All notable changes to Mantra are recorded here.
   in workspace-write, so a fix worker could not unstage a file or merge; the worktree still
   isolates it. An agent's own "I cannot … in this sandbox" question is a question, not a dead
   machine.
+- **A gateway outage is not the worker's fault.** A turn that fails on the transport (HTTP 5xx,
+  "upstream provider returned an error", a reset connection, a timeout) no longer costs an attempt:
+  a running worker retries with a short backoff, and one that failed while the run was halted (or
+  outlasted the backoff) is respawned automatically in its own worktree on resume and after a
+  restart, logged as `↻ respawning <task> after the gateway outage`. The halt message for a dead
+  gateway says to press resume.
+- **A rejected reasoning effort is remapped.** A 400 naming `reasoning_effort` / "effort must be …"
+  sets the nearest effort the model lists (the lower one on a tie) and retries the turn once.
 - **Example gateway config** in `docs/examples/riti`: a `models.toml` for one OpenAI-compatible
   gateway fronting two model families, and the patterns the Android app build ran with.
 
