@@ -32,6 +32,8 @@ pub struct SpawnSpec {
     pub config: serde_json::Map<String, Value>,
     pub extra_args: Vec<String>,
     pub resume_thread: Option<String>,
+    /// What to call the thread in the backend (`thread/name/set`), where it supports names.
+    pub thread_name: Option<String>,
     /// Which process type owns this agent (`hub::run_process` for Codex, `hub::claude` for
     /// Claude Code — WP10). `agent_task` dispatches on this; everything above is Codex-only and
     /// ignored for the Claude backend.
@@ -57,6 +59,9 @@ pub enum Cmd {
     SetEffort(String),
     SetModel(String),
     SetApproval(String),
+    /// Rename the agent's thread (the run's title changed). Codex only; a Claude Code session has
+    /// no name to set.
+    SetName(String),
     Restart,
     /// A `mantra mcp-bridge` subprocess (spawned by `claude` per `--mcp-config`, WP10.4) connected
     /// to the Hub's Unix socket and identified itself as belonging to this agent; handed over by
@@ -485,6 +490,9 @@ async fn run_process(
     }
     *thread_id = Some(tid.clone());
     let _ = ev.send(HubEvent::Ready { agent: id, thread_id: tid.clone(), model: model.clone(), resumed: is_restart });
+    if let Some(name) = &spec.thread_name {
+        fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": name}), "name", None);
+    }
     // Deliver anything held across the relaunch (a crash-backoff wait, or a Claude restart_pending
     // hold) now that there's a process again to send it to.
     for text in replay.drain(..) {
@@ -536,6 +544,7 @@ async fn run_process(
                     Some(Cmd::RespondErr { id: rid, message }) => conn.respond_err(rid, -32000, &message),
                     Some(Cmd::SetEffort(e)) => *effort = e,
                     Some(Cmd::SetModel(m)) => *model = m,
+                    Some(Cmd::SetName(n)) => fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": n}), "name", None),
                     Some(Cmd::SetApproval(a)) => {
                         // Apply to the live thread now (not just the next turn/start we send).
                         fire(&conn, ev, id, "thread/settings/update", json!({"threadId": tid, "approvalPolicy": a}), "settings", None);
@@ -707,6 +716,7 @@ mod tests {
             config: Default::default(),
             extra_args: vec![],
             resume_thread: None,
+            thread_name: None,
             backend: Backend::Codex,
             envs: vec![],
             claude: None,
@@ -740,6 +750,71 @@ mod tests {
         }
         drop(ctl);
         assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 7 }));
+    }
+
+    /// A thread is given its name (`<run title> · <role>`) as soon as it is ready, and a later
+    /// `Cmd::SetName` renames it — both through the app-server's `thread/name/set`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_thread_is_named_when_ready_and_renamed_on_request() {
+        let dir = std::env::temp_dir().join(format!("mantra-hub-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("names.log");
+        // a minimal app-server: answers the handshake and thread/start, records thread/name/set
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id";;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr-1"},"model":"m"}}\n' "$id";;
+    *'"method":"thread/name/set"'*) printf '%s\n' "$line" >> "$NAMES_LOG"; printf '{"id":%s,"result":{}}\n' "$id";;
+  esac
+done"#;
+        let spec = SpawnSpec {
+            cwd: dir.clone(),
+            model: "m".into(),
+            provider: "openai".into(),
+            effort: String::new(),
+            approval: "never".into(),
+            sandbox: "read-only".into(),
+            developer_instructions: String::new(),
+            dynamic_tools: vec![],
+            config: Default::default(),
+            extra_args: vec![],
+            resume_thread: None,
+            thread_name: Some("Notes sync · planner".into()),
+            backend: Backend::Codex,
+            envs: vec![("NAMES_LOG".into(), log.to_string_lossy().to_string())],
+            claude: None,
+        };
+        let cmd: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
+        let (ev, mut rx) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        tokio::spawn(agent_task(9, spec, cmd, ev, cmds, Duration::ZERO));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("the agent comes up").expect("alive") {
+                HubEvent::Ready { thread_id, .. } => {
+                    assert_eq!(thread_id, "thr-1");
+                    break;
+                }
+                HubEvent::Crashed { reason, .. } => panic!("the fake app-server failed: {reason}"),
+                _ => {}
+            }
+        }
+        ctl.send(Cmd::SetName("Notes sync · qa".into())).unwrap();
+        let mut lines = vec![];
+        for _ in 0..100 {
+            lines = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+            if lines.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("\"threadId\":\"thr-1\"") && l.contains("Notes sync · planner")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("\"threadId\":\"thr-1\"") && l.contains("Notes sync · qa")), "{lines:?}");
+        drop(ctl);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

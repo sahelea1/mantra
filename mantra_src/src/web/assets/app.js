@@ -324,7 +324,7 @@
         if (r.name === 'agent') return null;
         const app = S.app || {};
         const title = r.name === 'team' ? 'Overview' : TITLES[r.name];
-        const sub = r.name === 'team' ? (app.project || '') : r.name === 'run' && S.run ? S.run.id : '';
+        const sub = r.name === 'team' ? (app.project || '') : r.name === 'run' && S.run ? (S.run.title || S.run.id) : '';
         return h('header', { class: 'main-head', key: 'mh' },
             h('h1', null, title), sub ? h('span', { class: 'main-sub mono' }, sub) : null, h('span', { class: 'spacer' }),
             r.name === 'runs' ? P.btn('Refresh', () => SC.loadRuns(), { sm: true, kind: 'ghost', icon: 'refresh' }) : null,

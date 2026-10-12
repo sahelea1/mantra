@@ -22,7 +22,7 @@ You already have a coding agent in your terminal. Mantra is the room you put it 
 |  | what you get |
 |---|---|
 | **Solo** | One agent, with everything you actually want on screen: the diff it is writing, its plan, how full its context is, what it is running right now. Type while it works. |
-| **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a QA gate merges and checks their work, a manager watches the whole run and unsticks whatever stalls, and a finale does heavy QA, a security sweep and a final verification. |
+| **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a fresh read-only QA agent checks the merged work every round and fix workers repair what it finds, a manager watches the whole run and unsticks whatever stalls, and a finale does one QA pass over the diff and a final verification. |
 
 Mantra does not reimplement an agent loop. It drives the official CLIs — `codex app-server` and `claude -p` — one process per agent. Your logins, sandboxes and model access keep working exactly as they do today; you just get a room where several of them can work at once without stepping on each other.
 
@@ -141,9 +141,9 @@ Press `ctrl+o`, describe the goal, and this happens:
 
 **2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together. Above it, from the first phase to the end of the finale, a **manager** watches the whole run: anything that stalls or halts reaches it first, and every few minutes it gets a health digest of the whole team.
 
-**3. The gate merges and checks.** Mantra merges the worker branches, runs the phase's shell checks, and hands the merged result to a QA agent to make coherent. QA only edits when its role's sandbox allows writes — a read-only QA reports what is wrong instead of touching files. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed. A check that keeps failing identically, or a gate that runs out of rounds, goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you.
+**3. The gate merges, checks and reviews — and never fixes.** Mantra merges the worker branches, runs the phase's shell checks, and starts a **fresh, read-only QA agent** for the round: a new session that is handed the check results, the merged phase's `git diff --stat` and diff (capped; lockfiles left out) and the previous round's verdict — it starts from the diff instead of re-reading the repo. It verifies and reports with `mantra_gate_report`; on a fail the report is a work order (file, what is wrong, what to change), and `big` marks fixes that span several files. **Mantra routes the fix itself**: it spawns a worker named `fix-<round>` (`worker-small`, or `worker-big` when the report said so; merge conflicts always go to `worker-big`) with the findings as its prompt, scoped to the files the findings name, on the integrated copy. When it is done the checks run again and the next QA round starts — a fresh agent again. The same happens when QA passes but the checks still fail. `gate_max_rounds` bounds the loop; a check that keeps failing identically, a QA agent that reports the same blocker twice, or a fix worker that cannot do its job goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed.
 
-**4. The finale**: heavy QA → a security sweep → the planner verifying its own plan, able to spawn ad-hoc fixers.
+**4. The finale** depends on the pattern (below). In the default one: a single QA pass that starts from the run's diff and the gate reports — security is a checklist inside it, defects go to fix workers — then the planner verifying its own plan against the same diff and reports, able to spawn fix workers for real gaps.
 
 **5. `/land`** merges the run branch into yours. Everything else lives in `~/.mantra` — plan, journal, per-phase outputs, merge logs. Nothing is written into your project.
 
@@ -163,12 +163,12 @@ You can talk to anyone: plain text on the stage re-prompts the planner, `@p2-api
 <details>
 <summary>The manager: someone whose job is the whole run</summary>
 
-Every other agent owns a slice — a plan, a phase, a task, a gate. The **manager** owns the run. It starts with the first phase (right after you approve the plan), is briefed once with the goal, the phases and the run's settings, and stays through every phase and the finale. It never edits code: its sandbox is read-only and its tools only steer other agents. In the default pattern it is `◈`, on `sol` at high effort (`fable51` in `mantra-default-claude`).
+Every other agent owns a slice — a plan, a phase, a task, a gate. The **manager** owns the run. It starts with the first phase (right after you approve the plan), is briefed once with the goal, the phases and the run's settings, and stays through every phase and the finale. It never edits code: its sandbox is read-only and its tools only steer other agents. In the default pattern it is `◈`, on `sol` at `auto` effort (`fable51` in `mantra-default-claude`).
 
 Two things wake it:
 
 - **Escalations.** A gate or a task out of attempts, an agent whose turn failed past its free respawn, or an agent the watchdog could not get moving, reaches the manager before the planner (or you), with the same facts. It reads first — `mantra_status` is the whole run for it, `mantra_log` on the agent involved, `mantra_journal` for the recent journal — then makes the smallest intervention: a hint (`mantra_prompt`, or `mantra_resume_run` when halted), a fresh start (`mantra_retry` a task, `mantra_respawn` any agent with a note), a different effort, a word to the orchestrator. Restarting an agent during an escalated halt *is* the decision to go on: it lifts the halt, and an exhausted task gets one more attempt. Changes to the plan or the gate checks are the planner's — it hands those up with `mantra_ask`.
-- **A health digest**, every `manager_minutes` (default 5) while the team builds or the finale runs: stage, plan progress, every non-worker agent with what it is doing and how long it has been quiet, all workers, the last journal lines — and the instruction to intervene only where something is off, otherwise `mantra_wait`.
+- **A health digest**, every `manager_minutes` (default 5; 10 in `mantra-default`) while the team builds or the finale runs: stage, plan progress, every non-worker agent with what it is doing and how long it has been quiet, all workers, the last journal lines — and the instruction to intervene only where something is off, otherwise `mantra_wait`.
 
 It asks you (`mantra_ask_user`) only when nobody in the team can decide — credentials, the machine, a trade-off that is yours. The band reads *the manager asks: …* and your next message answers it.
 
@@ -191,7 +191,7 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 | auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
 | provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
 | environment | a command died in the sandbox (`bwrap`, user namespaces) — reported once, then Mantra halts right away instead of retrying blind | fix the machine — `mantra doctor` prints the sysctl |
-| gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
+| gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice (a fix worker that is blocked or whose turn fails is an *attempts exhausted* halt on `fix-<round>`) | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
 | attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
 
@@ -259,6 +259,8 @@ The same chain carries halts: **manager → planner → you**. *Gate exhausted* 
 An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
 
 Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
+
+A role can also say `effort = "auto"` (the Studio cycles it first): Mantra then picks per spawn from the role's job — planner, manager, orchestrator and gate `medium`; a worker `low` for `worker-small` and `medium` otherwise; any role running a finale step `high` — and the agent list shows the level it actually runs at. A named effort is always used as it is; `/effort auto` on a live agent does the same pick for its role.
 
 <details>
 <summary>Claude Code as a backend for any role</summary>
@@ -344,11 +346,13 @@ Every agent is launched with an explicit context window and compaction threshold
 Every run writes a typed snapshot as it goes, so closing Mantra — or losing the machine — is not fatal.
 
 ```bash
-mantra runs                        # id · project · stage · when · goal
+mantra runs                        # title · project · stage · when · id
 mantra runs resume 238330          # an id prefix is enough, from any directory
 mantra runs delete 238330          # worktrees, branches and journal, after a y/N
 mantra --resume-last               # the most recent unfinished run
 ```
+
+A run has a **title** people can recognise — the plan's title once the planner has submitted it, the goal's first six words before that. It leads the runs list, the TUI header and the web run header; the id (`<seconds>-<slug of the goal>`) stays the stable key and is shown second. Each Codex agent's thread carries the same name, `<title> · <role>`, so a run is easy to find in Codex's own session list (Claude Code sessions have no title API, so they are left alone).
 
 Inside the app, `/runs` lists this project's runs (`⏎` resume, `D` delete), and the welcome screen says `↻ 1 unfinished run` when there is something to pick up.
 
@@ -373,6 +377,16 @@ A resume never replays what the old process was in the middle of. It restarts at
 ## Patterns and the Studio
 
 <img src="docs/img/studio.png" alt="The Studio: roles with model, effort, sandbox and permission, plus the architect agent" width="920">
+
+Three patterns ship in the binary (and load by name, with or without a file of your own in `~/.mantra/patterns/`):
+
+| pattern | for | shape |
+|---|---|---|
+| `mantra-default` | most work | plan → phases (fresh read-only QA gate every round, automatic fix workers) → **one** `qa-heavy` pass on the diff, with security as a checklist in its prompt → planner verification. Manager on (`manager_minutes = 10`), `review_minutes = 5`, every role on `effort = "auto"`. |
+| `mantra-lean` | small and medium tasks | the same phases and gates (`gate_max_rounds = 2`) but **no manager**, no coordination review, `max_parallel = 3`, and the finale is the planner's verification alone. |
+| `mantra-thorough` | releases, security-sensitive work | the heavy flow: `qa-heavy` → `security` → planner verification (heavy QA and security fix directly), manager every 5 minutes, a review every 3, named efforts up to `max`. |
+
+`mantra-default-claude` is `mantra-default` with the planner, manager and orchestrator on `fable51` and the workers on `sonnet5`. Every built-in role prompt is short and says what it owns, what it never does, when to stop — and not to re-read files it already read or run the full suite more than once a turn unless it failed.
 
 A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation; its flow panel shows the manager between the planner and the orchestrator.
 

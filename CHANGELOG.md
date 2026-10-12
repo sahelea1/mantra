@@ -2,6 +2,36 @@
 
 All notable changes to Mantra are recorded here.
 
+## Unreleased
+
+Mantra should produce coherent code by default without taking unnecessarily long or burning
+tokens. A real three-file task cost 760k tokens: the QA gate alone spent 197k re-reading
+everything after four passing checks, edited code itself and kept one stale session across rounds.
+
+- **Fresh read-only QA every gate round; Mantra routes the fixes.** Each round spawns a new QA
+  agent (the old one is archived) with the check results, the phase's `git diff --stat` and diff
+  (capped) and the previous round's verdict. The gate role is read-only and never fixes; a failing
+  report (or checks that still fail after a pass) starts a `fix-<round>` worker — `worker-small`,
+  `worker-big` when the report sets `big` — scoped to the files the findings name, then the checks
+  and the next fresh round run. Merge conflicts go to a fix worker too. The "Route the fix to a
+  worker." message to the orchestrator and the `[mantra:gate-round N]` same-session prompts are
+  gone. `gate_max_rounds` still bounds the loop.
+- **Three built-in patterns.** `mantra-default` (balanced: one `qa-heavy` pass on the diff with a
+  security checklist, then planner verification; manager every 10 minutes), `mantra-lean` (no
+  manager, planner verification only, `max_parallel = 3`) and `mantra-thorough` (the previous heavy
+  flow: QA, security sweep, verification). `mantra-default-claude` derives from the default.
+  `Pattern::names()` lists them; fresh ChatGPT-subscription installs save all three.
+- **Lean prompts.** Every built-in role is short and budget-aware: what it owns, what it never
+  does, when to stop; no re-reading files, no repeated full test suites. Finale agents start from
+  the run's diff and the gate reports, which are put in their prompt.
+- **`effort = "auto"`.** Resolved per spawn from the role's job (planner, manager, orchestrator,
+  gate `medium`; `worker-small` `low`, other workers `medium`; finale roles `high`); a named effort
+  is used as it is. The Studio cycles it, `/effort auto` and the web `set_effort` accept it.
+- **Recognizable runs.** A run has a `title` (the plan's title, else the goal's first six words)
+  saved in `state.json` and shown in `mantra runs`, `/runs`, the TUI header, the web run header and
+  `runs_list`; the id stays the key. Codex threads are named `<title> · <role>` via
+  `thread/name/set`.
+
 ## v0.5.0 — 2026-09-26
 
 Mantra leaves the terminal. `--web` serves the same running session as a small, installable web

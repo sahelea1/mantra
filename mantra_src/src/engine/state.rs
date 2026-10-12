@@ -19,6 +19,9 @@ pub const FORMAT: u32 = 2;
 pub struct RunState {
     pub format: u32,
     pub id: String,
+    /// What the run is called for people (the plan's title, else the goal's first words). Empty in
+    /// a file written before titles existed; `display_title` falls back to the goal.
+    pub title: String,
     /// Absolute project path; a run can be resumed from any directory.
     pub project: PathBuf,
     pub brief: String,
@@ -38,6 +41,8 @@ pub struct RunState {
     pub updated_unix: u64,
     pub ws: Option<Workspace>,
     pub handoff: String,
+    /// One line per gate/finale report so far (see `Run::gate_notes`).
+    pub gate_notes: Vec<String>,
     pub workers: Vec<WorkerState>,
     pub agents: Vec<AgentState>,
     /// Phases already completed (for the summary screen after a resume).
@@ -115,6 +120,15 @@ impl RunState {
         matches!(self.stage, Stage::Done | Stage::Failed(_))
     }
 
+    /// The run's name for people: its saved title, or the goal's first words for an older file.
+    pub fn display_title(&self) -> String {
+        if self.title.trim().is_empty() {
+            super::run::title_from_goal(&self.brief)
+        } else {
+            self.title.clone()
+        }
+    }
+
     /// Short, human stage text — the same vocabulary the stage header uses.
     pub fn stage_label(&self) -> String {
         stage_label(&self.stage)
@@ -132,6 +146,7 @@ pub fn stage_label(stage: &Stage) -> String {
                 PhaseStep::Merging => "merging".into(),
                 PhaseStep::Checks { round } => format!("checks r{round}"),
                 PhaseStep::Gate { round } => format!("gate r{round}"),
+                PhaseStep::Fix { round } => format!("fix r{round}"),
                 PhaseStep::Handoff => "handoff".into(),
             };
             format!("phase {} · {s}", idx + 1)
@@ -155,6 +170,15 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
+    /// The run's name for people (see `RunState::display_title`); the goal's first line when the
+    /// state could not be read.
+    pub fn title(&self) -> String {
+        match &self.state {
+            Ok(s) => s.display_title(),
+            Err(_) => super::run::title_from_goal(&self.brief()),
+        }
+    }
+
     pub fn brief(&self) -> String {
         match &self.state {
             Ok(s) => s.brief.lines().next().unwrap_or("").to_string(),
@@ -302,6 +326,8 @@ mod tests {
         RunState {
             format: FORMAT,
             id: "123-add-login".into(),
+            title: "Add a login page".into(),
+            gate_notes: vec!["phase 1 · QA round 1: pass — fine".into()],
             project: PathBuf::from("/tmp/proj"),
             brief: "add login".into(),
             pattern: "mantra-default".into(),
@@ -313,7 +339,7 @@ mod tests {
             finished_unix: None,
             active_secs: Some(7),
             updated_unix: 20,
-            ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None }),
+            ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None, base_commit: None }),
             handoff: "phase 1 done".into(),
             workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into() }],
             agents: vec![AgentState { slot: "orchestrator".into(), name: "orchestrator".into(), role: "orchestrator".into(), provider: "openai".into(), model_alias: "astra".into(), effort: "high".into(), thread_id: Some("t-1".into()), cwd: "/tmp/wt/integration".into() }],
@@ -348,8 +374,53 @@ mod tests {
     fn stage_labels_are_short_and_stable() {
         assert_eq!(stage_label(&Stage::Planning), "planning");
         assert_eq!(stage_label(&Stage::Phase { idx: 0, step: PhaseStep::Orchestrating }), "phase 1 · working");
+        assert_eq!(stage_label(&Stage::Phase { idx: 1, step: PhaseStep::Fix { round: 2 } }), "phase 2 · fix r2");
         assert_eq!(stage_label(&Stage::Finale { idx: 2 }), "finale 3");
         assert_eq!(stage_label(&Stage::Failed("boom".into())), "failed");
+    }
+
+    #[test]
+    fn a_fix_step_and_a_deferred_fix_survive_the_round_trip() {
+        let dir = std::env::temp_dir().join(format!("mantra-state-fix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = sample();
+        st.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+        st.pending = Some(Pending::Fix { idx: 0, round: 1, findings: "src/a.rs is wrong".into(), big: true });
+        st.save(&dir);
+        let back = RunState::load(&dir).unwrap();
+        assert_eq!(back, st);
+        // a pending fix written without the `big` flag still loads
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        v["pending"]["Fix"].as_object_mut().unwrap().remove("big");
+        std::fs::write(dir.join("state.json"), v.to_string()).unwrap();
+        assert!(matches!(RunState::load(&dir).unwrap().pending, Some(Pending::Fix { big: false, .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_file_from_before_titles_still_loads_and_names_itself_from_the_goal() {
+        let dir = std::env::temp_dir().join(format!("mantra-state-notitle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = sample();
+        st.title = String::new();
+        st.gate_notes.clear();
+        st.save(&dir);
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("title");
+        v.as_object_mut().unwrap().remove("gate_notes");
+        std::fs::write(dir.join("state.json"), v.to_string()).unwrap();
+        let back = RunState::load(&dir).unwrap();
+        assert_eq!(back.title, "");
+        assert_eq!(back.display_title(), "add login");
+        let with_title = RunState { title: "Add a login page".into(), ..back.clone() };
+        assert_eq!(with_title.display_title(), "Add a login page");
+        // the runs list shows the title, and falls back to the goal for an unreadable state
+        let ok = RunSummary { id: "1-x".into(), dir: dir.clone(), project_key: "p".into(), state: Ok(with_title), updated_unix: 0 };
+        assert_eq!(ok.title(), "Add a login page");
+        let bad = RunSummary { id: "2-y".into(), dir: dir.clone(), project_key: "p".into(), state: Err("old".into()), updated_unix: 0 };
+        std::fs::write(dir.join("brief.md"), "write the docs for the whole thing please\n").unwrap();
+        assert_eq!(bad.title(), "write the docs for the whole");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

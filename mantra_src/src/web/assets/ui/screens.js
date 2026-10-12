@@ -115,7 +115,8 @@
                 h('span', { class: 'run-hero-id' }, h('span', { class: 'mono dim' }, run.id), h('span', { class: 'dim' }, ' · ' + run.pattern)),
                 run.landable ? P.btn('Land', () => M.act.sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => M.act.cmd('land', {}, { ok: 'Landing…' }) }), { kind: 'primary', icon: 'land', sm: true }) : null,
                 st.kind !== 'done' && st.kind !== 'failed' ? P.btn(run.halted ? 'Resume' : 'Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: run.halted ? 'play' : 'pause', busyKey: 'resume', kind: run.halted ? 'primary' : null }) : null),
-            h('h1', { class: 'run-title' }, run.brief),
+            h('h1', { class: 'run-title' }, run.title || run.brief),
+            run.title && run.title !== run.brief ? h('div', { class: 'run-brief dim' }, F.trunc(run.brief, 200)) : null,
             P.stageRail(run, plan, true),
             h('div', { class: 'run-stats' },
                 stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens)), stat('busy', String(run.busy_count || 0))),
@@ -239,14 +240,14 @@
             kids.push(h('div', { class: 'card flush', key: 'rl' }, list.map((x) => h('div', { class: 'run-row', key: x.id },
                 h('div', { class: 'run-row-main' },
                     h('div', { class: 'run-row-top' },
-                        h('code', { class: 'mono' }, x.id),
+                        h('strong', null, x.title || x.id),
                         x.open ? h('span', { class: 'pill sm tone-busy' }, h('i', { class: 'dot' }), 'open') : x.unfinished ? h('span', { class: 'pill sm tone-wait' }, h('i', { class: 'dot' }), 'unfinished') : null,
                         h('span', { class: 'dim' }, x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
-                    h('div', { class: 'run-row-brief' }, x.brief || h('span', { class: 'dim' }, '(no brief)')),
+                    h('div', { class: 'run-row-brief' }, h('code', { class: 'mono dim' }, x.id), x.brief ? h('span', { class: 'dim' }, ' · ' + F.trunc(x.brief, 120)) : null),
                     x.error ? h('div', { class: 'run-row-err' }, x.error) : null),
                 h('div', { class: 'run-row-acts' },
                     !x.open && x.unfinished ? P.btn('Resume', () => M.act.cmd('run_resume', { id: x.id }, { busyKey: 'resume-' + x.id, ok: 'Run resumed' }).then(() => M.act.nav('/run'), () => { }), { sm: true, icon: 'play', busyKey: 'resume-' + x.id, disabled: !!s.run }) : null,
-                    !x.open ? P.iconBtn('trash', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Delete run ' + x.id + '?', body: 'Removes its state and journal from ~/.mantra. Branches and worktrees in your repo are not touched.', confirm: 'Delete', run: () => M.act.cmd('run_delete', { id: x.id }, { ok: 'Deleted' }).then(loadRuns) }), 'Delete run') : null)))));
+                    !x.open ? P.iconBtn('trash', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Delete run ' + (x.title || x.id) + '?', body: 'Removes its state and journal from ~/.mantra. Branches and worktrees in your repo are not touched.', confirm: 'Delete', run: () => M.act.cmd('run_delete', { id: x.id }, { ok: 'Deleted' }).then(loadRuns) }), 'Delete run') : null)))));
         }
         if (r.others) kids.push(h('p', { class: 'foot-note', key: 'others' }, F.plural(r.others, 'run') + ' in other projects — use ', h('code', null, 'mantra runs'), ' in a terminal.'));
         return page('runs', kids);

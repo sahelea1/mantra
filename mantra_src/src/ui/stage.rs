@@ -196,7 +196,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     }
     match &app.run {
         Some(r) => {
-            crumbs.push(Span::styled(format!("  {}", trunc(&r.id, if area.width < 110 { 18 } else { 30 })), theme::dim()));
+            // the run's title, with the id as a faint second crumb where there is room
+            crumbs.push(Span::styled(format!("  {}", trunc(&r.title, if area.width < 110 { 24 } else { 40 })), theme::text()));
+            if area.width >= 130 {
+                crumbs.push(Span::styled(format!("  {}", trunc(&r.id, 30)), theme::faint()));
+            }
             crumbs.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
             if app.demo {
                 crumbs.insert(2, Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
@@ -310,6 +314,8 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
             PhaseStep::Merging => "merging worker branches".into(),
             PhaseStep::Checks { round } => format!("running gate checks{}", if *round > 0 { " (verify)" } else { "" }),
             PhaseStep::Gate { round } => format!("QA gate · round {round}"),
+            PhaseStep::Fix { round: 0 } => "fix worker merging the conflicting branches".into(),
+            PhaseStep::Fix { round } => format!("fix worker on what QA round {round} found"),
             PhaseStep::Handoff => "handoff → next phase".into(),
         };
         lines.push(Line::from(Span::styled(format!("   {s}"), theme::faint())));
@@ -862,6 +868,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
             line2.push(Span::styled(format!("gate opens when all tasks are done ({done}/{total})"), theme::faint()));
         }
         PhaseStep::Merging => line2.push(Span::styled(format!("{} merging branches…", anim::spinner()), theme::fg(theme::AMBER))),
+        PhaseStep::Fix { round } => line2.push(Span::styled(format!("{} fix-{round} is working on {}…", anim::spinner(), if *round == 0 { "the merge" } else { "what QA found" }), theme::fg(theme::AMBER))),
         _ => {
             if run.checks.is_empty() && matches!(step, PhaseStep::Checks { .. }) {
                 line2.push(Span::styled(format!("{} running checks…", anim::spinner()), theme::fg(theme::BLUE)));

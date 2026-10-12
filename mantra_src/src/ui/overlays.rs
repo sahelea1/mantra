@@ -485,8 +485,8 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
     let r = centered(area, 100, (list.len() as u16).max(1) + 5);
     f.render_widget(Clear, r);
     let inner_w = r.width.saturating_sub(4) as usize;
-    let brief_w = inner_w.saturating_sub(2 + 22 + 1 + 18 + 1 + 9 + 2).max(8);
-    let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<22} {:<18} {:>9}  {}", "run", "stage", "updated", "goal"), theme::faint()))];
+    let id_w = inner_w.saturating_sub(2 + 32 + 1 + 18 + 1 + 9 + 2).max(8);
+    let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<32} {:<18} {:>9}  {}", "run", "stage", "updated", "id"), theme::faint()))];
     if list.is_empty() {
         l.push(Line::from(Span::styled("   no runs for this project yet — ctrl+o starts one", theme::dim())));
     }
@@ -502,16 +502,16 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
             theme::fg(theme::GREEN)
         };
         l.push(Line::from(vec![
-            Span::styled(format!(" {} {:<22}", if i == sel { theme::g("▶", ">") } else { " " }, trunc(&run.id, 22)), st),
+            Span::styled(format!(" {} {:<32}", if i == sel { theme::g("▶", ">") } else { " " }, trunc(&run.title(), 32)), st),
             Span::styled(format!(" {:<18}", trunc(&run.stage_label(), 18)), stage_style),
             Span::styled(format!(" {:>9}", fmt_ago(run.updated_unix)), theme::faint()),
-            Span::styled(format!("  {}", trunc(&run.brief(), brief_w)), theme::dim()),
+            Span::styled(format!("  {}", trunc(&run.id, id_w)), theme::faint()),
             Span::styled(if cur { "  (open)".to_string() } else { String::new() }, theme::fg(theme::GREEN)),
         ]));
     }
     l.push(Line::default());
     if confirm {
-        let id = list.get(sel).map(|r| r.id.clone()).unwrap_or_default();
+        let id = list.get(sel).map(|r| r.title()).unwrap_or_default();
         l.push(Line::from(Span::styled(format!("  delete {id} — its branches, worktrees and journal? y / n"), theme::bold(theme::fg(theme::ROSE)))));
     } else {
         let mut hint = "  ⏎ resume where it stopped · D delete · esc".to_string();

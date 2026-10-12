@@ -222,6 +222,7 @@ fn handle(st: &Arc<St>, method: &str, id: Value, p: Value) {
             });
         }
         "thread/archive" => ok(json!({})),
+        "thread/name/set" => ok(json!({})),
         "thread/settings/update" => {
             let tid = p.get("threadId").and_then(|t| t.as_str()).unwrap_or("");
             if let (Some(t), Some(a)) = (st.threads.lock().unwrap().get_mut(tid), p.get("approvalPolicy").and_then(|a| a.as_str())) {
@@ -780,10 +781,9 @@ async fn gate(e: &Em, text: &str) -> Outcome {
     step!(e.think(if security { "**Security sweep**\n\nLooking for injection points, auth gaps and secrets in the new code." } else { "**Reviewing the merged result**\n\nChecking that the parallel changes fit together: names, interfaces, duplicated logic." }).await);
     step!(e.command("git log --oneline -6", "a1b2c3d mantra: phase work\n9f8e7d6 merge worker branches\n1234567 initial", 0).await);
     step!(e.command("cargo test", "running 18 tests\n..................\ntest result: ok. 18 passed; 0 failed", 0).await);
+    // The phase QA is read-only (it verifies and reports); only the security sweep writes.
     if security {
         step!(e.write("SECURITY.md", "# Security notes\n\n- Input validation on all API handlers\n- Tokens compared in constant time\n").await);
-    } else {
-        step!(e.write("docs/INTEGRATION.md", "# Integration notes\n\nModules share `models::*`; config is loaded once at startup.\n").await);
     }
     let _ = e.tool("mantra_gate_report", json!({"pass": true, "summary": if security { "No critical issues; hardened token comparison." } else { "Coherent, tests green." }})).await;
     step!(e.say("GATE: pass — everything is coherent and the checks are green.").await);
