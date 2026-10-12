@@ -2782,7 +2782,9 @@ mod tests {
         app.canvas_focus = false;
         let rows = frame(&mut app, 120, 36);
         assert!(rows[2].contains("tab for keys") && !rows[2].contains("e details"), "{:?}", rows[2]);
-        app.canvas_focus = true;
+        app.input.set("a draft");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.canvas_focus && app.input.text() == "a draft", "tab reaches the keys and keeps the draft");
         let rows = frame(&mut app, 120, 36);
         assert!(rows[2].contains("e details") && !rows[2].contains("tab for keys"), "{:?}", rows[2]);
     }
