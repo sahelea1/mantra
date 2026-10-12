@@ -342,7 +342,8 @@
             full ? h('div', { class: 'band-more-row' },
                 h('button', { type: 'button', class: 'link sm band-more', 'aria-expanded': String(open), onclick: toggleFull }, h('span', null, open ? 'Show less' : 'Show the full error'), icon(open ? 'up' : 'down', 'chev')),
                 open ? h('button', { type: 'button', class: 'link sm band-more', onclick: () => M.act.copy(full) }, icon('copy', 'chev'), h('span', null, 'Copy')) : null) : null,
-            hv.hint ? h('div', { class: 'band-hint' }, hv.hint) : null,
+            // a hint that is only the button's own name (a pause: "Resume") would just repeat it
+            hv.hint && hv.hint !== haltResumeLabel(hv) ? h('div', { class: 'band-hint' }, hv.hint) : null,
             hv.reason !== 'user' ? h('div', { class: 'band-note' }, 'Changing a model doesn’t resume the run — press ' + haltResumeLabel(hv) + ' when you’re ready.') : null,
             h('div', { class: 'band-actions' }, acts),
             wantsFeedback ? feedbackField('halt-feedback', 'Feedback for the planner…', 'Send') : null);
