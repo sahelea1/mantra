@@ -3,7 +3,7 @@
 use super::{theme, *};
 use crate::app::{App, EditTarget, Overlay, StudioSel};
 use crate::config::ProviderEntry;
-use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, KINDS, PERMISSIONS};
+use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, EFFORT_AUTO, KINDS, PERMISSIONS};
 use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -237,10 +237,14 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 "color" => r.color = cycle(COLORS, &r.color, d),
                 "model" => {
                     r.model = cycle(&aliases, &r.model, d);
-                    r.effort = reg.resolve(&r.model).resolve_effort(&r.effort);
+                    if r.effort != EFFORT_AUTO {
+                        r.effort = reg.resolve(&r.model).resolve_effort(&r.effort);
+                    }
                 }
                 "effort" => {
-                    let effs = reg.resolve(&r.model).efforts();
+                    // "auto" leads the list: Mantra picks the effort per spawn from the role's job.
+                    let mut effs = reg.resolve(&r.model).efforts();
+                    effs.insert(0, EFFORT_AUTO.to_string());
                     r.effort = cycle(&effs, &r.effort, d);
                 }
                 "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
@@ -972,6 +976,28 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `auto` leads the effort list, and changing a role's model must not bake it into a level.
+    #[test]
+    fn the_effort_cycle_offers_auto_and_a_model_change_keeps_it() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert_eq!(app.studio.pattern.roles["worker-big"].effort, EFFORT_AUTO);
+        // stepping back from auto wraps to the model's heaviest effort; forward from there returns to auto
+        nudge(&mut app, "worker-big", "effort", -1);
+        assert_ne!(app.studio.pattern.roles["worker-big"].effort, EFFORT_AUTO);
+        nudge(&mut app, "worker-big", "effort", 1);
+        assert_eq!(app.studio.pattern.roles["worker-big"].effort, EFFORT_AUTO);
+        nudge(&mut app, "worker-big", "effort", 1);
+        assert_eq!(app.studio.pattern.roles["worker-big"].effort, "low", "after auto comes the model's first effort");
+        // a model change re-clamps a named effort, but leaves auto alone
+        app.studio.pattern.roles.get_mut("worker-big").unwrap().effort = EFFORT_AUTO.into();
+        nudge(&mut app, "worker-big", "model", 1);
+        assert_eq!(app.studio.pattern.roles["worker-big"].effort, EFFORT_AUTO);
+        app.studio.pattern.roles.get_mut("worker-big").unwrap().effort = "ultra".into();
+        nudge(&mut app, "worker-big", "model", 1);
+        assert_ne!(app.studio.pattern.roles["worker-big"].effort, EFFORT_AUTO);
+    }
 
     /// Review fix: `nudge()` and `apply_edit()` used to enforce different floors (15/30 vs 5/10)
     /// and neither checked `escalate > watchdog_seconds`, so a value `Pattern::validate` would

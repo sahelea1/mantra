@@ -190,6 +190,8 @@ pub(super) async fn run_claude_process(
                         }
                         tr.restart_pending = true;
                     }
+                    // Claude Code sessions have no title API: the run's name stays on Mantra's side.
+                    Some(Cmd::SetName(_)) => {}
                     Some(Cmd::SetApproval(_)) => {
                         // Only "never" (--dangerously-skip-permissions) is modeled until Role.permission
                         // (WP3) lands in a later batch; every Claude agent runs unattended for now.
@@ -1084,6 +1086,7 @@ mod tests {
             config: serde_json::Map::new(),
             extra_args: vec![],
             resume_thread: None,
+            thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode,
             envs: vec![],
             claude: None,
@@ -1115,6 +1118,7 @@ mod tests {
             config: serde_json::Map::new(),
             extra_args: vec![],
             resume_thread: None,
+            thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode,
             envs: vec![],
             claude: None,

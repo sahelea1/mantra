@@ -18,6 +18,10 @@ pub struct Workspace {
     pub base_branch: String,
     pub git_common_dir: Option<PathBuf>,
     pub note: Option<String>,
+    /// The commit the run branch started from (worktree mode): the base of the run's whole diff.
+    /// Absent in a state file written before it existed.
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -44,6 +48,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         base_branch: String::new(),
         git_common_dir: None,
         note,
+        base_commit: None,
     };
     if isolation == "shared" {
         return Ok(shared(None));
@@ -65,6 +70,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         let _ = ensure_excluded(&top); // legacy per-project dir from older versions: keep it out of `git status`
     }
     let dirty = git(&top, &["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false);
+    let base_commit = git(&top, &["rev-parse", "HEAD"]).ok();
     let branch = format!("mantra/{run_id}");
     let integ = crate::config::worktrees_dir().join(run_id).join("integration");
     let _ = std::fs::create_dir_all(integ.parent().unwrap_or(&integ));
@@ -85,6 +91,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         branch,
         base_branch,
         git_common_dir: common,
+        base_commit,
         note: if dirty { Some("you have uncommitted changes — agents work from your last commit (commit first, or set isolation = shared)".into()) } else { None },
     })
 }
@@ -239,6 +246,90 @@ pub fn land(ws: &Workspace) -> Result<String, String> {
     git(&ws.repo, &["-c", "user.name=Mantra", "-c", "user.email=mantra@localhost", "merge", "--no-ff", "--no-edit", &ws.branch])?;
     let _ = git(&ws.repo, &["worktree", "remove", "--force", &ws.integ.to_string_lossy()]);
     Ok(format!("merged {} into {}", ws.branch, ws.base_branch))
+}
+
+/// How far back a review diff reaches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiffSpan {
+    /// Since the last phase commit (`mantra: phase …`) — what the current phase's gate reviews.
+    Phase,
+    /// Since the run started — what the finale reviews.
+    Run,
+}
+
+/// What a reviewer reads instead of exploring the repo: the `--stat` and the (capped) diff.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReviewDiff {
+    pub stat: String,
+    pub diff: String,
+    /// The diff was cut at the cap; the rest is one `git diff` away.
+    pub truncated: bool,
+}
+
+impl ReviewDiff {
+    pub fn is_empty(&self) -> bool {
+        self.stat.trim().is_empty() && self.diff.trim().is_empty()
+    }
+
+    /// Prompt-ready text, or a one-line note when git has nothing to show.
+    pub fn render(&self) -> String {
+        if self.is_empty() {
+            return "(no changes in the working tree, or no git diff available)".into();
+        }
+        let more = if self.truncated { "\n[diff cut here — run `git diff` for the rest, limited to the files you need]" } else { "" };
+        format!("{}\n\n{}{more}", self.stat.trim(), self.diff.trim())
+    }
+}
+
+/// Lockfiles and the like add bulk and no signal to a review.
+const DIFF_EXCLUDES: &[&str] = &[":(exclude)*.lock", ":(exclude)package-lock.json", ":(exclude)pnpm-lock.yaml", ":(exclude)*.min.js", ":(exclude)*.map"];
+
+/// `git diff --stat` and the diff of the integration copy over `span`, capped at `max_bytes`.
+/// Blocking — run it on a background thread. Worktree mode marks new files "intent to add" first
+/// (Mantra commits everything with `add -A` anyway) so they show up as additions; in shared mode
+/// the user's index is left alone and untracked files are only listed.
+pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize) -> ReviewDiff {
+    let dir = ws.integ.as_path();
+    if git(dir, &["rev-parse", "--git-dir"]).is_err() {
+        return ReviewDiff::default();
+    }
+    let base = if ws.worktree {
+        let phase = (span == DiffSpan::Phase).then(|| git(dir, &["log", "-1", "--format=%H", "--grep=^mantra: phase ", "HEAD"]).ok().filter(|h| !h.is_empty())).flatten();
+        phase.or_else(|| ws.base_commit.clone()).unwrap_or_else(|| "HEAD".into())
+    } else {
+        "HEAD".into()
+    };
+    if ws.worktree {
+        let _ = git(dir, &["add", "-N", "--", "."]);
+    }
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U3"];
+    let mut stat_args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100"];
+    for a in [&mut args, &mut stat_args] {
+        a.push(&base);
+        a.push("--");
+        a.push(".");
+        a.extend(DIFF_EXCLUDES.iter().copied());
+    }
+    let mut stat = git(dir, &stat_args).unwrap_or_default();
+    let mut diff = git(dir, &args).unwrap_or_default();
+    if !ws.worktree {
+        let fresh = git(dir, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+        let list: Vec<&str> = fresh.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !list.is_empty() {
+            let shown = list.iter().take(30).copied().collect::<Vec<_>>().join(", ");
+            let more = if list.len() > 30 { format!(" … and {} more", list.len() - 30) } else { String::new() };
+            stat.push_str(&format!("\nuntracked (new) files: {shown}{more}"));
+        }
+    }
+    let truncated = diff.len() > max_bytes;
+    if truncated {
+        let mut cut = max_bytes;
+        while cut > 0 && !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        diff.truncate(cut);
+    }
+    ReviewDiff { stat, diff, truncated }
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +506,72 @@ mod tests {
         assert!(res[0].ok);
         assert_eq!(discard_check_artifacts(&dir, &before), vec!["scratch.txt"]);
         assert!(dir.join("zzz.txt").exists(), "a worker's file is never deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_ws(dir: &Path, base: Option<String>) -> Workspace {
+        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base }
+    }
+
+    #[test]
+    fn review_diff_covers_the_phase_since_the_last_phase_commit_and_the_run_since_its_base() {
+        let dir = temp_repo("review");
+        let base = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        // phase 1: committed by Mantra
+        std::fs::write(dir.join("one.txt"), "phase one\n").unwrap();
+        assert!(commit_all(&dir, "mantra: phase 1 — first").unwrap());
+        // phase 2: an edit, a brand-new file, and a lockfile that must stay out
+        std::fs::write(dir.join("tracked.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("Cargo.lock"), "lock\n").unwrap();
+        let ws = test_ws(&dir, Some(base));
+        let phase = review_diff(&ws, DiffSpan::Phase, 100_000);
+        assert!(phase.stat.contains("tracked.txt") && phase.stat.contains("new.rs"), "{}", phase.stat);
+        assert!(!phase.stat.contains("one.txt"), "phase one is already committed: {}", phase.stat);
+        assert!(!phase.stat.contains("Cargo.lock") && !phase.diff.contains("Cargo.lock"), "lockfiles stay out");
+        assert!(phase.diff.contains("+two") && phase.diff.contains("+fn main() {}"), "{}", phase.diff);
+        assert!(!phase.truncated);
+        let run = review_diff(&ws, DiffSpan::Run, 100_000);
+        assert!(run.stat.contains("one.txt") && run.stat.contains("new.rs"), "the run reaches back to its base: {}", run.stat);
+        assert!(run.render().contains("one.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_diff_is_capped_and_says_so() {
+        let dir = temp_repo("review-cap");
+        std::fs::write(dir.join("big.txt"), "é".repeat(5000)).unwrap();
+        let ws = test_ws(&dir, None);
+        let d = review_diff(&ws, DiffSpan::Phase, 1000);
+        assert!(d.truncated);
+        assert!(d.diff.len() <= 1000, "{}", d.diff.len());
+        assert!(d.render().contains("diff cut here"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_diff_in_shared_mode_leaves_the_index_alone_and_lists_untracked_files() {
+        let dir = temp_repo("review-shared");
+        std::fs::write(dir.join("tracked.txt"), "one\nedited\n").unwrap();
+        std::fs::write(dir.join("fresh.txt"), "new\n").unwrap();
+        let mut ws = test_ws(&dir, None);
+        ws.worktree = false;
+        let d = review_diff(&ws, DiffSpan::Phase, 100_000);
+        assert!(d.stat.contains("tracked.txt"), "{}", d.stat);
+        assert!(d.stat.contains("untracked (new) files: fresh.txt"), "{}", d.stat);
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(status.lines().any(|l| l == "?? fresh.txt"), "no intent-to-add in the user's repo: {status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_diff_of_a_non_repo_is_empty() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-norepo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = test_ws(&dir, None);
+        let d = review_diff(&ws, DiffSpan::Run, 1000);
+        assert!(d.is_empty());
+        assert!(d.render().contains("no git diff"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

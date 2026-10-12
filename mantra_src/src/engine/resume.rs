@@ -28,6 +28,8 @@ impl Run {
     pub fn from_state(st: &RunState, pattern: Pattern, plan: Option<Plan>, dir: PathBuf) -> Run {
         let mut run = Run::new(st.project.clone(), pattern, st.brief.clone());
         run.id = st.id.clone();
+        run.title = st.display_title();
+        run.gate_notes = st.gate_notes.clone();
         run.dir = dir;
         run.stage = st.stage.clone();
         run.ws = st.ws.clone();
@@ -109,9 +111,14 @@ impl Run {
                                 self.cleanup_done = true;
                                 self.maybe_next_phase(ctx);
                             }
-                            PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } => {
+                            PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. } => {
                                 // Every task had finished; merging is idempotent, so start the gate
-                                // sequence from the top.
+                                // sequence from the top. A fix worker that was mid-turn lost its
+                                // agent with the old process: the fresh gate round finds what is
+                                // still wrong and a new fix worker takes it from there.
+                                for w in self.workers.iter_mut().filter(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled)) {
+                                    w.state = WState::Cancelled;
+                                }
                                 self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
                                 self.check_phase_done(ctx);
                                 if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
@@ -384,7 +391,7 @@ mod tests {
             pattern: "mantra-default".into(),
             plan_version: 1,
             stage,
-            ws: Some(Workspace { worktree: true, repo: tmp.clone(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None }),
+            ws: Some(Workspace { worktree: true, repo: tmp.clone(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None }),
             workers,
             agents,
             ..Default::default()
@@ -459,6 +466,26 @@ mod tests {
         run.resume_boot(&mut ctx, &st);
         assert_eq!(ctx.spawned, vec![("planner".to_string(), Some("thr-p".to_string()))]);
         assert!(ctx.prompts.iter().any(|(_, t)| t.starts_with("[mantra:resume]") && t.contains("mantra_submit_plan")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that died while a fix worker was working: the fix agent is gone with the process, so
+    /// the phase starts its gate sequence from the merge, and the dead fix attempt is dropped.
+    #[test]
+    fn fix_stage_cancels_the_lost_fix_worker_and_reruns_the_merge() {
+        let dir = tmp("fix");
+        let mut p = plan();
+        p.phases[0].tasks.truncate(2);
+        let mut fix = worker("fix-1", "running", 1, Some(dir.join("integration")));
+        fix.adhoc = true;
+        let st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } }, vec![worker("a", "done", 1, Some(dir.join("integration"))), worker("b", "done", 1, None), fix], vec![]);
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(p), dir.join("run"));
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Merging }, "the merge/checks/gate sequence starts over");
+        let fixer = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+        assert_eq!(fixer.state, WState::Cancelled, "its agent died with the old process");
+        assert!(ctx.spawned.iter().all(|(n, _)| n != "fix-1"), "no fix worker is respawned blindly: {:?}", ctx.spawned);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

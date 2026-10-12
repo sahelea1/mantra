@@ -5,7 +5,7 @@
 
 use super::git::{self, CheckResult, Workspace};
 use super::state::{AgentState, PhaseHistory, RunState, WorkerState};
-use super::pattern::{Pattern, Role};
+use super::pattern::{auto_effort, Pattern, Role, EFFORT_AUTO};
 use super::plan::{Phase, Plan, Task};
 use super::tools;
 use crate::agent::{looks_like_broken_sandbox, Agent, ErrKind, Status};
@@ -16,12 +16,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// How much of a phase's diff the QA agent is shown (the rest is one `git diff` away).
+const GATE_DIFF_BYTES: usize = 30_000;
+/// How much of the run's diff a finale agent is shown.
+const FINALE_DIFF_BYTES: usize = 24_000;
+
 #[derive(Debug)]
 pub enum JobTag {
     Setup,
     WorkerWt { task: String, attempt: u32 },
     Merge { phase: usize },
     Checks { phase: usize, round: u32 },
+    /// The checks re-run after a fix worker finished a gate round (`round` is the round it fixed).
+    FixChecks { phase: usize, round: u32 },
     Cleanup { phase: usize },
     Finish,
     Land,
@@ -31,8 +38,11 @@ pub enum JobOut {
     Setup(Result<Workspace, String>),
     Wt(Result<(PathBuf, String), String>),
     Merge(git::MergeResult),
-    /// The results, plus the paths the checks left behind that were discarded before any commit.
-    Checks(Vec<CheckResult>, Vec<String>),
+    /// The results, the paths the checks left behind that were discarded before any commit, and
+    /// the phase's diff for the gate agent that follows.
+    Checks(Vec<CheckResult>, Vec<String>, git::ReviewDiff),
+    /// The phase commit's outcome, plus the run's diff so far (what the finale reviews).
+    Cleanup(Result<String, String>, git::ReviewDiff),
     Text(Result<String, String>),
 }
 
@@ -52,6 +62,9 @@ pub struct SpawnReq {
     /// Explicit context-window override for this spawn (set after a ContextFull halving); `None`
     /// means "use the model's own effective context".
     pub context_override: Option<u64>,
+    /// What the agent's session is called in the backend (`<run title> · <role name>`), where the
+    /// backend can name a session.
+    pub thread_name: Option<String>,
 }
 
 /// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
@@ -87,6 +100,9 @@ pub trait Ctx {
     fn agent(&self, a: AgentId) -> Option<&Agent>;
     fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>);
     fn notify(&mut self, text: &str);
+    /// Rename a live agent's session (the run's title changed once the plan came in). Best effort;
+    /// the default does nothing.
+    fn set_thread_name(&mut self, _a: AgentId, _name: &str) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -96,6 +112,8 @@ pub enum PhaseStep {
     Merging,
     Checks { round: u32 },
     Gate { round: u32 },
+    /// A fix worker (`fix-<round>`) is working on what gate round `round` found.
+    Fix { round: u32 },
     Handoff,
 }
 
@@ -137,6 +155,15 @@ pub enum Pending {
     },
     /// `begin_handoff(idx)` — phase `idx` passed its gate.
     Handoff { idx: usize },
+    /// The fix worker for what gate round `round` of phase `idx` found (`findings`, `big` as the
+    /// report flagged it).
+    Fix {
+        idx: usize,
+        round: u32,
+        findings: String,
+        #[serde(default)]
+        big: bool,
+    },
 }
 
 /// What `respawn` reports when it went ahead, and when the pause boundary deferred it.
@@ -150,6 +177,7 @@ impl Pending {
             Pending::Finale { idx, .. } => format!("finale step {}", idx + 1),
             Pending::Gate { idx, round, .. } => format!("phase {} gate round {round}", idx + 1),
             Pending::Handoff { idx } => format!("phase {} handoff", idx + 1),
+            Pending::Fix { idx, round, .. } => format!("phase {} fix for gate round {round}", idx + 1),
         }
     }
 }
@@ -324,6 +352,9 @@ pub struct PhaseRecord {
 
 pub struct Run {
     pub id: String,
+    /// What the run is called for people: the plan's title once the plan is submitted, the goal's
+    /// first words before that. The id stays the stable key.
+    pub title: String,
     pub dir: PathBuf,
     pub project: PathBuf,
     pub pattern: Pattern,
@@ -347,6 +378,24 @@ pub struct Run {
     pub checks: Vec<CheckResult>,
     pub conflicts: Vec<String>,
     pub gate_report: Option<(bool, String)>,
+    /// What the planner/manager/user said when they resumed a halted gate or fix: it goes to the
+    /// fresh QA agent / the restarted fix worker that replaces the stuck one.
+    resume_note: Option<String>,
+    /// How often the current QA agent was told to report (it ended its turn without).
+    gate_nudges: u32,
+    /// The latest gate report said the fixes are big (`mantra_gate_report big=true`): the fix
+    /// worker is then `worker-big`.
+    gate_big: bool,
+    /// One line per gate report and finale report of the run so far — what later reviewers start
+    /// from instead of re-deriving it. Saved with the state.
+    pub gate_notes: Vec<String>,
+    /// The previous gate round's verdict for the phase in progress, shown to the next round's
+    /// fresh agent (`pass|fail` and the summary).
+    prev_gate: Option<(u32, bool, String)>,
+    /// The merged phase's diff as of the last checks run: what the gate agent starts from.
+    phase_diff: git::ReviewDiff,
+    /// The run's diff as of the last phase commit: what the finale starts from.
+    run_diff: Option<git::ReviewDiff>,
     pub pulse: VecDeque<Pulse>,
     /// Total pulse lines ever logged by this run (the ring above keeps only the last 300).
     pub pulse_seq: u64,
@@ -444,8 +493,10 @@ impl Run {
     pub fn new(project: PathBuf, pattern: Pattern, brief: String) -> Run {
         let id = format!("{}-{}", crate::util::unix_secs() % 1_000_000, crate::util::slug(&brief).chars().take(24).collect::<String>().trim_matches('-'));
         let dir = crate::config::runs_dir(&project).join(&id);
+        let title = title_from_goal(&brief);
         Run {
             id,
+            title,
             dir,
             project,
             pattern,
@@ -465,6 +516,13 @@ impl Run {
             checks: vec![],
             conflicts: vec![],
             gate_report: None,
+            gate_big: false,
+            gate_nudges: 0,
+            resume_note: None,
+            gate_notes: vec![],
+            prev_gate: None,
+            phase_diff: git::ReviewDiff::default(),
+            run_diff: None,
             pulse: VecDeque::new(),
             pulse_seq: 0,
             phase_started: Instant::now(),
@@ -605,6 +663,7 @@ impl Run {
         RunState {
             format: super::state::FORMAT,
             id: self.id.clone(),
+            title: self.title.clone(),
             project: self.project.clone(),
             brief: self.brief.clone(),
             pattern: self.pattern.name.clone(),
@@ -618,6 +677,7 @@ impl Run {
             updated_unix: crate::util::unix_secs(),
             ws: self.ws.clone(),
             handoff: self.handoff.clone(),
+            gate_notes: self.gate_notes.clone(),
             workers,
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
@@ -737,6 +797,21 @@ impl Run {
     /// `resume`, with the agent that caused it (the planner acting on an escalation) left out of
     /// the "continue where you left off" re-prompts — it is mid-turn and knows.
     pub fn resume_by(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>) {
+        self.resume_core(ctx, except, true);
+    }
+
+    /// Lift a halt so that a restart of `target` (a retry, a respawn) can go ahead. When that
+    /// restart replaces the agent the stage is waiting on (the QA agent of a gate round, the fix
+    /// worker), the stage's own pick-up is skipped: the restart *is* the pick-up, and doing both
+    /// would start the agent twice.
+    fn resume_for_restart(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, target: AgentId) {
+        let in_gate = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
+        let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc).unwrap_or(false);
+        let replaces = in_gate && (Some(target) == self.gate_agent || fix_worker);
+        self.resume_core(ctx, except, !replaces);
+    }
+
+    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool) {
         if self.halt.is_none() {
             return;
         }
@@ -750,9 +825,15 @@ impl Run {
         self.log("▶", "green", "run resumed");
         self.save_state();
         let t0 = Instant::now();
-        if let Some(p) = self.pending.take() {
+        let pending = self.pending.take();
+        if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. }))) = (pickup, &pending) {
+            // the restart that follows replaces the very agent this was waiting to start
+            self.log("‖", "amber", format!("{} was due — superseded by the restart", p.label()));
+        } else if let Some(p) = pending {
             // A transition that became due during the halt (the pause boundary): now, once.
             self.perform_pending(ctx, p);
+        } else if !pickup {
+            // the explicit restart of the agent this stage waits on takes it from here
         } else if let Stage::Phase { idx, step } = self.stage.clone() {
             match step {
                 PhaseStep::Orchestrating => {
@@ -765,19 +846,16 @@ impl Run {
                     if has_checks {
                         // verify first: a revised/fixed check may already be green
                         self.run_checks(ctx, idx, 1);
-                    } else if let Some(g) = self.gate_agent {
-                        // no checks to verify with — the gate agent itself is the gate
-                        self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: 1 } };
-                        self.gate_report = None;
-                        self.mark_edge(g);
-                        ctx.prompt(g, "[mantra:gate-round 1] The run resumed. Continue the gate: make the result coherent and green, then call mantra_gate_report.".into());
                     } else {
+                        // no checks to verify with — a fresh QA agent is the gate
                         self.spawn_gate_at_round(ctx, idx, 1);
                     }
                 }
+                PhaseStep::Fix { round } => self.resume_fix(ctx, idx, round),
                 _ => {}
             }
         }
+        self.resume_note = None;
         // Re-prompt what the halt interrupted — unless the pick-up above already gave it its
         // next prompt (`edges` is stamped at every engine prompt) or archived it.
         let live = self.all_agents();
@@ -812,20 +890,12 @@ impl Run {
             }
             Pending::Handoff { idx } => self.begin_handoff(ctx, idx),
             Pending::Gate { idx, round, note } => {
-                match self.gate_agent {
-                    Some(g) => {
-                        self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
-                        self.gate_report = None;
-                        self.mark_edge(g);
-                        let s = self.check_summary();
-                        ctx.prompt(g, format!("[mantra:gate-round {round}] The run resumed. Continue the gate: fix what's left so it passes, then call mantra_gate_report.\nGate checks:\n{s}"));
-                    }
-                    None => self.spawn_gate_at_round(ctx, idx, round),
-                }
+                self.spawn_gate_at_round(ctx, idx, round);
                 if let (Some(n), Some(g)) = (note, self.gate_agent) {
                     ctx.prompt(g, format!("[mantra:respawn] {n}"));
                 }
             }
+            Pending::Fix { idx, round, findings, big } => self.start_fix(ctx, idx, round, findings, big),
         }
     }
 
@@ -1101,6 +1171,44 @@ Then summarize in 2-4 lines.",
         self.pattern.role(name).cloned().unwrap_or_default()
     }
 
+    /// The effort to hand a spawn. An explicit request (the orchestrator's `mantra_spawn`, a
+    /// task's own) wins; `auto` — asked for or set on the role — becomes a concrete level from the
+    /// role's job (`pattern::auto_effort`; `finale` when the role runs a finale step); anything
+    /// else is `None`, which leaves the role's own concrete effort in force.
+    pub(super) fn effort_for(&self, requested: Option<String>, role_name: &str, role: &Role, finale: bool) -> Option<String> {
+        let requested = requested.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        let auto = requested.as_deref().map(|e| e == EFFORT_AUTO).unwrap_or_else(|| role.effort.trim() == EFFORT_AUTO);
+        if auto {
+            Some(auto_effort(&role.kind, role_name, finale).to_string())
+        } else {
+            requested
+        }
+    }
+
+    /// The plan came in (or was revised): its title becomes the run's name, and the sessions of the
+    /// agents already running are renamed to match.
+    fn retitle(&mut self, ctx: &mut dyn Ctx, title: &str) {
+        let title = trunc(title.split_whitespace().collect::<Vec<_>>().join(" ").trim(), 60);
+        if title.is_empty() || title == self.title {
+            return;
+        }
+        self.title = title;
+        let live: Vec<AgentId> = [self.planner, self.manager, self.orchestrator, self.gate_agent].into_iter().flatten().collect();
+        let named: Vec<(AgentId, String)> = live.into_iter().filter_map(|a| self.role_name_of(a).map(|r| (a, r))).collect();
+        for (a, role) in named {
+            if let Some(n) = self.thread_name(&role) {
+                ctx.set_thread_name(a, &n);
+            }
+        }
+        self.save_state();
+    }
+
+    /// What an agent's backend session is called: `<run title> · <role name>`.
+    pub(super) fn thread_name(&self, role_name: &str) -> Option<String> {
+        let title = self.title.trim();
+        Some(if title.is_empty() { role_name.to_string() } else { format!("{title} · {role_name}") })
+    }
+
     fn resolve(&self, name: &str) -> Option<AgentId> {
         let n = name.trim().trim_start_matches('@').to_lowercase();
         match n.as_str() {
@@ -1274,6 +1382,15 @@ Then summarize in 2-4 lines.",
                         v.push((g, Expect::Gating));
                     }
                 }
+                PhaseStep::Fix { .. } => {
+                    for w in &self.workers {
+                        if w.adhoc && w.state == WState::Running {
+                            if let Some(a) = w.agent.filter(|a| !asking(*a)) {
+                                v.push((a, Expect::Working(w.task.id.clone())));
+                            }
+                        }
+                    }
+                }
                 PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Handoff => {}
             },
             Stage::Finale { idx } => {
@@ -1360,11 +1477,12 @@ Then summarize in 2-4 lines.",
         let wr = self.pattern.worker_roles();
         let req = SpawnReq {
             name: "planner".into(),
+            effort: self.effort_for(None, &name, &role, false),
+            thread_name: self.thread_name(&name),
             role_name: name,
             instructions: format!("{}\n{}", role.instructions, tools::PLANNER_PROTOCOL),
             cwd: self.workspace_dir(),
             tools: tools::planner_tools(&wr),
-            effort: None,
             extra_writable: vec![],
             context_override: None,
             network: self.pattern.settings.network,
@@ -1437,6 +1555,8 @@ Then summarize in 2-4 lines.",
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
+        self.prev_gate = None;
+        self.phase_diff = git::ReviewDiff::default();
         self.handoff_note_done = false;
         self.cleanup_done = false;
         self.log("◆", "saffron", format!("phase {}/{} — {}", idx + 1, plan.phases.len(), phase.name));
@@ -1568,25 +1688,18 @@ Then summarize in 2-4 lines.",
             Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
             None => format!("{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
         };
-        let effort = w.effort.clone().or(w.task.effort.clone());
+        let requested = w.effort.clone().or(w.task.effort.clone());
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
         let context_override = w.context_override;
         let resumed = resume.is_some();
-        let req = SpawnReq {
-            name,
-            role_name: rname.clone(),
-            role,
-            cwd: dir.clone(),
-            instructions,
-            tools: tools::worker_tools(),
-            effort,
-            extra_writable: vec![],
-            context_override,
-            network: self.pattern.settings.network,
-            writable_roots: self.pattern.settings.writable_roots.clone(),
-        };
+        // A fix worker shares the integration copy; it needs the git dir writable only to merge
+        // branches that conflicted.
+        let extra_writable = if w.adhoc { self.integ_writable() } else { vec![] };
+        let effort = self.effort_for(requested, &rname, &role, false);
+        let thread_name = self.thread_name(&rname);
+        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone() };
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -1642,10 +1755,28 @@ Then summarize in 2-4 lines.",
         self.save_state();
     }
 
+    /// The gate checks of phase `idx` (a background job that also collects the phase's diff for
+    /// the QA agent that follows). `round` 0 is the run before any QA; later rounds verify what a
+    /// QA pass cleared.
     fn run_checks(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        self.launch_checks(ctx, idx, round, false);
+    }
+
+    /// The same checks after a fix worker finished gate round `round`: the next QA round follows
+    /// whatever they say.
+    fn run_checks_after_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        self.launch_checks(ctx, idx, round, true);
+    }
+
+    fn launch_checks(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, after_fix: bool) {
         let checks = self.current_phase().map(|p| p.gate.checks.clone()).unwrap_or_default();
-        if checks.is_empty() {
-            if round == 0 {
+        // Nothing to run and nothing to diff (no workspace) — or a verify with no checks at all,
+        // which needs no diff either: straight on to what the result decides.
+        if checks.is_empty() && (self.ws.is_none() || (round > 0 && !after_fix)) {
+            self.checks.clear();
+            if after_fix {
+                self.spawn_gate_at_round(ctx, idx, round + 1);
+            } else if round == 0 {
                 self.spawn_gate(ctx, idx);
             } else {
                 self.begin_handoff(ctx, idx);
@@ -1653,19 +1784,24 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Checks { round } };
-        self.log("⎔", "blue", format!("running {} gate check(s){}", checks.len(), if round > 0 { " (verify)" } else { "" }));
+        if !checks.is_empty() {
+            self.log("⎔", "blue", format!("running {} gate check(s){}", checks.len(), if round > 0 || after_fix { " (verify)" } else { "" }));
+        }
         let dir = self.workspace_dir();
         let timeout = Duration::from_secs(self.pattern.settings.check_timeout_secs);
+        let ws = self.ws.clone();
         // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
         // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
-        let tidy = self.ws.as_ref().map(|w| w.worktree).unwrap_or(false);
+        let tidy = ws.as_ref().map(|w| w.worktree).unwrap_or(false);
+        let tag = if after_fix { JobTag::FixChecks { phase: idx, round } } else { JobTag::Checks { phase: idx, round } };
         ctx.job(
-            JobTag::Checks { phase: idx, round },
+            tag,
             Box::new(move || {
                 let before = if tidy { git::status_snapshot(&dir) } else { None };
-                let results = git::run_checks(&dir, &checks, timeout);
+                let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout) };
                 let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
-                JobOut::Checks(results, dropped)
+                let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES)).unwrap_or_default();
+                JobOut::Checks(results, dropped, diff)
             }),
         );
     }
@@ -1689,49 +1825,74 @@ Then summarize in 2-4 lines.",
         self.spawn_gate_at_round(ctx, idx, 1);
     }
 
-    /// Same as `spawn_gate` but for a caller-supplied round (WP7.4 `respawn_gate`), so respawning
-    /// a stuck gate agent does not silently reset the round counter — `gate_max_rounds` and the L4
-    /// identical-blocker halt are both keyed off `round`.
+    /// Archive the gate agent: every QA round is a fresh agent, so the one that reported is done.
+    fn retire_gate_agent(&mut self, ctx: &mut dyn Ctx) {
+        if let Some(g) = self.gate_agent.take() {
+            self.tokens_prev += ctx.agent(g).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(g, true);
+        }
+    }
+
+    /// Gate round `round` of phase `idx`: a FRESH QA agent (new session, the previous one is
+    /// archived) that gets the check results, the phase's diff and the previous round's verdict,
+    /// and only verifies and reports — fixes go to a fix worker (`start_fix`). Also what
+    /// `respawn_gate` (WP7.4) calls with the round it replaces, so a respawn does not reset the
+    /// round counter: `gate_max_rounds` and the identical-blocker halt both key off `round`.
     fn spawn_gate_at_round(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
         let Some(phase) = self.current_phase().cloned() else { return };
         if self.halted() {
             self.defer(Pending::Gate { idx, round, note: None });
             return;
         }
+        self.retire_gate_agent(ctx);
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
-        self.last_gate_blocker = None;
-        self.last_verify_sig = None;
+        self.gate_big = false;
+        self.gate_nudges = 0;
+        if round <= 1 {
+            // loop protection counts across rounds; only the first round of a run of rounds starts it over
+            self.last_gate_blocker = None;
+            self.last_verify_sig = None;
+        }
         let name = self.pattern.flow.phase_gate.clone();
         let role = self.role(&name);
-        // A read-only gate role cannot fix anything itself — say so plainly instead of leaving it
-        // to discover that by trying (empty `sandbox` means workspace-write, same as `Role::default`).
+        // Whatever the pattern's gate role says, Mantra never lets the gate agent fix: a writable
+        // sandbox is told to hold back (a read-only one cannot write at all).
         let sandbox_note = if role.sandbox == "read-only" {
-            "Your role cannot write files: do not try to edit or create anything. Report every needed change precisely (file, what, why) in mantra_gate_report as fail with a fix list; the orchestrator routes it to a worker."
+            "Your role cannot write files: do not try to edit or create anything."
         } else {
-            "You may edit files to make the result coherent and green (small fixes; anything larger goes into the report as a fix list)."
+            "Do not edit anything: you verify and report, Mantra routes every fix to a worker."
         };
-        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 1500))).collect();
-        let conflicts = if self.conflicts.is_empty() {
-            String::new()
-        } else {
-            format!("\nThese branches could NOT be merged automatically (conflicts). Merge each yourself with `git merge <branch>`, resolve, and commit:\n{}\n", self.conflicts.join("\n"))
+        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 600))).collect();
+        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, trunc(&w.report, 600))).collect();
+        let previous = match &self.prev_gate {
+            Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, trunc(sum, 1200)),
+            None => String::new(),
         };
+        let previous = if fixes.is_empty() { previous } else { format!("{previous}{}\n{fixes}", if self.prev_gate.is_some() { "Fix workers since then:" } else { "\nFix workers (before this round):" }) };
         let prompt = format!(
-            "[mantra:gate] Phase: {}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nWorker reports:\n{reports}{conflicts}\nGate checks:\n{}\n\nMake the result coherent and green, then call mantra_gate_report.",
+            "[mantra:gate] Phase {}: {} — QA round {round}/{}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nGate checks (run by Mantra just now):\n{}\n\nWorker reports:\n{reports}{previous}\nThe phase's diff (stat, then the diff — start here, read a file in full only if the diff cannot answer):\n{}\n\nVerify the result against the goal and the criteria, then call mantra_gate_report. You do not fix anything: report each problem with file, what is wrong and what to change.",
+            idx + 1,
             phase.name,
+            self.pattern.settings.gate_max_rounds,
             phase.goal,
             if phase.gate.criteria.is_empty() { "build + tests pass, code coherent" } else { &phase.gate.criteria },
             if phase.gate.focus.is_empty() { "integration and consistency between the parallel changes" } else { &phase.gate.focus },
-            self.check_summary()
+            self.check_summary(),
+            self.phase_diff.render()
         );
+        let prompt = match self.resume_note.take() {
+            Some(n) => format!("{prompt}\n\n{n}"),
+            None => prompt,
+        };
         let id = ctx.spawn(SpawnReq {
             name: name.clone(),
+            effort: self.effort_for(None, &name, &role, false),
+            thread_name: self.thread_name(&name),
             role_name: name.clone(),
             instructions: format!("{}\n{}\n{sandbox_note}", role.instructions, tools::GATE_PROTOCOL),
             cwd: self.workspace_dir(),
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
-            effort: None,
             extra_writable: self.integ_writable(),
             context_override: None,
             network: self.pattern.settings.network,
@@ -1741,7 +1902,109 @@ Then summarize in 2-4 lines.",
         self.gate_agent = Some(id);
         self.mark_edge(id);
         ctx.prompt(id, prompt);
-        self.log(&role.glyph, "green", format!("{name} gate started"));
+        self.log(&role.glyph, "green", format!("{name} gate started (round {round}, fresh agent)"));
+        self.save_state();
+    }
+
+    /// Remember a gate verdict: the journal line later reviewers start from, and the previous-round
+    /// note the next fresh QA agent is shown.
+    fn note_gate(&mut self, idx: usize, round: u32, pass: bool, summary: &str) {
+        let line = format!("phase {} · QA round {round}: {} — {}", idx + 1, if pass { "pass" } else { "fail" }, trunc(summary.replace('\n', " ").trim(), 400));
+        self.gate_notes.push(line.clone());
+        self.prev_gate = Some((round, pass, summary.to_string()));
+        let _ = std::fs::create_dir_all(&self.dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("gate-reports.md")) {
+            use std::io::Write;
+            let _ = writeln!(f, "- {line}");
+        }
+    }
+
+    /// The worker role a fix goes to: `worker-big` when the QA report flagged the fixes as big,
+    /// `worker-small` otherwise; a custom pattern without those names gets the closest worker role.
+    fn fix_role(&self, big: bool) -> String {
+        let want = if big { "worker-big" } else { "worker-small" };
+        let roles = self.pattern.worker_roles();
+        if roles.iter().any(|r| r == want) {
+            return want.into();
+        }
+        let hint = if big { "big" } else { "small" };
+        roles.iter().find(|r| r.to_lowercase().contains(hint)).or_else(|| roles.first()).cloned().unwrap_or_else(|| want.into())
+    }
+
+    /// Route what gate round `round` found to a fix worker (`fix-<round>`, scoped to the files the
+    /// findings name) and wait for it: when it is done Mantra re-runs the checks and starts the
+    /// next QA round (`on_fix_done`). The caller has checked `round < gate_max_rounds`.
+    fn start_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
+        if self.halted() {
+            self.defer(Pending::Fix { idx, round, findings: trunc(&findings, 6000), big });
+            return;
+        }
+        let Some(phase) = self.current_phase().cloned() else { return };
+        self.retire_gate_agent(ctx);
+        let role = self.fix_role(big);
+        let scope = paths_in(&findings, &self.workspace_dir());
+        let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\nThe gate will re-run: {}", phase.gate.checks.join(" ; ")) };
+        let prompt = format!(
+            "[mantra:fix] Phase {} ({}), {}. The gate found the problems below. Fix exactly these — no refactors, no extras — and stop.\n\nFindings:\n{}\n\nYou work in the integrated copy of the phase: every worker's changes are already merged here. Stay with the files the findings name{}. Before you finish run only what covers what you touched, once.{checks}\nEnd with the STATUS and SUMMARY lines.",
+            idx + 1,
+            phase.name,
+            if round == 0 { "before the first QA round".to_string() } else { format!("gate round {round}") },
+            trunc(findings.trim(), 6000),
+            if scope.is_empty() { String::new() } else { format!(" ({})", scope.join(", ")) }
+        );
+        let what = if round == 0 { "Merge the conflicting branches".to_string() } else { format!("Fix what gate round {round} found") };
+        let task = Task { id: format!("fix-{round}"), title: what, role: role.clone(), prompt, scope, acceptance: "every finding is resolved and nothing else changed".into(), effort: None };
+        self.stage = Stage::Phase { idx, step: PhaseStep::Fix { round } };
+        if round == 0 {
+            self.log("⚒", "amber", format!("branches did not merge — fix-0 ({role}) merges them before QA"));
+        } else {
+            self.log("⚒", "amber", format!("gate round {round} found problems — fix-{round} ({role}) takes them"));
+        }
+        let r = self.spawn_task(ctx, task, None, None);
+        if r.starts_with("REFUSED") {
+            self.log("!", "amber", format!("fix-{round}: {}", trunc(&r, 100)));
+        }
+        self.save_state();
+    }
+
+    /// The fix worker of gate round `round` finished: re-run the checks (the next QA round
+    /// follows the result, `JobTag::FixChecks`).
+    fn on_fix_done(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        let report = self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).map(|w| w.report.clone()).unwrap_or_default();
+        if !report.trim().is_empty() {
+            self.gate_notes.push(format!("phase {} · fix-{round}: {}", idx + 1, trunc(report.replace('\n', " ").trim(), 300)));
+        }
+        // a merge-conflict fix has merged the branches by hand
+        self.conflicts.clear();
+        self.run_checks_after_fix(ctx, idx, round);
+    }
+
+    /// A halt was lifted while a fix worker owned the phase: pick up where it is.
+    fn resume_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        let id = format!("fix-{round}");
+        let Some(w) = self.workers.iter().rev().find(|w| w.task.id == id) else {
+            // never got a worker: nothing to wait for, check what is there
+            self.run_checks_after_fix(ctx, idx, round);
+            return;
+        };
+        match w.state {
+            WState::Done => self.on_fix_done(ctx, idx, round),
+            WState::Failed(_) | WState::Cancelled => {
+                let (agent, task, prompt, effort) = (w.agent, w.task.clone(), w.prompt.clone(), w.effort.clone());
+                self.log("↻", "violet", format!("{id} starts over"));
+                match agent {
+                    Some(a) => {
+                        let prompt = self.resume_note.take().map(|n| join_note(Some(n), self.workers.iter().rev().find(|w| w.agent == Some(a)).map(|w| w.prompt.clone()).unwrap_or_default()));
+                        self.retry_worker(ctx, a, prompt);
+                    }
+                    None => {
+                        self.spawn_task(ctx, task, Some(prompt), effort);
+                    }
+                }
+            }
+            // still working: the halt's "continue where you left off" re-prompt reaches it
+            _ => {}
+        }
     }
 
     fn begin_handoff(&mut self, ctx: &mut dyn Ctx, idx: usize) {
@@ -1780,12 +2043,13 @@ Then summarize in 2-4 lines.",
         ctx.job(
             JobTag::Cleanup { phase: idx },
             Box::new(move || {
-                let Some(ws) = ws else { return JobOut::Text(Ok(String::new())) };
+                let Some(ws) = ws else { return JobOut::Cleanup(Ok(String::new()), git::ReviewDiff::default()) };
                 let committed = git::phase_commit(&ws, &msg);
                 for (d, b) in wts {
                     git::remove_worker(&ws, &d, &b, false);
                 }
-                JobOut::Text(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }))
+                let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES);
+                JobOut::Cleanup(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }), diff)
             }),
         );
         match self.orchestrator {
@@ -1835,17 +2099,23 @@ Then summarize in 2-4 lines.",
         self.gate_report = None;
         self.phase_started = Instant::now();
         let role = self.role(&step.role);
-        // Same sandbox-aware note as `spawn_gate_at_round`: a read-only finale role (the built-in
-        // "planner" finale step included) needs to be told it cannot write, same as any other gate.
-        let sandbox_note = if role.sandbox == "read-only" {
-            "Your role cannot write files: do not try to edit or create anything. Report every needed change precisely (file, what, why) in mantra_gate_report as fail with a fix list; the orchestrator routes it to a worker."
-        } else {
-            "You may edit files to make the result coherent and green (small fixes; anything larger goes into the report as a fix list)."
+        // A read-only finale role (the built-in "planner" step included) needs to be told it cannot
+        // write; with `may_spawn` its defects go to fix workers, otherwise into the report. A role
+        // that can write is left to its own instructions.
+        let sandbox_note = match (role.sandbox == "read-only", step.may_spawn) {
+            (true, true) => "Your role cannot write files: do not try to edit or create anything. Have each real defect fixed by a fix worker (mantra_spawn_adhoc), then mantra_wait.",
+            (true, false) => "Your role cannot write files: do not try to edit or create anything. Report every needed change precisely (file, what, why) in mantra_gate_report as fail with a fix list.",
+            (false, _) => "",
         };
         let plan = self.plan.clone().unwrap_or_default();
         let final_checks = if plan.final_checks.is_empty() { "(none defined)".to_string() } else { plan.final_checks.join("\n") };
+        let reports = if self.gate_notes.is_empty() { "(none)".to_string() } else { self.gate_notes.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n") };
+        let diff = match &self.run_diff {
+            Some(d) => d.render(),
+            None => "(not captured — read it from git: `git log --stat` and `git diff` against the commit the run started from)".into(),
+        };
         let prompt = format!(
-            "[mantra:finale] Step {}/{}: {}\n\nOriginal request:\n{}\n\nPlan summary: {}\nFinal checks:\n{final_checks}\n\nWork in: {}\n{}When done, call mantra_gate_report.",
+            "[mantra:finale] Step {}/{}: {}\n\nOriginal request:\n{}\n\nPlan summary: {}\nFinal checks:\n{final_checks}\n\nGate and finale reports so far:\n{reports}\n\nThe run's diff as of the last phase commit (stat, then the diff — start here, read a file in full only if the diff cannot answer; later fixes show in `git diff` and `git status`):\n{diff}\n\nWork in: {}\n{}When done, call mantra_gate_report.",
             k + 1,
             steps.len(),
             step.task,
@@ -1855,16 +2125,23 @@ Then summarize in 2-4 lines.",
             if step.may_spawn { "You may spawn ad-hoc workers with mantra_spawn_adhoc, then mantra_wait until they finish.\n" } else { "" }
         );
         // The planner verifies with its full context of the plan; other roles get a fresh agent.
+        let effort = self.effort_for(None, &step.role, &role, true);
         let agent = if step.role == self.pattern.flow.planner && self.planner.is_some() {
-            self.planner.unwrap_or_default()
+            let p = self.planner.unwrap_or_default();
+            if let Some(e) = &effort {
+                // the planner is already running at its planning effort: a finale step is a harder look
+                ctx.set_effort(p, e);
+            }
+            p
         } else {
             ctx.spawn(SpawnReq {
                 name: step.role.clone(),
+                effort,
+                thread_name: self.thread_name(&step.role),
                 role_name: step.role.clone(),
                 instructions: format!("{}\n{}\n{sandbox_note}", role.instructions, tools::GATE_PROTOCOL),
                 cwd: self.workspace_dir(),
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
-                effort: None,
                 extra_writable: self.integ_writable(),
                 context_override: None,
                 network: self.pattern.settings.network,
@@ -1974,23 +2251,25 @@ Then summarize in 2-4 lines.",
                 let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), m.log);
                 self.run_checks(ctx, phase, 0);
             }
-            (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped)) => {
-                for c in &results {
-                    self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s)", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
-                }
-                if !dropped.is_empty() {
-                    self.log("⌫", "blue", format!("dropped {} file(s) left behind by checks", dropped.len()));
-                }
-                let all_ok = results.iter().all(|c| c.ok);
-                self.checks = results;
+            (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
+                let all_ok = self.record_checks(results, dropped, diff);
                 if round == 0 {
-                    self.spawn_gate(ctx, phase);
+                    // Merge conflicts are not for a read-only QA agent to resolve: a fix worker
+                    // merges the branches, then the gate runs on the result.
+                    if !self.conflicts.is_empty() {
+                        let list = self.conflicts.join("\n");
+                        let findings = format!("These branches could NOT be merged automatically (conflicts). Merge each into the integrated copy yourself with `git merge <branch>`, resolve the conflicts so the result builds and keeps both sides' intent, and commit:\n{list}");
+                        // round 0: the merge fix comes before QA round 1, it does not use one up
+                        self.start_fix(ctx, phase, 0, findings, true);
+                    } else {
+                        self.spawn_gate(ctx, phase);
+                    }
                 } else if all_ok {
                     self.begin_handoff(ctx, phase);
                 } else if round < self.pattern.settings.gate_max_rounds {
-                    // The very same failure as last round means the gate agent isn't fixing it —
-                    // typically a check that cannot pass on this machine while the agent keeps
-                    // reporting "pass". Don't burn the remaining rounds: escalate now.
+                    // The very same failure as last round means the fix worker isn't fixing it —
+                    // typically a check that cannot pass on this machine. Don't burn the
+                    // remaining rounds: escalate now.
                     let sig = failing_sig(&self.checks);
                     if self.last_verify_sig.as_deref() == Some(sig.as_str()) {
                         let gate = self.gate_agent;
@@ -2005,25 +2284,8 @@ Then summarize in 2-4 lines.",
                         return;
                     }
                     self.last_verify_sig = Some(sig);
-                    self.stage = Stage::Phase { idx: phase, step: PhaseStep::Gate { round: round + 1 } };
-                    self.gate_report = None;
-                    match self.gate_agent {
-                        // results are recorded while halted; the next round waits for the resume
-                        _ if self.halted() => self.defer(Pending::Gate { idx: phase, round: round + 1, note: None }),
-                        Some(_) if self.role(&self.pattern.flow.phase_gate.clone()).sandbox == "read-only" => {
-                            // A read-only gate can't fix a failing check itself — hand it to the
-                            // orchestrator instead of telling this agent to "fix them".
-                            let s = self.check_summary();
-                            self.orch_event(ctx, format!("Phase {} gate checks still fail (gate is read-only, cannot write files):\n{s}\nRoute the fix to a worker.", phase + 1));
-                        }
-                        Some(g) => {
-                            self.mark_edge(g);
-                            let s = self.check_summary();
-                            ctx.prompt(g, format!("[mantra:gate-round {}] Gate checks still fail after your fixes:\n{s}\n\nFix them, then call mantra_gate_report again. If a check is wrong or cannot pass on this machine, do not report pass — say so with mantra_ask.", round + 1));
-                        }
-                        // the gate agent is gone (stopped by a revision or a respawn): a fresh one
-                        None => self.spawn_gate_at_round(ctx, phase, round + 1),
-                    }
+                    let findings = format!("The QA agent passed the phase but these gate checks still fail:\n{}", self.check_summary());
+                    self.start_fix(ctx, phase, round, findings, false);
                 } else {
                     let gate = self.gate_agent;
                     let cmds = failing_cmds(&self.checks);
@@ -2036,10 +2298,24 @@ Then summarize in 2-4 lines.",
                     );
                 }
             }
-            (JobTag::Cleanup { phase }, JobOut::Text(r)) => {
+            (JobTag::FixChecks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
+                let all_ok = self.record_checks(results, dropped, diff);
+                if !all_ok {
+                    // A fix that leaves the very same failure behind did nothing: stop here.
+                    let sig = failing_sig(&self.checks);
+                    if self.last_verify_sig.as_deref() == Some(sig.as_str()) {
+                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, self.gate_agent, format!("phase {} gate: the same check(s) fail identically after fix-{round} — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
+                        return;
+                    }
+                    self.last_verify_sig = Some(sig);
+                }
+                self.spawn_gate_at_round(ctx, phase, round + 1);
+            }
+            (JobTag::Cleanup { phase }, JobOut::Cleanup(r, diff)) => {
                 if let Err(e) = r {
                     self.log("⚠", "amber", format!("phase {} commit: {e}", phase + 1));
                 }
+                self.run_diff = Some(diff);
                 self.cleanup_done = true;
                 self.maybe_next_phase(ctx);
             }
@@ -2050,6 +2326,21 @@ Then summarize in 2-4 lines.",
             (JobTag::Finish, _) => {}
             _ => {}
         }
+    }
+
+    /// Take a checks run's results: journal them, keep them and the phase diff for the next gate
+    /// agent. True when every check passed (or there were none).
+    fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff) -> bool {
+        for c in &results {
+            self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s)", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
+        }
+        if !dropped.is_empty() {
+            self.log("⌫", "blue", format!("dropped {} file(s) left behind by checks", dropped.len()));
+        }
+        let all_ok = results.iter().all(|c| c.ok);
+        self.checks = results;
+        self.phase_diff = diff;
+        all_ok
     }
 
     /// A worker that hit ContextFull while running on the *assumed* 200k window (no explicit
@@ -2293,14 +2584,28 @@ Then summarize in 2-4 lines.",
                 match report {
                     Some((true, summary)) => {
                         self.last_gate_blocker = None;
+                        self.note_gate(idx, round, true, &summary);
                         self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
                         self.run_checks(ctx, idx, round);
                     }
                     // the halt interrupted the round before a report: the resume picks the same
                     // round back up (`resume_by`), it is not a round that failed
                     None if self.halted() => self.log("‖", "amber", format!("gate round {round} interrupted by the halt — it goes on when the run resumes")),
-                    other => {
-                        let why = other.map(|(_, s)| s).unwrap_or_else(|| "no gate report".into());
+                    // The QA agent ended its turn without its verdict: ask for it (twice at most) —
+                    // there is nothing to hand a fix worker yet.
+                    None => {
+                        if self.gate_nudges < 2 {
+                            self.gate_nudges += 1;
+                            self.log("◎", "amber", format!("gate round {round}: no report — asking the QA agent for its verdict"));
+                            self.mark_edge(a);
+                            ctx.prompt(a, "[mantra:gate] You ended your turn without calling mantra_gate_report. Call it now with your verdict (pass, or fail with every finding: file, what is wrong, what to change).".into());
+                        } else {
+                            self.halt_and_escalate(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate round {round}: the QA agent ended its turn without a report, twice", idx + 1));
+                        }
+                    }
+                    Some((false, why)) => {
+                        let big = self.gate_big;
+                        self.note_gate(idx, round, false, &why);
                         // L4 loop protection (WP12.4/WP6): two consecutive gate reports blocked on
                         // the same thing will never resolve themselves — halt now instead of
                         // spending the remaining rounds repeating the same failed fix.
@@ -2316,20 +2621,11 @@ Then summarize in 2-4 lines.",
                                 format!("phase {} gate stuck on the same blocker twice: {why}", idx + 1),
                             );
                         } else if round < self.pattern.settings.gate_max_rounds {
-                            self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round: round + 1 } };
                             self.gate_report = None;
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
-                            if self.halted() {
-                                // the report is recorded; the next round waits for the resume
-                                self.defer(Pending::Gate { idx, round: round + 1, note: None });
-                            } else if self.role(&self.pattern.flow.phase_gate.clone()).sandbox == "read-only" {
-                                // It correctly reported what it can't fix itself — don't tell it to
-                                // "keep going" anyway; hand the fix list to the orchestrator instead.
-                                self.orch_event(ctx, format!("Gate round {round} (read-only, cannot write files) did not pass:\n{}\nRoute the fix to a worker.", trunc(&why, 1200)));
-                            } else {
-                                self.mark_edge(a);
-                                ctx.prompt(a, format!("[mantra:gate-round {}] Keep going: fix what's left so the gate passes, then call mantra_gate_report.", round + 1));
-                            }
+                            // The fix goes to a worker; Mantra re-runs the checks and starts a
+                            // fresh QA round when it is done (deferred if the run is halted).
+                            self.start_fix(ctx, idx, round, why, big);
                         } else {
                             self.halt_and_escalate_full(
                                 ctx,
@@ -2364,6 +2660,8 @@ Then summarize in 2-4 lines.",
                 }
                 if let Some((pass, s)) = rep {
                     self.log(if pass { "✓" } else { "⚠" }, if pass { "green" } else { "amber" }, format!("finale step {} report: {}", idx + 1, trunc(&s, 70)));
+                    let who = self.pattern.flow.finale.get(idx).map(|st| st.role.clone()).unwrap_or_default();
+                    self.gate_notes.push(format!("finale {} · {who}: {} — {}", idx + 1, if pass { "pass" } else { "fail" }, trunc(s.replace('\n', " ").trim(), 400)));
                 }
                 self.start_finale(ctx, idx + 1);
             }
@@ -2385,11 +2683,18 @@ Then summarize in 2-4 lines.",
     }
 
     fn on_worker_done(&mut self, ctx: &mut dyn Ctx, wi: usize, status: &str, error: Option<String>) {
+        // The fix worker of a gate round (`start_fix`) is Mantra's to follow, not the orchestrator's.
+        let fix_round = match &self.stage {
+            Stage::Phase { step: PhaseStep::Fix { round }, .. } if self.workers[wi].adhoc => Some(*round),
+            _ => None,
+        };
         let w = &mut self.workers[wi];
         if w.paused || w.state == WState::Cancelled {
             return;
         }
         let tid = w.task.id.clone();
+        let agent = w.agent;
+        let mut fix_done: Option<(usize, u32)> = None;
         let report = w.agent.and_then(|a| ctx.agent(a)).and_then(|a| a.final_message.clone()).unwrap_or_default();
         let waiting = w.agent.map(|a| self.pending_questions.contains_key(&a)).unwrap_or(false);
         match status {
@@ -2407,14 +2712,21 @@ Then summarize in 2-4 lines.",
                 if blocked {
                     w.state = WState::Failed("blocked".into());
                     self.log("⚠", "amber", format!("{tid} is blocked"));
-                    self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", trunc(&report, 1200)));
+                    if let Some(round) = fix_round {
+                        self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)));
+                    } else {
+                        self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", trunc(&report, 1200)));
+                    }
                 } else {
                     w.state = WState::Done;
                     let el = fmt_dur(w.spawned.elapsed());
                     let adhoc = w.adhoc;
                     let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
                     self.log("✓", "green", format!("{tid} done in {el}"));
-                    if adhoc {
+                    if let (true, Stage::Phase { idx, .. }, Some(round)) = (adhoc, &self.stage, fix_round) {
+                        // a gate round's fix: Mantra re-runs the checks and starts the next QA round
+                        fix_done = Some((*idx, round));
+                    } else if adhoc {
                         // finale fixes report straight to the finale agent
                         let fa = if let Stage::Finale { .. } = self.stage { self.finale_agent } else { None };
                         let still = self.workers.iter().any(|w| w.adhoc && matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_) | WState::Queued));
@@ -2430,14 +2742,23 @@ Then summarize in 2-4 lines.",
             }
             "interrupted" => {
                 self.log("■", "amber", format!("{tid} interrupted"));
-                self.orch_event(ctx, format!("{tid} was interrupted (it is idle now). mantra_prompt it to continue or mantra_retry."));
+                if fix_round.is_none() {
+                    self.orch_event(ctx, format!("{tid} was interrupted (it is idle now). mantra_prompt it to continue or mantra_retry."));
+                }
             }
             _ => {
                 let e = error.unwrap_or_else(|| "turn failed".into());
                 self.workers[wi].state = WState::Failed(e.clone());
                 self.log("✗", "red", format!("{tid} failed: {}", trunc(&e, 70)));
-                self.orch_event(ctx, format!("{tid} FAILED: {e}\nUse mantra_retry (optionally with a better prompt)."));
+                if let Some(round) = fix_round {
+                    self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200)));
+                } else {
+                    self.orch_event(ctx, format!("{tid} FAILED: {e}\nUse mantra_retry (optionally with a better prompt)."));
+                }
             }
+        }
+        if let Some((idx, round)) = fix_done {
+            self.on_fix_done(ctx, idx, round);
         }
         self.fill_slots(ctx);
         self.check_phase_done(ctx);
@@ -2457,7 +2778,12 @@ Then summarize in 2-4 lines.",
         w.tripwires.extend(outside.clone());
         let tid = w.task.id.clone();
         let scope = w.task.scope.join(", ");
+        let fix = w.adhoc && matches!(self.stage, Stage::Phase { step: PhaseStep::Fix { .. }, .. });
         self.log("⚠", "amber", format!("tripwire: {tid} edited {} (scope: {scope})", outside.join(", ")));
+        if fix {
+            // The scope of a fix worker is guessed from the QA findings; nobody is woken for it.
+            return;
+        }
         self.orch_event(ctx, format!("TRIPWIRE: {tid} edited files outside its scope ({scope}): {}. Decide whether that's OK; steer it with mantra_prompt if not.", outside.join(", ")));
     }
 
@@ -3012,11 +3338,12 @@ Then summarize in 2-4 lines.",
         let role = self.role(&name);
         let req = SpawnReq {
             name: "manager".into(),
+            effort: self.effort_for(None, &name, &role, false),
+            thread_name: self.thread_name(&name),
             role_name: name,
             instructions: format!("{}\n{}", role.instructions, tools::MANAGER_PROTOCOL),
             cwd: self.workspace_dir(),
             tools: tools::manager_tools(),
-            effort: None,
             extra_writable: vec![],
             context_override: None,
             network: self.pattern.settings.network,
@@ -3254,7 +3581,7 @@ Then summarize in 2-4 lines.",
     /// The manager restarting an agent during an escalated halt *is* its decision to go on: lift
     /// the halt first (an exhausted task gets its extra attempt), so the retry/respawn is accepted.
     /// Returns whether a halt was lifted.
-    fn lift_halt_for_restart(&mut self, ctx: &mut dyn Ctx, by: AgentId) -> bool {
+    fn lift_halt_for_restart(&mut self, ctx: &mut dyn Ctx, by: AgentId, target: AgentId) -> bool {
         let Some(h) = &self.halt else { return false };
         if !matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) {
             return false;
@@ -3263,7 +3590,7 @@ Then summarize in 2-4 lines.",
             self.extra_attempts += 1;
         }
         self.log("▶", "green", format!("{} lifted the halt to restart an agent", self.name_of(by)));
-        self.resume_by(ctx, Some(by));
+        self.resume_for_restart(ctx, Some(by), target);
         true
     }
 
@@ -3294,11 +3621,12 @@ Then summarize in 2-4 lines.",
         let role = self.role(&name);
         let id = ctx.spawn(SpawnReq {
             name: "orchestrator".into(),
+            effort: self.effort_for(None, &name, &role, false),
+            thread_name: self.thread_name(&name),
             role_name: name,
             instructions: format!("{}\n{}\n## Project-specific brief from the planner\n{}", role.instructions, tools::ORCHESTRATOR_PROTOCOL, plan.orchestrator_brief),
             cwd: self.workspace_dir(),
             tools: tools::orchestrator_tools(),
-            effort: None,
             extra_writable: vec![],
             context_override: None,
             network: self.pattern.settings.network,
@@ -3319,7 +3647,7 @@ Then summarize in 2-4 lines.",
             // `r` on the task that exhausted its attempts *is* the decision to try once more.
             if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted).unwrap_or(false) {
                 self.extra_attempts += 1;
-                self.resume(ctx);
+                self.resume_for_restart(ctx, None, a);
             }
             // A note goes *on top of* the task prompt — `retry_worker`'s argument replaces it.
             let prompt = note.map(|n| join_note(Some(n), self.workers[wi].prompt.clone()));
@@ -3512,6 +3840,7 @@ Then summarize in 2-4 lines.",
                 let old = self.plan.replace(plan.clone());
                 self.plan_version += 1;
                 self.save_plan();
+                self.retitle(ctx, &plan.title);
                 let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
                 self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
                 if revising {
@@ -3589,7 +3918,7 @@ Then summarize in 2-4 lines.",
                         if let Some(refusal) = self.worker_done_guard(t) {
                             return (refusal.into(), false);
                         }
-                        let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a);
+                        let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a, t);
                         match self.respawn(ctx, t, note) {
                             Ok(what) => (format!("{n} {what}{}", if lifted { " — the run resumed" } else { "" }), true),
                             Err(e) => (e, false),
@@ -3719,7 +4048,7 @@ Then summarize in 2-4 lines.",
                         }
                         // The manager restarting a task during an escalated halt is its decision
                         // to go on — lifted only now that the retry is known to be accepted.
-                        let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a);
+                        let lifted = Some(a) == self.manager && self.lift_halt_for_restart(ctx, a, t);
                         let p = Some(s("prompt")).filter(|x| !x.is_empty());
                         let r = self.retry_worker(ctx, t, p);
                         let ok = !r.starts_with("REFUSED");
@@ -3774,7 +4103,12 @@ Then summarize in 2-4 lines.",
                 let who = self.name_of(a);
                 self.log(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", format!("{who} resumed the run: {}", trunc(&note, 60)));
                 if !note.trim().is_empty() {
-                    if let Some(t) = target {
+                    // A stuck QA agent or fix worker is replaced by a fresh one on resume: the note
+                    // goes to that one instead of waking the old one for a turn it will not finish.
+                    let replaced = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
+                    if replaced {
+                        self.resume_note = Some(format!("[from the {who}] {note}"));
+                    } else if let Some(t) = target {
                         self.mark_edge(t);
                         ctx.prompt(t, format!("[from the {who}] {note}"));
                     }
@@ -3786,6 +4120,11 @@ Then summarize in 2-4 lines.",
             "mantra_gate_report" => {
                 let pass = args.get("pass").and_then(|v| v.as_bool()).unwrap_or(false);
                 let summary = s("summary");
+                self.gate_big = match args.get("big") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
+                    _ => false,
+                };
                 self.gate_report = Some((pass, summary));
                 (format!("recorded: {}. End your turn now.", if pass { "pass" } else { "fail" }), true)
             }
@@ -3893,10 +4232,20 @@ Then summarize in 2-4 lines.",
             self.tokens_prev += ctx.agent(g).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(g, true);
         }
+        // a fix worker still at it is working on a gate that no longer stands
+        let fixers: Vec<AgentId> = self.workers.iter().filter(|w| w.adhoc && matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_) | WState::Queued)).filter_map(|w| w.agent).collect();
+        for a in fixers {
+            self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(a, true);
+        }
+        for w in self.workers.iter_mut().filter(|w| w.adhoc && matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_) | WState::Queued)) {
+            w.state = WState::Cancelled;
+        }
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
+        self.prev_gate = None;
         self.last_gate_blocker = None;
         self.last_verify_sig = None;
         self.drop_pending("the phase went back to building");
@@ -3943,6 +4292,54 @@ Then summarize in 2-4 lines.",
             ("forwarded to the orchestrator — the answer arrives as a [from the orchestrator] message. If you cannot continue without it, end your turn now (no STATUS line); you will be woken with the answer.".into(), true)
         }
     }
+}
+
+/// A run's name for people before it has a plan: the goal's first six words.
+pub fn title_from_goal(brief: &str) -> String {
+    let words: Vec<&str> = brief.split_whitespace().take(6).collect();
+    let t = words.join(" ");
+    let t = t.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '-' | '"' | '\'' | '`')).trim();
+    if t.is_empty() {
+        "new run".into()
+    } else {
+        trunc(t, 60)
+    }
+}
+
+/// Files a QA report or a check's output names: tokens that exist under `root`, or that look like
+/// the path of a file (a `/` and an extension) a worker is to create. In order of first mention,
+/// at most 12 — the scope of the fix worker the findings go to. Never a path that leaves `root`.
+fn paths_in(text: &str, root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '{' | '}' | '=' | '|');
+    for raw in text.split(is_sep) {
+        // `src/x.rs:12:5`, `src/x.rs#L10`, a trailing sentence dot
+        let t = raw.split([':', '#']).next().unwrap_or("").trim_matches(|c: char| matches!(c, '.' | '*' | '!' | '?' | '-'));
+        let t = t.strip_prefix("./").unwrap_or(t);
+        if t.len() < 3 || t.len() > 200 || t.starts_with('/') || t.starts_with('-') || t.contains("://") || t.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        // a diff header names `a/src/x.rs`; the file is `src/x.rs`
+        let candidates = [t.strip_prefix("a/").or_else(|| t.strip_prefix("b/")).unwrap_or(t).to_string(), t.to_string()];
+        let mut pick: Option<String> = None;
+        for c in candidates {
+            let looks_like_a_file = c.contains('/') && c.rsplit('/').next().and_then(|f| f.rsplit_once('.')).map(|(stem, ext)| !stem.is_empty() && (1..=6).contains(&ext.len()) && ext.chars().all(|ch| ch.is_ascii_alphanumeric())).unwrap_or(false);
+            let exists = (c.contains('.') || c.contains('/')) && root.join(&c).exists();
+            if exists || looks_like_a_file {
+                pick = Some(c);
+                break;
+            }
+        }
+        if let Some(p) = pick {
+            if !out.contains(&p) {
+                out.push(p);
+                if out.len() == 12 {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One line per failing check, for halt messages.
@@ -4021,14 +4418,33 @@ mod halt_tests {
         /// Every `ctx.spawn`'s instructions, by the id it was given — for tests that check what a
         /// freshly spawned agent was actually told (`spawn` itself ignores the `SpawnReq`).
         spawned_instructions: Vec<(AgentId, String)>,
+        /// Every `ctx.spawn`: who it was for and with what effort / thread name / working dir.
+        spawns: Vec<Spawned>,
+        /// The tag of every background job the engine asked for (the closures are never run).
+        jobs: Vec<String>,
+        stopped: Vec<AgentId>,
+        efforts_set: Vec<(AgentId, String)>,
+        renamed: Vec<(AgentId, String)>,
         /// Every `ctx.spawn`'s role model alias, by the id it was given.
         spawned_models: Vec<(AgentId, String)>,
         /// What `ctx.notify` was told, in order.
         notified: Vec<String>,
     }
+    #[derive(Clone, Debug)]
+    struct Spawned {
+        name: String,
+        role_name: String,
+        effort: Option<String>,
+        thread_name: Option<String>,
+        cwd: PathBuf,
+        sandbox: String,
+    }
     impl TestCtx {
         fn new() -> TestCtx {
-            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawned_models: vec![], notified: vec![] }
+            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![] }
+        }
+        fn spawned(&self, name: &str) -> Vec<Spawned> {
+            self.spawns.iter().filter(|s| s.name == name).cloned().collect()
         }
         /// Register a fake agent that looks busy (a live turn in progress).
         fn add_busy(&mut self) -> AgentId {
@@ -4093,6 +4509,7 @@ mod halt_tests {
             let id = self.next;
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
+            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone() });
             self.spawned_instructions.push((id, r.instructions));
             self.spawned_models.push((id, r.role.model));
             id
@@ -4110,15 +4527,23 @@ mod halt_tests {
             }
         }
         fn compact(&mut self, _a: AgentId) {}
-        fn stop(&mut self, _a: AgentId, _archive: bool) {}
+        fn stop(&mut self, a: AgentId, _archive: bool) {
+            self.stopped.push(a);
+        }
         fn tool_result(&mut self, _a: AgentId, _req: Value, _text: String, _ok: bool) {}
-        fn set_effort(&mut self, _a: AgentId, effort: &str) -> String {
+        fn set_effort(&mut self, a: AgentId, effort: &str) -> String {
+            self.efforts_set.push((a, effort.to_string()));
             effort.to_string()
+        }
+        fn set_thread_name(&mut self, a: AgentId, name: &str) {
+            self.renamed.push((a, name.to_string()));
         }
         fn agent(&self, a: AgentId) -> Option<&Agent> {
             self.agents.get(&a)
         }
-        fn job(&mut self, _tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {}
+        fn job(&mut self, tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
+            self.jobs.push(format!("{tag:?}"));
+        }
         fn notify(&mut self, text: &str) {
             self.notified.push(text.to_string());
         }
@@ -4210,6 +4635,37 @@ mod halt_tests {
 
     fn one_task_phase() -> Plan {
         Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks: vec![Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() }], ..Default::default() }], ..Default::default() }
+    }
+
+    /// Let the fix worker of gate round `round` do its job the way the engine sees it: its
+    /// workspace job returns, it starts, its turn completes (which re-runs the checks, and with no
+    /// checks and no workspace goes straight on to the next QA round).
+    fn finish_fix(ctx: &mut TestCtx, run: &mut Run, round: u32) {
+        let id = format!("fix-{round}");
+        let attempt = run.workers.iter().rev().find(|w| w.task.id == id).map(|w| w.attempt).expect("a fix worker was created");
+        run.on_job(ctx, JobTag::WorkerWt { task: id.clone(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        let agent = run.workers.iter().rev().find(|w| w.task.id == id).and_then(|w| w.agent).expect("the fix worker started");
+        ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed what was listed".into());
+        run.on_turn_done(ctx, agent, "completed", None, None);
+    }
+
+    /// A QA agent's turn ends with this verdict.
+    fn gate_says(ctx: &mut TestCtx, run: &mut Run, gate: AgentId, text: &str) {
+        ctx.agents.get_mut(&gate).unwrap().final_message = Some(text.into());
+        run.on_turn_done(ctx, gate, "completed", None, None);
+    }
+
+    /// Two identical failing QA verdicts with a fix in between: the loop protection halts. Returns
+    /// the second (fresh) QA agent. `run` must be at gate round 1 with `gate` as its agent.
+    fn drive_gate_to_halt(ctx: &mut TestCtx, run: &mut Run, gate: AgentId, blocked: &str) -> AgentId {
+        gate_says(ctx, run, gate, blocked);
+        assert!(!run.halted(), "the first blocked round goes to a fix worker, it does not halt");
+        finish_fix(ctx, run, 1);
+        let second = run.gate_agent.expect("round 2 has a fresh QA agent");
+        assert_ne!(second, gate, "every round is a fresh agent");
+        gate_says(ctx, run, second, blocked);
+        assert!(run.halted());
+        second
     }
 
     // WP7.2 watchdog tests ---------------------------------------------------------------------
@@ -4447,12 +4903,12 @@ mod halt_tests {
         let planner = ctx.add_idle();
         run.planner = Some(planner);
         run.finale_agent = Some(planner); // shared id, exactly as `start_finale` leaves it
-        run.stage = Stage::Finale { idx: 2 }; // built-in pattern's finale[2].role == "planner"
+        run.stage = Stage::Finale { idx: 1 }; // built-in pattern's last finale step (1) is the planner
         run.plan = Some(Plan { title: "x".into(), ..Default::default() });
 
         run.respawn(&mut ctx, planner, None).unwrap();
 
-        assert!(matches!(run.stage, Stage::Finale { idx: 2 }), "must stay on the finale step, got {:?}", run.stage);
+        assert!(matches!(run.stage, Stage::Finale { idx: 1 }), "must stay on the finale step, got {:?}", run.stage);
         assert_eq!(run.finale_agent, Some(planner), "the shared id keeps serving as the finale agent");
         assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:finale]")), "expected the finale step's own prompt, got {:?}", ctx.prompts);
         assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("Continue from stage")), "must not fall through to the planner respawn's resume prompt");
@@ -4522,26 +4978,21 @@ mod halt_tests {
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
         let blocked = "GATE: fail — Blocked: shell sandbox fails before any command runs (bwrap)";
-        ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
-
-        run.on_turn_done(&mut ctx, gate, "completed", None, None);
-        assert!(!run.halted(), "the first blocked round should just try again");
-
-        ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
-        run.on_turn_done(&mut ctx, gate, "completed", None, None);
-        assert!(run.halted(), "two consecutive identical blockers must halt immediately, not spend the remaining rounds");
+        drive_gate_to_halt(&mut ctx, &mut run, gate, blocked);
         assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
+        assert!(run.halt.as_ref().unwrap().message.contains("same blocker twice"), "two consecutive identical blockers must halt, not spend the remaining rounds");
     }
 
-    /// A read-only gate that correctly reports what it can't fix must not be told to "keep going
-    /// and fix it" anyway — that report goes to the orchestrator instead.
+    /// The gate never fixes: a failing verdict goes to a fix worker named `fix-<round>`, scoped to
+    /// the files the findings name, with the findings as its prompt — not to the orchestrator and
+    /// not back to the gate agent.
     #[test]
-    fn read_only_gate_report_fail_routes_to_the_orchestrator() {
+    fn a_failing_gate_report_goes_to_a_fix_worker_not_the_orchestrator() {
+        let dir = std::env::temp_dir().join(format!("mantra-fixscope-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
         let mut ctx = TestCtx::new();
-        let mut pattern = Pattern::builtin();
-        let gate_role = pattern.flow.phase_gate.clone();
-        pattern.roles.get_mut(&gate_role).unwrap().sandbox = "read-only".into();
-        let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+        let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
         let gate = ctx.add_idle();
         let orch = ctx.add_idle();
         ready(&mut ctx, orch);
@@ -4549,13 +5000,291 @@ mod halt_tests {
         run.orchestrator = Some(orch);
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
-        ctx.agents.get_mut(&gate).unwrap().final_message = Some("GATE: fail — README needs a usage section".into());
+        gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/lib.rs:12 exports `foo` but main.rs calls `bar`; rename it. Also docs/new-file.md should describe it.");
 
+        assert!(!run.halted());
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+        assert!(ctx.stopped.contains(&gate), "the QA agent is done — archived, never prompted again");
+        assert_eq!(run.gate_agent, None);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate), "the gate agent is not told to keep going: {:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == orch), "the orchestrator is not involved: {:?}", ctx.prompts);
+        let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("fix-1 was created");
+        assert_eq!(w.task.role, "worker-small");
+        assert!(w.adhoc, "a fix worker works on the integrated copy");
+        assert!(w.prompt.contains("src/lib.rs:12 exports `foo`"), "the findings are its prompt: {}", w.prompt);
+        assert_eq!(w.task.scope, vec!["src/lib.rs".to_string(), "docs/new-file.md".to_string()], "scoped to the files the findings name (existing, or a new file with an extension)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_big_flag_on_the_report_sends_the_fix_to_worker_big() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": false, "summary": "the auth flow is wired in three places inconsistently", "big": true}));
+        assert!(ok);
         run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert_eq!(run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().task.role, "worker-big");
+        // a pattern without those worker names falls back to its closest worker role
+        let mut p = Pattern::builtin();
+        let small = p.roles.remove("worker-small").unwrap();
+        p.roles.insert("tiny-fixer".into(), small);
+        let r2 = Run::new(PathBuf::from("."), p, "test".into());
+        assert_eq!(r2.fix_role(false), "tiny-fixer", "no small role left: the first worker role it has");
+        assert_eq!(r2.fix_role(true), "worker-big");
+    }
 
-        assert!(!run.halted(), "one report is not two identical blockers");
-        assert!(!ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("Keep going")), "a read-only gate must not be told to fix it itself: {:?}", ctx.prompts);
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("read-only") && t.contains("README needs a usage section")), "the orchestrator must get the fix list instead: {:?}", ctx.prompts);
+    /// A pass is verified by the checks; when they still fail the fix goes to a worker too.
+    #[test]
+    fn checks_failing_after_a_qa_pass_go_to_a_fix_worker() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let gate = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+        assert!(!run.halted());
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+        let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes the failing checks");
+        assert!(w.prompt.contains("Permission denied") && w.prompt.contains("uv venv .venv"), "{}", w.prompt);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate || *a == orch), "neither the gate nor the orchestrator is asked: {:?}", ctx.prompts);
+    }
+
+    /// After the fix worker finishes: checks again, then a FRESH QA agent that sees the previous
+    /// verdict, the fix worker's report and the check results.
+    #[test]
+    fn after_the_fix_the_checks_rerun_and_a_fresh_qa_round_follows() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        gate_says(&mut ctx, &mut run, gate, "GATE: fail — README needs a usage section");
+        // the fix worker, through the job/turn cycle
+        let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+        run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        let fixer = run.workers.iter().find(|w| w.task.id == "fix-1").and_then(|w| w.agent).unwrap();
+        assert!(ctx.spawned("fix-1").iter().any(|s| s.role_name == "worker-small"));
+        ctx.agents.get_mut(&fixer).unwrap().final_message = Some("STATUS: done\nSUMMARY: added the usage section".into());
+        run.on_turn_done(&mut ctx, fixer, "completed", None, None);
+        let second = run.gate_agent.expect("round 2 starts");
+        assert_ne!(second, gate);
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+        let (_, prompt) = ctx.prompts.iter().rev().find(|(a, _)| *a == second).expect("the fresh agent is briefed");
+        assert!(prompt.contains("QA round 2/3"), "{prompt}");
+        assert!(prompt.contains("Previous QA round (1) said fail: GATE: fail — README needs a usage section"), "{prompt}");
+        assert!(prompt.contains("fix-1: STATUS: done") && prompt.contains("added the usage section"), "the fix worker's report is shown: {prompt}");
+        assert!(prompt.contains("Gate checks") && prompt.contains("diff"), "{prompt}");
+        assert_eq!(ctx.spawned("qa").len(), 1, "one fresh QA agent for round 2 (the first was seeded by the test)");
+    }
+
+    /// The first QA round of a phase (a real spawn) is a fresh read-only agent whose instructions
+    /// say it never fixes.
+    #[test]
+    fn the_phase_gate_agent_is_fresh_read_only_and_told_not_to_fix() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
+        run.spawn_gate(&mut ctx, 0);
+        let g = run.gate_agent.unwrap();
+        let sp = &ctx.spawned("qa")[0];
+        assert_eq!(sp.sandbox, "read-only");
+        let instr = &ctx.spawned_instructions.iter().find(|(id, _)| *id == g).unwrap().1;
+        assert!(instr.contains("never fix") && instr.contains("Your role cannot write files"), "{instr}");
+        // a second round replaces it: the first is archived, the second is a different agent
+        run.spawn_gate_at_round(&mut ctx, 0, 2);
+        let g2 = run.gate_agent.unwrap();
+        assert_ne!(g, g2);
+        assert!(ctx.stopped.contains(&g));
+    }
+
+    #[test]
+    fn merge_conflicts_go_to_a_fix_worker_because_the_gate_cannot_merge() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
+        run.conflicts = vec!["mantra-w/r/p1-a-1".into()];
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+        assert!(run.gate_agent.is_none(), "no QA agent reads a tree that is not merged yet");
+        let w = run.workers.iter().find(|w| w.task.id == "fix-0").expect("a worker merges the branches, before QA round 1");
+        assert_eq!(w.task.role, "worker-big");
+        assert!(w.prompt.contains("git merge") && w.prompt.contains("mantra-w/r/p1-a-1"), "{}", w.prompt);
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 0 }, .. }), "{:?}", run.stage);
+        finish_fix(&mut ctx, &mut run, 0);
+        assert!(run.conflicts.is_empty(), "the fix worker resolved them");
+        let g = run.gate_agent.expect("the QA round follows");
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "the merge fix does not use up a QA round: {:?}", run.stage);
+        let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == g).unwrap();
+        assert!(p.contains("QA round 1/3") && p.contains("fix-0: STATUS: done"), "the first QA agent sees what the merge fix did: {p}");
+    }
+
+    #[test]
+    fn a_qa_agent_that_ends_without_a_report_is_asked_twice_then_the_run_halts() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        let gate = ctx.add_idle();
+        run.planner = Some(planner);
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        for n in 1..=2 {
+            ctx.prompts.clear();
+            run.on_turn_done(&mut ctx, gate, "completed", None, None);
+            assert!(!run.halted(), "nudge {n}");
+            assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("mantra_gate_report")), "{:?}", ctx.prompts);
+        }
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert!(run.halted());
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
+        assert!(run.workers.is_empty(), "nothing to hand a fix worker");
+    }
+
+    /// A fix worker that cannot do its job halts the run (the orchestrator cannot drive this
+    /// loop); the same task retried after the halt picks the round back up.
+    #[test]
+    fn a_blocked_fix_worker_halts_and_the_resume_starts_it_over() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        let planner = ctx.add_idle();
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        let gate = ctx.add_idle();
+        run.planner = Some(planner);
+        run.orchestrator = Some(orch);
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs is wrong");
+        let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+        run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        let fixer = run.workers[0].agent.unwrap();
+        ctx.agents.get_mut(&fixer).unwrap().final_message = Some("STATUS: blocked\nSUMMARY: cannot write src/a.rs".into());
+        ctx.prompts.clear();
+        run.on_turn_done(&mut ctx, fixer, "completed", None, None);
+        assert!(run.halted());
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::AttemptsExhausted);
+        assert!(!ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("FAILED")), "not the orchestrator's: {:?}", ctx.prompts);
+        run.resume(&mut ctx);
+        assert!(run.workers.iter().filter(|w| w.task.id == "fix-1").count() == 2, "a second attempt of the same fix task");
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+    }
+
+    /// The QA report arrives while the run is halted: the fix is remembered (and saved), not started.
+    #[test]
+    fn a_fail_report_during_a_pause_defers_the_fix_until_the_resume() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let gate = ctx.add_idle();
+        run.gate_agent = Some(gate);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        run.toggle_pause(&mut ctx);
+        assert!(run.halted());
+        gate_says(&mut ctx, &mut run, gate, "GATE: fail — fix src/a.rs");
+        match &run.pending {
+            Some(Pending::Fix { idx: 0, round: 1, findings, big: false }) => assert!(findings.contains("src/a.rs")),
+            other => panic!("expected a deferred fix, got {other:?}"),
+        }
+        assert!(run.workers.is_empty());
+        run.toggle_pause(&mut ctx);
+        assert!(run.workers.iter().any(|w| w.task.id == "fix-1"), "the resume starts the fix worker");
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+        assert!(run.pending.is_none());
+    }
+
+    /// The watchdog watches the fix worker like any other worker.
+    #[test]
+    fn the_watchdog_expects_the_fix_worker_to_be_busy() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+        let a = ctx.add_busy();
+        let mut w = mk_worker("fix-1", "worker-small", a, WState::Running);
+        w.adhoc = true;
+        run.workers.push(w);
+        assert!(run.expected_active().iter().any(|(id, e)| *id == a && *e == Expect::Working("fix-1".into())));
+    }
+
+    /// A fix worker's out-of-scope edit is logged, not sent to the orchestrator.
+    #[test]
+    fn a_fix_workers_scope_miss_does_not_wake_the_orchestrator() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let orch = ctx.add_idle();
+        ready(&mut ctx, orch);
+        run.orchestrator = Some(orch);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+        let a = ctx.add_busy();
+        let mut w = mk_worker("fix-1", "worker-small", a, WState::Running);
+        w.adhoc = true;
+        w.task.scope = vec!["src/a.rs".into()];
+        run.workers.push(w);
+        run.on_files_changed(&mut ctx, a, &["src/b.rs".into()]);
+        assert!(run.orch_inbox.is_empty() && ctx.prompts.is_empty(), "{:?}", ctx.prompts);
+        assert!(run.pulse.iter().any(|p| p.text.contains("tripwire")));
+    }
+
+    /// A plan revision sends the phase back to building: a fix worker of the gate that no longer
+    /// stands is stopped, not left editing the shared copy.
+    #[test]
+    fn a_plan_revision_stops_a_running_fix_worker() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+        let orch = ctx.add_idle();
+        run.orchestrator = Some(orch);
+        let a = ctx.add_busy();
+        let mut w = mk_worker("fix-1", "worker-small", a, WState::Running);
+        w.adhoc = true;
+        run.workers.push(w);
+        run.return_to_orchestrating(&mut ctx);
+        assert!(ctx.stopped.contains(&a));
+        assert_eq!(run.workers[0].state, WState::Cancelled);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating });
+    }
+
+    #[test]
+    fn the_big_flag_is_read_leniently() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let g = ctx.add_idle();
+        for (v, want) in [(json!(true), true), (json!("true"), true), (json!("no"), false), (json!(null), false)] {
+            run.handle_tool(&mut ctx, g, "mantra_gate_report", &json!({"pass": false, "summary": "x", "big": v}));
+            assert_eq!(run.gate_big, want, "{v}");
+        }
+        run.handle_tool(&mut ctx, g, "mantra_gate_report", &json!({"pass": false, "summary": "x"}));
+        assert!(!run.gate_big);
+    }
+
+    #[test]
+    fn paths_in_finds_the_files_a_report_names() {
+        let dir = std::env::temp_dir().join(format!("mantra-paths-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src/web")).unwrap();
+        std::fs::write(dir.join("src/web/app.js"), "").unwrap();
+        std::fs::write(dir.join("Makefile"), "").unwrap();
+        let t = "Problems: `src/web/app.js:40:5` calls a removed helper (see b/src/web/app.js too); the e.g. v1.2 and and/or are prose; ../etc/passwd and /etc/hosts are not ours; \
+                 a brand new tests/new_test.py should exist; https://example.com/x.html is a link. Makefile has a typo. Also src/web.";
+        let got = paths_in(t, &dir);
+        assert_eq!(got, vec!["src/web/app.js".to_string(), "tests/new_test.py".to_string(), "src/web".to_string()], "{got:?}");
+        assert!(paths_in("nothing to see, v2.0 and and/or", &dir).is_empty());
+        let many: String = (0..30).map(|i| format!("src/f{i}.rs ")).collect();
+        assert_eq!(paths_in(&many, &dir).len(), 12, "capped");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // v0.3 chain of command -------------------------------------------------------------------
@@ -4673,24 +5402,22 @@ mod halt_tests {
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
         let blocked = "GATE: fail — the venv is gone and uv cannot recreate it";
-        for _ in 0..2 {
-            ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
-            run.on_turn_done(&mut ctx, gate, "completed", None, None);
-        }
-        assert!(run.halted());
+        let gate = drive_gate_to_halt(&mut ctx, &mut run, gate, blocked);
         assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
         let esc = ctx.prompts.iter().find(|(a, t)| *a == planner && t.contains("[mantra:escalation]")).map(|(_, t)| t.clone()).expect("the planner is handed the halt");
         assert!(esc.contains("mantra_revise_plan") && esc.contains("mantra_resume_run") && esc.contains("mantra_ask_user"), "{esc}");
         assert!(run.halt_hint().contains("planner"));
 
-        // the planner: plan is right, here's a hint — the run resumes, the gate gets the note,
-        // and the planner itself is not told to "continue where you left off"
+        // the planner: plan is right, here's a hint — the run resumes with a fresh QA agent that
+        // gets the note, and the planner itself is not told to "continue where you left off"
         ctx.prompts.clear();
         let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_resume_run", &json!({"note": "the venv is at .venv — do not recreate it"}));
         assert!(ok, "{msg}");
         assert!(!run.halted());
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[from the planner]") && t.contains(".venv")));
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[mantra:gate-round 1]")), "no checks in this phase: the gate agent itself continues: {:?}", ctx.prompts);
+        let fresh = run.gate_agent.expect("no checks in this phase: a fresh QA agent is the gate");
+        assert_ne!(fresh, gate, "the stuck agent is replaced, not nudged");
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == fresh && t.contains("[mantra:gate]") && t.contains("QA round 1/") && t.contains("[from the planner]") && t.contains(".venv")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate), "the old agent is not woken for a turn it will not finish: {:?}", ctx.prompts);
         assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:resume]")));
         assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
     }
@@ -4706,36 +5433,43 @@ mod halt_tests {
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
         let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![]));
+        // QA passed, the checks still fail: fix-1 takes the output…
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
         assert!(!run.halted());
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[mantra:gate-round 2]") && t.contains("Permission denied") && t.contains("mantra_ask")), "round 2 with the output and the escape hatch: {:?}", ctx.prompts);
-        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 2 }, JobOut::Checks(fail(), vec![]));
+        let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
+        assert!(w.prompt.contains("Permission denied"), "{}", w.prompt);
+        // …and when the very same failure is still there afterwards, nobody is fixing it
+        run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
         assert!(run.halted(), "the identical failure twice means nobody is fixing it");
         assert!(run.halt.as_ref().unwrap().message.contains("identically"));
         assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));
     }
 
-    /// Same as the gate-report case above, but for checks still failing after a read-only gate
-    /// self-reported pass: it still can't fix them itself.
+    /// A fix that changes the failure moves on to a fresh QA round that sees the new check output.
     #[test]
-    fn read_only_gate_checks_still_failing_routes_to_the_orchestrator() {
+    fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
         let mut ctx = TestCtx::new();
-        let mut pattern = no_manager();
-        let gate_role = pattern.flow.phase_gate.clone();
-        pattern.roles.get_mut(&gate_role).unwrap().sandbox = "read-only".into();
-        let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
-        let orch = ctx.add_idle();
-        ready(&mut ctx, orch);
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
         let gate = ctx.add_idle();
-        run.orchestrator = Some(orch);
         run.gate_agent = Some(gate);
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
-        let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![]));
+        let fail = |out: &str| vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: out.into(), secs: 0 }];
+        run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
+        run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }));
         assert!(!run.halted());
-        assert!(!ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("Fix them")), "a read-only gate must not be told to fix the checks itself: {:?}", ctx.prompts);
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("read-only") && t.contains("Permission denied")), "the orchestrator must get the fix list instead: {:?}", ctx.prompts);
+        let g2 = run.gate_agent.expect("round 2");
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+        let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == g2).unwrap();
+        assert!(p.contains("a different failure") && p.contains("src/a.rs | 2 +-") && p.contains("+new line"), "the fresh QA agent sees the checks and the diff: {p}");
+        // the last round has no fix after it: a failure there halts
+        let mut r2 = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        r2.plan = Some(one_task_phase());
+        r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 3 } };
+        r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3 }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
+        assert!(r2.halted());
+        assert_eq!(r2.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
+        assert!(r2.workers.is_empty(), "no fix worker after the last round");
     }
 
     #[test]
@@ -5011,12 +5745,7 @@ mod halt_tests {
         run.gate_agent = Some(gate);
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
-        let blocked = "GATE: fail — the venv is gone";
-        for _ in 0..2 {
-            ctx.agents.get_mut(&gate).unwrap().final_message = Some(blocked.into());
-            run.on_turn_done(ctx, gate, "completed", None, None);
-        }
-        assert!(run.halted());
+        let gate = drive_gate_to_halt(ctx, &mut run, gate, "GATE: fail — the venv is gone");
         (run, planner, gate)
     }
 
@@ -5084,7 +5813,9 @@ mod halt_tests {
         assert!(ok, "{msg}");
         assert!(!run.halted());
         assert!(run.manager_escalation.is_none());
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("[from the manager]") && t.contains(".venv")), "{:?}", ctx.prompts);
+        let g2 = run.gate_agent.expect("a fresh QA agent takes over the gate");
+        assert_ne!(g2, gate);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == g2 && t.contains("[from the manager]") && t.contains(".venv")), "the note reaches the agent that replaces the stuck one: {:?}", ctx.prompts);
         assert!(!ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[mantra:resume]")), "the manager itself is not told to continue");
         assert!(!ctx.prompts.iter().any(|(a, _)| *a == planner));
         // and a later idle turn of the manager is nothing special any more
@@ -5257,7 +5988,7 @@ mod halt_tests {
         assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("did not act") && t.contains("orchestrator")), "{:?}", ctx.prompts);
         assert!(!run.halted());
         // a health digest brings a fresh manager back
-        run.last_health = Instant::now() - Duration::from_secs(6 * 60);
+        run.last_health = Instant::now() - Duration::from_secs(11 * 60);
         run.health_tick(&mut ctx);
         assert!(run.manager.is_some(), "the next digest spawns a fresh manager");
     }
@@ -5416,7 +6147,7 @@ mod halt_tests {
         run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
         let manager = run.ensure_manager(&mut ctx).unwrap();
         ready(&mut ctx, manager);
-        run.last_health = Instant::now() - Duration::from_secs(6 * 60);
+        run.last_health = Instant::now() - Duration::from_secs(11 * 60);
         run.last_tick = Instant::now() - Duration::from_secs(2);
         ctx.prompts.clear();
         run.tick(&mut ctx);
@@ -5481,6 +6212,272 @@ mod halt_tests {
         assert!(ok && !run.waiting_for_answer(orch));
     }
 
+    // Effort, titles, thread names, finale prompts ---------------------------------------------
+
+    fn mixed_phase() -> Plan {
+        Plan {
+            phases: vec![Phase {
+                id: "p1".into(),
+                name: "p1".into(),
+                tasks: vec![Task { id: "s1".into(), role: "worker-small".into(), ..Default::default() }, Task { id: "b1".into(), role: "worker-big".into(), ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Start `task` and let its workspace come back, so its agent is spawned (in `/tmp/wt-<id>`).
+    fn launch(ctx: &mut TestCtx, run: &mut Run, task: Task, effort: Option<String>) {
+        let id = task.id.clone();
+        run.spawn_task(ctx, task, None, effort);
+        let wi = run.workers.iter().position(|w| w.task.id == id).unwrap();
+        run.launch_worker(ctx, wi, PathBuf::from(format!("/tmp/wt-{id}")), String::new());
+    }
+
+    #[test]
+    fn auto_effort_is_resolved_per_spawn_from_the_roles_job() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(mixed_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        // the built-in default sets `auto` on every role
+        run.spawn_planner(&mut ctx);
+        run.spawn_orchestrator(&mut ctx);
+        run.ensure_manager(&mut ctx);
+        for who in ["planner", "orchestrator", "manager"] {
+            assert_eq!(ctx.spawned(who)[0].effort.as_deref(), Some("medium"), "{who}");
+        }
+        let tasks = mixed_phase().phases[0].tasks.clone();
+        launch(&mut ctx, &mut run, tasks[0].clone(), None);
+        launch(&mut ctx, &mut run, tasks[1].clone(), None);
+        assert_eq!(ctx.spawned("s1")[0].effort.as_deref(), Some("low"), "worker-small");
+        assert_eq!(ctx.spawned("b1")[0].effort.as_deref(), Some("medium"), "worker-big");
+        assert_eq!(ctx.spawned("s1")[0].cwd, PathBuf::from("/tmp/wt-s1"));
+        // an explicit request still wins: the orchestrator's override, a task's own effort
+        let mut t = Task { id: "s2".into(), role: "worker-small".into(), ..Default::default() };
+        launch(&mut ctx, &mut run, t.clone(), Some("xhigh".into()));
+        assert_eq!(ctx.spawned("s2")[0].effort.as_deref(), Some("xhigh"));
+        t.id = "s3".into();
+        t.effort = Some("high".into());
+        launch(&mut ctx, &mut run, t.clone(), None);
+        assert_eq!(ctx.spawned("s3")[0].effort.as_deref(), Some("high"));
+        t.id = "s4".into();
+        t.effort = None;
+        launch(&mut ctx, &mut run, t, Some("auto".into()));
+        assert_eq!(ctx.spawned("s4")[0].effort.as_deref(), Some("low"), "an orchestrator asking for auto gets the role's auto");
+        // the gate is a medium job
+        run.spawn_gate(&mut ctx, 0);
+        assert_eq!(ctx.spawned("qa")[0].effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_role_with_a_named_effort_is_left_alone_and_finale_roles_think_hard() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin_thorough(), "test".into());
+        run.plan = Some(mixed_phase());
+        run.spawn_planner(&mut ctx);
+        assert_eq!(ctx.spawned("planner")[0].effort, None, "the role's own effort applies downstream, untouched");
+        // the default's finale: the qa-heavy role is `auto`, which in a finale step is `high`
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.plan = Some(mixed_phase());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.start_finale(&mut ctx, 0);
+        assert_eq!(ctx.spawned("qa-heavy")[0].effort.as_deref(), Some("high"));
+        // the planner's own verification step reuses the planner agent: its effort is raised
+        run.start_finale(&mut ctx, 1);
+        assert_eq!(ctx.efforts_set, vec![(planner, "high".to_string())]);
+        // while a named planner effort stays what it was
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin_thorough(), "test".into());
+        run.plan = Some(mixed_phase());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.start_finale(&mut ctx, 2);
+        assert!(ctx.efforts_set.is_empty());
+        assert_eq!(ctx.spawned("security").len(), 0);
+    }
+
+    #[test]
+    fn the_run_has_a_title_and_every_thread_carries_it() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "Ich benutze schon seit langer Zeit ein Tool für Notizen".into());
+        assert_eq!(run.title, "Ich benutze schon seit langer Zeit", "the goal's first six words");
+        let id = run.id.clone();
+        assert!(id.ends_with("-ich-benutze-schon-seit-l"), "{id}");
+        let planner = run.spawn_planner(&mut ctx);
+        assert_eq!(ctx.spawned("planner")[0].thread_name.as_deref(), Some("Ich benutze schon seit langer Zeit · planner"));
+        run.spawn_orchestrator(&mut ctx);
+        assert_eq!(ctx.spawned("orchestrator")[0].thread_name.as_deref(), Some("Ich benutze schon seit langer Zeit · orchestrator"));
+
+        // the plan comes in: its title names the run, the id stays, live threads are renamed
+        let plan = json!({"title": "Notes sync", "summary": "S", "phases": [{"name": "A", "tasks": [
+            {"id": "a1", "title": "x", "role": "worker-small", "prompt": "do the first thing well", "scope": ["src/a/**"]}], "gate": {"checks": ["true"]}}]});
+        let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_submit_plan", &json!({"plan": plan}));
+        assert!(ok, "{msg}");
+        assert_eq!(run.title, "Notes sync");
+        assert_eq!(run.id, id, "the id is the stable key");
+        assert!(ctx.renamed.contains(&(planner, "Notes sync · planner".to_string())), "{:?}", ctx.renamed);
+        assert_eq!(ctx.renamed.len(), 2, "planner and orchestrator: {:?}", ctx.renamed);
+        // agents spawned from here on are named after it
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
+        run.spawn_gate(&mut ctx, 0);
+        assert_eq!(ctx.spawned("qa")[0].thread_name.as_deref(), Some("Notes sync · qa"));
+        // the same title again renames nothing
+        let n = ctx.renamed.len();
+        let (_, ok) = run.handle_tool(&mut ctx, planner, "mantra_submit_plan", &json!({"plan": plan}));
+        assert!(ok);
+        assert_eq!(ctx.renamed.len(), n);
+        // an empty title leaves the old one
+        assert_eq!(title_from_goal("   "), "new run");
+        assert_eq!(title_from_goal("\"fix the parser,\" he said."), "fix the parser,\" he said");
+        assert_eq!(title_from_goal(&"word ".repeat(40)), "word word word word word word");
+    }
+
+    #[test]
+    fn the_title_and_gate_notes_survive_a_save_and_a_resume() {
+        let dir = std::env::temp_dir().join(format!("mantra-title-{}", std::process::id()));
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "build a notes app with sync".into());
+        run.dir = dir.clone();
+        run.title = "Notes sync".into();
+        run.gate_notes.push("phase 1 · QA round 1: pass — fine".into());
+        run.save_state();
+        let st = crate::engine::state::RunState::load(&dir).unwrap();
+        assert_eq!(st.title, "Notes sync");
+        assert_eq!(st.gate_notes, vec!["phase 1 · QA round 1: pass — fine".to_string()]);
+        let back = Run::from_state(&st, Pattern::builtin(), None, dir.clone());
+        assert_eq!(back.title, "Notes sync");
+        assert_eq!(back.gate_notes, run.gate_notes);
+        // a state file from before titles: the goal's first words stand in
+        let mut old = st.clone();
+        old.title = String::new();
+        assert_eq!(old.display_title(), "build a notes app with sync");
+        assert_eq!(Run::from_state(&old, Pattern::builtin(), None, dir.clone()).title, "build a notes app with sync");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_finale_starts_from_the_diff_and_the_reports_not_the_whole_repo() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "make a thing".into());
+        run.plan = Some(Plan { title: "T".into(), summary: "a thing".into(), ..Default::default() });
+        run.note_gate(0, 1, false, "src/a.rs misses a test");
+        run.note_gate(0, 2, true, "all good now");
+        run.run_diff = Some(git::ReviewDiff { stat: " src/a.rs | 4 ++--".into(), diff: "+let x = 1;".into(), truncated: false });
+        run.start_finale(&mut ctx, 0);
+        let qa = run.finale_agent.expect("qa-heavy started");
+        let (_, prompt) = ctx.prompts.iter().find(|(a, _)| *a == qa).unwrap();
+        assert!(prompt.contains("phase 1 · QA round 1: fail — src/a.rs misses a test") && prompt.contains("phase 1 · QA round 2: pass — all good now"), "{prompt}");
+        assert!(prompt.contains("src/a.rs | 4 ++--") && prompt.contains("+let x = 1;"), "{prompt}");
+        assert!(prompt.contains("start here, read a file in full only if the diff cannot answer"), "{prompt}");
+        let instr = &ctx.spawned_instructions.iter().find(|(id, _)| *id == qa).unwrap().1;
+        assert!(!instr.contains("You may edit files"), "the QA pass verifies and has defects fixed by workers: {instr}");
+        assert!(instr.contains("run's diff") && instr.contains("spawn a fix worker"), "{instr}");
+        // its report joins the notes the next step starts from
+        ctx.agents.get_mut(&qa).unwrap().final_message = Some("GATE: pass — nothing real left".into());
+        run.on_turn_done(&mut ctx, qa, "completed", None, None);
+        assert!(run.gate_notes.iter().any(|n| n.starts_with("finale 1 · qa-heavy: pass — GATE: pass")), "{:?}", run.gate_notes);
+        assert!(run.gate_notes.len() == 3);
+        // without a captured diff the prompt says where to read it
+        let mut r2 = Run::new(PathBuf::from("."), Pattern::builtin(), "make a thing".into());
+        r2.start_finale(&mut ctx, 0);
+        let q2 = r2.finale_agent.unwrap();
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == q2 && t.contains("not captured")));
+    }
+
+    #[test]
+    fn the_planner_finale_names_what_it_may_do_when_read_only() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "make a thing".into());
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.start_finale(&mut ctx, 1);
+        assert_eq!(run.finale_agent, Some(planner));
+        let (_, p) = ctx.prompts.iter().find(|(a, _)| *a == planner).unwrap();
+        assert!(p.contains("mantra_spawn_adhoc"), "{p}");
+        assert!(run.pattern.flow.finale[1].task.contains("gate and finale reports"));
+    }
+
+    #[test]
+    fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
+        let dir = std::env::temp_dir().join(format!("mantra-jobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None };
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
+        run.ws = Some(ws);
+        let mut plan = one_task_phase();
+        plan.phases[0].gate.checks = vec!["true".into()];
+        run.plan = Some(plan);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
+        run.run_checks(&mut ctx, 0, 0);
+        run.run_checks(&mut ctx, 0, 1);
+        run.run_checks_after_fix(&mut ctx, 0, 1);
+        assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }", "Checks { phase: 0, round: 1 }", "FixChecks { phase: 0, round: 1 }"]);
+        // with no checks defined: the first round still needs the diff (a job); a verify has nothing to do
+        run.plan.as_mut().unwrap().phases[0].gate.checks.clear();
+        ctx.jobs.clear();
+        run.run_checks(&mut ctx, 0, 0);
+        assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }"]);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        run.run_checks(&mut ctx, 0, 1);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, "a verify with no checks hands off");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
+        // the real closure, on a real (git) directory
+        let dir = std::env::temp_dir().join(format!("mantra-jobrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        sh(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None };
+        struct Capture(Vec<JobOut>);
+        impl Capture {
+            fn run(&mut self, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
+                self.0.push(f());
+            }
+        }
+        // drive launch_checks through a ctx that runs the closure
+        struct RunJobs(TestCtx, Capture);
+        impl Ctx for RunJobs {
+            fn spawn(&mut self, r: SpawnReq) -> AgentId { self.0.spawn(r) }
+            fn prompt(&mut self, a: AgentId, t: String) { self.0.prompt(a, t) }
+            fn prompt_mode(&mut self, a: AgentId, t: String, m: Send) { self.0.prompt_mode(a, t, m) }
+            fn interrupt(&mut self, a: AgentId) { self.0.interrupt(a) }
+            fn compact(&mut self, a: AgentId) { self.0.compact(a) }
+            fn stop(&mut self, a: AgentId, x: bool) { self.0.stop(a, x) }
+            fn tool_result(&mut self, a: AgentId, r: Value, t: String, ok: bool) { self.0.tool_result(a, r, t, ok) }
+            fn set_effort(&mut self, a: AgentId, e: &str) -> String { self.0.set_effort(a, e) }
+            fn agent(&self, a: AgentId) -> Option<&Agent> { self.0.agent(a) }
+            fn job(&mut self, _tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) { self.1.run(f) }
+            fn notify(&mut self, t: &str) { self.0.notify(t) }
+        }
+        let mut ctx = RunJobs(TestCtx::new(), Capture(vec![]));
+        let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
+        run.ws = Some(ws);
+        let mut plan = one_task_phase();
+        plan.phases[0].gate.checks = vec!["test -f a.txt".into(), "exit 3".into()];
+        run.plan = Some(plan);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
+        run.run_checks(&mut ctx, 0, 0);
+        match ctx.1 .0.pop() {
+            Some(JobOut::Checks(results, _, diff)) => {
+                assert_eq!(results.iter().map(|c| c.ok).collect::<Vec<_>>(), vec![true, false]);
+                assert!(diff.stat.contains("a.txt") && diff.diff.contains("+two"), "{diff:?}");
+            }
+            _ => panic!("expected the checks job's result"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // Pause boundary --------------------------------------------------------------------------
 
     fn two_phase_plan() -> Plan {
@@ -5529,7 +6526,7 @@ mod halt_tests {
         assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate), "the archived gate agent gets no 'continue' prompt: {:?}", ctx.prompts);
         ctx.agents.get_mut(&orch).unwrap().final_message = Some("phase 1 built t1".into());
         run.on_turn_done(&mut ctx, orch, "completed", None, None);
-        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Text(Ok("committed".into())));
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Cleanup(Ok("committed".into()), git::ReviewDiff::default()));
         assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
         let orch2 = run.orchestrator.expect("phase 2 has an orchestrator");
         assert!(ctx.prompts.iter().any(|(a, t)| *a == orch2 && t.contains("[mantra:phase] Phase 2/2")), "{:?}", ctx.prompts);
@@ -5551,7 +6548,7 @@ mod halt_tests {
         run.toggle_pause(&mut ctx);
         let agents_before = ctx.next;
         // the phase's cleanup commit finishes during the pause: phase 2 is due
-        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Text(Ok("committed".into())));
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Cleanup(Ok("committed".into()), git::ReviewDiff::default()));
         assert_eq!(run.pending, Some(Pending::Phase { idx: 1 }));
         assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
         assert_eq!(ctx.next, agents_before, "no orchestrator is spawned while paused");
@@ -5722,7 +6719,12 @@ mod halt_tests {
         assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::User), "{:?}", run.halt.as_ref().map(|h| &h.message));
         ctx.prompts.clear();
         run.toggle_pause(&mut ctx);
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == gate && t.contains("The run resumed")), "{:?}", ctx.prompts);
+        let fresh = run.gate_agent.expect("the interrupted round is taken over by a fresh QA agent");
+        assert_ne!(fresh, gate);
+        assert!(ctx.stopped.contains(&gate));
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == fresh && t.contains("[mantra:gate]") && t.contains("QA round 1/")), "{:?}", ctx.prompts);
+        assert!(!ctx.prompts.iter().any(|(a, _)| *a == gate), "the interrupted agent is not prompted again: {:?}", ctx.prompts);
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }));
     }
 
     #[test]
@@ -6042,7 +7044,7 @@ mod halt_tests {
         ready(&mut ctx, manager);
         let digests = |ctx: &TestCtx| ctx.prompts.iter().filter(|(a, t)| *a == manager && t.contains("[mantra:health]")).count();
         let rearm = |run: &mut Run| {
-            run.last_health = Instant::now() - Duration::from_secs(6 * 60);
+            run.last_health = Instant::now() - Duration::from_secs((run.pattern.settings.manager_minutes + 1) * 60);
             run.last_tick = Instant::now() - Duration::from_secs(2);
         };
 

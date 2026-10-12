@@ -223,7 +223,10 @@ impl App {
                 for name in &targets {
                     if let Some(r) = pattern.roles.get_mut(name) {
                         r.model = alias.clone();
-                        r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                        // a named effort is re-clamped to the new model; "auto" stays "auto"
+                        if r.effort != crate::engine::pattern::EFFORT_AUTO {
+                            r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                        }
                     }
                 }
                 let path = pattern.save().map_err(|e| e.to_string())?;
@@ -234,7 +237,9 @@ impl App {
                     for name in &targets {
                         if let Some(r) = run.pattern.roles.get_mut(name) {
                             r.model = alias.clone();
-                            r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                            if r.effort != crate::engine::pattern::EFFORT_AUTO {
+                                r.effort = self.registry.resolve(&alias).resolve_effort(&r.effort);
+                            }
                         }
                     }
                 }
@@ -264,10 +269,13 @@ impl App {
             Command::SetEffort { agent, effort } => {
                 self.agent_ok(agent)?;
                 let alias = self.agents.get(&agent).map(|a| a.model_alias.clone()).unwrap_or_default();
-                let efforts = self.registry.resolve(&alias).efforts();
+                let m = self.registry.resolve(&alias);
+                let efforts = m.efforts();
                 if efforts.is_empty() {
                     return Err("this model has no effort levels".into());
                 }
+                // "auto" is the role's own choice: resolved for this agent before the check
+                let effort = if effort == crate::engine::pattern::EFFORT_AUTO { m.resolve_effort(self.auto_effort_for(agent)) } else { effort };
                 if !efforts.contains(&effort) {
                     return Err("unknown effort".into());
                 }
@@ -322,22 +330,7 @@ impl App {
                 let all = crate::engine::state::list_all();
                 let others = all.iter().filter(|r| r.project_key != key).count();
                 let open = self.run.as_ref().map(|r| r.id.clone());
-                let runs: Vec<Value> = all
-                    .iter()
-                    .filter(|r| r.project_key == key)
-                    .map(|r| {
-                        json!({
-                            "id": r.id,
-                            "stage": r.stage_label(),
-                            "updated_at": r.updated_unix,
-                            "ago": crate::engine::state::fmt_ago(r.updated_unix),
-                            "brief": r.brief(),
-                            "unfinished": r.unfinished(),
-                            "error": r.state.as_ref().err(),
-                            "open": open.as_deref() == Some(r.id.as_str()),
-                        })
-                    })
-                    .collect();
+                let runs: Vec<Value> = all.iter().filter(|r| r.project_key == key).map(|r| run_row(r, open.as_deref())).collect();
                 Ok(json!({"runs": runs, "others": others}))
             }
             Command::RunResume { id } => {
@@ -449,6 +442,21 @@ impl App {
     }
 }
 
+/// One row of the `runs_list` reply: the run's title first (the id is the key, shown second).
+fn run_row(r: &crate::engine::state::RunSummary, open: Option<&str>) -> Value {
+    json!({
+        "id": r.id,
+        "title": r.title(),
+        "stage": r.stage_label(),
+        "updated_at": r.updated_unix,
+        "ago": crate::engine::state::fmt_ago(r.updated_unix),
+        "brief": r.brief(),
+        "unfinished": r.unfinished(),
+        "error": r.state.as_ref().err(),
+        "open": open == Some(r.id.as_str()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +522,55 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Cmd::Respond { result, .. }) if result["decision"] == "accept"));
         let r = run(&mut app, &mut h, 2, Command::Approve { key, decision: "yes".into(), answer: None });
         assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("approval is gone")));
+    }
+
+    #[test]
+    fn set_effort_accepts_auto_and_resolves_it_for_the_agents_role() {
+        let (mut app, mut h, _rx) = wired();
+        let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), Pattern::builtin(), "goal".into());
+        run_.workers.push(crate::engine::run::Worker {
+            task: crate::engine::plan::Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() },
+            prompt: String::new(),
+            effort: None,
+            agent: Some(1),
+            attempt: 1,
+            state: crate::engine::run::WState::Running,
+            report: String::new(),
+            wt: None,
+            branch: String::new(),
+            spawned: std::time::Instant::now(),
+            finished: None,
+            tripwires: vec![],
+            adhoc: false,
+            paused: false,
+            stall_flagged: false,
+            budget_flagged: false,
+            context_override: None,
+            idle_prompts: vec![],
+        });
+        app.run = Some(run_);
+        assert_eq!(app.auto_effort_for(1), "low", "a small worker");
+        let r = run(&mut app, &mut h, 1, Command::SetEffort { agent: 1, effort: "auto".into() });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+        assert_eq!(app.agents[&1].effort, "low");
+        let r = run(&mut app, &mut h, 2, Command::SetEffort { agent: 1, effort: "sideways".into() });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("unknown effort")), "{r:?}");
+        app.run = None;
+        assert_eq!(app.auto_effort_for(1), "medium", "outside a run auto is the middle of the road");
+    }
+
+    #[test]
+    fn a_runs_list_row_leads_with_the_title() {
+        use crate::engine::state::{RunState, RunSummary};
+        let st = RunState { id: "760583-ich-benutze-schon-seit-l".into(), title: "Notes sync".into(), brief: "Ich benutze schon seit langer Zeit ein Tool".into(), stage: Stage::Done, updated_unix: 5, ..Default::default() };
+        let row = run_row(&RunSummary { id: st.id.clone(), dir: std::path::PathBuf::from("."), project_key: "p".into(), state: Ok(st), updated_unix: 5 }, Some("760583-ich-benutze-schon-seit-l"));
+        assert_eq!(row["title"], "Notes sync");
+        assert_eq!(row["id"], "760583-ich-benutze-schon-seit-l", "the id stays, as the key");
+        assert_eq!(row["open"], true);
+        assert_eq!(row["unfinished"], false);
+        let old = run_row(&RunSummary { id: "1-x".into(), dir: std::path::PathBuf::from("."), project_key: "p".into(), state: Ok(RunState { brief: "add a login page to the app now".into(), ..Default::default() }), updated_unix: 0 }, None);
+        assert_eq!(old["title"], "add a login page to the", "an older state names itself from the goal");
+        assert_eq!(old["open"], false);
     }
 
     #[test]
@@ -626,6 +683,24 @@ mod tests {
 
     /// A project-local pattern (`<project>/.mantra/patterns/`) always wins on load — so a save
     /// must land there too, not in `$MANTRA_HOME`, or the change is invisible next load.
+    #[test]
+    fn set_role_model_keeps_an_auto_effort_auto() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.registry.models.push(crate::config::ModelEntry { alias: "capped".into(), model: "capped-model".into(), efforts: vec!["low".into(), "medium".into()], default_effort: "low".into(), ..Default::default() });
+            let mut pattern = Pattern::builtin();
+            pattern.name = "set-role-model-auto-test".into();
+            pattern.roles.get_mut("planner").unwrap().effort = "high".into();
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            let saved = Pattern::load(&app.pattern_name, &app.project).unwrap();
+            assert_eq!(saved.roles["planner"].effort, "medium", "a named effort is clamped to the new model");
+            assert_eq!(saved.roles["worker-big"].effort, "auto", "auto is not baked into a level by a model change");
+        });
+    }
+
     #[test]
     fn set_role_model_saves_back_to_the_project_local_pattern() {
         with_mantra_home(|| {

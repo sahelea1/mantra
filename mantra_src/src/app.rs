@@ -125,7 +125,7 @@ pub struct ModelsState {
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "switch model (picker)"),
-    ("/effort", "set reasoning effort: low|medium|high|xhigh|max"),
+    ("/effort", "set reasoning effort: auto|low|medium|high|xhigh|max"),
     ("/approvals", "approval mode: untrusted|on-request|never"),
     ("/new", "start a fresh Solo session"),
     ("/compact", "compact the current agent's context"),
@@ -225,6 +225,8 @@ pub struct AgentOpts {
     /// Re-attach to a saved Codex thread / Claude session instead of starting a new one
     /// (`mantra runs resume`).
     pub resume_thread: Option<String>,
+    /// What the backend calls this agent's thread (`<run title> · <role name>`), where it can.
+    pub thread_name: Option<String>,
 }
 
 fn toml_str(s: &str) -> String {
@@ -340,6 +342,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         config: serde_json::Map::new(),
         extra_args: extra,
         resume_thread: o.resume_thread.clone(),
+        thread_name: o.thread_name.clone(),
         backend,
         envs,
         claude,
@@ -484,6 +487,7 @@ impl Ctx for Ctxt<'_> {
                 writable_roots: r.writable_roots,
                 context_override: r.context_override,
                 resume_thread: None,
+                thread_name: r.thread_name,
             },
         )
     }
@@ -511,6 +515,7 @@ impl Ctx for Ctxt<'_> {
                 writable_roots: r.writable_roots,
                 context_override: r.context_override,
                 resume_thread: Some(thread),
+                thread_name: r.thread_name,
             },
         )
     }
@@ -565,6 +570,9 @@ impl Ctx for Ctxt<'_> {
     }
     fn notify(&mut self, text: &str) {
         self.notes.push(text.to_string());
+    }
+    fn set_thread_name(&mut self, a: AgentId, name: &str) {
+        self.hub.send(a, Cmd::SetName(name.to_string()));
     }
 }
 
@@ -685,6 +693,7 @@ impl App {
                 writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
+                thread_name: None,
             },
         );
         self.solo = Some(id);
@@ -792,7 +801,22 @@ impl App {
         v
     }
 
+    /// What `effort = "auto"` means for this agent right now: its role's job in the open run (a
+    /// finale step is `high`), else `medium`.
+    pub fn auto_effort_for(&self, a: AgentId) -> &'static str {
+        if let Some(r) = &self.run {
+            if let Some(role) = r.role_name_of(a) {
+                let kind = r.pattern.role(&role).map(|x| x.kind.clone()).unwrap_or_default();
+                let finale = matches!(r.stage, Stage::Finale { .. }) && Some(a) == r.finale_agent;
+                return crate::engine::pattern::auto_effort(&kind, &role, finale);
+            }
+        }
+        "medium"
+    }
+
     pub fn set_effort(&mut self, a: AgentId, e: &str) {
+        // "auto" is resolved for this agent first, then clamped to what its model offers like any other
+        let e = if e.trim().eq_ignore_ascii_case(crate::engine::pattern::EFFORT_AUTO) { self.auto_effort_for(a) } else { e };
         let Some(ag) = self.agents.get_mut(&a) else { return };
         let m = self.registry.resolve(&ag.model_alias);
         let (e, lowered) = m.resolve_effort_lowered(e);
@@ -1088,6 +1112,7 @@ impl App {
                 writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
+                thread_name: None,
             },
         );
         self.studio.architect = Some(id);
@@ -1139,6 +1164,7 @@ impl App {
                 writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
+                thread_name: None,
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
@@ -1421,6 +1447,8 @@ impl App {
                     }
                 }
                 "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
+                // naming a thread is a nicety: an older app-server without `thread/name/set` is no reason to bother anyone
+                "name" => crate::mlog!("agent {agent}: thread/name/set not supported ({error})"),
                 other => {
                     if let Some(a) = self.agents.get_mut(&agent) {
                         if other == "compact" {
@@ -2188,7 +2216,7 @@ impl App {
             }
             "/effort" => match target {
                 Some(a) if !arg.is_empty() => self.set_effort(a, arg),
-                _ => self.toast("usage: /effort low|medium|high|xhigh|max", Level::Info),
+                _ => self.toast("usage: /effort auto|low|medium|high|xhigh|max", Level::Info),
             },
             "/approvals" => {
                 if ["untrusted", "on-request", "never"].contains(&arg) {
@@ -2311,6 +2339,42 @@ mod tests {
             other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    /// The agent list shows what an agent really runs at: an `auto` effort that reaches the spawn is
+    /// resolved before anything is sent, and an engine-resolved level passes through unchanged.
+    #[tokio::test]
+    async fn a_spawned_agent_shows_its_resolved_effort_never_auto() {
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hub = Hub::new(vec!["true".into()], vec![], ev_tx, false);
+        let mut agents = BTreeMap::new();
+        let reg = Registry::defaults();
+        let opts = |effort: Option<&str>| AgentOpts {
+            name: "w".into(),
+            role: "worker-small".into(),
+            glyph: "◇".into(),
+            color: "teal".into(),
+            model_alias: "luna".into(),
+            effort: effort.map(str::to_string),
+            cwd: PathBuf::from("."),
+            approval: "never".into(),
+            sandbox: "workspace-write".into(),
+            instructions: String::new(),
+            tools: vec![],
+            extra_writable: vec![],
+            context_override: None,
+            resume_thread: None,
+            thread_name: Some("Notes sync · worker-small".into()),
+            network: true,
+            writable_roots: vec![],
+        };
+        let a = spawn_agent(&mut hub, &mut agents, &reg, opts(Some("auto")));
+        assert_eq!(agents[&a].effort, "medium", "auto that reaches the spawn means the middle of the road");
+        let b = spawn_agent(&mut hub, &mut agents, &reg, opts(Some("low")));
+        assert_eq!(agents[&b].effort, "low", "the engine's resolved level is used as it is");
+        let c = spawn_agent(&mut hub, &mut agents, &reg, opts(None));
+        assert_eq!(agents[&c].effort, "medium", "no request: the model's default");
+        assert!(agents.values().all(|x| x.effort != "auto"));
     }
 
     #[test]

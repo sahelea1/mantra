@@ -251,6 +251,12 @@ impl ModelEntry {
             return String::new(); // model has no reasoning-effort setting
         }
         let want = want.trim().to_lowercase();
+        if want == crate::engine::pattern::EFFORT_AUTO {
+            // "auto" is resolved per spawn by the engine (`pattern::auto_effort`) before it gets
+            // here; reaching this point (a hand-typed `/effort auto`, a Studio edit) means "no
+            // opinion", which is the middle of the road.
+            return self.resolve_effort("medium");
+        }
         if want == "max" && !list.iter().any(|e| e == "max") {
             // "max" means "the heaviest this model has" (ultra excluded: it changes behaviour).
             return list.iter().rev().find(|e| *e != "ultra").cloned().unwrap_or_else(|| "high".into());
@@ -802,16 +808,17 @@ impl Registry {
     }
 }
 
-/// The built-in pattern with every `astra` role moved to `sol`: what a fresh install saves as
-/// `mantra-default` when Codex is signed in through a ChatGPT subscription, which has no access to
-/// `astra` (it stays in `models.toml` as a plain alias — nothing defaults to it any more).
-pub fn chatgpt_default_pattern() -> crate::engine::pattern::Pattern {
-    let mut p = crate::engine::pattern::Pattern::builtin();
+/// A built-in pattern with every `astra` role moved to `sol`: what a fresh install saves when Codex
+/// is signed in through a ChatGPT subscription, which has no access to `astra` (it stays in
+/// `models.toml` as a plain alias — nothing defaults to it any more). An `auto` effort stays `auto`.
+pub fn chatgpt_variant(mut p: crate::engine::pattern::Pattern) -> crate::engine::pattern::Pattern {
     let sol = Registry::defaults().resolve("sol");
     for role in p.roles.values_mut() {
         if role.model == "astra" {
             role.model = "sol".into();
-            role.effort = sol.resolve_effort(&role.effort);
+            if role.effort != crate::engine::pattern::EFFORT_AUTO {
+                role.effort = sol.resolve_effort(&role.effort);
+            }
         }
     }
     p.description = format!("{} — ChatGPT subscription models", p.description);
@@ -989,7 +996,7 @@ mod tests {
         assert!(r.preflight(&crate::engine::pattern::Pattern::builtin()).is_empty(), "built-in models run on Codex's account");
         r.providers.push(ProviderEntry { id: "zai".into(), name: "Z.ai".into(), base_url: "https://api.z.ai/v1".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
         r.models.push(ModelEntry { alias: "glm".into(), provider: "zai".into(), model: "glm-5.2".into(), ..Default::default() });
-        let mut p = crate::engine::pattern::Pattern::builtin();
+        let mut p = crate::engine::pattern::Pattern::builtin_thorough();
         let sec = p.roles.keys().find(|k| k.contains("security")).cloned().expect("built-in has a security role");
         p.roles.get_mut(&sec).unwrap().model = "glm".into();
         let msgs = r.preflight(&p);
@@ -1008,7 +1015,7 @@ mod tests {
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("example.com placeholder") && msgs[0].contains("/models"), "{msgs:?}");
         // the fallback model is checked like the model itself
-        let mut f = crate::engine::pattern::Pattern::builtin();
+        let mut f = crate::engine::pattern::Pattern::builtin_thorough();
         f.roles.get_mut(&sec).unwrap().fallback = Some("sol".into());
         assert!(r.preflight(&f).is_empty(), "a known fallback passes");
         f.roles.get_mut(&sec).unwrap().fallback = Some("no-such-alias".into());
@@ -1150,7 +1157,7 @@ mod tests {
     }
     #[test]
     fn chatgpt_default_pattern_moves_astra_roles_to_sol() {
-        let p = chatgpt_default_pattern();
+        let p = chatgpt_variant(crate::engine::pattern::Pattern::builtin());
         assert_eq!(p.name, "mantra-default");
         assert!(p.description.ends_with(" — ChatGPT subscription models"), "{}", p.description);
         let reg = Registry::defaults();
@@ -1159,5 +1166,33 @@ mod tests {
             assert!(!reg.resolve(&r.model).is_custom_provider(), "role '{n}' must resolve to a Codex-account model");
         }
         assert!(p.validate().is_ok(), "{:?}", p.validate());
+    }
+    #[test]
+    fn chatgpt_variants_cover_every_built_in_and_keep_auto_efforts() {
+        use crate::engine::pattern::{Pattern, EFFORT_AUTO};
+        let reg = Registry::defaults();
+        for n in ["mantra-default", "mantra-lean", "mantra-thorough"] {
+            let src = Pattern::builtin_named(n).unwrap();
+            let v = chatgpt_variant(src.clone());
+            assert_eq!(v.name, n);
+            assert!(v.roles.values().all(|r| r.model != "astra"), "{n}");
+            assert!(v.validate().is_ok(), "{n}: {:?}", v.validate());
+            for (rn, r) in &v.roles {
+                if src.roles[rn].effort == EFFORT_AUTO {
+                    assert_eq!(r.effort, EFFORT_AUTO, "{n}/{rn}: an auto effort must not be baked into a level");
+                }
+                assert!(!reg.resolve(&r.model).is_custom_provider());
+            }
+        }
+    }
+    #[test]
+    fn auto_effort_resolves_like_medium_when_it_reaches_the_registry() {
+        let sol = Registry::defaults().resolve("sol");
+        assert_eq!(sol.resolve_effort("auto"), "medium");
+        assert_eq!(sol.resolve_effort_lowered("auto"), ("medium".into(), false));
+        let m = ModelEntry { efforts: vec!["low".into(), "high".into()], ..Default::default() };
+        assert_eq!(m.resolve_effort("AUTO"), "low", "nearest to medium on a model without it");
+        let none = ModelEntry { provider: "gw".into(), ..Default::default() };
+        assert_eq!(none.resolve_effort("auto"), "", "a model without effort control stays without");
     }
 }

@@ -384,6 +384,8 @@ pub struct CheckView {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RunView {
     pub id: String,
+    /// The run's name for people (the plan's title, else the goal's first words); `id` stays the key.
+    pub title: String,
     pub pattern: String,
     pub brief: String,
     pub stage: StageView,
@@ -838,6 +840,7 @@ fn stage_view(s: &Stage) -> StageView {
                 PhaseStep::Merging => ("merging", None),
                 PhaseStep::Checks { round } => ("checks", Some(*round)),
                 PhaseStep::Gate { round } => ("gate", Some(*round)),
+                PhaseStep::Fix { round } => ("fix", Some(*round)),
                 PhaseStep::Handoff => ("handoff", None),
             };
             v.step = Some(name.into());
@@ -913,6 +916,7 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
     let members = r.all_agents();
     RunView {
         id: r.id.clone(),
+        title: r.title.clone(),
         pattern: r.pattern.name.clone(),
         brief: r.brief.clone(),
         stage: stage_view(&r.stage),
@@ -1442,6 +1446,23 @@ pub(crate) mod tests {
         assert!(p.publish(&app, None).map(|d| d.pulse.is_none()).unwrap_or(true));
         assert_eq!(p.full(true).unwrap().pulse.len(), 2);
         let _ = std::fs::remove_dir_all(&app.run.as_ref().unwrap().dir);
+    }
+
+    #[test]
+    fn the_run_header_carries_the_title_and_the_fix_step() {
+        let app = test_app();
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "build a notes app with sync today please".into());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 2 } };
+        let v = run_view(&app, &run);
+        assert_eq!(v.title, "build a notes app with sync");
+        assert_eq!(v.id, run.id, "the id is still the key");
+        assert_eq!((v.stage.step.as_deref(), v.stage.round), (Some("fix"), Some(2)));
+        run.title = "Notes sync".into();
+        let v = run_view(&app, &run);
+        assert_eq!(v.title, "Notes sync");
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["title"], "Notes sync");
+        assert_eq!(json["stage"]["label"], "phase 1 · fix r2");
     }
 
     #[test]

@@ -97,8 +97,12 @@ fn read_phase_tool() -> Value {
 fn gate_report_tool() -> Value {
     tool(
         "mantra_gate_report",
-        "Report the gate verdict. pass=true only when the criteria are met and checks are green.",
-        json!({"pass": {"type": "boolean"}, "summary": {"type": "string"}}),
+        "Report the gate verdict. pass=true only when the criteria are met and checks are green. On fail, `summary` lists every finding as file, what is wrong, what to change.",
+        json!({
+            "pass": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"}
+        }),
         &["pass", "summary"],
     )
 }
@@ -276,11 +280,14 @@ SUMMARY: <2-5 lines: what you changed, how you verified it, anything the next ag
 pub const GATE_PROTOCOL: &str = r#"
 mantra-role: gate
 ## Mantra protocol
-- You work on the integrated result.
-- When done, call `mantra_gate_report` with pass=true/false and a short summary. Then end your turn.
-- Mantra re-runs the gate checks after you report; if they fail you'll get another round.
-- Never report pass while a gate check fails. A check that is wrong, or cannot pass on this machine, is a
-  plan problem: say so with `mantra_ask` (it goes up the chain; the planner can amend the checks) and wait.
+- You work on the integrated result. You verify and report; you never fix it yourself.
+- Your prompt holds the check results, the diff and the reports so far: start there, read further only to settle a doubt.
+- When done, call `mantra_gate_report` with pass=true/false and a summary. Then end your turn.
+- On fail the summary is the work order for a fix worker: every finding with file, what is wrong, what to change.
+  Set big=true only if the fixes span several files or need design work.
+- Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails. A check that is wrong,
+  or cannot pass on this machine, is a plan problem: say so with `mantra_ask` (it goes up the chain; the planner
+  can amend the checks) and wait.
 "#;
 
 pub const ARCHITECT_PROMPT: &str = r#"
@@ -288,7 +295,7 @@ mantra-role: architect
 You are the Pattern Architect inside Mantra's Studio. You design agent workflows ("patterns") with the user.
 A pattern is TOML with: name, description, [settings], [roles.<name>] (kind = planner|manager|orchestrator|worker|gate,
 glyph = one narrow symbol like ✦ ◉ ◇ ◆ ◎ ▲ ■ ● ★, color = saffron|violet|teal|cyan|green|rose|red|amber|blue|gray,
-model = alias, effort = low|medium|high|xhigh|max, sandbox, description, instructions), and [flow]
+model = alias, effort = auto|low|medium|high|xhigh|max (auto: Mantra picks per spawn from the role's job), sandbox, description, instructions), and [flow]
 (planner, manager ("" = none: a run-wide supervisor that unsticks agents and resolves halts before the
 planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]] steps with role, task, may_spawn).
 [settings] also has manager_minutes (how often the manager gets a health digest; 0 = escalations only).

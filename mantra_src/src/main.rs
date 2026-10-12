@@ -307,8 +307,12 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     // default every role to a model that account can actually run, once, so the first run doesn't
     // just fail on the built-in pattern's `astra` roles.
     if fresh_install && !demo && config::codex_chatgpt_signed_in(&settings.codex_command) {
-        if !engine::pattern::Pattern::path_for("mantra-default").exists() {
-            let _ = config::chatgpt_default_pattern().save();
+        for name in [engine::pattern::NAME_DEFAULT, engine::pattern::NAME_LEAN, engine::pattern::NAME_THOROUGH] {
+            if !engine::pattern::Pattern::path_for(name).exists() {
+                if let Some(p) = engine::pattern::Pattern::builtin_named(name) {
+                    let _ = config::chatgpt_variant(p).save();
+                }
+            }
         }
         settings.default_pattern = "mantra-default".into();
         settings.default_model = "sol".into();
@@ -491,10 +495,10 @@ fn runs_list() {
         println!("no runs yet — `mantra run \"<goal>\"` starts one (or `mantra --demo`)");
         return;
     }
-    println!("{:<28} {:<22} {:<18} {:>9}  goal", "run", "project", "stage", "updated");
+    println!("{:<36} {:<20} {:<18} {:>9}  id", "run", "project", "stage", "updated");
     for r in &all {
         let project = r.project().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| r.project_key.rsplit_once('-').map(|(a, _)| a.to_string()).unwrap_or_else(|| r.project_key.clone()));
-        println!("{:<28} {:<22} {:<18} {:>9}  {}", util::trunc(&r.id, 28), util::trunc(&project, 22), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), util::trunc(&r.brief(), 60));
+        println!("{:<36} {:<20} {:<18} {:>9}  {}", util::trunc(&r.title(), 36), util::trunc(&project, 20), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), r.id);
     }
     let n = all.iter().filter(|r| r.unfinished()).count();
     println!("\n{} run{}, {n} unfinished · mantra runs resume <id> · mantra runs delete <id>", all.len(), if all.len() == 1 { "" } else { "s" });
@@ -510,7 +514,7 @@ fn runs_delete(id: &str, yes: bool) {
         }
     };
     let where_ = r.project().map(|p| p.display().to_string()).unwrap_or_else(|| r.project_key.clone());
-    println!("run {} ({}) — {}\n  {}", r.id, r.stage_label(), where_, util::trunc(&r.brief(), 100));
+    println!("run {} [{}] ({}) — {}\n  {}", r.title(), r.id, r.stage_label(), where_, util::trunc(&r.brief(), 100));
     if r.unfinished() {
         println!("  this run is not finished; its work lives on branch mantra/{} until deleted", r.id);
     }
