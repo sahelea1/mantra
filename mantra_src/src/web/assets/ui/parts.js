@@ -248,7 +248,7 @@
         const kindTone = run.halted ? 'halt' : st.kind === 'done' ? 'done' : st.kind === 'failed' ? 'bad' : run.want_review ? 'review' : 'live';
         return h('button', { type: 'button', key: 'runcard', class: 'card run-card tone-' + kindTone + (opts.compact ? ' compact' : ''), onclick: () => M.act.nav('/run') },
             h('div', { class: 'run-card-top' },
-                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? 'halted' : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
+                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? (run.halted.reason === 'user' ? 'paused' : 'halted') : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
                 h('span', { class: 'run-id', title: run.id + ' · ' + run.pattern }, run.id)),
             h('div', { class: 'run-name' }, F.trunc(run.title || run.brief, opts.compact ? 90 : 160)),
             !opts.compact && run.title && run.title !== run.brief ? h('div', { class: 'run-goal' }, F.trunc(run.brief, 200)) : null,
