@@ -45,7 +45,7 @@ pub enum EditTarget {
 }
 
 pub enum Overlay {
-    Help,
+    Help { scroll: usize },
     ModelPicker { sel: usize, target: Option<AgentId> },
     Diff { agent: AgentId, file: usize, scroll: usize },
     Inbox { sel: usize },
@@ -92,7 +92,8 @@ impl PatternChoice {
                 // the reason, without the file's path in front of it (the row already names it)
                 let why = |e: anyhow::Error| {
                     let e = e.to_string();
-                    e.split_once(".toml: ").map(|(_, why)| why.to_string()).unwrap_or(e)
+                    let why = e.split_once(".toml: ").map(|(_, why)| why).unwrap_or(&e);
+                    why.lines().next().unwrap_or_default().to_string()
                 };
                 PatternChoice { about: loaded.map(|p| p.description).map_err(why), name, tag }
             })
@@ -1717,7 +1718,7 @@ impl App {
 
     fn scroll(&mut self, delta: i32) {
         match self.overlays.last_mut() {
-            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) | Some(Overlay::Halt { scroll }) => {
+            Some(Overlay::Diff { scroll, .. }) | Some(Overlay::Plan { scroll }) | Some(Overlay::Halt { scroll }) | Some(Overlay::Help { scroll }) => {
                 *scroll = (*scroll as i32 - delta).max(0) as usize;
                 return;
             }
@@ -1802,10 +1803,10 @@ impl App {
             return;
         }
         if k.code == KeyCode::F(1) {
-            self.overlays.push(Overlay::Help);
+            self.overlays.push(Overlay::Help { scroll: 0 });
             return;
         }
-        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. }) | Some(Overlay::Halt { .. })) {
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. }) | Some(Overlay::Halt { .. }) | Some(Overlay::Help { .. })) {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
         }
@@ -1916,7 +1917,7 @@ impl App {
             return;
         }
         if k.code == KeyCode::Char('?') && self.input.is_empty() {
-            self.overlays.push(Overlay::Help);
+            self.overlays.push(Overlay::Help { scroll: 0 });
             return;
         }
         match self.input.key(k) {
@@ -2026,7 +2027,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.open_studio(),
-            KeyCode::Char('?') => self.overlays.push(Overlay::Help),
+            KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
             KeyCode::Char('/') | KeyCode::Char('@') => {
                 self.canvas_focus = false;
                 if let KeyCode::Char(c) = k.code {
@@ -2242,7 +2243,7 @@ impl App {
         let target = self.focus_agent();
         match cmd {
             "/quit" | "/exit" | "/q" => self.quit = true,
-            "/help" => self.overlays.push(Overlay::Help),
+            "/help" => self.overlays.push(Overlay::Help { scroll: 0 }),
             "/model" => {
                 if arg.is_empty() {
                     let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();

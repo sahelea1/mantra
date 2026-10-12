@@ -248,10 +248,12 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     if let Some(h) = &r.halt {
         // What fixes it must never be cut off by a long message: it gets the second line, or the
         // front of the only one. `e` opens the whole message.
-        let mut keys = r.halt_hint();
-        if h.reason == HaltReason::ProviderRejected {
-            keys.push_str(" · a model change waits for space");
-        }
+        let keys = match (h.reason, h.agent.and_then(|a| app.agents.get(&a))) {
+            // the engine's hint for this one can be a long paragraph (the details have it): the
+            // band keeps to the keys, and says a model change alone does not resume
+            (HaltReason::ProviderRejected, Some(a)) => format!("m switch model for {}, then space resumes · r retry", a.name),
+            _ => r.halt_hint(),
+        };
         let head = format!(" {} halted {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()));
         let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let w = area.width as usize;

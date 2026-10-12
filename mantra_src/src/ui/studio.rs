@@ -434,7 +434,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
 
     let wide = rows[1].width >= 120;
     let cols = if wide {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(36), Constraint::Min(40), Constraint::Length(46)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(34), Constraint::Min(40), Constraint::Length(44)]).split(rows[1])
     } else {
         Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
     };
@@ -470,9 +470,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let fs = fields(app, &entry);
     let fsel = app.studio.field.min(fs.len().saturating_sub(1));
     // name column as wide as the longest name (settings has a 25-char one); the value column gets
-    // the box's inner width less the " ▶" + name prefix and the " ◂ ▸" arrows
+    // the box's inner width less the " ▶" + name prefix, and on the selected row the arrows too
     let nw = fs.iter().map(|f| w_of(f)).max().unwrap_or(0).max(19) + 1;
-    let fw = (cols[1].width as usize).saturating_sub(2 + 2 + nw + 4);
+    let fw_all = (cols[1].width as usize).saturating_sub(2 + 2 + nw);
     let mut fl = vec![];
     if let Some(r) = app.studio.pattern.roles.get(&entry) {
         let dw = (cols[1].width as usize).saturating_sub(7 + w_of(&entry));
@@ -485,6 +485,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         let v = get_value(app, &entry, fname);
         let is = i == fsel && app.studio.focus == 1;
         let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
+        let fw = if is { fw_all.saturating_sub(4) } else { fw_all };
         let shown = if fname == "instructions" || fname.ends_with(".task") {
             let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
             format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
@@ -513,7 +514,8 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         }
     }
     fl.push(Line::default());
-    fl.push(Line::from(Span::styled(" ←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())));
+    let pad = || vec![Span::raw(" ")];
+    fl.extend(md::wrap(vec![Span::styled("←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
     let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
     // A list longer than the box (settings on a short terminal) scrolls to keep the selection in view.
     let fh = cols[1].height.saturating_sub(2) as usize;

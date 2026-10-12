@@ -16,7 +16,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_one(f: &mut Frame, app: &App, i: usize) {
     let area = f.area();
     match &app.overlays[i] {
-        Overlay::Help => help(f, area),
+        Overlay::Help { scroll } => help(f, area, *scroll),
         Overlay::ModelPicker { sel, target } => model_picker(f, area, app, *sel, *target),
         Overlay::Diff { agent, file, scroll } => diff(f, area, app, *agent, *file, *scroll),
         Overlay::Inbox { sel } => inbox(f, area, app, *sel),
@@ -160,12 +160,15 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
 }
 
-fn help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 86, 34);
-    f.render_widget(Clear, r);
-    let k = |a: &str, b: &str| Line::from(vec![Span::styled(format!("  {a:<16}"), theme::bold(theme::accent())), Span::styled(b.to_string(), theme::text())]);
-    let h = |t: &str| Line::from(Span::styled(format!(" {t}"), theme::bold(theme::fg(theme::VIOLET))));
-    let mut l = vec![
+fn help(f: &mut Frame, area: Rect, scroll: usize) {
+    let w = 104u16.min(area.width.saturating_sub(2));
+    // keys in a column as wide as the longest one; descriptions wrap under themselves, a
+    // column short of the border
+    let tw = w.saturating_sub(3) as usize;
+    let k = |a: &str, b: &str| md::wrap(vec![Span::styled(b.to_string(), theme::text())], tw, vec![Span::styled(format!("  {a:<21}"), theme::bold(theme::accent()))], vec![Span::raw(" ".repeat(23))]);
+    let h = |t: &str| vec![Line::from(Span::styled(format!(" {t}"), theme::bold(theme::fg(theme::VIOLET))))];
+    let gap = || vec![Line::default()];
+    let l: Vec<Line<'static>> = [
         h("everywhere"),
         k("ctrl+o", "switch Solo ⇄ Mandala"),
         k("ctrl+k", "model picker (←→ effort)"),
@@ -179,34 +182,45 @@ fn help(f: &mut Frame, area: Rect) {
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
         k("pgup / pgdn", "scroll (mouse wheel too)"),
         k("/", "commands (tab completes) · ! runs a shell command"),
-        Line::default(),
+        gap(),
         h("solo"),
         k("⏎ / alt+⏎", "send / newline (or end a line with \\)"),
         k("esc", "clear the input (never interrupts)"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
-        Line::default(),
+        gap(),
         h("busy-agent chat (solo, zoom, @name)"),
         k("⏎", "queue a message behind the current turn (shown as a chip above the input)"),
         k("ctrl+f", "force-send: deliver the queue + input into the running turn right now"),
         k("backspace", "on an empty input, pops the last queued message back in to edit"),
         k("ctrl+x", "on an empty input, discards the whole queue"),
-        Line::default(),
+        gap(),
         h("mandala stage"),
         k("tab", "toggle between typing and navigating the canvas"),
         k("←→↑↓ · alt+←→ · 1-9", "select an agent · jump straight to the nth and zoom in"),
         k("⏎", "zoom into the selected agent (esc to come back to the overview)"),
-        k("space", "pause / resume the whole run (also after changing a model while halted)"),
-        k("e", "on a halted run: the whole message, what fixes it"),
+        k("space", "pause / resume the whole run; a halted run resumes only on space, also after m"),
+        k("e", "on a halted run: the whole message and what fixes it"),
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
-        k("m", "switch model for the selected agent (fixes a halted ProviderRejected)"),
+        k("m", "switch model for the selected agent (fixes a halt where the provider rejected it)"),
         k("p · a", "plan · approve plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
         k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
-    ];
-    l.push(Line::default());
-    l.push(Line::from(Span::styled("  esc to close", theme::faint())));
-    f.render_widget(Paragraph::new(l).block(block("keys", theme::SAFFRON)), r);
+    ]
+    .concat();
+    let r = centered(area, w, l.len() as u16 + 3);
+    f.render_widget(Clear, r);
+    let blk = block("keys", theme::SAFFRON);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    // the list outgrows a 36-row terminal: it scrolls, the footer stays put
+    let vh = inner.height.saturating_sub(1) as usize;
+    let more = l.len() > vh;
+    let scroll = scroll.min(l.len().saturating_sub(vh));
+    let view: Vec<Line> = l.into_iter().skip(scroll).take(vh).collect();
+    f.render_widget(Paragraph::new(view), Rect { height: vh as u16, ..inner });
+    let hint = if more { " ↑↓ scroll · esc close " } else { " esc close " };
+    f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
 }
 
 /// Which runtime a provider's models run through (WP10): `codex app-server` or `claude -p`.
@@ -595,7 +609,13 @@ pub fn key(app: &mut App, k: KeyEvent) {
     let Some(top) = app.overlays.pop() else { return };
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let keep = match top {
-        Overlay::Help => None,
+        Overlay::Help { scroll } => match k.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(Overlay::Help { scroll: scroll.saturating_sub(1) }),
+            KeyCode::Down | KeyCode::Char('j') => Some(Overlay::Help { scroll: scroll + 1 }),
+            KeyCode::PageUp => Some(Overlay::Help { scroll: scroll.saturating_sub(10) }),
+            KeyCode::PageDown => Some(Overlay::Help { scroll: scroll + 10 }),
+            _ => None,
+        },
         Overlay::Web => match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
             _ => Some(Overlay::Web),
