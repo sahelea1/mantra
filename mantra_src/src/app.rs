@@ -377,11 +377,16 @@ pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentI
         }
     } else {
         a.awaiting_start = true;
+        a.turn_wait_since = Some(Instant::now());
         a.status = Status::Busy;
         a.activity = "starting turn".into();
         hub.send(id, Cmd::Turn { text });
     }
 }
+
+/// What the toast says after a model change on a halted run: the change applied, the run did not
+/// resume (see `App::model_switched_for_run_agent`).
+pub const MODEL_CHANGED_HALTED: &str = "model changed — resume the run to continue (space / Resume)";
 
 /// The engine's window into the app.
 pub struct Ctxt<'a> {
@@ -494,6 +499,7 @@ impl Ctx for Ctxt<'_> {
             ag.status = Status::Stopped;
             ag.turn_active = false;
             ag.awaiting_start = false;
+            ag.turn_wait_since = None;
             ag.finished.get_or_insert(Instant::now());
             ag.activity = "archived".into();
         }
@@ -821,8 +827,10 @@ impl App {
     }
 
     /// After switching a run agent's model (e.g. from the halt-band `m` picker), persist the
-    /// choice into this run's own pattern copy so a later spawn of that role picks it up, and —
-    /// if the run was halted — resume it so the newly-configured agent gets going again.
+    /// choice into this run's own pattern copy so a later spawn of that role picks it up. A
+    /// halted run stays halted: the user may want to change more than one model (or look at the
+    /// error again) before going on, and resuming as a side effect of a settings change is how a
+    /// run restarts unnoticed — so the toast says what is left to do.
     pub fn model_switched_for_run_agent(&mut self, a: AgentId) {
         if !self.run.as_ref().map(|r| r.all_agents().contains(&a)).unwrap_or(false) {
             return;
@@ -836,7 +844,7 @@ impl App {
             }
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
-            self.with_run(|r, c| r.resume(c));
+            self.toast(MODEL_CHANGED_HALTED, Level::Info);
         }
     }
 
@@ -1277,6 +1285,7 @@ impl App {
                     if resumed {
                         a.turn_active = false;
                         a.awaiting_start = false;
+                        a.turn_wait_since = None;
                         a.notice(Level::Ok, "process restarted — conversation resumed");
                     }
                     if matches!(a.status, Status::Starting | Status::Crashed(_) | Status::Retrying(_)) || resumed {
@@ -1358,6 +1367,7 @@ impl App {
                 "turn" => {
                     if let Some(a) = self.agents.get_mut(&agent) {
                         a.awaiting_start = false;
+                        a.turn_wait_since = None;
                         a.status = Status::Failed(error.clone());
                         a.notice(Level::Error, format!("couldn't start the turn: {error}"));
                     }

@@ -680,4 +680,44 @@ mod tests {
             assert_ne!(app.agents[&planner_agent].model_alias, "capped", "the run's own live agent must be untouched");
         });
     }
+
+    /// Changing the model of the role that halted the run applies the change but never resumes
+    /// the run behind the user's back — they resume it themselves, and the toast says how.
+    #[test]
+    fn set_role_model_on_a_halted_run_applies_the_change_and_leaves_it_halted() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            let mut pattern = Pattern::builtin();
+            pattern.name = "halted-switch-test".into();
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+            let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern.clone(), "goal".into());
+            let planner: AgentId = 2;
+            add_agent(&mut app, planner, "planner");
+            app.agents.get_mut(&planner).unwrap().role = "planner".into();
+            run_.planner = Some(planner);
+            let msg = "planner (astra via zai): Unexpected message role.".to_string();
+            run_.halt = Some(crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent: Some(planner), message: msg.clone(), full: msg, since: Instant::now() });
+            app.run = Some(run_);
+            assert_ne!(pattern.roles["planner"].model, "luna");
+
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "planner".into(), alias: "luna".into(), all: false });
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            let run_ = app.run.as_ref().unwrap();
+            assert!(run_.halted(), "the model change must not resume the run");
+            assert_eq!(run_.pattern.roles["planner"].model, "luna", "but the change is applied");
+            assert_eq!(app.agents[&planner].model_alias, "luna");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("model changed — resume the run to continue (space / Resume)"));
+            assert!(!run_.pulse.iter().any(|p| p.text.contains("run resumed")), "no resume line in the journal");
+
+            // an explicit resume still works, and a model change on a running run says nothing
+            app.toast = None;
+            let r = run(&mut app, &mut h, 2, Command::PauseResume);
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert!(!app.run.as_ref().unwrap().halted());
+            let r = run(&mut app, &mut h, 3, Command::SetRoleModel { role: "planner".into(), alias: "sol".into(), all: false });
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert!(app.toast.is_none(), "{:?}", app.toast);
+        });
+    }
 }

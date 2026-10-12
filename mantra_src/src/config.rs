@@ -763,6 +763,11 @@ impl Registry {
             if let Some(why) = self.alias_problem(&role.model) {
                 out.push(format!("{name}: {why}"));
             }
+            // The fallback is only ever used when the primary has already failed twice, so a
+            // typo in it must surface here, not at 3 a.m. in the middle of a run.
+            if let Some(why) = role.fallback.as_deref().filter(|f| !f.trim().is_empty()).and_then(|f| self.alias_problem(f)) {
+                out.push(format!("{name}: fallback {why}"));
+            }
         }
         out
     }
@@ -1002,6 +1007,14 @@ mod tests {
         let msgs = r.preflight(&p);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("example.com placeholder") && msgs[0].contains("/models"), "{msgs:?}");
+        // the fallback model is checked like the model itself
+        let mut f = crate::engine::pattern::Pattern::builtin();
+        f.roles.get_mut(&sec).unwrap().fallback = Some("sol".into());
+        assert!(r.preflight(&f).is_empty(), "a known fallback passes");
+        f.roles.get_mut(&sec).unwrap().fallback = Some("no-such-alias".into());
+        let msgs = r.preflight(&f);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].starts_with(&format!("{sec}: fallback model alias 'no-such-alias' is not in /models")), "{msgs:?}");
         // plain http is not a placeholder: a LAN box runs
         r.providers.iter_mut().find(|p| p.id == "myprovider").unwrap().base_url = "http://192.168.1.20:8000/v1".into();
         assert!(r.preflight(&p).is_empty(), "{:?}", r.preflight(&p));

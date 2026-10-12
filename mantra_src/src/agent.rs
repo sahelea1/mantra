@@ -5,7 +5,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MAX_ITEMS: usize = 3000;
 const MAX_OUTPUT: usize = 24_000;
@@ -153,6 +153,12 @@ pub struct Agent {
     pub ctx_anim: Option<(u64, Instant)>,
     pub ctx_warned: bool,
     pub turn_started: Option<Instant>,
+    /// When the turn now in flight began waiting for its first output — the prompt going out, or
+    /// `turn/started` for a turn Mantra did not send itself. Cleared by the first real output
+    /// (a token count that grew, a delta, a non-echo item) and when the turn ends, so `Some` means
+    /// "active turn, nothing back yet": the silent / "Reconnecting… n/5" state `last_event` cannot
+    /// show, since the retry notices themselves move it. See `first_token_wait`.
+    pub turn_wait_since: Option<Instant>,
     pub turn_count: u32,
     pub plan: Vec<(String, String)>,
     pub files: BTreeMap<String, FileStat>,
@@ -212,6 +218,7 @@ impl Agent {
             ctx_anim: None,
             ctx_warned: false,
             turn_started: None,
+            turn_wait_since: None,
             turn_count: 0,
             plan: vec![],
             files: BTreeMap::new(),
@@ -247,6 +254,16 @@ impl Agent {
 
     pub fn busy(&self) -> bool {
         self.turn_active || self.awaiting_start
+    }
+
+    /// How long the turn in flight has produced nothing at all (no tokens, no text, no tool
+    /// activity) — `None` when there is no such turn, or when silence is expected: a hand stop,
+    /// an approval being waited on, a compaction.
+    pub fn first_token_wait(&self) -> Option<Duration> {
+        if !self.busy() || self.stopped_by_user || self.compacting || self.status == Status::Waiting {
+            return None;
+        }
+        self.turn_wait_since.map(|t| t.elapsed())
     }
 
     /// Percent of the context window a token count represents.
@@ -348,6 +365,9 @@ impl Agent {
                 }
             }
             "turn/started" => {
+                // A turn we sent has been waiting since the prompt went out; one we did not send
+                // (a replay, a steer that became a turn) starts waiting now.
+                self.turn_wait_since = if self.awaiting_start { self.turn_wait_since.or_else(|| Some(Instant::now())) } else { Some(Instant::now()) };
                 self.turn_active = true;
                 self.awaiting_start = false;
                 self.turn_started = Some(Instant::now());
@@ -360,6 +380,10 @@ impl Agent {
                 self.compact_item = None;
             }
             "item/started" | "item/completed" => {
+                // The echo of our own prompt is not the model speaking.
+                if p.pointer("/item/type").and_then(|x| x.as_str()) != Some("userMessage") {
+                    self.turn_wait_since = None;
+                }
                 if let Some(item) = p.get("item") {
                     let done = method == "item/completed";
                     if let Some(sig) = self.apply_item(item, done) {
@@ -377,6 +401,7 @@ impl Agent {
                 out.push(Signal::Activity);
             }
             "item/agentMessage/delta" => {
+                self.turn_wait_since = None;
                 let id = s(p, "itemId");
                 let d = s(p, "delta");
                 let it = self.get_or_insert(&id, Kind::Agent);
@@ -385,6 +410,7 @@ impl Agent {
                 self.activity = "writing".into();
             }
             "item/plan/delta" => {
+                self.turn_wait_since = None;
                 let id = s(p, "itemId");
                 let d = s(p, "delta");
                 let it = self.get_or_insert(&id, Kind::Plan);
@@ -392,6 +418,7 @@ impl Agent {
                 it.touch();
             }
             "item/reasoning/summaryTextDelta" => {
+                self.turn_wait_since = None;
                 let id = s(p, "itemId");
                 let d = s(p, "delta");
                 let it = self.get_or_insert(&id, Kind::Reasoning);
@@ -408,6 +435,7 @@ impl Agent {
                 it.touch();
             }
             "item/commandExecution/outputDelta" => {
+                self.turn_wait_since = None;
                 let id = s(p, "itemId");
                 let d = s(p, "delta");
                 let it = self.get_or_insert(&id, Kind::Command { cmd: String::new(), output: String::new(), exit: None, status: "inProgress".into(), dur_ms: None });
@@ -439,7 +467,11 @@ impl Agent {
             }
             "thread/tokenUsage/updated" => {
                 if let Some(t) = p.get("tokenUsage") {
+                    let before = self.tokens_total;
                     self.tokens_total = t.pointer("/total/totalTokens").and_then(|x| x.as_u64()).unwrap_or(self.tokens_total);
+                    if self.tokens_total > before {
+                        self.turn_wait_since = None;
+                    }
                     let last_in = t.pointer("/last/inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     let last_out = t.pointer("/last/outputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     if last_in + last_out > 0 {
@@ -506,6 +538,7 @@ impl Agent {
             }
             "turn/completed" => {
                 self.turn_active = false;
+                self.turn_wait_since = None;
                 let status = p.pointer("/turn/status").and_then(|x| x.as_str()).unwrap_or("completed").to_string();
                 let err = p.pointer("/turn/error");
                 let (emsg, kind) = match err {
@@ -961,6 +994,60 @@ fn last_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `first_token_wait` is the engine's "active turn, nothing back yet": it runs from the prompt
+    /// (or `turn/started`) and ends with the first token, text or tool activity — never with the
+    /// echo of our own prompt or the retry notices a flaky gateway produces.
+    #[test]
+    fn first_token_wait_ends_only_with_real_output() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "solo", std::path::PathBuf::from("."));
+        assert!(a.first_token_wait().is_none(), "no turn, no wait");
+        // a turn Mantra sent: the clock started when the prompt went out, before turn/started
+        a.awaiting_start = true;
+        a.turn_wait_since = Some(Instant::now() - Duration::from_secs(90));
+        assert!(a.first_token_wait().unwrap() >= Duration::from_secs(90));
+        a.apply("turn/started", &json!({"turn": {"id": "t1"}}));
+        assert!(a.first_token_wait().unwrap() >= Duration::from_secs(90), "turn/started must not restart the clock of a turn we sent");
+        // the echo of our prompt, a status change and "Reconnecting… 2/5" are not output
+        a.apply("item/started", &json!({"item": {"type": "userMessage", "id": "u1", "content": [{"text": "go"}]}}));
+        a.apply("thread/status/changed", &json!({"status": {"type": "active"}}));
+        a.apply("error", &json!({"error": {"message": "Reconnecting... 2/5"}, "willRetry": true}));
+        assert!(matches!(a.status, Status::Retrying(_)));
+        assert!(a.first_token_wait().is_some(), "retry notices move last_event but are not output");
+        a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": 0}, "last": {"inputTokens": 0, "outputTokens": 0}}}));
+        assert!(a.first_token_wait().is_some(), "a token count that did not grow is not output");
+        // silence is expected while an approval is open, after a hand stop, during a compaction
+        a.status = Status::Waiting;
+        assert!(a.first_token_wait().is_none());
+        a.status = Status::Busy;
+        a.stopped_by_user = true;
+        assert!(a.first_token_wait().is_none());
+        a.stopped_by_user = false;
+        a.compacting = true;
+        assert!(a.first_token_wait().is_none());
+        a.compacting = false;
+        assert!(a.first_token_wait().is_some());
+        // the first token ends it
+        a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": 120}, "last": {"inputTokens": 100, "outputTokens": 20}}}));
+        assert!(a.first_token_wait().is_none());
+        // a turn that starts by itself (not sent by us) waits from turn/started; a delta ends it
+        a.apply("turn/completed", &json!({"turn": {"id": "t1", "status": "completed"}}));
+        a.apply("turn/started", &json!({"turn": {"id": "t2"}}));
+        let w = a.first_token_wait().expect("a fresh wait");
+        assert!(w < Duration::from_secs(5), "{w:?}");
+        a.apply("item/agentMessage/delta", &json!({"itemId": "m1", "delta": "hi"}));
+        assert!(a.first_token_wait().is_none());
+        // a command or reasoning item counts as well, and a finished turn never leaves a wait behind
+        a.apply("turn/completed", &json!({"turn": {"id": "t2", "status": "completed"}}));
+        a.apply("turn/started", &json!({"turn": {"id": "t3"}}));
+        a.apply("item/started", &json!({"item": {"type": "commandExecution", "id": "c1", "command": "ls", "status": "inProgress"}}));
+        assert!(a.first_token_wait().is_none());
+        a.apply("turn/started", &json!({"turn": {"id": "t4"}}));
+        a.apply("turn/completed", &json!({"turn": {"id": "t4", "status": "interrupted"}}));
+        assert!(a.first_token_wait().is_none() && a.turn_wait_since.is_none());
+    }
+
     /// Codex ≥ 0.157 warns for every custom model tag; Mantra supplies the metadata that matters
     /// (context window) itself, so the transcript shows one muted info line, not an amber alert.
     #[test]

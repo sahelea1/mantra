@@ -292,6 +292,8 @@ model = alias, effort = low|medium|high|xhigh|max, sandbox, description, instruc
 (planner, manager ("" = none: a run-wide supervisor that unsticks agents and resolves halts before the
 planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]] steps with role, task, may_spawn).
 [settings] also has manager_minutes (how often the manager gets a health digest; 0 = escalations only).
+A role may also set fallback = alias: the model that takes over when an agent of that role sits through
+settings.first_token_minutes (default 4; 0 = off) twice with no output at all.
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.
 If validation fails, fix and retry. Finally explain the change in 1-3 sentences.
 "#;
