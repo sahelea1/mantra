@@ -419,10 +419,11 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) {
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let h = inner.height.saturating_sub(1) as usize;
+    let more = if l.len() > h { " · ↑↓ scroll" } else { "" };
     let scroll = scroll.min(l.len().saturating_sub(h));
     let view: Vec<Line> = l.into_iter().skip(scroll).take(h).collect();
     f.render_widget(Paragraph::new(view), Rect { height: h as u16, ..inner });
-    let hint = if run.halt.is_some() { " space resume · m model · ↑↓ scroll · esc " } else { " esc " };
+    let hint = if run.halt.is_some() { format!(" space resume · m model{more} · esc ") } else { " esc ".into() };
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
 }
 
@@ -896,6 +897,12 @@ pub fn key(app: &mut App, k: KeyEvent) {
             }
             KeyCode::Down => {
                 sel = (sel + 1).min(list.len().saturating_sub(1));
+                Some(Overlay::Patterns { sel, list })
+            }
+            // a pattern whose file does not load would only fail the next run (and the studio
+            // cannot open it): say so, stay here
+            KeyCode::Enter | KeyCode::Char('e') if list.get(sel).map(|p| p.about.is_err()).unwrap_or(false) => {
+                app.toast(format!("{} does not load — fix its .toml file first", list[sel].name), crate::agent::Level::Warn);
                 Some(Overlay::Patterns { sel, list })
             }
             KeyCode::Enter => {

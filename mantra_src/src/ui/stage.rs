@@ -215,9 +215,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             }
             tail.push(Span::styled(format!("  {} {}", theme::g("◈", "#"), r.pattern.name), theme::faint()));
             let sum = |v: &[Span<'static>]| v.iter().map(|s| w_of(&s.content)).sum::<usize>();
-            // " ✦ mantra" + the title's own two-space gap + header()'s margin and the gap it needs
-            // before drawing the right side at all
-            let room = |crumbs: &[Span<'static>], tail: &[Span<'static>], right: &[Span<'static>]| (area.width as usize).saturating_sub(9 + 2 + 2 + sum(crumbs) + sum(tail) + sum(right));
+            // " ✦ mantra" + the title's own two-space gap + header()'s margin and a two-space gap
+            // before the right side, like the one between crumbs
+            let room = |crumbs: &[Span<'static>], tail: &[Span<'static>], right: &[Span<'static>]| (area.width as usize).saturating_sub(9 + 2 + 3 + sum(crumbs) + sum(tail) + sum(right));
             if room(&crumbs, &tail, &right) < 24 {
                 tail.clear();
             }
@@ -420,9 +420,11 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     // descriptions start in one column, however long each role's "model · effort" is
     let rw = |row: &[Span<'static>]| row.iter().map(|s| w_of(&s.content)).sum::<usize>();
     let mw = rows.iter().map(|(row, _)| rw(row)).max().unwrap_or(0);
+    // cut with an ellipsis where the terminal ends, not mid-word at its edge
+    let dw = (area.width as usize).saturating_sub(mw + 4).min(50);
     for (mut row, d) in rows {
         row.push(Span::raw(" ".repeat(mw - rw(&row))));
-        row.push(Span::styled(format!("   {}", trunc(&d, 50)), theme::faint()));
+        row.push(Span::styled(format!("   {}", trunc(&d, dw)), theme::faint()));
         l.push(Line::from(row));
     }
     l.push(Line::default());

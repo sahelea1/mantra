@@ -206,6 +206,9 @@ pub struct App {
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
     pub sel: usize,
+    /// When the halt the stage selection last jumped to began: a new halt about one agent
+    /// selects it once, so the band's `m` / `r` act on the agent it names.
+    halt_seen: Option<Instant>,
     pub canvas_focus: bool,
     pub verbose: bool,
     pub side_panel: bool,
@@ -646,6 +649,7 @@ impl App {
             approvals: vec![],
             toast: None,
             sel: 0,
+            halt_seen: None,
             canvas_focus: false,
             verbose: false,
             pulse_panel: true,
@@ -1371,13 +1375,28 @@ impl App {
             }
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
-        if let Some(r) = &self.run {
+        if self.run.is_some() {
             let n = self.stage_nodes().len();
             if n > 0 && self.sel >= n {
                 self.sel = n - 1;
             }
-            let _ = r;
+            self.select_halted_agent();
         }
+    }
+
+    /// A new halt about one agent selects that agent on the stage, once: the band's
+    /// "m switch model for <agent> · r retry" then acts on the agent it names, not on whatever
+    /// was selected before. Moving the selection afterwards is left alone.
+    fn select_halted_agent(&mut self) {
+        let Some(h) = self.run.as_ref().and_then(|r| r.halt.as_ref()) else { return };
+        if self.halt_seen == Some(h.since) {
+            return;
+        }
+        let (since, agent) = (h.since, h.agent);
+        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == a)) {
+            self.sel = i;
+        }
+        self.halt_seen = Some(since);
     }
 
     fn on_hub(&mut self, ev: HubEvent) {
@@ -2611,6 +2630,31 @@ mod tests {
         app.run = Some(run);
         assert!(!app.animating(), "a paused run is not an animation");
         assert!(app.clocks_visible(), "but its clocks still tick");
+    }
+
+    /// A halt about one agent selects it once, so the band's `m` / `r` reach the agent it
+    /// names; the user moving the selection afterwards is not undone, and a new halt moves it again.
+    #[test]
+    fn a_halt_selects_the_agent_it_names_once() {
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.orchestrator = Some(3);
+        let halt = |agent| crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent, message: "rejected".into(), full: "rejected".into(), since: Instant::now() };
+        run.halt = Some(halt(Some(3)));
+        app.run = Some(run);
+        app.select_halted_agent();
+        assert_eq!(app.stage_nodes()[app.sel], 3, "the halted agent is selected");
+        app.sel = 0;
+        app.select_halted_agent();
+        assert_eq!(app.sel, 0, "the same halt does not pull the selection back");
+        app.run.as_mut().unwrap().halt = Some(halt(None));
+        app.select_halted_agent();
+        assert_eq!(app.sel, 0, "a halt about no one agent leaves the selection");
+        std::thread::sleep(Duration::from_millis(2));
+        app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
+        app.select_halted_agent();
+        assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the
