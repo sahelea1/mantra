@@ -2,6 +2,35 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.6.1 — 2026-10-12
+
+Both interfaces catch up with 0.6.0, and were checked frame by frame (the TUI at 120×36 and
+80×24, the web UI on desktop and phone, light and dark).
+
+- **Runs are called by their names.** The run title leads in the TUI header (it survives
+  narrow terminals; the id and pattern give way first), in the web run cards, the Team screen's
+  unfinished runs, and halt / run-complete push notifications; the id stays visible but
+  secondary. A run resumed from an older save takes its plan's title instead of the goal's
+  first words.
+- **Studio edits everything 0.6.0 added.** Roles get a `fallback` model (⏎ / ←→ cycle through
+  none and the other aliases); settings get `network` and `writable_roots`; ⏎ on an enum or
+  on/off setting steps it instead of opening a text editor that ignored the input. The
+  selected field shows a short hint (what `auto` effort picks, what a fallback is for, …), the
+  list scrolls on short terminals, and the flow preview wraps instead of clipping.
+- **Halts explain themselves.** The TUI halt band reads `⛔ halted · why` over the keys that
+  help, and `e` opens the full error, word-wrapped and scrollable, with what to do next. A halt
+  about one agent selects it, so `m` and `r` act on the right one. The web halt band can show
+  the whole error (wrapped, with Copy) and both say that a model change does not resume the
+  run: space / Resume does. Headers say "halted" or "paused" while the run is stopped.
+- **Pattern pickers list the built-ins first.** `mantra-default` leads and is marked default,
+  then the other built-ins, then your own patterns, each with its one-line description. A
+  pattern that does not load is marked and cannot be picked.
+- **Effort `auto` and fallbacks are visible.** `auto` gets its own colour in the TUI and the
+  web roles screen, which also shows each role's fallback.
+- **Smaller fixes:** the help overlay scrolls instead of losing its last rows; a word that
+  exactly fills a line no longer pushes a stray space onto the next; the fix-round step reads
+  "QA gate · fix r<n>"; the web run card no longer wraps its state label in the sidebar.
+
 ## v0.6.0 — 2026-10-12
 
 - **Agents that wait really stop.** `mantra_wait` ends the turn: any further tool call in it is
