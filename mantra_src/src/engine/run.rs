@@ -1674,7 +1674,13 @@ Then summarize in 2-4 lines.",
     pub(super) fn launch_worker_with(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String, resume: Option<String>) {
         let plan_summary = self.plan.as_ref().map(|p| p.summary.clone()).unwrap_or_default();
         let w = &self.workers[wi];
-        let role = self.role(&w.task.role);
+        let mut role = self.role(&w.task.role);
+        // Codex's workspace-write sandbox keeps every `.git` read-only whatever the writable roots
+        // say, so a fix worker on the integration copy (merging conflicted branches, unstaging a
+        // file) could not touch the index. It runs unsandboxed; the worktree still isolates it.
+        if w.adhoc && role.sandbox != "read-only" {
+            role.sandbox = "danger-full-access".into();
+        }
         let scope = if w.task.scope.is_empty() { "(not restricted)".to_string() } else { w.task.scope.join(", ") };
         let instructions = format!(
             "{}\n{}\n## Your task: {} — {}\nScope: {scope}\nAcceptance: {}\n",

@@ -111,11 +111,9 @@ pub enum Signal {
 /// `ask_up`'s pre-routing check, so both halt on the same, single definition of "broken".
 pub fn looks_like_broken_sandbox(text: &str) -> bool {
     let hay = text.to_lowercase();
-    hay.contains("bwrap")
-        || hay.contains("user namespace")
-        || hay.contains("unprivileged_userns")
-        || hay.contains("apparmor_restrict")
-        || (hay.contains("sandbox") && (hay.contains("fail") || hay.contains("denied") || hay.contains("cannot") || hay.contains("unable")))
+    // Only the sandbox's own failure markers count: an agent that merely says "I cannot do X in
+    // this sandbox" is asking a question, not reporting a machine that cannot run commands.
+    hay.contains("bwrap") || hay.contains("user namespace") || hay.contains("unprivileged_userns") || hay.contains("apparmor_restrict")
 }
 
 pub struct Agent {
@@ -1195,7 +1193,8 @@ mod tests {
         assert!(super::looks_like_broken_sandbox("Codex's Linux sandbox uses bubblewrap and needs access to create USER NAMESPACES."));
         assert!(super::looks_like_broken_sandbox("kernel.unprivileged_userns_clone = 0"));
         assert!(super::looks_like_broken_sandbox("kernel.apparmor_restrict_unprivileged_userns = 1"));
-        assert!(super::looks_like_broken_sandbox("the sandbox denied this operation"));
+        // an agent saying it cannot do something in its sandbox is asking, not reporting a dead machine
+        assert!(!super::looks_like_broken_sandbox("I cannot resolve finding #1 myself: the sandbox denied writing .git/index"));
         // a read-only role refusing a write is its own scope, not a broken environment
         assert!(!super::looks_like_broken_sandbox("Failed to write file: README.md"));
         assert!(!super::looks_like_broken_sandbox("tests failed: 2 assertions"));
