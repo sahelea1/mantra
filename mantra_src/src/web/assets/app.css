@@ -475,7 +475,7 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--b
 .role-row .row-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .role-fallback { display: block; text-overflow: ellipsis; font-size: var(--fs-xs); }
 .role-fallback b { font-weight: 600; color: var(--text); }
-.effort-auto { color: var(--accent); font-weight: 600; }
+.effort-auto { color: var(--muted); font-style: italic; }
 .band-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .inline-form { display: flex; gap: 8px; }
 .inline-form .input { flex: 1; min-width: 0; }

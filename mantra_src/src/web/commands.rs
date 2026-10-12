@@ -461,7 +461,7 @@ fn run_row(r: &crate::engine::state::RunSummary, open: Option<&str>) -> Value {
 mod tests {
     use super::*;
     use crate::app::Approval;
-    use crate::web::snapshot::tests::{add_agent, test_app};
+    use crate::web::snapshot::tests::{add_agent, test_app, with_mantra_home};
     use crate::web::{Link, LinkInfo, WebRegistryHandle};
     use std::time::Instant;
 
@@ -633,26 +633,6 @@ mod tests {
         app.agents.get_mut(&1).unwrap().queued = vec!["a".into()];
         let r = run(&mut app, &mut h, 3, Command::Send { agent: 1, text: "".into(), force: Some(true) });
         assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
-    }
-
-    /// A temp `$MANTRA_HOME` for a test that saves a pattern, restored afterwards. Serialized
-    /// against other tests here that do the same (the env var is process-wide).
-    fn with_mantra_home<R>(f: impl FnOnce() -> R) -> R {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("mantra-test-home-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var("MANTRA_HOME").ok();
-        std::env::set_var("MANTRA_HOME", &dir);
-        let r = f();
-        match prev {
-            Some(v) => std::env::set_var("MANTRA_HOME", v),
-            None => std::env::remove_var("MANTRA_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        r
     }
 
     #[test]

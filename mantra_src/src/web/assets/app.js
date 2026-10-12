@@ -176,7 +176,9 @@
     }
     function updateTitle() {
         const n = attention();
-        const name = (S.app && S.app.project_name) || 'Mantra';
+        // an open run is called by its title; otherwise the project
+        const run = S.run;
+        const name = run ? F.trunc(run.title || run.brief || run.id, 60) : (S.app && S.app.project_name) || 'Mantra';
         const t = (n ? '(' + n + ') ' : '') + name + ' · Mantra';
         if (document.title !== t) document.title = t;
         if (navigator.setAppBadge) { try { n ? navigator.setAppBadge(n) : navigator.clearAppBadge(); } catch (_) { } }
@@ -575,11 +577,12 @@
     function paletteItems(q) {
         const items = [];
         for (const a of M.store.agentList()) items.push({ key: 'a' + a.id, label: a.worker ? a.worker.task_id : a.name, sub: P.status(a).text, glyph: a, run: () => nav('/agent/' + a.id) });
+        const haltItem = (p) => ({ key: 'pause', label: p.label === 'Resume' ? 'Resume run' : p.label, icon: p.icon, run: p.run });
         const go = [['/', 'Overview', 'team'], ['/run', 'Run', 'run'], ['/inbox', 'Inbox', 'inbox'], ['/pulse', 'Pulse', 'pulse'], ['/runs', 'Runs', 'runs'], ['/settings', 'Settings', 'settings']];
         for (const [p, l, i] of go) items.push({ key: 'go' + p, label: 'Go to ' + l, icon: i, run: () => nav(p) });
         const run = S.run;
         if (run && run.stage.kind === 'review') items.push({ key: 'approve', label: 'Approve plan', icon: 'check', run: () => cmd('plan_approve', {}, { ok: 'Plan approved' }) });
-        if (run && run.stage.kind !== 'done') items.push({ key: 'pause', label: run.halted ? 'Resume run' : 'Pause run', icon: run.halted ? 'play' : 'pause', run: () => cmd('pause_resume', {}) });
+        if (run && run.stage.kind !== 'done') items.push(run.halted ? haltItem(P.haltPrimary(run.halted)) : { key: 'pause', label: 'Pause run', icon: 'pause', run: () => cmd('pause_resume', {}) });
         if (run && run.landable) items.push({ key: 'land', label: 'Land run', icon: 'land', run: () => sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => cmd('land', {}, { ok: 'Landing…' }) }) });
         items.push({ key: 'solo', label: 'New Solo session', icon: 'plus', run: () => cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && nav('/agent/' + d.agent)) });
         items.push({ key: 'theme', label: 'Toggle dark / light', icon: 'sun', run: () => { const dark = S.ui.theme === 'dark' || (S.ui.theme === 'system' && mqDark.matches); M.store.setPref('theme', dark ? 'light' : 'dark'); applyPrefs(); } });
