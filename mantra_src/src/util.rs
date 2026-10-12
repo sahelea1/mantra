@@ -373,7 +373,33 @@ const TOOLCHAIN_HOME_DIRS: &[&str] = &[".cache", ".pub-cache", ".gradle", ".andr
 pub fn toolchain_writable_roots() -> Vec<PathBuf> {
     let home = dirs::home_dir();
     let path_var = std::env::var("PATH").unwrap_or_default();
+    if let Some(h) = home.as_deref() {
+        ensure_toolchain_dirs(h, &path_var);
+    }
     toolchain_roots_with(home.as_deref(), |k| std::env::var_os(k).map(PathBuf::from), &path_var)
+}
+
+/// The cache directories a toolchain on PATH will want on its first run, created ahead of time:
+/// bubblewrap can only bind a directory that exists, so without this the first `dart analyze`
+/// inside the sandbox dies on a read-only `~/.dartServer`, the first Gradle build on `~/.gradle`.
+/// Only the tools actually installed get their directories; nothing is created for the rest.
+fn ensure_toolchain_dirs(home: &Path, path_var: &str) {
+    const BY_TOOL: &[(&str, &[&str])] = &[
+        ("dart", &[".dart", ".dartServer", ".dart-tool", ".pub-cache"]),
+        ("flutter", &[".dart", ".dartServer", ".dart-tool", ".pub-cache", ".flutter", ".flutter-devtools", ".config/flutter", ".gradle", ".android", ".kotlin"]),
+        ("gradle", &[".gradle", ".kotlin", ".m2"]),
+        ("java", &[".gradle", ".m2"]),
+        ("cargo", &[".cargo"]),
+        ("npm", &[".npm", ".cache"]),
+    ];
+    for (tool, dirs) in BY_TOOL {
+        if which_in(tool, path_var).is_none() {
+            continue;
+        }
+        for d in *dirs {
+            let _ = std::fs::create_dir_all(home.join(d));
+        }
+    }
 }
 
 /// `toolchain_writable_roots` with its inputs passed in, so the candidate list can be tested.
@@ -633,6 +659,20 @@ mod tests {
         let p = f.display().to_string();
         assert_eq!(why, format!("{p} is not executable — chmod +x {p}"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toolchain_dirs_are_created_only_for_tools_on_path() {
+        let root = scratch("ensure");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        touch_exec(&bin.join("cargo"));
+        ensure_toolchain_dirs(&home, &path_of(&[&bin]));
+        assert!(home.join(".cargo").is_dir(), "cargo is on PATH: its cache dir exists");
+        assert!(!home.join(".gradle").exists() && !home.join(".dartServer").exists(), "nothing for tools that are not installed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
