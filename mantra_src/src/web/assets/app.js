@@ -466,10 +466,15 @@
     // The model list shared by the per-agent and per-role pickers. A model with a `problem`
     // (draft provider, missing key…) is shown but disabled — picking it would just bounce off
     // the server's own check.
-    function modelPickList(currentAlias, onPick) {
-        const models = (S.app && S.app.models) || [];
+    // `opts.except`: an alias left out; `opts.none`: a first "None" entry (picked as null).
+    function modelPickList(currentAlias, onPick, opts) {
+        opts = opts || {};
+        const models = ((S.app && S.app.models) || []).filter((m) => m.alias !== opts.except);
         if (!models.length) return P.empty('model', 'No models', 'The model registry is empty.');
-        return h('div', { class: 'pick-list' }, models.map((m) => h('button', {
+        const none = opts.none ? h('button', { type: 'button', key: '-none', class: 'pick' + (currentAlias ? '' : ' on'), onclick: () => onPick(null) },
+            h('span', { class: 'pick-main' }, h('b', null, 'None')), h('span', { class: 'pick-sub' }, opts.none),
+            currentAlias ? null : icon('check', 'pick-check')) : null;
+        return h('div', { class: 'pick-list' }, none, models.map((m) => h('button', {
             type: 'button', key: m.alias, class: 'pick' + (m.alias === currentAlias ? ' on' : '') + (m.problem ? ' problem' : ''),
             disabled: m.problem ? true : null,
             onclick: () => onPick(m.alias),
@@ -506,10 +511,26 @@
                 const role = all ? null : (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
                 if (!all && !role) break;
                 title = 'Model for ' + (all ? 'all roles' : role.name);
-                body = modelPickList(all ? null : role.model_alias, (alias) => {
+                body = [
+                    // the fallback is per role: its own sheet, one tap away (above the long model list)
+                    all ? null : h('div', { class: 'pick-list', key: 'fb', style: { marginBottom: '14px' } }, h('button', { type: 'button', class: 'pick', onclick: () => sheet({ kind: 'role-fallback', role: role.name }) },
+                        h('span', { class: 'pick-main' }, h('b', null, 'Fallback model'), h('span', { class: 'dim sm' }, ' ' + (role.fallback || 'none'))),
+                        h('span', { class: 'pick-sub' }, 'Takes over when ' + role.model_alias + ' gives no first token in time'),
+                        icon('chevron', 'pick-check'))),
+                    modelPickList(all ? null : role.model_alias, (alias) => {
+                        closeSheet();
+                        cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
+                    })];
+                break;
+            }
+            case 'role-fallback': {
+                const role = (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
+                if (!role) break;
+                title = 'Fallback for ' + role.name;
+                body = modelPickList(role.fallback || null, (alias) => {
                     closeSheet();
-                    cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
-                });
+                    if (alias !== (role.fallback || null)) cmd('set_role_fallback', { role: role.name, alias }, { ok: alias ? role.name + ' falls back to ' + alias : role.name + ': no fallback' });
+                }, { except: role.model_alias, none: 'The manager is asked instead' });
                 break;
             }
             case 'effort': {

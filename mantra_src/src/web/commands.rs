@@ -266,6 +266,25 @@ impl App {
                 }
                 Ok(json!({"changed": targets, "path": path.display().to_string()}))
             }
+            Command::SetRoleFallback { role, alias } => {
+                let mut pattern = Pattern::load(&self.pattern_name, &self.project).map_err(|e| e.to_string())?;
+                let Some(r) = pattern.roles.get_mut(&role) else { return Err("no such role".into()) };
+                if let Some(a) = &alias {
+                    if self.registry.get(a).is_none() {
+                        return Err("unknown model".into());
+                    }
+                    if *a == r.model {
+                        return Err("a fallback must be another model than the role's own".into());
+                    }
+                }
+                r.fallback = alias.clone();
+                let path = pattern.save().map_err(|e| e.to_string())?;
+                // the active run picks it up only when it runs this very pattern (as set_role_model)
+                if let Some(r) = self.run.as_mut().filter(|r| r.pattern.name == pattern.name).and_then(|r| r.pattern.roles.get_mut(&role)) {
+                    r.fallback = alias;
+                }
+                Ok(json!({"path": path.display().to_string()}))
+            }
             Command::SetEffort { agent, effort } => {
                 self.agent_ok(agent)?;
                 let alias = self.agents.get(&agent).map(|a| a.model_alias.clone()).unwrap_or_default();
@@ -679,6 +698,32 @@ mod tests {
             let saved = Pattern::load(&app.pattern_name, &app.project).unwrap();
             assert_eq!(saved.roles["planner"].effort, "medium", "a named effort is clamped to the new model");
             assert_eq!(saved.roles["worker-big"].effort, "auto", "auto is not baked into a level by a model change");
+        });
+    }
+
+    #[test]
+    fn set_role_fallback_takes_another_known_alias_or_none() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.registry.models.push(crate::config::ModelEntry { alias: "backup".into(), model: "backup-model".into(), ..Default::default() });
+            let mut pattern = Pattern::builtin();
+            pattern.name = "set-role-fallback-test".into();
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+            let own = pattern.roles["planner"].model.clone();
+            let mut set = |app: &mut App, role: &str, alias: Option<&str>| run(app, &mut h, 1, Command::SetRoleFallback { role: role.into(), alias: alias.map(|a| a.into()) });
+            let refused = |r: ServerMsg| matches!(r, ServerMsg::Result(ref x) if !x.ok);
+            assert!(refused(set(&mut app, "planner", Some("no-such-alias"))), "an unknown alias");
+            assert!(refused(set(&mut app, "planner", Some(own.as_str()))), "the role's own model");
+            assert!(refused(set(&mut app, "no-such-role", Some("backup"))), "an unknown role");
+            let saved = || Pattern::load("set-role-fallback-test", std::path::Path::new(".")).unwrap().roles["planner"].fallback.clone();
+            assert_eq!(saved(), None, "nothing refused was saved");
+            let r = set(&mut app, "planner", Some("backup"));
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert_eq!(saved().as_deref(), Some("backup"));
+            let r = set(&mut app, "planner", None);
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert_eq!(saved(), None, "none clears it");
         });
     }
 
