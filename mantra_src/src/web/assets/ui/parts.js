@@ -248,9 +248,10 @@
         const kindTone = run.halted ? 'halt' : st.kind === 'done' ? 'done' : st.kind === 'failed' ? 'bad' : run.want_review ? 'review' : 'live';
         return h('button', { type: 'button', key: 'runcard', class: 'card run-card tone-' + kindTone + (opts.compact ? ' compact' : ''), onclick: () => M.act.nav('/run') },
             h('div', { class: 'run-card-top' },
-                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? 'halted' : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
-                h('span', { class: 'run-id' }, run.pattern)),
-            h('div', { class: 'run-brief' }, F.trunc(run.brief, opts.compact ? 90 : 160)),
+                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? (run.halted.reason === 'user' ? 'paused' : 'halted') : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
+                h('span', { class: 'run-id', title: run.id + ' · ' + run.pattern }, run.id)),
+            h('div', { class: 'run-name' }, F.trunc(run.title || run.brief, opts.compact ? 90 : 160)),
+            !opts.compact && run.title && run.title !== run.brief ? h('div', { class: 'run-goal' }, F.trunc(run.brief, 200)) : null,
             stageRail(run, s.plan, false),
             h('div', { class: 'run-meta' }, runSummary(run)));
     }
@@ -289,15 +290,39 @@
             h('input', { class: 'input', value: val, placeholder, enterkeyhint: 'send', 'aria-label': placeholder, oninput: (e) => { S().ui.drafts[key] = e.target.value; M.act.changed(); } }),
             btn(label || 'Send', null, { type: 'submit', kind: 'primary', busyKey: key, disabled: !val.trim() }));
     }
+    // The haltActions button that un-halts the run — what a model change still waits for.
+    function haltResumeLabel(hv) {
+        const who = hv.agent !== undefined && hv.agent !== null;
+        switch (hv.reason) {
+            case 'provider_rejected': case 'environment': return who ? 'Retry' : 'Resume';
+            case 'gate_exhausted': return 'Retry gate';
+            case 'attempts_exhausted': return who ? 'Retry ' + (hv.agent_name || 'the agent') : 'Resume';
+            case 'agent_turn_failed': return 'Retry turn';
+        }
+        return 'Resume';
+    }
     function haltBand(run) {
         const hv = run.halted;
         if (!hv) return null;
+        const s = S();
+        // A halt without an agent has nothing to respawn: Resume is what's left.
         const acts = haltActions(hv).filter(Boolean);
+        if (!acts.length) acts.push(...haltActions({ reason: 'user' }));
         const wantsFeedback = hv.reason === 'gate_exhausted' || hv.reason === 'attempts_exhausted';
+        // The whole text, when the message is a shortened form of it (HaltView.full).
+        const full = hv.full && hv.full !== hv.message ? hv.full : null;
+        // Per halt, so the next one starts collapsed.
+        const fk = 'halt-full-' + hv.since_at;
+        const open = !!(full && s.ui.expanded[fk]);
+        const toggleFull = () => { s.ui.expanded[fk] = !open; M.act.changed(); };
         return h('div', { class: 'band halt', key: 'halt', role: 'alert' },
             h('div', { class: 'band-head' }, h('span', { class: 'band-ico' }, '⛔'), h('b', null, HALT_TITLE[hv.reason] || 'Halted'), h('span', { class: 'band-age' }, F.ago(hv.since_at))),
-            hv.message ? h('div', { class: 'band-msg' }, F.trunc(hv.message, 400)) : null,
+            open ? h('pre', { class: 'band-full' }, full) : hv.message ? h('div', { class: 'band-msg' }, F.trunc(hv.message, 400)) : null,
+            full ? h('div', { class: 'band-more-row' },
+                h('button', { type: 'button', class: 'link sm band-more', 'aria-expanded': String(open), onclick: toggleFull }, h('span', null, open ? 'Show less' : 'Show the full error'), icon(open ? 'up' : 'down', 'chev')),
+                open ? h('button', { type: 'button', class: 'link sm band-more', onclick: () => M.act.copy(full) }, icon('copy', 'chev'), h('span', null, 'Copy')) : null) : null,
             hv.hint ? h('div', { class: 'band-hint' }, hv.hint) : null,
+            hv.reason !== 'user' ? h('div', { class: 'band-note' }, 'Changing a model doesn’t resume the run — press ' + haltResumeLabel(hv) + ' when you’re ready.') : null,
             h('div', { class: 'band-actions' }, acts),
             wantsFeedback ? feedbackField('halt-feedback', 'Feedback for the planner…', 'Send') : null);
     }
@@ -411,6 +436,6 @@
     M.parts = {
         glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
-        haltBand, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
+        haltBand, haltResumeLabel, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };
 })(window.Mantra = window.Mantra || {});

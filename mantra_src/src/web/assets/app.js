@@ -250,10 +250,17 @@
     const BANNER_ROUTES = { team: 1, settings: 1, more: 1 };
     const TITLES = { run: 'Run', pulse: 'Pulse', inbox: 'Inbox', runs: 'Runs', settings: 'Settings', more: 'More' };
 
+    // Where the run is, for the headers: the stage label, and whether it's stopped there (as
+    // `mantra runs` puts it).
+    function runWhere(run) {
+        const st = run.stage || {};
+        const stopped = run.halted && st.kind !== 'done' && st.kind !== 'failed';
+        return (st.label || '') + (stopped ? (run.halted.reason === 'user' ? ' · paused' : ' · halted') : '');
+    }
     function topbar(r) {
         const app = S.app || {};
-        const sub = r.name === 'team' ? (S.run ? S.run.stage.label + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
-            : r.name === 'run' && S.run ? S.run.stage.label : r.name === 'pulse' && S.run ? S.run.stage.label : '';
+        const sub = r.name === 'team' ? (S.run ? runWhere(S.run) + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
+            : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
         const backTo = { pulse: '/more', runs: '/more', settings: '/more' }[r.name];
         return h('header', { class: 'topbar', key: 'topbar' },
             backTo ? P.iconBtn('back', () => back(backTo), 'Back', { cls: 'back' }) : h('img', { class: 'topbar-logo', src: '/icons/icon.svg', alt: '', width: 28, height: 28 }),
@@ -324,9 +331,10 @@
         if (r.name === 'agent') return null;
         const app = S.app || {};
         const title = r.name === 'team' ? 'Overview' : TITLES[r.name];
-        const sub = r.name === 'team' ? (app.project || '') : r.name === 'run' && S.run ? (S.run.title || S.run.id) : '';
+        // The run's title is the hero right below; the header carries where the run is.
+        const sub = r.name === 'team' ? (app.project || '') : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
         return h('header', { class: 'main-head', key: 'mh' },
-            h('h1', null, title), sub ? h('span', { class: 'main-sub mono' }, sub) : null, h('span', { class: 'spacer' }),
+            h('h1', null, title), sub ? h('span', { class: 'main-sub' + (r.name === 'team' ? ' mono' : '') }, sub) : null, h('span', { class: 'spacer' }),
             r.name === 'runs' ? P.btn('Refresh', () => SC.loadRuns(), { sm: true, kind: 'ghost', icon: 'refresh' }) : null,
             mqWide.matches && (r.name === 'team') ? P.iconBtn('panel', () => M.store.setPref('panelOpen', !S.ui.panelOpen), S.ui.panelOpen ? 'Hide side panel' : 'Show side panel') : null,
             h('button', { type: 'button', class: 'kbd-hint', onclick: () => openPalette() }, icon('search'), h('span', null, 'Search'), h('kbd', null, isMac() ? '⌘K' : 'Ctrl K')));
@@ -441,6 +449,11 @@
     }
 
     // ── sheets ───────────────────────────────────────────────────────────────────────────────────
+    // A model change never resumes a halted run (resuming is always explicit): the toast says so.
+    function modelOk(text) {
+        const hv = S.run && S.run.halted;
+        return hv ? text + ' · still ' + (hv.reason === 'user' ? 'paused' : 'halted') + ' — ' + P.haltResumeLabel(hv) + ' to continue' : text;
+    }
     async function loadDiff(sh) {
         sh.loading = true; sh.error = null;
         try {
@@ -488,7 +501,7 @@
             case 'model': {
                 if (!a) break;
                 title = 'Model for ' + a.name;
-                body = modelPickList(a.model_alias, (alias) => { closeSheet(); if (alias !== a.model_alias) cmd('set_model', { agent: a.id, alias }, { ok: a.name + ' → ' + alias }); });
+                body = modelPickList(a.model_alias, (alias) => { closeSheet(); if (alias !== a.model_alias) cmd('set_model', { agent: a.id, alias }, { ok: a.in_run ? modelOk(a.name + ' → ' + alias) : a.name + ' → ' + alias }); });
                 break;
             }
             case 'role-model': {
@@ -498,7 +511,7 @@
                 title = 'Model for ' + (all ? 'all roles' : role.name);
                 body = modelPickList(all ? null : role.model_alias, (alias) => {
                     closeSheet();
-                    cmd('set_role_model', { role: sh.role, alias, all }, { ok: (all ? 'all roles' : sh.role) + ' → ' + alias });
+                    cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
                 });
                 break;
             }

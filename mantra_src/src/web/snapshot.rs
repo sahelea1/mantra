@@ -21,6 +21,8 @@ const ITEM_WINDOW: u64 = 300;
 const SNAPSHOT_ITEMS: usize = 150;
 /// Pulse lines in a full snapshot.
 const SNAPSHOT_PULSE: usize = 100;
+/// Columns of a halt's full text the halt band can expand to.
+const HALT_FULL_MAX: usize = 8000;
 
 // ───────────────────────────── time ─────────────────────────────
 
@@ -104,6 +106,18 @@ pub struct PatternRoleView {
     /// "codex" | "claude-code"
     pub backend: String,
     pub sandbox: String,
+    /// Model alias used when this role's model gives no first token in time (`Role.fallback`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+}
+
+/// A pattern the start-run picker offers: built-ins first (in `Pattern::names()` order), then the
+/// user's own, each with its one-line description.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PatternInfoView {
+    pub name: String,
+    pub description: String,
+    pub builtin: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -116,6 +130,9 @@ pub struct AppInfo {
     pub demo: bool,
     pub pattern_name: String,
     pub patterns: Vec<String>,
+    /// `patterns` with descriptions, same order.
+    #[serde(default)]
+    pub pattern_list: Vec<PatternInfoView>,
     pub approval_mode: String,
     pub default_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,6 +358,9 @@ pub struct HaltView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub message: String,
+    /// The whole halt text when `message` is a shortened form of it (`Halt.full`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<String>,
     pub since_at: u64,
     pub hint: String,
 }
@@ -891,6 +911,9 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
             agent,
             agent_name: agent.map(|a| r.name_of(a)),
             message: h.message.clone(),
+            // Plain text (stderr may be colourized) and capped: the run view is resent on every
+            // change, and the journal keeps the whole of it anyway.
+            full: (!h.full.is_empty() && h.full != h.message).then(|| crate::util::trunc(&crate::util::strip_ansi(&h.full), HALT_FULL_MAX)),
             since_at: ms(h.since),
             hint: web_hint(&r.halt_hint()),
         }
@@ -1023,7 +1046,7 @@ fn screen_str(s: Screen) -> String {
     }
 }
 
-pub fn app_info(app: &App, env: &Env, patterns: &[String]) -> AppInfo {
+pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         protocol: super::protocol::PROTOCOL,
@@ -1032,7 +1055,8 @@ pub fn app_info(app: &App, env: &Env, patterns: &[String]) -> AppInfo {
         branch: app.branch.clone(),
         demo: app.demo,
         pattern_name: app.pattern_name.clone(),
-        patterns: patterns.to_vec(),
+        patterns: patterns.iter().map(|p| p.name.clone()).collect(),
+        pattern_list: patterns.to_vec(),
         approval_mode: app.settings.approval_mode.clone(),
         default_model: app.settings.default_model.clone(),
         solo: app.solo,
@@ -1072,6 +1096,7 @@ pub fn app_info(app: &App, env: &Env, patterns: &[String]) -> AppInfo {
                 model_alias: role.model,
                 effort: role.effort,
                 sandbox: role.sandbox,
+                fallback: role.fallback,
             })
             .collect(),
         push_enabled: env.push,
@@ -1079,6 +1104,20 @@ pub fn app_info(app: &App, env: &Env, patterns: &[String]) -> AppInfo {
         listen: env.listen.clone(),
         headless: env.headless,
     }
+}
+
+/// Every pattern `Pattern::list` names, with its description; one that fails to load still shows
+/// (it may be mid-edit), just without one.
+pub fn pattern_list(project: &std::path::Path) -> Vec<PatternInfoView> {
+    use crate::engine::pattern::Pattern;
+    Pattern::list(project)
+        .into_iter()
+        .map(|name| PatternInfoView {
+            description: Pattern::load(&name, project).map(|p| p.description).unwrap_or_default(),
+            builtin: Pattern::builtin_named(&name).is_some(),
+            name,
+        })
+        .collect()
 }
 
 pub fn toast_view(app: &App) -> Option<ToastView> {
@@ -1116,7 +1155,7 @@ pub struct Publisher {
     pulse_sent: u64,
     pulse_run: Option<String>,
     plan_cache: Option<(String, u32, Option<PlanView>)>,
-    patterns: Option<(Instant, Vec<String>)>,
+    patterns: Option<(Instant, Vec<PatternInfoView>)>,
 }
 
 impl Publisher {
@@ -1130,11 +1169,12 @@ impl Publisher {
         self.seq
     }
 
-    /// `Pattern::list` reads the disk; ten seconds of staleness is fine for a picker.
-    fn patterns(&mut self, app: &App) -> Vec<String> {
+    /// `Pattern::list` (and loading each for its description) reads the disk; ten seconds of
+    /// staleness is fine for a picker.
+    fn patterns(&mut self, app: &App) -> Vec<PatternInfoView> {
         let fresh = self.patterns.as_ref().map(|(t, _)| t.elapsed() < Duration::from_secs(10)).unwrap_or(false);
         if !fresh {
-            self.patterns = Some((Instant::now(), crate::engine::pattern::Pattern::list(&app.project)));
+            self.patterns = Some((Instant::now(), pattern_list(&app.project)));
         }
         self.patterns.as_ref().map(|(_, p)| p.clone()).unwrap_or_default()
     }
@@ -1463,6 +1503,54 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["title"], "Notes sync");
         assert_eq!(json["stage"]["label"], "phase 1 · fix r2");
+    }
+
+    #[test]
+    fn a_shortened_halt_carries_its_full_text_and_an_unshortened_one_does_not() {
+        let app = test_app();
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        let halt = |message: &str, full: &str| crate::engine::run::Halt { reason: HaltReason::ProviderRejected, agent: None, message: message.into(), full: full.into(), since: Instant::now() };
+        run.halt = Some(halt("400 bad request …", "400 bad request: the whole body"));
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert_eq!(json["halted"]["message"], "400 bad request …");
+        assert_eq!(json["halted"]["full"], "400 bad request: the whole body");
+        run.halt = Some(halt("400 bad request …", &format!("\u{1b}[31m400\u{1b}[0m {}", "x".repeat(20_000))));
+        let full = serde_json::to_value(run_view(&app, &run)).unwrap()["halted"]["full"].as_str().unwrap().to_string();
+        assert!(full.starts_with("400 x") && full.ends_with('…') && full.chars().count() == HALT_FULL_MAX, "plain and capped");
+        run.halt = Some(halt("paused by you", "paused by you"));
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert!(json["halted"].get("full").is_none(), "{json}");
+    }
+
+    #[test]
+    fn the_pattern_picker_lists_the_builtins_first_with_descriptions_and_roles_carry_their_fallback() {
+        let dir = std::env::temp_dir().join(format!("mantra-patlist-{}", std::process::id()));
+        let pats = dir.join(".mantra").join("patterns");
+        std::fs::create_dir_all(&pats).unwrap();
+        let mut own = Pattern::builtin_lean();
+        own.name = "my-split".into();
+        own.description = "my own".into();
+        std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
+        let list = pattern_list(&dir);
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(&names[..4], &Pattern::names()[..], "built-ins first, default leading");
+        assert!(list[..4].iter().all(|p| p.builtin && !p.description.is_empty()));
+        let mine = list.iter().find(|p| p.name == "my-split").expect("the user's own pattern is listed");
+        assert_eq!((mine.description.as_str(), mine.builtin), ("my own", false));
+
+        let mut app = test_app();
+        app.pattern_name = "my-split".into();
+        app.project = dir.clone();
+        own.roles.get_mut("planner").unwrap().fallback = Some("backup".into());
+        std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
+        let info = app_info(&app, &Env::default(), &pattern_list(&dir));
+        assert_eq!(info.patterns.len(), info.pattern_list.len());
+        let json = serde_json::to_value(&info).unwrap();
+        let roles = json["pattern_roles"].as_array().unwrap();
+        let planner = roles.iter().find(|r| r["name"] == "planner").unwrap();
+        assert_eq!(planner["fallback"], "backup");
+        assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r.get("fallback").is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

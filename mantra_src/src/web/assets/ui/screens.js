@@ -14,11 +14,17 @@
     }
 
     // ── Team ─────────────────────────────────────────────────────────────────────────────────────
+    const DEFAULT_PATTERN = 'mantra-default';
     function startRunCard() {
         const s = S();
         const app = s.app || {};
-        const pats = app.patterns || [];
-        const pat = s.ui.runPattern || app.pattern_name || pats[0] || '';
+        // pattern_list: built-ins first (mantra-default leading), then the user's own; an older
+        // server only sends the names.
+        const pats = app.pattern_list || (app.patterns || []).map((name) => ({ name, description: '', builtin: false }));
+        const pat = s.ui.runPattern || app.pattern_name || (pats[0] && pats[0].name) || '';
+        const cur = pats.find((p) => p.name === pat);
+        const opt = (p) => h('option', { value: p.name, key: p.name, selected: p.name === pat }, p.name + (p.name === DEFAULT_PATTERN ? ' (default)' : ''));
+        const builtins = pats.filter((p) => p.builtin), own = pats.filter((p) => !p.builtin);
         const goal = s.ui.runGoal || '';
         const start = () => {
             const g = (S().ui.runGoal || '').trim();
@@ -29,10 +35,14 @@
         return card('Start a run', [
             h('p', { class: 'sec-sub' }, 'A planner breaks the goal into phases, workers build them in parallel, a gate checks every phase.'),
             h('textarea', { class: 'input goal', rows: 3, value: goal, placeholder: 'What should the team build? e.g. “Add OAuth login with GitHub, with tests”', 'aria-label': 'Run goal', oninput: (e) => { s.ui.runGoal = e.target.value; M.act.changed(); }, onkeydown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); start(); } } }),
-            h('div', { class: 'form-row' },
-                pats.length ? h('label', { class: 'select-wrap' }, h('span', { class: 'select-label' }, 'Pattern'),
-                    h('select', { class: 'select', value: pat, onchange: (e) => { s.ui.runPattern = e.target.value; M.act.changed(); } }, pats.map((p) => h('option', { value: p, key: p, selected: p === pat }, p)))) : h('span'),
-                P.btn('Start run', start, { kind: 'primary', icon: 'play', busyKey: 'start-run', disabled: !goal.trim() || s.conn.state !== 'open' })),
+            // A grid, so the pattern's description stays under the picker on a phone too (where
+            // the button drops below both).
+            h('div', { class: 'start-row' },
+                pats.length ? h('label', { class: 'select-wrap', key: 'pick' }, h('span', { class: 'select-label' }, 'Pattern'),
+                    h('select', { class: 'select', value: pat, onchange: (e) => { s.ui.runPattern = e.target.value; M.act.changed(); } },
+                        builtins.length && own.length ? [h('optgroup', { label: 'Built-in', key: 'b' }, builtins.map(opt)), h('optgroup', { label: 'Yours', key: 'o' }, own.map(opt))] : pats.map(opt))) : null,
+                cur && cur.description ? h('p', { class: 'pat-desc', key: 'desc', title: cur.description }, cur.description) : null,
+                P.btn('Start run', start, { kind: 'primary', icon: 'play', busyKey: 'start-run', disabled: !goal.trim() || s.conn.state !== 'open', key: 'go' })),
         ], { icon: 'run', key: 'startrun' });
     }
 
@@ -40,10 +50,21 @@
         const s = S();
         const ids = (s.app && s.app.unfinished_runs) || [];
         if (!ids.length) return null;
+        // The snapshot names unfinished runs by id; their titles come from the runs list, asked for
+        // again (at most every 15 s) while it lacks one of them — a run closed since, say.
+        const rows = (s.ui.runs && s.ui.runs.list) || [];
+        const missing = !s.ui.runs || ids.some((id) => !rows.some((x) => x.id === id));
+        if (missing && s.conn.state === 'open' && !(s.ui.runs && s.ui.runs.loading) && Date.now() - (s.ui.runsAsked || 0) > 15000) {
+            s.ui.runsAsked = Date.now();
+            setTimeout(loadRuns, 0);
+        }
         return card('Unfinished runs', [
-            h('div', { class: 'list' }, ids.map((id) => h('div', { class: 'list-row', key: id },
-                h('code', { class: 'mono' }, id),
-                P.btn('Resume', () => M.act.cmd('run_resume', { id }, { busyKey: 'resume-' + id, ok: 'Run resumed' }).then(() => M.act.nav('/run'), () => { }), { sm: true, busyKey: 'resume-' + id, icon: 'play' })))),
+            h('div', { class: 'list' }, ids.map((id) => {
+                const title = (rows.find((x) => x.id === id) || {}).title;
+                return h('div', { class: 'list-row', key: id },
+                    title ? h('span', { class: 'unf-name' }, h('b', null, title), h('code', { class: 'mono dim' }, id)) : h('code', { class: 'mono' }, id),
+                    P.btn('Resume', () => M.act.cmd('run_resume', { id }, { busyKey: 'resume-' + id, ok: 'Run resumed' }).then(() => M.act.nav('/run'), () => { }), { sm: true, busyKey: 'resume-' + id, icon: 'play' }));
+            })),
             h('button', { type: 'button', class: 'link sm', onclick: () => M.act.nav('/runs') }, 'All runs →'),
         ], { icon: 'runs', key: 'unfinished' });
     }
@@ -298,8 +319,10 @@
             P.glyph(r, 'lg'),
             h('span', { class: 'row-main' },
                 h('span', { class: 'row-title' }, r.name),
-                h('span', { class: 'row-sub' }, r.kind)),
-            h('span', { class: 'chip model' }, h('b', null, r.model_alias), r.effort ? [h('span', { class: 'sep' }, '·'), h('span', null, r.effort)] : null),
+                h('span', { class: 'row-sub' }, r.kind),
+                r.fallback ? h('span', { class: 'row-sub role-fallback', title: 'Used when ' + r.model_alias + ' gives no first token in time' }, '↪ falls back to ', h('b', null, r.fallback)) : null),
+            h('span', { class: 'chip model' }, h('b', null, r.model_alias), r.effort ? [h('span', { class: 'sep' }, '·'),
+                r.effort === 'auto' ? h('span', { class: 'effort-auto', title: 'Auto effort: Mantra picks it for each spawn' }, 'auto') : h('span', null, r.effort)] : null),
             icon('chevron', 'chev')))), {
             key: 'roles', icon: 'model',
             right: P.btn('Set all roles…', () => M.act.sheet({ kind: 'role-model', role: '', all: true }), { sm: true, kind: 'ghost' }),
