@@ -23,6 +23,8 @@ struct Thread {
     turns: u32,
     active: Option<(String, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>)>,
     tokens: u64,
+    /// The part of `tokens` that was the thread's prefix re-read from the cache (see `tokens`).
+    cached: u64,
     ctx: u64,
 }
 
@@ -117,7 +119,7 @@ fn handle(st: &Arc<St>, method: &str, id: Value, p: Value) {
             let resumed = method == "thread/resume";
             {
                 let mut th = st.threads.lock().unwrap();
-                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, ctx: 9000 });
+                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, cached: 0, ctx: 9000 });
                 if !dev.is_empty() {
                     e.role = role;
                     e.dev = dev;
@@ -300,11 +302,17 @@ impl Em {
         !self.cancelled()
     }
     fn tokens(&self, add: u64) {
-        let (total, mut ctx, model) = self.th(|t| {
-            t.tokens += add;
+        let (total, cached, mut ctx, model) = self.th(|t| {
+            // Codex's running total counts every request's whole input, and each request
+            // re-reads the thread so far — the same prefix, served from the cache. So a busy
+            // agent's total is mostly cached input, which is what the cards' "· n cached"
+            // suffix exists to say; the demo shows the same shape.
+            let prefix = t.ctx;
+            t.tokens += add + prefix;
+            t.cached += prefix;
             t.ctx += add * 2;
-            (t.tokens, t.ctx, t.model.clone())
-        }).unwrap_or((add, add, String::new()));
+            (t.tokens, t.cached, t.ctx, t.model.clone())
+        }).unwrap_or((add, 0, add, String::new()));
         let window: u64 = if model.contains("astra") { 400_000 } else { 272_000 };
         // Codex-style automatic compaction mid-turn when the context gets full.
         if ctx > window * 7 / 10 {
@@ -318,7 +326,7 @@ impl Em {
         }
         let ctx = ctx.min(window - 1000);
         self.notify("thread/tokenUsage/updated", json!({"threadId": self.tid, "turnId": self.turn, "tokenUsage": {
-            "total": {"totalTokens": total, "inputTokens": total * 4 / 5, "cachedInputTokens": total / 2, "cacheWriteInputTokens": 0, "outputTokens": total / 5, "reasoningOutputTokens": total / 10},
+            "total": {"totalTokens": total, "inputTokens": total * 4 / 5, "cachedInputTokens": cached.min(total * 4 / 5), "cacheWriteInputTokens": 0, "outputTokens": total / 5, "reasoningOutputTokens": total / 10},
             "last": {"totalTokens": ctx, "inputTokens": ctx.saturating_sub(800), "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 800, "reasoningOutputTokens": 300},
             "modelContextWindow": window}}));
     }

@@ -135,6 +135,19 @@ fn zoomed_header(f: &mut Frame, area: Rect, app: &App, a: &Agent) {
         None => (String::new(), "zoomed · esc back to overview "),
     };
     let w = area.width as usize;
+    // The token count, with its cached reading, is the first thing to give way (the reading
+    // before the count): the keys and the run's title are what the band is for, so it is only
+    // added where they, and at least a short title, still fit.
+    if a.tokens_total > 0 {
+        let fits = |extra: &str| w_of(&left) + w_of(extra) + w_of(&stop) + w_of(right) + 2 + 3 + 6 <= w;
+        let count = format!(" · {} tok", fmt_tokens(a.tokens_total));
+        let read = a.cached_share().map(|c| format!("{count} · {c}")).unwrap_or_default();
+        if !read.is_empty() && fits(&read) {
+            left.push_str(&read);
+        } else if fits(&count) {
+            left.push_str(&count);
+        }
+    }
     // the marker never gives way; "zoomed" does, then the title (which gets up to 40 columns),
     // and a long agent name is cut before it
     let left = trunc(&left, w.saturating_sub(w_of(&stop) + 2));
@@ -316,6 +329,10 @@ fn side_panel(f: &mut Frame, area: Rect, app: &App, id: Option<AgentId>) {
     l.push(Line::default());
     l.push(sec("Session", vec![]));
     l.push(Line::from(Span::styled(format!(" {} turns · {} tok{} · {}", a.turn_count, fmt_tokens(a.tokens_total), if app.demo { " (simulated)" } else { "" }, fmt_dur(a.created.elapsed())), theme::dim())));
+    // its own line: the panel is too narrow for a suffix, and this is a reading of the count
+    if let Some(c) = a.cached_share() {
+        l.push(Line::from(Span::styled(format!(" of which {c}"), theme::faint())));
+    }
     l.push(Line::from(Span::styled(format!(" {}", trunc(&a.model, w)), theme::faint())));
     let status = match &a.status {
         Status::Crashed(r) => format!("crashed: {}", trunc(r, w.saturating_sub(10))),

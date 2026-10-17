@@ -200,11 +200,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 crumbs.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
-            let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
+            let (tokens, cached) = super::run_token_totals(app, r);
             // The halt band (drawn in the rail, just under this header) already says why and
             // what to do — no separate badge needed here.
             right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
+            // how much of Σ was the same context re-read from the cache, when that is most of it
+            right.extend(super::cached_suffix(crate::agent::cached_share(tokens, cached)));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
             // The run's title gets the room the rest leaves (up to 40 columns), with the id as a
             // faint crumb where there is plenty; on a narrow terminal "› overview" and the pattern
@@ -225,7 +227,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 crumbs.remove(1);
             }
             if room(&crumbs, &tail, &right) < 16 {
-                // the token count is the least of what the right side says
+                // the token count is the least of what the right side says — its cached
+                // reading goes first, then the count itself
+                right.retain(|s| !s.content.ends_with("cached") && s.content != " · ");
+            }
+            if room(&crumbs, &tail, &right) < 16 {
                 right.retain(|s| !s.content.contains('Σ'));
             }
             let tw = room(&crumbs, &tail, &right).min(40);
@@ -590,6 +596,18 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
             }
             if prompting(run, w.agent) {
                 l3.push(Span::styled(format!("  {} prompted", theme::g("◂", "<")), theme::fg(theme::ROSE)));
+            }
+            // "· 1.2M cached" reads the count as what it mostly is; it comes last so that on a
+            // narrow card the badges, which call for a look, keep their columns over it — and
+            // where the count twice does not fit, "· 86% cached" says the same in fewer columns.
+            let used = |spans: &[Span<'static>]| spans.iter().map(|s| w_of(&s.content)).sum::<usize>();
+            let room = (iw as usize).saturating_sub(used(&l3));
+            for share in [a.cached_share(), crate::agent::cached_share_short(a.tokens_total, a.tokens_cached)] {
+                let suffix = super::cached_suffix(share);
+                if !suffix.is_empty() && used(&suffix) <= room {
+                    l3.extend(suffix);
+                    break;
+                }
             }
         } else if let Some(sc) = t.scope.first() {
             l3.push(Span::styled(trunc(sc, iw as usize), theme::faint()));
@@ -1043,8 +1061,10 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
         y += 1;
     }
     y += 1;
-    let tokens = run.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-    cv.put(x, y, &format!("Σ {} tokens across all agents{}", fmt_tokens(tokens), if app.demo { " (simulated)" } else { "" }), theme::muted());
+    let (tokens, cached) = super::run_token_totals(app, run);
+    let mut sum = vec![Span::styled(format!("Σ {} tokens across all agents{}", fmt_tokens(tokens), if app.demo { " (simulated)" } else { "" }), theme::muted())];
+    sum.extend(super::cached_suffix(crate::agent::cached_share(tokens, cached)));
+    cv.spans(x, y, &sum, area.width as i32 - 6);
     y += 1;
     if let (Some(ws), Stage::Done) = (&run.ws, &run.stage) {
         if ws.worktree {
@@ -1098,11 +1118,13 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
         Status::Crashed(m) => format!("crashed: {}", trunc(m, 30)),
         s => format!("{s:?}").to_lowercase(),
     };
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(format!(" {} {} ", theme::role_glyph(&a.glyph), a.name), theme::bold(theme::fg(col))),
-        Span::styled(format!("{} · {}·{} · {} · {} tok ", a.role, a.model_alias, a.effort, st, fmt_tokens(a.tokens_total)), theme::dim()),
-        Span::styled("⏎ zoom ", theme::faint()),
-    ]);
+        Span::styled(format!("{} · {}·{} · {} · {} tok", a.role, a.model_alias, a.effort, st, fmt_tokens(a.tokens_total)), theme::dim()),
+    ];
+    title.extend(super::cached_suffix(a.cached_share()));
+    title.push(Span::styled(" ⏎ zoom ", theme::faint()));
+    let title = Line::from(title);
     let blk = Block::default().borders(Borders::TOP).border_style(theme::faint()).title(title);
     let inner = blk.inner(area);
     f.render_widget(blk, area);

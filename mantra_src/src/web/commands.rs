@@ -6,7 +6,7 @@ use super::{ConnKind, Inbound};
 use crate::agent::Level;
 use crate::app::{prompt_agent, App};
 use crate::engine::pattern::Pattern;
-use crate::engine::run::{Send, Stage};
+use crate::engine::run::{Send, Stage, WState};
 use crate::hub::{AgentId, Cmd};
 use serde_json::{json, Value};
 
@@ -247,7 +247,15 @@ impl App {
                 // its role names happened to collide with this pattern's.
                 let run_mismatch = self.run.as_ref().map(|r| r.pattern.name != pattern.name).unwrap_or(false);
                 let new_backend = self.registry.backend_of(&self.registry.resolve(&alias));
-                let live: Vec<AgentId> = self.agents.iter().filter(|(_, a)| targets.contains(&a.role)).map(|(id, _)| *id).collect();
+                // Only agents that will run again are switched. An archived one, or a worker
+                // whose attempt is over (done, failed, cancelled), is kept for its card and its
+                // log: it ran on the model it ran on, and rewriting its alias would make a
+                // finished card claim the role's new model.
+                let over = |id: AgentId, a: &crate::agent::Agent| {
+                    a.status == crate::agent::Status::Stopped
+                        || self.run.as_ref().map(|r| r.workers.iter().any(|w| w.agent == Some(id) && matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled))).unwrap_or(false)
+                };
+                let live: Vec<AgentId> = self.agents.iter().filter(|(id, a)| targets.contains(&a.role) && !over(**id, a)).map(|(id, _)| *id).collect();
                 for id in live {
                     if run_mismatch && self.in_run(id) {
                         continue;
@@ -782,6 +790,61 @@ mod tests {
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert_eq!(app.run.as_ref().unwrap().pattern.roles["planner"].model, planner_model_before, "the active run's own pattern must be untouched");
             assert_ne!(app.agents[&planner_agent].model_alias, "capped", "the run's own live agent must be untouched");
+        });
+    }
+
+    /// The reported bug: a role model change rewrote the alias of every agent with that role,
+    /// finished workers included, so a done card read the role's new model although its attempt
+    /// ran on another one. An attempt that is over keeps the alias it ran with; only agents that
+    /// will run again are switched, and the role itself takes the new model for the next spawn.
+    #[test]
+    fn set_role_model_leaves_finished_attempts_on_the_model_they_ran_with() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            let mut pattern = Pattern::builtin();
+            pattern.name = "done-alias-test".into();
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+            let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern.clone(), "goal".into());
+            let worker = |id: &str, agent: AgentId, state: WState| crate::engine::run::Worker {
+                task: crate::engine::plan::Task { id: id.into(), role: "worker-small".into(), ..Default::default() },
+                prompt: String::new(),
+                effort: None,
+                agent: Some(agent),
+                attempt: 1,
+                state,
+                report: String::new(),
+                wt: None,
+                branch: String::new(),
+                spawned: Instant::now(),
+                finished: None,
+                tripwires: vec![],
+                adhoc: false,
+                paused: false,
+                stall_flagged: false,
+                budget_flagged: false,
+                context_override: None,
+                idle_prompts: vec![],
+                transient: false,
+            };
+            for (id, name) in [(2, "p1-done"), (3, "p1-live"), (4, "p1-old")] {
+                add_agent(&mut app, id, name);
+                let a = app.agents.get_mut(&id).unwrap();
+                a.role = "worker-small".into();
+                a.model_alias = "sol".into();
+            }
+            app.agents.get_mut(&4).unwrap().status = crate::agent::Status::Stopped;
+            run_.workers.push(worker("p1-done", 2, WState::Done));
+            run_.workers.push(worker("p1-live", 3, WState::Running));
+            run_.workers.push(worker("p1-old", 4, WState::Cancelled));
+            app.run = Some(run_);
+
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "worker-small".into(), alias: "luna".into(), all: false });
+            assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
+            assert_eq!(app.agents[&3].model_alias, "luna", "a running worker switches");
+            assert_eq!(app.agents[&2].model_alias, "sol", "a done attempt ran on sol, and its card keeps saying so");
+            assert_eq!(app.agents[&4].model_alias, "sol", "an archived attempt too");
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["worker-small"].model, "luna", "the next spawn of the role takes the new model");
         });
     }
 

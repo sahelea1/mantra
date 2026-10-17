@@ -226,6 +226,10 @@ pub struct AgentView {
     pub quiet_ms: Option<u64>,
     pub turn_count: u32,
     pub tokens_total: u64,
+    /// Of `tokens_total`, the input served from the cache — the same context re-read on every
+    /// request, which is most of a big total (`Agent::tokens_cached`).
+    #[serde(default)]
+    pub tokens_cached: u64,
     pub ctx_used: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctx_window: Option<u64>,
@@ -432,6 +436,9 @@ pub struct RunView {
     pub started_at: u64,
     pub elapsed_ms: u64,
     pub total_tokens: u64,
+    /// Of `total_tokens`, the cached input of the agents still on the run (`ui::run_token_totals`).
+    #[serde(default)]
+    pub cached_tokens: u64,
     pub busy_count: usize,
     pub workspace: String,
     pub branch: String,
@@ -816,6 +823,7 @@ fn agent_view_with(app: &App, a: &Agent, facts: &RunFacts) -> AgentView {
         quiet_ms: crate::ui::quiet_for(a).map(secs_ms),
         turn_count: a.turn_count,
         tokens_total: a.tokens_total,
+        tokens_cached: a.tokens_cached,
         ctx_used: a.ctx_used,
         ctx_window: a.ctx_window,
         ctx_percent: a.ctx_percent(),
@@ -944,6 +952,7 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         })
         .collect();
     let members = r.all_agents();
+    let (total_tokens, cached_tokens) = crate::ui::run_token_totals(app, r);
     RunView {
         id: r.id.clone(),
         title: r.title.clone(),
@@ -967,7 +976,8 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         alerts: r.alerts.clone(),
         started_at: r.started_unix.saturating_mul(1000),
         elapsed_ms: secs_ms(r.elapsed()),
-        total_tokens: r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0)),
+        total_tokens,
+        cached_tokens,
         busy_count: members.iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count(),
         workspace: r.workspace_dir().to_string_lossy().to_string(),
         branch: format!("mantra/{}", r.id),
@@ -1530,6 +1540,51 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["title"], "Notes sync");
         assert_eq!(json["stage"]["label"], "phase 1 · fix r2");
+    }
+
+    /// Token counts travel with their cached share — per agent and for the run — so the web
+    /// chips and the run hero can read a big total as what it mostly was.
+    #[test]
+    fn views_carry_the_cached_share_of_the_token_totals() {
+        let mut app = test_app();
+        add_agent(&mut app, 1, "p1-api");
+        add_agent(&mut app, 2, "orchestrator");
+        let usage = |app: &mut App, id: AgentId, total: u64, cached: u64| {
+            app.agents.get_mut(&id).unwrap().apply("thread/tokenUsage/updated", &serde_json::json!({"tokenUsage": {"total": {"totalTokens": total, "cachedInputTokens": cached}, "last": {"inputTokens": 1000, "outputTokens": 10}}}));
+        };
+        usage(&mut app, 1, 6_800_000, 5_900_000);
+        usage(&mut app, 2, 200_000, 50_000);
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        run.orchestrator = Some(2);
+        run.workers.push(crate::engine::run::Worker {
+            task: crate::engine::plan::Task { id: "p1-api".into(), role: "worker-small".into(), ..Default::default() },
+            prompt: String::new(),
+            effort: None,
+            agent: Some(1),
+            attempt: 1,
+            state: crate::engine::run::WState::Running,
+            report: String::new(),
+            wt: None,
+            branch: String::new(),
+            spawned: Instant::now(),
+            finished: None,
+            tripwires: vec![],
+            adhoc: false,
+            paused: false,
+            stall_flagged: false,
+            budget_flagged: false,
+            context_override: None,
+            idle_prompts: vec![],
+            transient: false,
+        });
+        let v = run_view(&app, &run);
+        assert_eq!((v.total_tokens, v.cached_tokens), (7_000_000, 5_950_000), "the run's total and its cached share over the agents on it");
+        app.run = Some(run);
+        let facts = run_facts(&app);
+        let a = agent_view_with(&app, &app.agents[&1], &facts);
+        assert_eq!((a.tokens_total, a.tokens_cached), (6_800_000, 5_900_000));
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["tokens_cached"], 5_900_000);
     }
 
     #[test]

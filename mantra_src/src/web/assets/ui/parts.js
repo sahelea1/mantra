@@ -45,9 +45,14 @@
     }
 
     function ctxColor(p) { return p >= 85 ? 'var(--red)' : p >= 65 ? 'var(--amber)' : 'var(--teal)'; }
+    // " · 5.9M cached" after a token count, muted — nothing when the share is not worth a word.
+    function cachedNote(total, cachedN) {
+        const c = F.cached(total, cachedN);
+        return c ? h('span', { class: 'ctx-cached' }, ' · ' + c) : null;
+    }
     function ctxGauge(a, wide) {
         if (a.ctx_percent === undefined || a.ctx_percent === null) {
-            return a.tokens_total ? h('span', { class: 'ctx none' }, F.tokens(a.tokens_total) + ' tok') : null;
+            return a.tokens_total ? h('span', { class: 'ctx none' }, F.tokens(a.tokens_total) + ' tok', cachedNote(a.tokens_total, a.tokens_cached)) : null;
         }
         const p = a.ctx_percent;
         return h('span', { class: 'ctx' + (wide ? ' wide' : ''), title: 'context ' + p + '% of ' + F.tokens(a.ctx_window) + (a.ctx_assumed ? ' (window assumed)' : '') + ' · compacts at ' + a.compact_percent + '%' },
@@ -55,7 +60,7 @@
                 h('span', { class: 'ctx-fill', style: { width: p + '%', background: ctxColor(p) } }),
                 a.compact_percent ? h('span', { class: 'ctx-tick', style: { left: a.compact_percent + '%' } }) : null),
             h('span', { class: 'ctx-num', style: { color: p >= 65 ? ctxColor(p) : null } }, 'ctx ' + p + '%'),
-            a.tokens_total ? h('span', { class: 'ctx-tok' }, ' · ' + F.tokens(a.tokens_total) + ' tok') : null);
+            a.tokens_total ? h('span', { class: 'ctx-tok' }, ' · ' + F.tokens(a.tokens_total) + ' tok', cachedNote(a.tokens_total, a.tokens_cached)) : null);
     }
 
     function modelChip(a, onclick) {
@@ -154,7 +159,7 @@
                     h('i', { class: 'dot' }),
                     h('span', { class: 'st' }, st.text),
                     !opts.compact && w && w.title ? h('span', { class: 'row-extra' }, ' · ' + F.trunc(w.title, 60)) : null,
-                    !opts.compact && a.tokens_total && a.busy ? h('span', { class: 'row-extra' }, ' · ' + F.tokens(a.tokens_total) + ' tok') : null)),
+                    !opts.compact && a.tokens_total && a.busy ? h('span', { class: 'row-extra' }, ' · ' + F.tokens(a.tokens_total) + ' tok', cachedNote(a.tokens_total, a.tokens_cached)) : null)),
             unread ? h('span', { class: 'unread', title: unread + ' new' }, unread > 9 ? '9+' : String(unread)) : null,
             opts.compact ? null : h('span', { class: 'row-meta' }, a.model_alias),
             icon('chevron', 'chev'));
@@ -253,6 +258,8 @@
         bits.push(stageWhere(run));
         if (run.elapsed_ms) bits.push(F.durShort(run.elapsed_ms));
         if (run.total_tokens) bits.push(F.tokens(run.total_tokens) + ' tok');
+        const c = F.cached(run.total_tokens, run.cached_tokens);
+        if (c) bits.push(c);
         if (run.busy_count) bits.push(run.busy_count + ' busy');
         return bits.filter(Boolean).join(' · ');
     }

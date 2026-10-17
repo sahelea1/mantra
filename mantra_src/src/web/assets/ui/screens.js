@@ -141,7 +141,7 @@
             run.title && run.title !== run.brief ? h('div', { class: 'run-brief dim' }, F.trunc(run.brief, 200)) : null,
             P.stageRail(run, plan, true),
             h('div', { class: 'run-stats' },
-                stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens)), stat('busy', String(run.busy_count || 0))),
+                stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens), F.cached(run.total_tokens, run.cached_tokens)), stat('busy', String(run.busy_count || 0))),
             run.branch ? h('div', { class: 'run-branch mono dim' }, '⎇ ' + run.branch) : null,
             st.error ? h('div', { class: 'errbox' }, icon('alert'), h('span', null, st.error)) : null));
         // The review card below replaces the review band here.
@@ -174,7 +174,8 @@
         }
         return page('run', kids);
     }
-    function stat(label, value) { return value ? h('div', { class: 'stat', key: label }, h('span', { class: 'stat-v' }, value), h('span', { class: 'stat-l' }, label)) : null; }
+    // `sub` is a muted reading of the value under it ("5.9M cached" under a token total).
+    function stat(label, value, sub) { return value ? h('div', { class: 'stat', key: label }, h('span', { class: 'stat-v' }, value), sub ? h('span', { class: 'stat-sub' }, sub) : null, h('span', { class: 'stat-l' }, label)) : null; }
 
     // ── Pulse ────────────────────────────────────────────────────────────────────────────────────
     const ALERT = { red: 1, amber: 1, rose: 1 };
