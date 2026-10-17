@@ -724,6 +724,13 @@ async fn worker(e: &Em, text: &str) -> Outcome {
         step!(e.say("Waiting for the orchestrator's decision on pagination before writing the handlers.").await);
         return Outcome::Done;
     }
+    // Demo (`MANTRA_MOCK_GATEWAY_DOWN=<file>`): while that file exists, every turn of a fix worker
+    // fails the way a dead gateway does (a 503) — the outage halt that wakes nobody, and the
+    // respawn on resume once the file is gone.
+    if id.starts_with("fix-") && std::env::var_os("MANTRA_MOCK_GATEWAY_DOWN").map(|f| std::path::Path::new(&f).exists()).unwrap_or(false) {
+        step!(e.sleep(200).await);
+        return Outcome::Failed(json!({"responseStreamDisconnected": {"httpStatusCode": 503}}), "unexpected status 503 Service Unavailable".into());
+    }
     if text.contains("[mantra:retry]") || text.contains("[mantra:resume]") {
         step!(e.think("**Resuming**\n\nPicking up where the previous attempt stopped.").await);
     } else if !text.contains("[from") {
