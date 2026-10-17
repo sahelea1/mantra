@@ -209,6 +209,10 @@ pub struct App {
     /// When the halt the stage selection last jumped to began: a new halt about one agent
     /// selects it once, so the band's `m` / `r` act on the agent it names.
     halt_seen: Option<Instant>,
+    /// The task whose card the selection follows across an `r` respawn: the new attempt has no
+    /// agent, so no node, until its worktree is ready, and the selection lands on it when it
+    /// does instead of staying wherever the shorter node list left it.
+    sel_follow: Option<String>,
     pub canvas_focus: bool,
     pub verbose: bool,
     pub side_panel: bool,
@@ -650,6 +654,7 @@ impl App {
             toast: None,
             sel: 0,
             halt_seen: None,
+            sel_follow: None,
             canvas_focus: false,
             verbose: false,
             pulse_panel: true,
@@ -1392,11 +1397,28 @@ impl App {
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
         if self.run.is_some() {
+            self.follow_respawned_task();
             let n = self.stage_nodes().len();
             if n > 0 && self.sel >= n {
                 self.sel = n - 1;
             }
             self.select_halted_agent();
+        }
+    }
+
+    /// `sel_follow`: once the respawned task's newest attempt has an agent, select its node.
+    fn follow_respawned_task(&mut self) {
+        let Some(task) = &self.sel_follow else { return };
+        let Some(r) = &self.run else { return };
+        let Some(newest) = r.workers.iter().rev().find(|w| &w.task.id == task) else {
+            self.sel_follow = None;
+            return;
+        };
+        if let Some(a) = newest.agent {
+            if let Some(i) = self.stage_nodes().iter().position(|n| *n == a) {
+                self.sel = i;
+            }
+            self.sel_follow = None;
         }
     }
 
@@ -1983,10 +2005,12 @@ impl App {
         if nav {
             match k.code {
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                    self.sel_follow = None;
                     self.sel = self.sel.saturating_sub(1);
                     return true;
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                    self.sel_follow = None;
                     if !nodes.is_empty() {
                         self.sel = (self.sel + 1).min(nodes.len() - 1);
                     }
@@ -2031,7 +2055,11 @@ impl App {
                         self.hub.send(a, Cmd::Restart);
                     } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
                         match res {
-                            Ok(what) => self.toast(what, Level::Info),
+                            Ok(what) => {
+                                // a worker's new attempt has no node until its agent exists
+                                self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
+                                self.toast(what, Level::Info);
+                            }
                             Err(msg) => self.toast(msg, Level::Warn),
                         }
                     }
@@ -2714,6 +2742,43 @@ mod tests {
         app.run.as_mut().unwrap().workers.push(attempt("fix-1", 1, Some(20), WState::Running));
         app.run.as_mut().unwrap().gate_agent = Some(30);
         assert_eq!(app.stage_nodes(), vec![1, 3, 11, 20, 30]);
+    }
+
+    /// `r` on a worker: its new attempt has no node until its agent exists, so the shorter
+    /// list would leave the selection on a neighbour. It follows the task and lands on the new
+    /// attempt's card when that attempt has an agent; moving the selection meanwhile cancels that.
+    #[test]
+    fn the_selection_follows_a_respawned_task_to_its_new_attempt() {
+        use crate::engine::plan::{Phase, Plan, Task};
+        use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::worker as attempt;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.orchestrator = Some(3);
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-api"), task("p1-ui")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(attempt("p1-api", 1, Some(10), WState::Running));
+        run.workers.push(attempt("p1-ui", 1, Some(11), WState::Cancelled));
+        run.workers.push(attempt("p1-ui", 2, None, WState::Preparing));
+        app.run = Some(run);
+        app.sel = 2;
+        app.sel_follow = Some("p1-ui".into());
+        app.tick();
+        assert_eq!(app.stage_nodes(), vec![3, 10]);
+        assert_eq!(app.sel, 1, "clamped to the last card while the new attempt has none");
+        app.run.as_mut().unwrap().workers[2].agent = Some(12);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 12, "and back on p1-ui once it has");
+        assert_eq!(app.sel_follow, None);
+        // an arrow key in between is the user choosing: nothing follows any more
+        app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 3, None, WState::Preparing));
+        app.sel_follow = Some("p1-ui".into());
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.run.as_mut().unwrap().workers[3].agent = Some(13);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 10, "the selection stays on p1-api, where ← put it");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the

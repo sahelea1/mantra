@@ -588,27 +588,32 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
         if let (Some(w), Some(a)) = (w, a) {
             let el = w.finished.map(|f| f.duration_since(w.spawned)).unwrap_or_else(|| w.spawned.elapsed());
             l3.push(Span::styled(format!("{} · {}", fmt_dur(el), fmt_tokens(a.tokens_total)), theme::faint()));
+            let mut badges = vec![];
             if w.attempt > 1 {
-                l3.push(Span::styled(format!("  {}{}", theme::g("↻", "r"), w.attempt), theme::fg(theme::AMBER)));
+                badges.push(Span::styled(format!("  {}{}", theme::g("↻", "r"), w.attempt), theme::fg(theme::AMBER)));
             }
             if !w.tripwires.is_empty() {
-                l3.push(Span::styled(format!("  {} scope", theme::g("⚠", "!")), theme::fg(theme::AMBER)));
+                badges.push(Span::styled(format!("  {} scope", theme::g("⚠", "!")), theme::fg(theme::AMBER)));
             }
             if prompting(run, w.agent) {
-                l3.push(Span::styled(format!("  {} prompted", theme::g("◂", "<")), theme::fg(theme::ROSE)));
+                badges.push(Span::styled(format!("  {} prompted", theme::g("◂", "<")), theme::fg(theme::ROSE)));
             }
-            // "· 1.2M cached" reads the count as what it mostly is; it comes last so that on a
-            // narrow card the badges, which call for a look, keep their columns over it — and
-            // where the count twice does not fit, "· 86% cached" says the same in fewer columns.
+            // "· 1.2M cached" reads the count as what it mostly is. The badges, which call for a
+            // look, keep their columns over it; where the count twice does not fit, "· 86%
+            // cached" says the same in fewer columns. On a card too narrow even for that (three
+            // tasks side by side) the elapsed time gives way to it once the count is in the
+            // millions — the bare "6.8M" that misleads; a smaller count keeps the clock.
             let used = |spans: &[Span<'static>]| spans.iter().map(|s| w_of(&s.content)).sum::<usize>();
-            let room = (iw as usize).saturating_sub(used(&l3));
-            for share in [a.cached_share(), crate::agent::cached_share_short(a.tokens_total, a.tokens_cached)] {
-                let suffix = super::cached_suffix(share);
-                if !suffix.is_empty() && used(&suffix) <= room {
-                    l3.extend(suffix);
-                    break;
-                }
+            let room = (iw as usize).saturating_sub(used(&badges));
+            let full = super::cached_suffix(a.cached_share());
+            let short = super::cached_suffix(crate::agent::cached_share_short(a.tokens_total, a.tokens_cached));
+            let bare = vec![Span::styled(fmt_tokens(a.tokens_total), theme::faint())];
+            let big = a.tokens_total >= 1_000_000;
+            let read = [(&l3, full, true), (&l3, short.clone(), true), (&bare, short, big)].into_iter().find(|(count, suffix, ok)| *ok && !suffix.is_empty() && used(count) + used(suffix) <= room);
+            if let Some((count, suffix, _)) = read {
+                l3 = count.iter().cloned().chain(suffix).collect();
             }
+            l3.extend(badges);
         } else if let Some(sc) = t.scope.first() {
             l3.push(Span::styled(trunc(sc, iw as usize), theme::faint()));
         }
@@ -1263,9 +1268,23 @@ mod tests {
         let all = frame(&mut app, 120, 36).join("\n");
         assert!(all.contains("Σ 6.80M tok · 5.90M cached"), "{all}");
         assert!(all.contains("6.80M · 5.90M cached") || all.contains("6.80M · 86% cached"), "{all}");
-        let all = frame(&mut app, 80, 24).join("\n");
-        assert!(all.contains("6.80M"), "{all}");
-        assert!(!all.contains("cached cached"), "{all}");
+        // three tasks side by side: the reading takes the clock's columns for a count in the
+        // millions, and a smaller count keeps its clock
+        use crate::engine::run::WState;
+        let run = app.run.as_mut().unwrap();
+        let mut t = run.plan.as_ref().unwrap().phases[0].tasks[0].clone();
+        t.id = "p1-docs".into();
+        run.plan.as_mut().unwrap().phases[0].tasks.push(t);
+        run.workers.push(crate::web::snapshot::tests::worker("p1-docs", 1, Some(12), WState::Running));
+        crate::web::snapshot::tests::add_agent(&mut app, 12, "p1-docs");
+        let small = serde_json::json!({"tokenUsage": {"total": {"totalTokens": 33_000, "cachedInputTokens": 26_400}, "last": {"inputTokens": 1000, "outputTokens": 10}}});
+        app.agents.get_mut(&12).unwrap().apply("thread/tokenUsage/updated", &small);
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains("│ 6.80M · 86% cached"), "{all}");
+        assert!(all.contains("│ 0s · 33.0k "), "{all}");
+        // where the header runs out of room the reading goes before the count
+        let top = frame(&mut app, 80, 24).remove(0);
+        assert!(top.contains("Σ 6.83M tok") && !top.contains("cached"), "{top}");
     }
 
     /// One card per fix task in the finale's side column, the newest attempt — the node the

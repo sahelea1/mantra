@@ -59,6 +59,22 @@ impl St {
     }
 }
 
+/// Demo (`MANTRA_MOCK_BIGCTX=1`): the agents work in a big repo and cycle tools, so each step
+/// is several requests that all re-read a large prefix, and a worker's total reaches millions
+/// within a few turns, nearly all of it cached — the shape the cards' cached reading exists for.
+fn big_ctx() -> bool {
+    std::env::var("MANTRA_MOCK_BIGCTX").is_ok()
+}
+
+/// A new thread's context (see `big_ctx`).
+fn start_ctx() -> u64 {
+    if big_ctx() {
+        120_000
+    } else {
+        9000
+    }
+}
+
 pub async fn run() {
     let speed = std::env::var("MANTRA_MOCK_SPEED").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0).max(0.05);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -119,7 +135,7 @@ fn handle(st: &Arc<St>, method: &str, id: Value, p: Value) {
             let resumed = method == "thread/resume";
             {
                 let mut th = st.threads.lock().unwrap();
-                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, cached: 0, ctx: 9000 });
+                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, cached: 0, ctx: start_ctx() });
                 if !dev.is_empty() {
                     e.role = role;
                     e.dev = dev;
@@ -306,10 +322,11 @@ impl Em {
             // Codex's running total counts every request's whole input, and each request
             // re-reads the thread so far — the same prefix, served from the cache. So a busy
             // agent's total is mostly cached input, which is what the cards' "· n cached"
-            // suffix exists to say; the demo shows the same shape.
-            let prefix = t.ctx;
+            // suffix exists to say; the demo shows the same shape. Not every re-read hits the
+            // cache (an edited file, an expired entry): an eighth of the prefix is read afresh.
+            let prefix = t.ctx * if big_ctx() { 4 } else { 1 };
             t.tokens += add + prefix;
-            t.cached += prefix;
+            t.cached += prefix / 8 * 7;
             t.ctx += add * 2;
             (t.tokens, t.cached, t.ctx, t.model.clone())
         }).unwrap_or((add, 0, add, String::new()));
@@ -325,8 +342,10 @@ impl Em {
             self.item(&json!({"type": "contextCompaction", "id": id}), true);
         }
         let ctx = ctx.min(window - 1000);
+        // what was not re-read from the cache: the new input and the output, a third of it output
+        let fresh = total.saturating_sub(cached);
         self.notify("thread/tokenUsage/updated", json!({"threadId": self.tid, "turnId": self.turn, "tokenUsage": {
-            "total": {"totalTokens": total, "inputTokens": total * 4 / 5, "cachedInputTokens": cached.min(total * 4 / 5), "cacheWriteInputTokens": 0, "outputTokens": total / 5, "reasoningOutputTokens": total / 10},
+            "total": {"totalTokens": total, "inputTokens": total - fresh / 3, "cachedInputTokens": cached, "cacheWriteInputTokens": 0, "outputTokens": fresh / 3, "reasoningOutputTokens": fresh / 6},
             "last": {"totalTokens": ctx, "inputTokens": ctx.saturating_sub(800), "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 800, "reasoningOutputTokens": 300},
             "modelContextWindow": window}}));
     }
