@@ -298,7 +298,8 @@ glyph = one narrow symbol like ✦ ◉ ◇ ◆ ◎ ▲ ■ ● ★, color = saff
 model = alias, effort = auto|low|medium|high|xhigh|max (auto: Mantra picks per spawn from the role's job), sandbox, description, instructions), and [flow]
 (planner, manager ("" = none: a run-wide supervisor that unsticks agents and resolves halts before the
 planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]] steps with role, task, may_spawn).
-[settings] also has manager_minutes (how often the manager gets a health digest; 0 = escalations only).
+[settings] also has manager_minutes (how often the manager gets a health digest; 0 = escalations only) and
+context_cap (the most tokens of context any agent is told it has, 200000 in the built-ins; 0 = the model's full window).
 A role may also set fallback = alias: the model that takes over when an agent of that role sits through
 settings.first_token_minutes (default 4; 0 = off) twice with no output at all.
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.

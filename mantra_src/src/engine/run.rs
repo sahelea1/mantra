@@ -1063,20 +1063,22 @@ impl Run {
     /// (gate exhausted, attempts exhausted) is handed to the planner with everything it needs to
     /// decide — revise the phase, give the stuck agent a hint and resume, or ask the user.
     fn halt_and_escalate(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String) {
-        self.halt_and_escalate_full(ctx, reason, agent, message.clone(), message);
+        self.halt_and_escalate_full(ctx, reason, agent, message.clone(), message, None);
     }
 
     /// `halt_and_escalate` with the untruncated text (see `halt_full`): the escalation prompt
-    /// carries `full`, so the manager or planner reads the real error.
-    fn halt_and_escalate_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
+    /// carries `full`, so the manager or planner reads the real error. `error`: the failed turn's
+    /// own error when the halt is about one (a task out of attempts, a fix worker whose turn
+    /// failed) — only that is read for an outage, never the prose around it: a blocked report
+    /// or a task title that says "timeout" is not the gateway.
+    fn halt_and_escalate_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String, error: Option<&str>) {
         if self.halted() {
             return;
         }
         // A failure that is the gateway's (a 5xx, a reset connection — `is_transport_error`) is
         // nobody's to resolve: the manager and the planner run through the same gateway, so
-        // waking them is just more failed turns. Only a halt that carries a turn's error is read
-        // this way — a gate verdict is the QA agent's prose, where "timeout" means something else.
-        if matches!(reason, HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) && crate::agent::is_transport_error(None, &full) {
+        // waking them is just more failed turns.
+        if error.map(|e| crate::agent::is_transport_error(None, e)).unwrap_or(false) {
             self.halt_for_outage(ctx, reason, agent, message, full);
             return;
         }
@@ -1112,12 +1114,13 @@ impl Run {
         }
     }
 
-    /// The model gateway is down: halt for the user and nobody else, with the wording of a dead
-    /// gateway under a planner (`GATEWAY_DOWN_HINT`, so the band and the web hint already fit).
-    /// `reason` is the halt's own — `AgentTurnFailed` for a worker the outage failed, the
-    /// exhausted-attempts one when it came through `halt_and_escalate` — but no rung of the
-    /// chain of command is woken: the manager and the planner would only fail the same way, and
-    /// `resume` respawns every worker the outage took (`respawn_after_outage`).
+    /// The model gateway is down: halt for the user and nobody else, with the dead-gateway
+    /// wording (`GATEWAY_DOWN_HINT`, so the band and the web hint already fit). `reason` is the
+    /// halt's own — `AgentTurnFailed` for a worker past its gateway retries or for every working
+    /// agent failing on the transport at once, the exhausted-attempts one when it came through
+    /// `halt_and_escalate` — but no rung of the chain of command is woken: the manager and the
+    /// planner would only fail the same way, and `resume` respawns every worker the outage took
+    /// (`respawn_after_outage`).
     fn halt_for_outage(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
         if self.halted() {
             return;
@@ -1766,8 +1769,8 @@ Then summarize in 2-4 lines.",
             // escalation get the whole last failure
             let tail = |m: Option<String>| m.map(|m| format!(" Last failure: {m}.")).unwrap_or_default();
             let msg = format!("{} has used all {cap} attempts — not respawning.{}", task.id, tail(failure.as_ref().map(|m| trunc(m, 160))));
-            let full = format!("{} has used all {cap} attempts — not respawning.{}", task.id, tail(failure));
-            self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, None, msg.clone(), full);
+            let full = format!("{} has used all {cap} attempts — not respawning.{}", task.id, tail(failure.clone()));
+            self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, None, msg.clone(), full, failure.as_deref());
             return format!("REFUSED: {msg}");
         }
         let queued = running >= self.pattern.settings.max_parallel;
@@ -2454,6 +2457,7 @@ Then summarize in 2-4 lines.",
                             gate,
                             format!("phase {} gate: the same check(s) fail identically after two gate rounds — {}", phase + 1, trunc(&cmds, 80)),
                             format!("phase {} gate: the same check(s) fail identically after two gate rounds — {cmds}", phase + 1),
+                            None,
                         );
                         return;
                     }
@@ -2469,6 +2473,7 @@ Then summarize in 2-4 lines.",
                         gate,
                         format!("phase {} gate still failing after {} rounds: {}", phase + 1, round, trunc(&cmds, 80)),
                         format!("phase {} gate still failing after {} rounds: {cmds}", phase + 1, round),
+                        None,
                     );
                 }
             }
@@ -2529,8 +2534,11 @@ Then summarize in 2-4 lines.",
         if agent.ctx_window != Some(crate::discover::ASSUMED_CONTEXT) {
             return; // an explicit context_window is in effect — leave it to the user
         }
-        let halved = crate::discover::ASSUMED_CONTEXT / 2;
         let model = agent.model_alias.clone();
+        if self.known_models.get(&model).map(|w| *w != crate::discover::ASSUMED_CONTEXT).unwrap_or(false) {
+            return; // a bigger window of the model's own, told 200k by `context_cap`: no assumption
+        }
+        let halved = crate::discover::ASSUMED_CONTEXT / 2;
         self.workers[wi].context_override = Some(halved);
         self.log("⚠", "amber", format!("context window assumed 200k was too large for {model}; using {}k — set it in /models", halved / 1000));
     }
@@ -2668,15 +2676,19 @@ Then summarize in 2-4 lines.",
                     }
                 }
                 let n = self.name_of(a);
+                if reason == HaltReason::AgentTurnFailed && kind == Some(ErrKind::Transient) && self.gateway_down(ctx, a) {
+                    // every agent that was working failed on the transport within the minute: the
+                    // gateway is down, for the manager too — nobody but the user is told
+                    self.halt_for_outage(ctx, reason, Some(a), format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"));
+                    self.retry_counts.remove(&a);
+                    return;
+                }
                 // The pulse line keeps the short form; the journal, `state.json` and the escalation
                 // get the backend's whole error.
                 let (detail, full) = if reason == HaltReason::ProviderRejected {
                     let (alias, provider) = ctx.agent(a).map(|ag| (ag.model_alias.clone(), ag.provider.clone())).unwrap_or_default();
                     let role = self.role_name_of(a).unwrap_or_default();
                     (format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120)), format!("{n} [{role}] ({alias} via {provider}): {msg}"))
-                } else if reason == HaltReason::AgentTurnFailed && kind == Some(ErrKind::Transient) && self.gateway_down(ctx, a) {
-                    // every agent that was working failed on the transport within the minute
-                    (format!("{n}: {} — {GATEWAY_DOWN_HINT}", trunc(&msg, 120)), format!("{n}: {msg} — {GATEWAY_DOWN_HINT}"))
                 } else {
                     (format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"))
                 };
@@ -2817,6 +2829,7 @@ Then summarize in 2-4 lines.",
                                 Some(a),
                                 format!("phase {} gate stuck on the same blocker twice: {}", idx + 1, trunc(&why, 80)),
                                 format!("phase {} gate stuck on the same blocker twice: {why}", idx + 1),
+                                None,
                             );
                         } else if round < self.pattern.settings.gate_max_rounds {
                             self.gate_report = None;
@@ -2831,6 +2844,7 @@ Then summarize in 2-4 lines.",
                                 Some(a),
                                 format!("phase {} gate not passed after {round} rounds: {}", idx + 1, trunc(&why, 80)),
                                 format!("phase {} gate not passed after {round} rounds: {why}", idx + 1),
+                                None,
                             );
                         }
                     }
@@ -3054,7 +3068,8 @@ Then summarize in 2-4 lines.",
                     // the manager and the planner are asked. The run waits for the gateway.
                     self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"));
                 } else if let Some(round) = fix_round {
-                    self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200)));
+                    let msg = format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200));
+                    self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, msg.clone(), msg, Some(&e));
                 } else {
                     self.orch_event(ctx, format!("{tid} FAILED: {e}\nUse mantra_retry (optionally with a better prompt)."));
                 }
@@ -3418,8 +3433,16 @@ Then summarize in 2-4 lines.",
             if let Some(r) = self.pattern.roles.get_mut(&role_name) {
                 r.model = alias;
             }
-            // a resume rebuilds the pattern from this file, so it must carry the switch
-            let _ = std::fs::write(self.dir.join("pattern.toml"), self.pattern.to_toml());
+            // The fallback is the role's model from now on (a resume rebuilds the pattern from the
+            // run's `pattern.toml`, which `save_state` rewrites below); a model the user had
+            // switched this very agent to is what went silent, so it no longer outranks the role.
+            match self.worker_idx(a) {
+                Some(wi) => self.workers[wi].model = None,
+                None => {
+                    let slot = self.slot_of(a);
+                    self.slot_models.remove(&slot);
+                }
+            }
             // the new model gets its own restart-then-escalate cycle
             self.first_token_strikes.remove(&key);
             let note = format!("[mantra:watchdog] Your previous model produced no output for {quiet}, twice in a row; you are its replacement. Continue where you left off.");
@@ -7678,6 +7701,32 @@ mod halt_tests {
         assert!(h.full.ends_with("failed workers are respawned automatically"));
     }
 
+    /// The dead-gateway halt of a fixed agent is not handed to the manager either: it would
+    /// fail its turn on the same gateway. A planner failure that is not the gateway still is.
+    #[test]
+    fn a_dead_gateway_halt_does_not_wake_the_manager() {
+        for (outage, err) in [(true, "502 Bad Gateway"), (false, "the model returned an empty response")] {
+            let mut ctx = TestCtx::new();
+            let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+            run.dir = scratch_dir("gateway-manager");
+            assert!(run.has_manager());
+            let planner = ctx.add_idle();
+            let w = ctx.add_busy();
+            run.planner = Some(planner);
+            run.stage = Stage::Planning;
+            run.turn_fail_retried.insert("planner".into());
+            run.retry_counts.insert(planner, 99);
+            run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+            run.transport_errs.insert(w, Instant::now());
+            run.on_turn_done(&mut ctx, planner, "failed", Some(err.into()), if outage { Some(ErrKind::Transient) } else { None });
+            let h = run.halt.as_ref().expect("halted");
+            assert_eq!(h.reason, HaltReason::AgentTurnFailed);
+            assert_eq!(h.message.ends_with(GATEWAY_DOWN_HINT), outage, "{}", h.message);
+            assert_eq!(ctx.spawns.iter().any(|s| s.name == "manager"), !outage, "{err}: the manager is asked only when it is not the gateway");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+    }
+
     // A gateway outage under a fix worker ---------------------------------------------------------
 
     /// A `TestCtx` whose jobs run: the closure's result is kept with its tag, for the test to
@@ -7806,6 +7855,22 @@ mod halt_tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    /// Only a failed turn's own error is read for an outage: a blocked fix worker whose report
+    /// talks about timeouts and a 503 from the code under test is still escalated.
+    #[test]
+    fn a_blocked_report_that_mentions_timeouts_is_not_an_outage() {
+        let integ = scratch_dir("fix-blocked-integ");
+        let mut ctx = TestCtx::new();
+        let (mut run, _planner, w) = run_in_fix_round(&mut ctx, &integ);
+        ctx.agents.get_mut(&w).unwrap().final_message = Some("status: blocked\nthe API test gets a timeout and a 503 from the stub server; the gate's check cannot pass here".into());
+        run.on_turn_done(&mut ctx, w, "completed", None, None);
+        let h = run.halt.as_ref().expect("halted");
+        assert_eq!(h.reason, HaltReason::AttemptsExhausted);
+        assert!(h.message.contains("it is blocked") && !h.message.contains("gateway looks down"), "{}", h.message);
+        assert!(run.manager_escalation.is_some(), "the chain of command is asked");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
     /// `halt_and_escalate` itself, handed a transport error (a task out of attempts whose last
     /// failure was a 503): the halt stands, with the gateway wording, and nobody is woken — the
     /// manager and the planner share the outage.
@@ -7901,6 +7966,27 @@ mod halt_tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    /// A switched agent that goes silent twice falls back like any other: the role's fallback
+    /// replaces the model the user picked, which no longer outranks the role.
+    #[test]
+    fn the_fallback_replaces_a_switched_model_that_went_silent() {
+        let mut ctx = TestCtx::new();
+        let mut pat = no_manager();
+        pat.roles.get_mut("planner").unwrap().fallback = Some("luna".into());
+        let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+        run.dir = scratch_dir("slot-fallback");
+        run.stage = Stage::Planning;
+        let p = run.spawn_planner(&mut ctx);
+        run.set_agent_model(p, "nova");
+        ctx.agents.get_mut(&p).unwrap().model_alias = "nova".into();
+        let key = run.first_token_key(p).unwrap();
+        run.first_token_strikes.insert(key, 1);
+        run.on_first_token_deadline(&mut ctx, p, Duration::from_secs(300));
+        assert_eq!(ctx.spawned("planner").last().unwrap().model, "luna", "on the fallback, not back on the switch");
+        assert!(run.slot_models.is_empty());
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
     // The context cap ---------------------------------------------------------------------------
 
     /// Every spawn is told `min(model window, context_cap)`: a big model is capped, a small one
@@ -7933,6 +8019,26 @@ mod halt_tests {
         run.respawn_orchestrator(&mut ctx, None);
         assert_eq!(ctx.spawned("orchestrator")[0].context_override, None);
         let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// A model with a big window of its own, told 200k by the cap, that still fills its context
+    /// is not on an *assumed* window: it is not halved. One the registry only assumes 200k for is.
+    #[test]
+    fn a_capped_window_is_not_mistaken_for_an_assumed_one() {
+        for (window, halved) in [(1_000_000u64, false), (crate::discover::ASSUMED_CONTEXT, true)] {
+            let mut ctx = TestCtx::new();
+            let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+            run.dir = scratch_dir("cap-shrink");
+            run.set_known_models(known(&[("big", window)]));
+            let w = ctx.add_idle();
+            let ag = ctx.agents.get_mut(&w).unwrap();
+            ag.model_alias = "big".into();
+            ag.ctx_window = Some(crate::discover::ASSUMED_CONTEXT);
+            run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+            run.shrink_assumed_context(&mut ctx, w);
+            assert_eq!(run.workers[0].context_override.is_some(), halved, "window {window}");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
     }
 
     // The owner file ----------------------------------------------------------------------------
