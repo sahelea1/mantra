@@ -115,6 +115,8 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
 /// files are already staged: those stay staged and are the user's to commit, not Mantra's. The
 /// repo's own identity is used when it has one; a fresh `git init` on a machine with no
 /// `user.name`/`user.email` gets Mantra's, so the commit does not fail on "please tell me who you are".
+/// `--no-verify`: the repo's hooks are for the user's own commits — a linter or a commit-message
+/// policy has nothing to check in an empty one, and must not stop the run before it starts.
 fn initial_empty_commit(top: &Path) -> Result<(), String> {
     let mut args: Vec<&str> = vec![];
     if git(top, &["config", "user.name"]).map(|v| v.is_empty()).unwrap_or(true) {
@@ -123,8 +125,8 @@ fn initial_empty_commit(top: &Path) -> Result<(), String> {
     if git(top, &["config", "user.email"]).map(|v| v.is_empty()).unwrap_or(true) {
         args.extend(["-c", "user.email=mantra@localhost"]);
     }
-    args.extend(["commit", "-q", "--allow-empty", "--only", "-m", "mantra: initial commit"]);
-    git(top, &args).map(|_| ())
+    args.extend(["commit", "-q", "--allow-empty", "--only", "--no-verify", "-m", "mantra: initial commit"]);
+    git(top, &args).map(|_| ()).map_err(|e| format!("the repository has no commit yet and Mantra could not create one for the worktrees ({e}) — commit once yourself, or set isolation = shared"))
 }
 
 fn ensure_excluded(top: &Path) -> std::io::Result<()> {
@@ -647,6 +649,14 @@ mod tests {
             git(&staged, &["init", "-q"]).unwrap();
             std::fs::write(staged.join("app.py"), "print('hi')\n").unwrap();
             git(&staged, &["add", "app.py"]).unwrap();
+            // a hook that rejects every commit is the user's policy, not the empty commit's
+            let hook = staged.join(".git").join("hooks").join("pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
             let ws = setup(&staged, "r-staged", "worktree").unwrap();
             assert!(ws.worktree && ws.initial_commit);
             assert_eq!(git(&staged, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap(), "", "an empty commit");

@@ -130,11 +130,16 @@ impl Owner {
     }
 
     /// Remove the owner file — only when it is `self`'s (another process may have taken the run
-    /// over in the meantime; its claim stays).
+    /// over in the meantime; its claim stays) or a dead process's (a crash's leftover, which a
+    /// recycled pid would otherwise turn into a claim one day).
     pub fn release(&self, dir: &Path) {
-        if Owner::load(dir).map(|o| o.pid == self.pid && o.hostname == self.hostname).unwrap_or(false) {
+        if Owner::load(dir).map(|o| o.same_process(self) || !o.alive()).unwrap_or(false) {
             let _ = std::fs::remove_file(dir.join(OWNER_FILE));
         }
+    }
+
+    fn same_process(&self, other: &Owner) -> bool {
+        self.pid == other.pid && self.hostname == other.hostname
     }
 
     /// Remove whatever owner file is there (`--take-over`).
@@ -154,17 +159,25 @@ impl Owner {
     }
 }
 
-/// The owner of `dir`'s run when it is a live process on this host; `None` for no owner file, a
-/// dead pid (a crash — resume normally) or another host.
+/// The owner of `dir`'s run when it is another live process on this host; `None` for no owner
+/// file, a dead pid (a crash — resume normally), another host — or this very process: a file that
+/// names our own pid was left by an earlier process the pid was recycled from (a container's
+/// Mantra is often pid 1 or 7 at every start), since this process gives up its own claim before
+/// it lets go of a run (`App::resume_run` refuses while a run is still active).
 pub fn live_owner(dir: &Path) -> Option<Owner> {
-    Owner::load(dir).filter(|o| o.alive())
+    Owner::load(dir).filter(|o| o.alive() && !o.same_process(&Owner::this_process()))
 }
 
 /// Is there a process with this pid? `/proc` on Linux; `kill -0` elsewhere (it answers "no" for
-/// another user's process too, which for the owner of one's own run dir does not happen).
+/// another user's process too, which for the owner of one's own run dir does not happen). A
+/// zombie — killed, not yet reaped by its parent — still has its `/proc` entry and is gone all
+/// the same: right after a `kill -9` that is exactly what the crashed owner looks like.
 pub fn pid_alive(pid: u32) -> bool {
     if cfg!(target_os = "linux") {
-        return Path::new("/proc").join(pid.to_string()).exists();
+        // `<pid> (<comm>) <state> …` — comm may hold spaces and parentheses, the state follows the last ')'
+        let Ok(stat) = std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")) else { return false };
+        let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next());
+        return !matches!(state, Some('Z' | 'X') | None);
     }
     std::process::Command::new("kill").args(["-0", &pid.to_string()]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
@@ -402,7 +415,7 @@ fn mtime_unix(p: &Path) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sample() -> RunState {
@@ -542,6 +555,25 @@ mod tests {
     /// says "owned", the process is gone — the crash case.
     const DEAD_PID: u32 = 4_000_000_000;
 
+    /// Another live process on this host — what a second Mantra holding the run looks like to
+    /// the check (this test process's own pid would be a recycled one's leftover). Killed on drop.
+    pub(crate) struct Stranger(std::process::Child);
+    impl Stranger {
+        pub(crate) fn spawn() -> Stranger {
+            Stranger(std::process::Command::new("sleep").arg("60").spawn().expect("sleep"))
+        }
+        /// `owner.json` as that process would have written it.
+        pub(crate) fn owner(&self) -> Owner {
+            Owner { pid: self.0.id(), ..Owner::this_process() }
+        }
+    }
+    impl Drop for Stranger {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn the_owner_file_names_this_process_and_is_released_only_by_its_owner() {
         let dir = std::env::temp_dir().join(format!("mantra-owner-{}", std::process::id()));
@@ -552,16 +584,38 @@ mod tests {
         let back = Owner::load(&dir).expect("owner.json written");
         assert_eq!(back.pid, std::process::id());
         assert!(back.alive(), "this test process is alive");
-        assert_eq!(live_owner(&dir).map(|o| o.pid), Some(std::process::id()), "a live owner refuses a second resume");
-        assert!(me.refusal("7-x").contains("pid") && me.refusal("7-x").contains("--take-over"), "{}", me.refusal("7-x"));
-        // another process's claim is not ours to remove …
-        let other = Owner { pid: DEAD_PID, ..me.clone() };
+        assert!(live_owner(&dir).is_none(), "our own pid is no other Mantra: a recycled pid's leftover");
+        // another live Mantra on this host holds it: a second resume is refused
+        let stranger = Stranger::spawn();
+        let other = stranger.owner();
         other.write(&dir);
+        assert_eq!(live_owner(&dir).map(|o| o.pid), Some(other.pid), "a live owner refuses a second resume");
+        assert!(other.refusal("7-x").contains("pid") && other.refusal("7-x").contains("--take-over"), "{}", other.refusal("7-x"));
+        // … and its claim is not ours to remove
         me.release(&dir);
         assert!(Owner::load(&dir).is_some(), "release only removes the caller's own claim");
-        // … but a dead owner is a crash: no refusal, and a resume may take the run
-        assert!(!pid_alive(DEAD_PID));
+        // a dead owner is a crash: no refusal, a resume may take the run, a release tidies it up —
+        // already while it is a zombie its parent has not reaped yet (a `kill -9` a moment ago)
+        #[cfg(target_os = "linux")]
+        {
+            let mut zombie = std::process::Command::new("true").spawn().expect("true");
+            let zpid = zombie.id();
+            let t0 = std::time::Instant::now();
+            while std::fs::read_to_string(format!("/proc/{zpid}/stat")).map(|s| !s.contains(") Z")).unwrap_or(false) && t0.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(Path::new(&format!("/proc/{zpid}")).exists(), "not reaped yet");
+            assert!(!pid_alive(zpid), "a zombie is no live owner");
+            let _ = zombie.wait();
+        }
+        drop(stranger);
+        assert!(!pid_alive(other.pid));
         assert!(live_owner(&dir).is_none(), "a dead pid does not block the resume");
+        Owner { pid: DEAD_PID, ..me.clone() }.write(&dir);
+        assert!(!pid_alive(DEAD_PID) && live_owner(&dir).is_none());
+        me.release(&dir);
+        assert!(Owner::load(&dir).is_none(), "a dead owner's leftover goes with the next release");
+        other.write(&dir);
         Owner::clear(&dir);
         assert!(Owner::load(&dir).is_none());
         me.write(&dir);

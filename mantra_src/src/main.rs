@@ -1243,8 +1243,12 @@ mod resume_tests {
         let root = runs_root("owned", &[&project]);
         let r = list_in(&root).remove(0);
         assert!(claim_for_resume(&r, false).is_ok(), "no owner file: nothing to refuse");
-        // this test process is a live Mantra as far as the check can tell
+        // our own pid in the file is a recycled pid's leftover (a container restart), not a claim
         Owner::this_process().write(&r.dir);
+        assert!(claim_for_resume(&r, false).is_ok(), "this process is no other Mantra");
+        // another live process holds the run
+        let stranger = engine::state::tests::Stranger::spawn();
+        stranger.owner().write(&r.dir);
         let e = claim_for_resume(&r, false).unwrap_err();
         assert!(e.contains("open in another Mantra") && e.contains("--take-over"), "{e}");
         assert!(Owner::load(&r.dir).is_some(), "a refusal leaves the claim alone");
@@ -1265,7 +1269,8 @@ mod resume_tests {
         std::fs::create_dir_all(&project).unwrap();
         let root = runs_root("app", &[&project]);
         let r = list_in(&root).remove(0);
-        Owner { pid: std::process::id(), hostname: Owner::this_process().hostname, started_unix: 1 }.write(&r.dir);
+        let stranger = engine::state::tests::Stranger::spawn();
+        stranger.owner().write(&r.dir);
         let mut app = crate::web::snapshot::tests::test_app();
         app.resume_run(r.clone());
         assert!(app.run.is_none(), "nothing was opened");

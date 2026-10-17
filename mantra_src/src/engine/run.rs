@@ -50,6 +50,10 @@ pub enum JobOut {
 /// and what happens then. One text, so the band, the web hint and the journal always agree.
 pub const GATEWAY_DOWN_HINT: &str = "the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically";
 
+/// The same for a task that ran out of attempts on the outage: there is no failed worker left
+/// for a resume to respawn, so the way back is one more attempt.
+pub const GATEWAY_DOWN_RETRY_HINT: &str = "the model gateway looks down — nobody was asked; once it is back, r (Retry) gives the task one more attempt";
+
 pub struct SpawnReq {
     pub name: String,
     pub role_name: String,
@@ -1079,7 +1083,9 @@ impl Run {
         // nobody's to resolve: the manager and the planner run through the same gateway, so
         // waking them is just more failed turns.
         if error.map(|e| crate::agent::is_transport_error(None, e)).unwrap_or(false) {
-            self.halt_for_outage(ctx, reason, agent, message, full);
+            // no agent: a task out of attempts (`spawn_task`), which no resume respawns
+            let hint = if agent.is_none() && reason == HaltReason::AttemptsExhausted { GATEWAY_DOWN_RETRY_HINT } else { GATEWAY_DOWN_HINT };
+            self.halt_for_outage(ctx, reason, agent, message, full, hint);
             return;
         }
         self.halt_full(ctx, reason, agent, message, full.clone());
@@ -1115,17 +1121,18 @@ impl Run {
     }
 
     /// The model gateway is down: halt for the user and nobody else, with the dead-gateway
-    /// wording (`GATEWAY_DOWN_HINT`, so the band and the web hint already fit). `reason` is the
+    /// wording (`hint`: `GATEWAY_DOWN_HINT`, so the band and the web hint already fit, or
+    /// `GATEWAY_DOWN_RETRY_HINT` for a task with no attempt left). `reason` is the
     /// halt's own — `AgentTurnFailed` for a worker past its gateway retries or for every working
     /// agent failing on the transport at once, the exhausted-attempts one when it came through
     /// `halt_and_escalate` — but no rung of the chain of command is woken: the manager and the
     /// planner would only fail the same way, and `resume` respawns every worker the outage took
     /// (`respawn_after_outage`).
-    fn halt_for_outage(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
+    fn halt_for_outage(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String, hint: &str) {
         if self.halted() {
             return;
         }
-        self.halt_full(ctx, reason, agent, format!("{message} — {GATEWAY_DOWN_HINT}"), format!("{full} — {GATEWAY_DOWN_HINT}"));
+        self.halt_full(ctx, reason, agent, format!("{message} — {hint}"), format!("{full} — {hint}"));
         self.log("◈", "amber", "not escalated: the manager and the planner share the outage — resume when the gateway is back");
     }
 
@@ -2269,6 +2276,11 @@ Then summarize in 2-4 lines.",
             self.finish(ctx);
             return;
         };
+        // A model switched live on a finale agent was a choice for that step's role: the next
+        // step (another role) starts on its own model, a respawn of the same step keeps it.
+        if !matches!(self.stage, Stage::Finale { idx } if idx == k) {
+            self.slot_models.remove("finale");
+        }
         self.stage = Stage::Finale { idx: k };
         self.gate_report = None;
         self.phase_started = Instant::now();
@@ -2523,24 +2535,30 @@ Then summarize in 2-4 lines.",
     }
 
     /// A worker that hit ContextFull while running on the *assumed* 200k window (no explicit
-    /// `context_window` set for its model) gets that assumption halved for its next attempt.
-    /// A model with an explicit setting is left alone — the user made that choice deliberately.
+    /// `context_window` set for its model) gets the window it was told halved for its next attempt
+    /// — the assumed one, or `context_cap` when that is smaller. A model with an explicit setting
+    /// is left alone — the user made that choice deliberately.
     fn shrink_assumed_context(&mut self, ctx: &mut dyn Ctx, a: AgentId) {
         let Some(wi) = self.worker_idx(a) else { return };
         if self.workers[wi].context_override.is_some() {
             return; // already shrunk once for this attempt's live process
         }
         let Some(agent) = ctx.agent(a) else { return };
-        if agent.ctx_window != Some(crate::discover::ASSUMED_CONTEXT) {
+        let Some(told) = agent.ctx_window else { return };
+        let model = agent.model_alias.clone();
+        // What the registry says decides "assumed", not the window told: a capped 1M model is
+        // told 200k without assuming anything, and an assumed one under a 150k cap is told 150k.
+        // Never told (tests): the window itself is the only reading.
+        let assumed = match self.known_models.get(&model) {
+            Some(w) => *w == crate::discover::ASSUMED_CONTEXT,
+            None => told == crate::discover::ASSUMED_CONTEXT,
+        };
+        if !assumed {
             return; // an explicit context_window is in effect — leave it to the user
         }
-        let model = agent.model_alias.clone();
-        if self.known_models.get(&model).map(|w| *w != crate::discover::ASSUMED_CONTEXT).unwrap_or(false) {
-            return; // a bigger window of the model's own, told 200k by `context_cap`: no assumption
-        }
-        let halved = crate::discover::ASSUMED_CONTEXT / 2;
+        let halved = told / 2;
         self.workers[wi].context_override = Some(halved);
-        self.log("⚠", "amber", format!("context window assumed 200k was too large for {model}; using {}k — set it in /models", halved / 1000));
+        self.log("⚠", "amber", format!("context window assumed {}k was too large for {model}; using {}k — set it in /models", told / 1000, halved / 1000));
     }
 
     pub fn on_turn_done(&mut self, ctx: &mut dyn Ctx, a: AgentId, status: &str, error: Option<String>, kind: Option<ErrKind>) {
@@ -2679,7 +2697,7 @@ Then summarize in 2-4 lines.",
                 if reason == HaltReason::AgentTurnFailed && kind == Some(ErrKind::Transient) && self.gateway_down(ctx, a) {
                     // every agent that was working failed on the transport within the minute: the
                     // gateway is down, for the manager too — nobody but the user is told
-                    self.halt_for_outage(ctx, reason, Some(a), format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"));
+                    self.halt_for_outage(ctx, reason, Some(a), format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"), GATEWAY_DOWN_HINT);
                     self.retry_counts.remove(&a);
                     return;
                 }
@@ -3066,7 +3084,7 @@ Then summarize in 2-4 lines.",
                     // The gateway outlasted `GATEWAY_RETRIES`: it is down for everyone, so neither
                     // the orchestrator (a retry would fail the same way) nor — for a fix worker —
                     // the manager and the planner are asked. The run waits for the gateway.
-                    self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"));
+                    self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"), GATEWAY_DOWN_HINT);
                 } else if let Some(round) = fix_round {
                     let msg = format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200));
                     self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, msg.clone(), msg, Some(&e));
@@ -7890,7 +7908,7 @@ mod halt_tests {
             assert!(out.starts_with("REFUSED"), "{out}");
             let h = run.halt.as_ref().expect("halted");
             assert_eq!(h.reason, HaltReason::AttemptsExhausted, "the halt keeps its own reason (the web view offers Retry t1 from it)");
-            assert!(h.message.ends_with(GATEWAY_DOWN_HINT), "{}", h.message);
+            assert!(h.message.ends_with(GATEWAY_DOWN_RETRY_HINT), "no worker is left to respawn: {}", h.message);
             assert!(!run.escalation_open && run.manager_escalation.is_none());
             assert!(!ctx.spawns.iter().any(|s| s.name == "manager"));
             assert!(ctx.prompts.iter().all(|(a, _)| *a != planner), "{:?}", ctx.prompts);
@@ -7966,6 +7984,30 @@ mod halt_tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    /// A finale agent's switch is for its step: a respawn of that step keeps it, the next step —
+    /// another role — starts on that role's own model.
+    #[test]
+    fn a_finale_switch_does_not_carry_over_to_the_next_step() {
+        let mut ctx = TestCtx::new();
+        let mut pat = no_manager();
+        pat.flow.finale = vec![
+            crate::engine::pattern::FinaleStep { role: "qa".into(), task: "review".into(), may_spawn: false },
+            crate::engine::pattern::FinaleStep { role: "worker-big".into(), task: "docs".into(), may_spawn: false },
+        ];
+        let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+        run.dir = scratch_dir("finale-model");
+        run.plan = Some(one_task_phase());
+        run.start_finale(&mut ctx, 0);
+        let f = run.finale_agent.expect("a finale agent");
+        run.set_agent_model(f, "nova");
+        run.respawn(&mut ctx, f, None).unwrap();
+        assert_eq!(ctx.spawned("qa").last().unwrap().model, "nova", "the respawned step keeps the switch");
+        run.start_finale(&mut ctx, 1);
+        assert_eq!(ctx.spawned("worker-big").last().unwrap().model, run.role("worker-big").model, "the next step is another role's");
+        assert!(run.slot_models.is_empty());
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
     /// A switched agent that goes silent twice falls back like any other: the role's fallback
     /// replaces the model the user picked, which no longer outranks the role.
     #[test]
@@ -8022,10 +8064,13 @@ mod halt_tests {
     }
 
     /// A model with a big window of its own, told 200k by the cap, that still fills its context
-    /// is not on an *assumed* window: it is not halved. One the registry only assumes 200k for is.
+    /// is not on an *assumed* window: it is not halved. One the registry only assumes 200k for is
+    /// — the window it was told, which a smaller cap makes smaller than 200k.
     #[test]
     fn a_capped_window_is_not_mistaken_for_an_assumed_one() {
-        for (window, halved) in [(1_000_000u64, false), (crate::discover::ASSUMED_CONTEXT, true)] {
+        // (the model's window in the registry, the window the agent was told, what it is halved to)
+        let assumed = crate::discover::ASSUMED_CONTEXT;
+        for (window, told, halved) in [(1_000_000u64, 200_000u64, None), (assumed, assumed, Some(assumed / 2)), (assumed, 150_000, Some(75_000)), (128_000, 128_000, None)] {
             let mut ctx = TestCtx::new();
             let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
             run.dir = scratch_dir("cap-shrink");
@@ -8033,10 +8078,10 @@ mod halt_tests {
             let w = ctx.add_idle();
             let ag = ctx.agents.get_mut(&w).unwrap();
             ag.model_alias = "big".into();
-            ag.ctx_window = Some(crate::discover::ASSUMED_CONTEXT);
+            ag.ctx_window = Some(told);
             run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
             run.shrink_assumed_context(&mut ctx, w);
-            assert_eq!(run.workers[0].context_override.is_some(), halved, "window {window}");
+            assert_eq!(run.workers[0].context_override, halved, "window {window}, told {told}: an assumed window under a smaller cap is halved too");
             let _ = std::fs::remove_dir_all(&run.dir);
         }
     }
@@ -8055,7 +8100,7 @@ mod halt_tests {
         run.start(&mut ctx);
         let o = Owner::load(&dir).expect("owner.json written at start");
         assert_eq!(o.pid, std::process::id());
-        assert!(crate::engine::state::live_owner(&dir).is_some(), "a second resume would be refused");
+        assert!(o.alive(), "a live owner: another Mantra's resume of it would be refused");
         run.stage = Stage::Planning;
         run.save_state();
         assert!(Owner::load(&dir).is_some(), "refreshed with the flush");
