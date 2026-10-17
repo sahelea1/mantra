@@ -940,13 +940,16 @@ impl App {
             return Ok(());
         }
         let effort = new.resolve_effort(&ag.effort);
+        // a run agent keeps the run's context cap (the backend was told it at spawn): the gauge
+        // shows the window it really has, not the new model's whole one
+        let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).map(|r| r.pattern.settings.context_cap).filter(|c| *c > 0);
         self.hub.send(a, Cmd::SetModel(new.model.clone()));
         self.hub.send(a, Cmd::SetEffort(effort.clone()));
         if let Some(ag) = self.agents.get_mut(&a) {
             ag.model_alias = new.alias.clone();
             ag.model = new.model.clone();
             ag.effort = effort;
-            ag.ctx_window = new.context_window.or(ag.ctx_window);
+            ag.ctx_window = new.context_window.map(|w| cap.map_or(w, |c| w.min(c))).or(ag.ctx_window);
             ag.notice(Level::Info, format!("model → {} ({})", new.alias, new.model));
         }
         if Some(a) == self.solo {
@@ -1146,8 +1149,13 @@ impl App {
     }
 
     /// Delete a saved run (branches, worktrees, journal). The run that is open right now can
-    /// only be deleted once it is finished.
+    /// only be deleted once it is finished, and one another live Mantra has open not at all:
+    /// its worktrees are that process's working copies.
     pub fn delete_run(&mut self, r: &crate::engine::state::RunSummary) -> bool {
+        if let Some(owner) = crate::engine::state::live_owner(&r.dir) {
+            self.toast(owner.refusal(&r.id).replace("resume", "delete"), Level::Error);
+            return false;
+        }
         if let Some(cur) = &self.run {
             if cur.id == r.id {
                 if cur.is_active() {

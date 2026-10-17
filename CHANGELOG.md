@@ -2,6 +2,44 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.6.2 — 2026-10-17
+
+An outside tester drove Mantra for hours on an OpenAI-compatible gateway and wrote up what went
+wrong. This release answers that list.
+
+- **A gateway outage wakes nobody.** A fix worker that died on a 5xx past its free retries used
+  to count as "could not fix what QA found" and woke the manager, then the planner — both on the
+  same dead gateway. Any worker the outage took now halts the run with the gateway wording and
+  no escalation; `space` / Resume respawns every such worker where it was, fix workers included,
+  and the halt names the one key that helps.
+- **One owner per run.** A run that is open in a live Mantra carries `owner.json`; a second
+  process refuses to resume or delete it ("open in another Mantra (pid …) — quit it first, or
+  `--take-over`"). A dead owner is a crash and resumes normally; a zombie counts as dead. And
+  `--resume-last` picks from this project's runs only, not every project on the machine.
+- **A model you switched stays switched.** Changing one agent's model (`m`, `ctrl+k`, the web
+  sheet) is now that attempt's choice, saved with the run: a respawn keeps it, a restart brings
+  the agent back on it, and other agents of the role are untouched (`set_role_model` still
+  changes the role). The first-token fallback still wins over a switched model that went silent.
+  A finished card names the model its attempt ran on, not the role's current one.
+- **Tokens say what they cost.** Codex counts cached input into every total; a worker that cycles
+  tools in a big context reads "6.8M tokens" of which almost all was cache. Cards, headers, the
+  run total and the web chips now show the cached share ("6.8M tok · 5.9M cached", "87% cached"
+  on a narrow card).
+- **A context cap.** `settings.context_cap` (200k in the built-in patterns, 0 = the model's full
+  window) is the context every agent is told it has: a 500k window let an agent cycle tools for
+  hours at ever-growing cost. The Studio edits it; it takes `200k`, `1m`, `off`.
+- **An empty repo gets its first commit.** `git init` with no commit used to put workers in the
+  shared project directory; Mantra now makes an empty initial commit (hooks skipped, staged
+  files left alone) so every worker gets an isolated worktree.
+- **One card per task.** A task with several attempts drew one card but had one selectable node
+  per attempt, so the arrows and `1`–`9` could land on a cancelled attempt. The selection follows
+  the card, and `r` keeps the respawned task selected.
+- **Smaller fixes:** Codex housekeeping warnings ("couldn't save diagnostic logs") no longer pose
+  as the agent's activity line; a done worker that answers a follow-up logs "done again" instead
+  of a second completion and does not wake the orchestrator twice; the demo honours the context
+  cap; `MANTRA_MOCK_GATEWAY_DOWN=<file>` and `MANTRA_MOCK_BIGCTX=1` reproduce the outage and the
+  big-context scenarios in `--demo`.
+
 ## v0.6.1 — 2026-10-12
 
 Both interfaces catch up with 0.6.0, and were checked frame by frame (the TUI at 120×36 and

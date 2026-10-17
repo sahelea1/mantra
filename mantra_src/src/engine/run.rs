@@ -3048,12 +3048,33 @@ Then summarize in 2-4 lines.",
                         self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", trunc(&report, 1200)));
                     }
                 } else {
+                    // A done worker the user (or the orchestrator) messaged finishes again: that is
+                    // a follow-up answered, not the task completing a second time.
+                    let again = w.state == WState::Done;
                     w.state = WState::Done;
                     let el = fmt_dur(w.spawned.elapsed());
                     let adhoc = w.adhoc;
                     let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
-                    self.log("✓", "green", format!("{tid} done in {el}"));
-                    if let (true, Stage::Phase { idx, .. }, Some(round)) = (adhoc, &self.stage, fix_round) {
+                    // Who asked for the follow-up: the user (typed in the zoomed view, or `@name …`,
+                    // which arrives as "[from the user] …"), or the orchestrator / manager / Mantra.
+                    let last_ask = agent.and_then(|a| ctx.agent(a)).and_then(|a| a.items.iter().rev().find(|i| matches!(i.kind, crate::agent::Kind::User))).map(|i| i.text.clone()).unwrap_or_default();
+                    let by_you = again && (last_ask.starts_with("[from the user]") || !(last_ask.starts_with("[mantra") || last_ask.starts_with("[from ")));
+                    let what = match (again, by_you) {
+                        (false, _) => "done",
+                        (true, true) => "done again (after your message)",
+                        (true, false) => "done again",
+                    };
+                    self.log("✓", "green", format!("{tid} {what} in {el}"));
+                    if again && by_you {
+                        // the orchestrator (or the finale) already had this task's completion: the
+                        // user's side conversation wakes nobody, and the new report is on the
+                        // worker for whoever reads it next
+                    } else if again {
+                        // the orchestrator (the finale step, in the finale) asked a done worker
+                        // something: it gets the answer, as an answer rather than the task
+                        // completing a second time
+                        self.orch_event(ctx, format!("{tid} answered the follow-up (it was already done). {summary}"));
+                    } else if let (true, Stage::Phase { idx, .. }, Some(round)) = (adhoc, &self.stage, fix_round) {
                         // a gate round's fix: Mantra re-runs the checks and starts the next QA round
                         fix_done = Some((*idx, round));
                     } else if adhoc {
@@ -4924,6 +4945,43 @@ mod halt_tests {
         fn notify(&mut self, text: &str) {
             self.notified.push(text.to_string());
         }
+    }
+
+    /// The reported bug: a done worker the user messaged finished again and the pulse read
+    /// "✓ p1-a done in …" twice, the orchestrator woken for a second completion. The second
+    /// one says what it is, and the orchestrator hears about the task once.
+    #[test]
+    fn a_done_worker_finishing_again_is_a_follow_up_not_a_second_completion() {
+        use crate::engine::plan::{Phase, Plan};
+        let mut ctx = TestCtx::new();
+        let o = ctx.add_idle();
+        let a = ctx.add_busy();
+        let b = ctx.add_busy();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-a"), task("p1-b")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.orchestrator = Some(o);
+        run.workers.push(mk_worker("p1-a", "worker-small", a, WState::Running));
+        run.workers.push(mk_worker("p1-b", "worker-small", b, WState::Running));
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+        assert!(run.pulse.back().unwrap().text.contains("p1-a done in"), "{:?}", run.pulse.back().map(|p| &p.text));
+        ctx.agents.get_mut(&a).unwrap().push_user("also add a test for the empty case");
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+        assert!(run.pulse.back().unwrap().text.contains("p1-a done again (after your message) in"), "{:?}", run.pulse.back().map(|p| &p.text));
+        // `@p1-a …` from the stage arrives as "[from the user] …": the user's message too
+        ctx.agents.get_mut(&a).unwrap().push_user("[from the user] and document it");
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+        assert!(run.pulse.back().unwrap().text.contains("p1-a done again (after your message) in"), "{:?}", run.pulse.back().map(|p| &p.text));
+        let heard = |run: &Run, ctx: &TestCtx, what: &str| ctx.prompts.iter().filter(|(to, t)| *to == o && t.contains(what)).count() + run.orch_inbox.iter().filter(|t| t.contains(what)).count();
+        assert_eq!(heard(&run, &ctx, "p1-a finished"), 1, "{:?}", ctx.prompts);
+        assert_eq!(heard(&run, &ctx, "p1-a answered"), 0, "the user's side conversation wakes nobody");
+        // the orchestrator's own follow-up to a done worker gets its answer — as an answer
+        ctx.agents.get_mut(&a).unwrap().push_user("[from the orchestrator] which file holds the parser?");
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+        assert!(run.pulse.back().unwrap().text.contains("p1-a done again in"), "{:?}", run.pulse.back().map(|p| &p.text));
+        assert_eq!(heard(&run, &ctx, "p1-a finished"), 1, "{:?}", ctx.prompts);
+        assert_eq!(heard(&run, &ctx, "p1-a answered the follow-up"), 1, "{:?} {:?}", ctx.prompts, run.orch_inbox);
     }
 
     #[test]

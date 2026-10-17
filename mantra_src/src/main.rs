@@ -524,6 +524,11 @@ fn runs_delete(id: &str, yes: bool) {
             std::process::exit(2);
         }
     };
+    if let Some(owner) = engine::state::live_owner(&r.dir) {
+        // its worktrees are that process's working copies
+        eprintln!("mantra: {}", owner.refusal(&r.id).replace("resume", "delete"));
+        std::process::exit(2);
+    }
     let where_ = r.project().map(|p| p.display().to_string()).unwrap_or_else(|| r.project_key.clone());
     println!("run {} [{}] ({}) — {}\n  {}", r.title(), r.id, r.stage_label(), where_, util::trunc(&r.brief(), 100));
     if r.unfinished() {

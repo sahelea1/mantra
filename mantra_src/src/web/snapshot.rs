@@ -1440,6 +1440,7 @@ pub(crate) mod tests {
             context_override: None,
             idle_prompts: vec![],
             transient: false,
+            model: None,
         }
     }
 

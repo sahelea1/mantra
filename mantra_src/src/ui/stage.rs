@@ -522,7 +522,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     cv.put(r.x as i32 + r.width as i32 - 3, y, &mark, theme::bold(theme::fg(mcol)));
     let h = r.height as i32;
     // line 1: model · effort · progress
-    let m_alias = attempt_model(a, role);
+    let m_alias = attempt_model(w, a, role);
     let eff = a.map(|a| a.effort.clone()).or_else(|| t.effort.clone()).or_else(|| role.map(|r| r.effort.clone())).unwrap_or_default();
     let (d, tot) = a.map(|a| a.plan_progress()).unwrap_or((0, 0));
     let eff = if app.registry.resolve(&m_alias).efforts().is_empty() { String::new() } else { eff };
@@ -627,8 +627,10 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
 /// will run again. The role's model is shown only for an attempt with no agent record: one not
 /// started yet, which will run on it, or a finished one a resume brought back without its agent,
 /// for which nothing better is known.
-fn attempt_model(a: Option<&Agent>, role: Option<&Role>) -> String {
-    a.map(|a| a.model_alias.clone()).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default()
+fn attempt_model(w: Option<&Worker>, a: Option<&Agent>, role: Option<&Role>) -> String {
+    // the live agent knows best; a restored attempt remembers the alias it was switched to; the
+    // role's model is all that is left for an attempt that never ran
+    a.map(|a| a.model_alias.clone()).or_else(|| w.and_then(|w| w.model.clone())).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1253,8 +1255,13 @@ mod tests {
         // with no agent record (a resume restores done workers without their agents) the
         // role's model is all that is known
         let role = app.run.as_ref().unwrap().pattern.role("worker-small").cloned();
-        assert_eq!(attempt_model(None, role.as_ref()), "luna");
-        assert_eq!(attempt_model(app.agents.get(&10), role.as_ref()), "sol");
+        assert_eq!(attempt_model(None, None, role.as_ref()), "luna");
+        assert_eq!(attempt_model(None, app.agents.get(&10), role.as_ref()), "sol");
+        // a restored attempt carries the alias it was switched to
+        let mut restored = crate::web::snapshot::tests::worker("p1-api", 1, None, crate::engine::run::WState::Done);
+        restored.model = Some("terra".into());
+        assert_eq!(attempt_model(Some(&restored), None, role.as_ref()), "terra");
+        assert_eq!(attempt_model(Some(&restored), app.agents.get(&10), role.as_ref()), "sol", "the live agent still wins");
     }
 
     /// A big total that was mostly cached input says so on the card and in the run header —

@@ -330,7 +330,10 @@ impl Em {
             t.ctx += add * 2;
             (t.tokens, t.cached, t.ctx, t.model.clone())
         }).unwrap_or((add, 0, add, String::new()));
-        let window: u64 = if model.contains("astra") { 400_000 } else { 272_000 };
+        // the model's own window, capped the way Mantra caps it (`-c model_context_window=…`
+        // on the command line), so the demo shows the cap the pattern sets
+        let own: u64 = if model.contains("astra") { 400_000 } else { 272_000 };
+        let window = std::env::args().filter_map(|a| a.strip_prefix("model_context_window=").and_then(|v| v.parse::<u64>().ok())).next().map(|c| c.min(own)).unwrap_or(own);
         // Codex-style automatic compaction mid-turn when the context gets full.
         if ctx > window * 7 / 10 {
             let id = self.st.uid("cc");
