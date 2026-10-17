@@ -1417,6 +1417,31 @@ pub(crate) mod tests {
         App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true)
     }
 
+    /// A worker record for one attempt at `task` (role `worker-small`), as the engine leaves it.
+    pub(crate) fn worker(task: &str, attempt: u32, agent: Option<AgentId>, state: crate::engine::run::WState) -> crate::engine::run::Worker {
+        crate::engine::run::Worker {
+            task: crate::engine::plan::Task { id: task.into(), role: "worker-small".into(), ..Default::default() },
+            prompt: String::new(),
+            effort: None,
+            agent,
+            attempt,
+            state,
+            report: String::new(),
+            wt: None,
+            branch: String::new(),
+            spawned: Instant::now(),
+            finished: None,
+            tripwires: vec![],
+            adhoc: false,
+            paused: false,
+            stall_flagged: false,
+            budget_flagged: false,
+            context_override: None,
+            idle_prompts: vec![],
+            transient: false,
+        }
+    }
+
     pub(crate) fn add_agent(app: &mut App, id: AgentId, name: &str) {
         let mut a = Agent::new(id, name, "worker", PathBuf::from("."));
         a.status = Status::Idle;
@@ -1556,29 +1581,17 @@ pub(crate) mod tests {
         usage(&mut app, 2, 200_000, 50_000);
         let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
         run.orchestrator = Some(2);
-        run.workers.push(crate::engine::run::Worker {
-            task: crate::engine::plan::Task { id: "p1-api".into(), role: "worker-small".into(), ..Default::default() },
-            prompt: String::new(),
-            effort: None,
-            agent: Some(1),
-            attempt: 1,
-            state: crate::engine::run::WState::Running,
-            report: String::new(),
-            wt: None,
-            branch: String::new(),
-            spawned: Instant::now(),
-            finished: None,
-            tripwires: vec![],
-            adhoc: false,
-            paused: false,
-            stall_flagged: false,
-            budget_flagged: false,
-            context_override: None,
-            idle_prompts: vec![],
-            transient: false,
-        });
+        run.workers.push(worker("p1-api", 1, Some(1), crate::engine::run::WState::Running));
         let v = run_view(&app, &run);
         assert_eq!((v.total_tokens, v.cached_tokens), (7_000_000, 5_950_000), "the run's total and its cached share over the agents on it");
+        // A retired agent (a respawned planner: stopped, off the run, its total in the run's
+        // carry-over) still counts in the cached share; an agent that was never on the run does not.
+        add_agent(&mut app, 3, "planner");
+        add_agent(&mut app, 4, "solo");
+        usage(&mut app, 3, 300_000, 250_000);
+        usage(&mut app, 4, 2_000_000, 1_000_000);
+        run.agent_meta.insert(3, crate::engine::state::AgentState::default());
+        assert_eq!(run_view(&app, &run).cached_tokens, 6_200_000);
         app.run = Some(run);
         let facts = run_facts(&app);
         let a = agent_view_with(&app, &app.agents[&1], &facts);

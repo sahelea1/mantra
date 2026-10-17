@@ -2678,31 +2678,6 @@ mod tests {
         assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
     }
 
-    /// A worker record for a task attempt, as the engine would leave it.
-    fn attempt(task: &str, attempt: u32, agent: Option<AgentId>, state: crate::engine::run::WState) -> crate::engine::run::Worker {
-        crate::engine::run::Worker {
-            task: crate::engine::plan::Task { id: task.into(), role: "worker-small".into(), ..Default::default() },
-            prompt: String::new(),
-            effort: None,
-            agent,
-            attempt,
-            state,
-            report: String::new(),
-            wt: None,
-            branch: String::new(),
-            spawned: Instant::now(),
-            finished: None,
-            tripwires: vec![],
-            adhoc: false,
-            paused: false,
-            stall_flagged: false,
-            budget_flagged: false,
-            context_override: None,
-            idle_prompts: vec![],
-            transient: false,
-        }
-    }
-
     /// The reported bug: a task retried once had one card on the overview but two entries in
     /// `stage_nodes`, so the arrows and `1`–`9` counted a card that was not there — selecting the
     /// visible card zoomed into the cancelled first attempt, and ↓ "moved" to a same-named card.
@@ -2711,6 +2686,7 @@ mod tests {
     fn stage_nodes_count_one_node_per_task_the_attempt_its_card_draws() {
         use crate::engine::plan::{Phase, Plan, Task};
         use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::worker as attempt;
         let mut app = screen_app();
         let mut run = a_run();
         run.planner = Some(1);

@@ -806,27 +806,7 @@ mod tests {
             pattern.save().unwrap();
             app.pattern_name = pattern.name.clone();
             let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern.clone(), "goal".into());
-            let worker = |id: &str, agent: AgentId, state: WState| crate::engine::run::Worker {
-                task: crate::engine::plan::Task { id: id.into(), role: "worker-small".into(), ..Default::default() },
-                prompt: String::new(),
-                effort: None,
-                agent: Some(agent),
-                attempt: 1,
-                state,
-                report: String::new(),
-                wt: None,
-                branch: String::new(),
-                spawned: Instant::now(),
-                finished: None,
-                tripwires: vec![],
-                adhoc: false,
-                paused: false,
-                stall_flagged: false,
-                budget_flagged: false,
-                context_override: None,
-                idle_prompts: vec![],
-                transient: false,
-            };
+            let worker = |id: &str, agent: AgentId, state: WState| crate::web::snapshot::tests::worker(id, 1, Some(agent), state);
             for (id, name) in [(2, "p1-done"), (3, "p1-live"), (4, "p1-old")] {
                 add_agent(&mut app, id, name);
                 let a = app.agents.get_mut(&id).unwrap();

@@ -522,7 +522,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     cv.put(r.x as i32 + r.width as i32 - 3, y, &mark, theme::bold(theme::fg(mcol)));
     let h = r.height as i32;
     // line 1: model · effort · progress
-    let m_alias = a.map(|a| a.model_alias.clone()).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default();
+    let m_alias = attempt_model(a, role);
     let eff = a.map(|a| a.effort.clone()).or_else(|| t.effort.clone()).or_else(|| role.map(|r| r.effort.clone())).unwrap_or_default();
     let (d, tot) = a.map(|a| a.plan_progress()).unwrap_or((0, 0));
     let eff = if app.registry.resolve(&m_alias).efforts().is_empty() { String::new() } else { eff };
@@ -615,6 +615,15 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
         cv.spans(x, y + 3, &l3, iw);
     }
     let _ = app;
+}
+
+/// The model a task's card names: the alias its attempt's agent runs on, or ran on — a finished
+/// attempt keeps the alias it ran with, since a role's model change only reaches agents that
+/// will run again. The role's model is shown only for an attempt with no agent record: one not
+/// started yet, which will run on it, or a finished one a resume brought back without its agent,
+/// for which nothing better is known.
+fn attempt_model(a: Option<&Agent>, role: Option<&Role>) -> String {
+    a.map(|a| a.model_alias.clone()).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1017,8 +1026,15 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
             ay += 4;
         }
     }
-    // ad-hoc fix workers spawned by the verifier
-    let adhoc: Vec<&Worker> = run.workers.iter().filter(|w| w.adhoc).collect();
+    // ad-hoc fix workers spawned by the verifier: one card per fix task, its newest attempt, in
+    // the order the tasks were first started — the nodes `App::stage_nodes` selects
+    let mut adhoc: Vec<&Worker> = vec![];
+    for wk in run.workers.iter().filter(|w| w.adhoc) {
+        match adhoc.iter_mut().find(|x| x.task.id == wk.task.id) {
+            Some(x) => *x = wk,
+            None => adhoc.push(wk),
+        }
+    }
     if !adhoc.is_empty() {
         if aw >= 20 {
             ay += 1;
@@ -1183,6 +1199,95 @@ mod tests {
             cols.push(row[..row.find(&d).unwrap()].chars().count());
         }
         assert!(cols.len() > 2 && cols.windows(2).all(|w| w[0] == w[1]), "{cols:?}");
+    }
+
+    /// Every row of a full frame of `app` at `w`×`h`, trimmed.
+    fn frame(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    /// A phase on the overview: an orchestrator and two workers, `p1-api` done on `sol` and
+    /// `p1-ui` running on `terra`, with `worker-small` since moved to `luna`.
+    fn phase_app() -> App {
+        use crate::engine::plan::{Phase, Plan, Task};
+        use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::{add_agent, worker};
+        let mut app = app();
+        let mut run = Run::new(PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.title = "Ship it".into();
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-api"), task("p1-ui")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.orchestrator = Some(3);
+        add_agent(&mut app, 3, "orchestrator");
+        for (id, name, alias) in [(10, "p1-api", "sol"), (11, "p1-ui", "terra")] {
+            add_agent(&mut app, id, name);
+            app.agents.get_mut(&id).unwrap().model_alias = alias.into();
+        }
+        run.workers.push(worker("p1-api", 1, Some(10), WState::Done));
+        run.workers.push(worker("p1-ui", 1, Some(11), WState::Running));
+        run.pattern.roles.get_mut("worker-small").unwrap().model = "luna".into();
+        app.run = Some(run);
+        app.screen = crate::app::Screen::Stage;
+        app
+    }
+
+    /// The reported bug: after the role's model was changed, finished cards named the role's
+    /// new alias although their attempt ran on another model. A card names its attempt's own.
+    #[test]
+    fn a_done_card_names_the_model_its_attempt_ran_on_after_a_role_change() {
+        let mut app = phase_app();
+        let rows = frame(&mut app, 120, 36);
+        let all = rows.join("\n");
+        assert!(rows.iter().any(|r| r.contains("p1-api")), "{all}");
+        assert!(all.contains("sol") && all.contains("terra"), "{all}");
+        assert!(!all.contains("luna"), "no card claims the role's new model: {all}");
+        // with no agent record (a resume restores done workers without their agents) the
+        // role's model is all that is known
+        let role = app.run.as_ref().unwrap().pattern.role("worker-small").cloned();
+        assert_eq!(attempt_model(None, role.as_ref()), "luna");
+        assert_eq!(attempt_model(app.agents.get(&10), role.as_ref()), "sol");
+    }
+
+    /// A big total that was mostly cached input says so on the card and in the run header —
+    /// as a count where the columns allow, as a share on a narrow card — and the header drops
+    /// the reading before the count when it runs out of room.
+    #[test]
+    fn cards_and_the_header_read_a_mostly_cached_total() {
+        let usage = serde_json::json!({"tokenUsage": {"total": {"totalTokens": 6_800_000, "cachedInputTokens": 5_900_000}, "last": {"inputTokens": 1000, "outputTokens": 10}}});
+        let mut app = phase_app();
+        app.agents.get_mut(&11).unwrap().apply("thread/tokenUsage/updated", &usage);
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains("Σ 6.80M tok · 5.90M cached"), "{all}");
+        assert!(all.contains("6.80M · 5.90M cached") || all.contains("6.80M · 86% cached"), "{all}");
+        let all = frame(&mut app, 80, 24).join("\n");
+        assert!(all.contains("6.80M"), "{all}");
+        assert!(!all.contains("cached cached"), "{all}");
+    }
+
+    /// One card per fix task in the finale's side column, the newest attempt — the node the
+    /// selection lands on — never one card per attempt.
+    #[test]
+    fn a_retried_fix_task_has_one_card() {
+        use crate::engine::run::WState;
+        use crate::web::snapshot::tests::{add_agent, worker};
+        let mut app = phase_app();
+        let run = app.run.as_mut().unwrap();
+        run.stage = Stage::Finale { idx: 0 };
+        run.workers.clear();
+        for (attempt, id, state) in [(1, 20, WState::Cancelled), (2, 21, WState::Running)] {
+            let mut w = worker("fix-7", attempt, Some(id), state);
+            w.adhoc = true;
+            run.workers.push(w);
+        }
+        add_agent(&mut app, 20, "fix-7");
+        add_agent(&mut app, 21, "fix-7");
+        let rows = frame(&mut app, 140, 40);
+        assert_eq!(rows.iter().filter(|r| r.contains("fix-7")).count(), 1, "{}", rows.join("\n"));
+        assert!(app.stage_nodes().contains(&21) && !app.stage_nodes().contains(&20));
     }
 
     /// A role asking for an effort its model doesn't offer shows requested→used.

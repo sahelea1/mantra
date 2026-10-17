@@ -209,14 +209,19 @@ pub fn cached_suffix(share: Option<String>) -> Vec<Span<'static>> {
     share.map(|s| vec![Span::styled(" · ", theme::faint()), Span::styled(s, theme::faint())]).unwrap_or_default()
 }
 
-/// A run's token total and how much of it was cached input: `Run::total_tokens` over the
-/// agents' totals, and the cached share of the agents still on the run. Agents already retired
-/// (earlier attempts, past QA rounds) count in the total through the run's own carry-over but
-/// not here, so the share can only be understated, never claimed where it is unknown.
+/// A run's token total and how much of it was cached input. The total is `Run::total_tokens`:
+/// the agents on the run plus what retired ones (past QA rounds, a respawned planner) left in
+/// its carry-over. The cached share is summed over every agent the run ever had —
+/// `agent_meta` keeps each one that got a thread, and a retired agent stays in `app.agents`,
+/// stopped, with its counts — so it covers the same agents as the total without the engine
+/// keeping a second carry-over.
 pub fn run_token_totals(app: &App, run: &crate::engine::run::Run) -> (u64, u64) {
     let total = run.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-    let cached = run.all_agents().into_iter().map(|a| app.agents.get(&a).map(|x| x.tokens_cached).unwrap_or(0)).sum::<u64>();
-    (total, cached)
+    let mut ever: Vec<crate::hub::AgentId> = run.agent_meta.keys().copied().chain(run.all_agents()).collect();
+    ever.sort_unstable();
+    ever.dedup();
+    let cached = ever.into_iter().map(|a| app.agents.get(&a).map(|x| x.tokens_cached).unwrap_or(0)).sum::<u64>();
+    (total, cached.min(total))
 }
 
 pub fn effort_label(e: &str) -> String {

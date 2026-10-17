@@ -321,6 +321,20 @@ impl Agent {
         self.push(it);
     }
 
+    /// A muted transcript line about the backend's own housekeeping rather than this agent's
+    /// work (`is_housekeeping_warning`, the fallback-metadata note): an info notice that the
+    /// card and peek lines skip (`tail_lines`), said once per session however often the backend
+    /// repeats it. Its id prefix is what marks it.
+    fn footnote(&mut self, text: String) {
+        if self.items.iter().any(|i| i.id.starts_with(FOOTNOTE) && i.text == text) {
+            return;
+        }
+        self.notice_seq += 1;
+        let mut it = Item::new(format!("{FOOTNOTE}{}", self.notice_seq), Kind::Notice { level: Level::Info }, text);
+        it.done = true;
+        self.push(it);
+    }
+
     fn push(&mut self, item: Item) {
         if self.items.len() >= MAX_ITEMS {
             let drop = MAX_ITEMS / 5;
@@ -526,12 +540,12 @@ impl Agent {
                     // Codex ≥ 0.157 says this for every model tag outside its own catalog (any
                     // custom provider). Mantra already passes the context window / compaction limit
                     // itself, so it's expected — one muted line, not an amber alert.
-                    self.notice(Level::Info, fallback_metadata_note(msg));
+                    self.footnote(fallback_metadata_note(msg));
                 } else if is_housekeeping_warning(msg) {
                     // Codex's own housekeeping (its diagnostic-log database, say) is not this
                     // agent's work going wrong: a muted footnote in the transcript, never the
                     // card's line, never amber. The activity label is left alone.
-                    self.notice(Level::Info, crate::util::trunc(msg, 400));
+                    self.footnote(crate::util::trunc(msg, 400));
                 } else if !msg.is_empty() {
                     self.notice(Level::Warn, crate::util::trunc(msg, 400));
                 }
@@ -836,17 +850,16 @@ impl Agent {
         signal
     }
 
-    /// One-line summaries of the latest activity (for peek strips and logs). Muted info
-    /// notices — Codex housekeeping, a model switch — are transcript footnotes, not activity:
-    /// an idle card's line must show what the agent last did or the last thing that went
-    /// wrong, not that Codex could not write its own logs.
+    /// One-line summaries of the latest activity (for peek strips and logs). Footnotes — the
+    /// backend's housekeeping (`footnote`) — are not activity: an idle card's line shows what
+    /// the agent last did or the last real notice, not that Codex could not write its own logs.
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
         let mut out = vec![];
         for it in self.items.iter().rev() {
             if out.len() >= n {
                 break;
             }
-            if matches!(it.kind, Kind::Notice { level: Level::Info }) {
+            if it.id.starts_with(FOOTNOTE) {
                 continue;
             }
             let line = match &it.kind {
@@ -934,9 +947,11 @@ pub fn classify(info: &Value) -> ErrKind {
 /// /feedback …"). Nothing Mantra or the user can act on mid-run, so it never shows as the
 /// agent's line. (The fallback-metadata warning has its own, reworded note.)
 pub fn is_housekeeping_warning(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("diagnostic logs") || m.contains("diagnostic log")
+    msg.to_lowercase().contains("diagnostic log")
 }
+
+/// The item-id prefix of a footnote (`Agent::footnote`).
+const FOOTNOTE: &str = "footnote-";
 
 /// "5.9M cached" for a token total of which `cached` was cached input, when that is worth a
 /// word: Codex's `total.totalTokens` counts every request's whole input, so a worker that
@@ -1191,10 +1206,20 @@ mod tests {
         assert!(matches!(it.kind, Kind::Notice { level: Level::Info }), "{:?}", it.kind);
         assert_eq!(a.activity, "idle", "the activity line is not replaced");
         assert_eq!(a.tail_lines(1), vec!["$ cargo test ✓".to_string()], "the card's line is the last real thing, not the footnote");
+        // Codex repeats it every turn: the transcript says it once
+        let n = a.items.len();
+        a.apply("warning", &json!({"message": "Codex couldn't save diagnostic logs to its local database. Use /feedback to report this issue."}));
+        assert_eq!(a.items.len(), n);
+        // the fallback-metadata note is a footnote too
+        a.apply("warning", &json!({"message": "Model metadata for `testing` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}));
+        assert_eq!(a.tail_lines(1), vec!["$ cargo test ✓".to_string()]);
         // a real warning still shows, in amber, and is what the card's idle line picks up
         a.apply("warning", &json!({"message": "tests were skipped"}));
         assert!(matches!(a.items.last().unwrap().kind, Kind::Notice { level: Level::Warn }));
         assert_eq!(a.tail_lines(1), vec!["! tests were skipped".to_string()]);
+        // and Mantra's own info notices (a model switch) are real notices, not footnotes
+        a.notice(Level::Info, "model → luna (luna-1)");
+        assert_eq!(a.tail_lines(1), vec!["! model → luna (luna-1)".to_string()]);
     }
 
     /// `total.totalTokens` counts every request's whole input, so a worker in a big context
