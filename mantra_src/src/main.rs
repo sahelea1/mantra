@@ -49,7 +49,8 @@ USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
   mantra run \"<goal>\" [--pattern NAME]  open straight into a Mandala run
   mantra runs                            list every run (all projects): id, stage, when, goal
-  mantra runs resume <id>                reopen a run where it stopped (id prefix is enough)
+  mantra runs resume <id> [--take-over]  reopen a run where it stopped (id prefix is enough);
+                                         refused while another Mantra has it open, unless --take-over
   mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
   mantra doctor                          check codex, login, terminal, config
   mantra --version
@@ -62,7 +63,8 @@ OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
-  --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
+  --resume-last   reopen this project's most recent unfinished run (cwd / --cwd; with --demo:
+                  the last demo run) — other projects' runs only by id, with `runs resume`
   --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
   --web-listen ADDR:PORT   where the web UI listens (default 127.0.0.1:7777; 8080 = 127.0.0.1:8080)
   --web-password PW        web UI password — needed off localhost and with --headless;
@@ -97,13 +99,15 @@ struct Cli {
     /// `mantra runs resume <id>`.
     resume: Option<String>,
     resume_last: bool,
+    /// `mantra runs resume <id> --take-over`: resume although `owner.json` names a live process.
+    take_over: bool,
     no_sandbox_check: bool,
     web: web::CliWeb,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false, web: web::CliWeb::default() };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, take_over: false, no_sandbox_check: false, web: web::CliWeb::default() };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -131,6 +135,7 @@ fn parse_args() -> Result<Option<Cli>> {
             }
             "run" => cli.run_goal = Some(next()?),
             "--resume-last" => cli.resume_last = true,
+            "--take-over" => cli.take_over = true,
             "--no-sandbox-check" => cli.no_sandbox_check = true,
             "--web" => {
                 cli.web.web = true;
@@ -263,15 +268,21 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         demo = true;
     }
     // A resumed run brings its own project directory (it was saved absolute), so `mantra runs
-    // resume <id>` works from anywhere — and with --demo from the previous demo's temp repo.
+    // resume <id>` works from anywhere. `--resume-last` is this project's last unfinished run —
+    // the one in cwd / --cwd; with --demo the previous demo's temp repo — never another
+    // project's: that run belongs to whoever is working there, and may well be open.
     let resume = match (&cli.resume, cli.resume_last) {
         (Some(id), _) => Some(engine::state::find(id).map_err(|e| anyhow::anyhow!(e))?),
         (None, true) => {
-            let pick = engine::state::list_all().into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir() && (!demo || p.to_string_lossy().contains("mantra-demo-"))).unwrap_or(false));
-            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run to resume (mantra runs lists them)"))?)
+            let here = if demo { None } else { Some(cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?)) };
+            let pick = resume_last_pick(engine::state::list_all(), here.as_deref());
+            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run of this project to resume (mantra runs lists every project's; mantra runs resume <id> takes any)"))?)
         }
         _ => None,
     };
+    if let Some(r) = &resume {
+        claim_for_resume(r, cli.take_over).map_err(|e| anyhow::anyhow!(e))?;
+    }
     let project = match &resume {
         Some(r) => {
             let p = r.project().ok_or_else(|| anyhow::anyhow!("run {} cannot be resumed: {}", r.id, r.state.as_ref().err().cloned().unwrap_or_default()))?;
@@ -1158,6 +1169,117 @@ fn claude_auth_status(cmd0: &str) -> Option<String> {
     }
     let first = t.lines().next().unwrap_or("").trim().to_string();
     (!first.is_empty()).then_some(first)
+}
+
+/// `--resume-last`: the newest unfinished run of the project in `here` (cwd / --cwd) whose
+/// directory still exists — never another project's: that run belongs to whoever is working
+/// there, and may well be open. `None` = `--demo`, where it is the last demo run (each demo has
+/// its own temp repo, so "this project" would never match).
+fn resume_last_pick(all: Vec<engine::state::RunSummary>, here: Option<&std::path::Path>) -> Option<engine::state::RunSummary> {
+    let key = here.map(engine::state::project_key);
+    all.into_iter().filter(|r| r.unfinished()).find(|r| {
+        let Some(p) = r.project().filter(|p| p.is_dir()) else { return false };
+        match &key {
+            Some(k) => r.project_key == *k,
+            None => p.to_string_lossy().contains("mantra-demo-"),
+        }
+    })
+}
+
+/// One owner per run: a run another Mantra has open right now (`owner.json`, a live pid on this
+/// host) is refused before anything starts, unless the user says the check is wrong
+/// (`--take-over`, which clears the claim). A dead owner is a crash and resumes as usual; the
+/// TUI's `/runs` and the web `run_resume` refuse the same way in `App::resume_run`.
+fn claim_for_resume(r: &engine::state::RunSummary, take_over: bool) -> Result<(), String> {
+    let Some(owner) = engine::state::live_owner(&r.dir) else { return Ok(()) };
+    if !take_over {
+        return Err(owner.refusal(&r.id));
+    }
+    eprintln!("mantra: taking run {} over from pid {} on {}", r.id, owner.pid, owner.hostname);
+    engine::state::Owner::clear(&r.dir);
+    Ok(())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use engine::state::{list_in, project_key, Owner, RunState};
+
+    /// A runs root with one unfinished run per project in `projects` (newest last).
+    fn runs_root(tag: &str, projects: &[&std::path::Path]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mantra-resume-last-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (i, p) in projects.iter().enumerate() {
+            let dir = root.join(project_key(p)).join(format!("{i}-run"));
+            RunState { format: engine::state::FORMAT, id: format!("{i}-run"), project: p.to_path_buf(), updated_unix: 100 + i as u64, ..Default::default() }.save(&dir);
+        }
+        root
+    }
+
+    /// `--resume-last` in project A never picks project B's run, however much newer it is; with
+    /// --demo it is the last demo run, wherever the demo repo is.
+    #[test]
+    fn resume_last_only_looks_at_this_projects_runs() {
+        let base = std::env::temp_dir().join(format!("mantra-resume-projects-{}", std::process::id()));
+        let (a, b, demo) = (base.join("alpha"), base.join("beta"), base.join("mantra-demo-x"));
+        for d in [&a, &b, &demo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let root = runs_root("pick", &[&a, &b, &demo]);
+        assert_eq!(resume_last_pick(list_in(&root), Some(&a)).map(|r| r.id), Some("0-run".into()), "A's own run, not B's newer one");
+        assert_eq!(resume_last_pick(list_in(&root), Some(&b)).map(|r| r.id), Some("1-run".into()));
+        assert_eq!(resume_last_pick(list_in(&root), None).map(|r| r.id), Some("2-run".into()), "--demo: the last demo run");
+        assert!(resume_last_pick(list_in(&root), Some(&base)).is_none(), "a project with no run of its own resumes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A resume of a run a live Mantra owns is refused (and names the way around it); a dead
+    /// owner is a crash and goes ahead; `--take-over` clears a live claim.
+    #[test]
+    fn a_resume_is_refused_while_the_owner_lives_and_take_over_clears_it() {
+        let project = std::env::temp_dir().join(format!("mantra-resume-owned-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let root = runs_root("owned", &[&project]);
+        let r = list_in(&root).remove(0);
+        assert!(claim_for_resume(&r, false).is_ok(), "no owner file: nothing to refuse");
+        // our own pid in the file is a recycled pid's leftover (a container restart), not a claim
+        Owner::this_process().write(&r.dir);
+        assert!(claim_for_resume(&r, false).is_ok(), "this process is no other Mantra");
+        // another live process holds the run
+        let stranger = engine::state::tests::Stranger::spawn();
+        stranger.owner().write(&r.dir);
+        let e = claim_for_resume(&r, false).unwrap_err();
+        assert!(e.contains("open in another Mantra") && e.contains("--take-over"), "{e}");
+        assert!(Owner::load(&r.dir).is_some(), "a refusal leaves the claim alone");
+        assert!(claim_for_resume(&r, true).is_ok());
+        assert!(Owner::load(&r.dir).is_none(), "--take-over clears it");
+        // a crash: the owner's pid is gone
+        Owner { pid: 4_000_000_000, ..Owner::this_process() }.write(&r.dir);
+        assert!(claim_for_resume(&r, false).is_ok(), "a dead owner does not block the resume");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// The TUI's `/runs` and the web `run_resume` go through `App::resume_run`: it refuses a
+    /// live owner the same way, with a toast, and opens nothing.
+    #[test]
+    fn the_app_refuses_to_resume_a_run_another_mantra_has_open() {
+        let project = std::env::temp_dir().join(format!("mantra-resume-app-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let root = runs_root("app", &[&project]);
+        let r = list_in(&root).remove(0);
+        let stranger = engine::state::tests::Stranger::spawn();
+        stranger.owner().write(&r.dir);
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.resume_run(r.clone());
+        assert!(app.run.is_none(), "nothing was opened");
+        let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(toast.contains("open in another Mantra"), "{toast}");
+        assert!(Owner::load(&r.dir).is_some(), "the owner's claim stands");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&project);
+    }
 }
 
 #[cfg(test)]

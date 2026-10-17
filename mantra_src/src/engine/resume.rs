@@ -66,6 +66,7 @@ impl Run {
         let label = state::stage_label(&self.stage);
         let was = st.halted.as_ref().map(|h| format!(" (it was halted: {h})")).unwrap_or_default();
         self.log("↻", "saffron", format!("resumed at {label}{was}"));
+        self.restore_slot_models(st);
         if let Some(ws) = self.ws.clone() {
             if ws.worktree && !ws.integ.is_dir() {
                 match git::reattach(&ws) {
@@ -120,10 +121,12 @@ impl Run {
                             PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. } => {
                                 // Every task had finished; merging is idempotent, so start the gate
                                 // sequence from the top. A fix worker that was mid-turn lost its
-                                // agent with the old process: the fresh gate round finds what is
-                                // still wrong and a new fix worker takes it from there.
-                                for w in self.workers.iter_mut().filter(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled)) {
+                                // agent with the old process (one the gateway outage failed is in
+                                // the same place): the fresh gate round finds what is still wrong
+                                // and a new fix worker takes it from there.
+                                for w in self.workers.iter_mut().filter(|w| w.adhoc && (!matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled) || w.transient)) {
                                     w.state = WState::Cancelled;
+                                    w.transient = false;
                                 }
                                 self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
                                 self.check_phase_done(ctx);
@@ -140,14 +143,15 @@ impl Run {
             Stage::Finale { idx } => {
                 self.resume_manager(ctx, st);
                 self.restore_workers(st);
-                // Unfinished ad-hoc fixes lost their agent with the old process: fresh attempts.
-                let redo: Vec<(Task, String, Option<String>)> = self
+                // Unfinished ad-hoc fixes lost their agent with the old process (and one the
+                // gateway outage failed was never its fault): fresh attempts.
+                let redo: Vec<(Task, String, Option<String>, bool)> = self
                     .workers
                     .iter_mut()
-                    .filter(|w| w.adhoc && !matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled))
+                    .filter(|w| w.adhoc && (!matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled) || w.transient))
                     .map(|w| {
                         w.state = WState::Cancelled;
-                        (w.task.clone(), w.prompt.clone(), w.effort.clone())
+                        (w.task.clone(), w.prompt.clone(), w.effort.clone(), std::mem::take(&mut w.transient))
                     })
                     .collect();
                 // the previous step reported while the run was paused: its successor was due
@@ -155,7 +159,12 @@ impl Run {
                     Some(p @ Pending::Finale { .. }) => self.perform_pending(ctx, p),
                     _ => self.start_finale(ctx, idx),
                 }
-                for (task, prompt, effort) in redo {
+                for (task, prompt, effort, outage) in redo {
+                    if outage {
+                        // the attempt the gateway took was not one
+                        self.extra_attempts += 1;
+                        self.log("↻", "violet", format!("respawning {} after the gateway outage", task.id));
+                    }
                     self.spawn_task(ctx, task, Some(prompt), effort);
                 }
             }
@@ -301,9 +310,32 @@ impl Run {
                     context_override: None,
                     idle_prompts: vec![],
                     transient: w.transient && w.state == "failed",
+                    // a model switched live for this task — if it still exists in the registry
+                    model: w.model.clone().filter(|m| self.knows_model(m)),
                 }
             })
             .collect();
+    }
+
+    /// The models the user switched live on the fixed agents, back from `state.json`: a saved
+    /// agent's alias that differs from its role's model (and still exists in the registry) is
+    /// what that slot — planner, manager, orchestrator, gate, finale — comes back on, re-attached
+    /// or fresh. `restore_workers` does the same per task.
+    fn restore_slot_models(&mut self, st: &RunState) {
+        let f = &self.pattern.flow;
+        let roles = [("planner", f.planner.clone()), ("manager", f.manager.clone()), ("orchestrator", f.orchestrator.clone()), ("gate", f.phase_gate.clone())];
+        let finale_role = match self.stage {
+            Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+            _ => None,
+        };
+        let roles = roles.into_iter().chain(finale_role.map(|r| ("finale", r)));
+        for (slot, role_name) in roles {
+            let Some(saved) = st.agents.iter().find(|a| a.slot == slot).map(|a| a.model_alias.trim().to_string()).filter(|m| !m.is_empty()) else { continue };
+            if saved != self.role(&role_name).model && self.knows_model(&saved) {
+                self.log("⚙", "blue", format!("{slot} comes back on {saved} (switched live before the restart)"));
+                self.slot_models.insert(slot.to_string(), saved);
+            }
+        }
     }
 }
 
@@ -343,19 +375,25 @@ mod tests {
         agents: HashMap<AgentId, Agent>,
         next: AgentId,
         spawned: Vec<(String, Option<String>)>,
+        /// Every spawn's model alias, by agent name.
+        models: Vec<(String, String)>,
         prompts: Vec<(AgentId, String)>,
         jobs: Vec<String>,
     }
     impl Fake {
         fn new() -> Fake {
-            Fake { agents: HashMap::new(), next: 1, spawned: vec![], prompts: vec![], jobs: vec![] }
+            Fake { agents: HashMap::new(), next: 1, spawned: vec![], models: vec![], prompts: vec![], jobs: vec![] }
         }
         fn add(&mut self, r: &SpawnReq, resume: Option<String>) -> AgentId {
             let id = self.next;
             self.next += 1;
             self.agents.insert(id, Agent::new(id, &r.name, &r.role_name, r.cwd.clone()));
             self.spawned.push((r.name.clone(), resume));
+            self.models.push((r.name.clone(), r.role.model.clone()));
             id
+        }
+        fn model_of(&self, name: &str) -> Option<&str> {
+            self.models.iter().find(|(n, _)| n == name).map(|(_, m)| m.as_str())
         }
     }
     impl Ctx for Fake {
@@ -411,7 +449,7 @@ mod tests {
             pattern: "mantra-default".into(),
             plan_version: 1,
             stage,
-            ws: Some(Workspace { worktree: true, repo: tmp.clone(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None }),
+            ws: Some(Workspace { worktree: true, repo: tmp.clone(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false }),
             workers,
             agents,
             ..Default::default()
@@ -613,6 +651,71 @@ mod tests {
         assert!(run.pending.is_none() && !run.halted());
         let saved = RunState::load(&run.dir).unwrap();
         assert!(saved.pending.is_none() && saved.halted.is_none(), "performed once: the saved state no longer carries it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Models switched live before the restart come back with the run: the fixed agents on the
+    /// alias `state.json` saved for their slot (re-attached or fresh), a worker on its own — and
+    /// an alias the registry no longer has falls back to the role's model.
+    #[test]
+    fn switched_models_survive_a_resume_when_the_registry_still_has_them() {
+        let dir = tmp("models");
+        std::fs::create_dir_all(dir.join("wt-b")).unwrap();
+        let mut b = worker("b", "running", 1, Some(dir.join("wt-b")));
+        b.model = Some("nova".into());
+        let mut c = worker("c", "queued", 1, None);
+        c.model = Some("gone".into());
+        let st = state(
+            &dir,
+            Stage::Phase { idx: 0, step: PhaseStep::Orchestrating },
+            vec![worker("a", "done", 1, None), b, c, worker("d", "done", 1, None)],
+            vec![
+                AgentState { slot: "manager".into(), thread_id: Some("thr-m".into()), model_alias: "nova".into(), ..Default::default() },
+                AgentState { slot: "orchestrator".into(), thread_id: Some("thr-o".into()), model_alias: "nova".into(), ..Default::default() },
+                AgentState { slot: "worker:b#1".into(), thread_id: Some("thr-b".into()), model_alias: "nova".into(), ..Default::default() },
+            ],
+        );
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run"));
+        let role_model = run.role("worker-small").model.clone();
+        run.set_known_models([("nova".to_string(), 128_000u64), (role_model.clone(), 200_000)].into_iter().collect());
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert_eq!(ctx.model_of("manager"), Some("nova"), "re-attached on the model it was switched to");
+        assert_eq!(ctx.model_of("orchestrator"), Some("nova"), "the fresh orchestrator too: the slot was switched");
+        assert_eq!(ctx.model_of("b"), Some("nova"), "the re-attached worker keeps its own");
+        let c2 = run.workers.iter().rev().find(|w| w.task.id == "c").unwrap();
+        assert_eq!((c2.attempt, c2.model.clone()), (2, None), "an alias the registry lost falls back to the role's model");
+        assert!(run.pulse.iter().any(|p| p.text.contains("orchestrator comes back on nova")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        // a run that was never switched: everything on the role's model, nothing logged about it
+        let plain = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating }, vec![worker("a", "done", 1, None)], vec![AgentState { slot: "orchestrator".into(), model_alias: run.role("orchestrator").model.clone(), ..Default::default() }]);
+        let mut run2 = Run::from_state(&plain, Pattern::builtin(), Some(plan()), dir.join("run2"));
+        let mut ctx2 = Fake::new();
+        run2.resume_boot(&mut ctx2, &plain);
+        assert_eq!(ctx2.model_of("orchestrator").map(str::to_string), Some(run2.role("orchestrator").model.clone()));
+        assert!(!run2.pulse.iter().any(|p| p.text.contains("comes back on")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fix worker the gateway outage failed, found by a restart: like one that was mid-turn,
+    /// it is closed and the gate sequence runs again — it must not sit there marked `transient`
+    /// for a later `resume` to respawn out of the blue.
+    #[test]
+    fn a_fix_worker_the_outage_failed_is_closed_by_the_restart() {
+        let dir = tmp("fix-outage");
+        let mut p = plan();
+        p.phases[0].tasks.truncate(1);
+        let mut fix = worker("fix-1", "failed", 1, Some(dir.join("integration")));
+        fix.adhoc = true;
+        fix.transient = true;
+        fix.error = "unexpected status 503".into();
+        let st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } }, vec![worker("a", "done", 1, Some(dir.join("integration"))), fix], vec![]);
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(p), dir.join("run"));
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        let fixer = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+        assert!(fixer.state == WState::Cancelled && !fixer.transient, "{:?}", fixer.state);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Merging });
+        assert!(ctx.spawned.iter().all(|(n, _)| n != "fix-1"), "{:?}", ctx.spawned);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

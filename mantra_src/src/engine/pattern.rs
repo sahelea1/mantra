@@ -109,6 +109,11 @@ pub struct PatternSettings {
     pub network: bool,
     /// Extra directories every workspace-write agent may write (`~` expands to the home dir), on top of the toolchain caches Mantra adds automatically.
     pub writable_roots: Vec<String>,
+    /// Tokens of context every spawned agent is told it has, whatever its model's window: the
+    /// effective window is `min(model window, context_cap)`, so the backend compacts there. A
+    /// 500k-token context let a worker cycle tools for hours (6.8M tokens, mostly cached input,
+    /// on one task); 200k keeps it honest. 0 = the model's full window.
+    pub context_cap: u64,
 }
 
 fn default_true() -> bool {
@@ -134,6 +139,7 @@ impl Default for PatternSettings {
             network: true,
             writable_roots: vec![],
             first_token_minutes: 4,
+            context_cap: 0,
         }
     }
 }
@@ -542,6 +548,8 @@ fn base_pattern(name: &str, description: &str) -> Pattern {
         p.roles.insert(n.into(), r);
     }
     p.flow = Flow { planner: "planner".into(), manager: String::new(), orchestrator: "orchestrator".into(), phase_gate: "qa".into(), on_reprompt: "planner".into(), finale: vec![] };
+    // 200k is plenty for any one task; a bigger window only lets an agent cycle tools for hours.
+    p.settings.context_cap = 200_000;
     p
 }
 
@@ -774,6 +782,21 @@ mod tests {
         assert_eq!(back.roles["planner"].fallback.as_deref(), Some("sol"));
         let zero = toml.replace("first_token_minutes = 4", "first_token_minutes = 0");
         assert_eq!(Pattern::from_toml(&zero).unwrap().settings.first_token_minutes, 0, "0 = off");
+    }
+
+    /// Every built-in caps the context at 200k; a pattern file from before the setting existed
+    /// (or one written by hand without it) keeps the model's full window.
+    #[test]
+    fn the_context_cap_is_200k_in_the_builtins_and_off_for_old_patterns() {
+        for p in all_builtins() {
+            assert_eq!(p.settings.context_cap, 200_000, "{}", p.name);
+        }
+        let toml = Pattern::builtin().to_toml();
+        assert!(toml.contains("context_cap = 200000"), "the Studio's TOML carries it");
+        let old = toml.replace("context_cap = 200000", "");
+        assert_eq!(Pattern::from_toml(&old).unwrap().settings.context_cap, 0, "missing = 0 = the model's full window");
+        let custom = toml.replace("context_cap = 200000", "context_cap = 64000");
+        assert_eq!(Pattern::from_toml(&custom).unwrap().settings.context_cap, 64_000);
     }
 
     #[test]

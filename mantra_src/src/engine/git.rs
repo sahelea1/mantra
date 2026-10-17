@@ -22,6 +22,10 @@ pub struct Workspace {
     /// Absent in a state file written before it existed.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// The repo had no commit at all (`git init` and nothing else): `setup` made an empty one so
+    /// the worktrees had something to branch from. Logged once, when the run starts.
+    #[serde(default)]
+    pub initial_commit: bool,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -49,6 +53,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         git_common_dir: None,
         note,
         base_commit: None,
+        initial_commit: false,
     };
     if isolation == "shared" {
         return Ok(shared(None));
@@ -62,8 +67,12 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
             return Ok(shared(Some("not a git repo — workers share the project directory".into())));
         }
     };
-    if git(&top, &["rev-parse", "HEAD"]).is_err() {
-        return Ok(shared(Some("repo has no commits yet — workers share the project directory".into())));
+    // `git init` and nothing else: an unborn HEAD has nothing to branch a worktree from. One empty
+    // commit gives it one — the shared fallback used to kick in here and quietly lose the
+    // isolation the pattern asked for; it is kept only for a directory that is no repo at all.
+    let initial_commit = git(&top, &["rev-parse", "HEAD"]).is_err();
+    if initial_commit {
+        initial_empty_commit(&top)?;
     }
     let base_branch = git(&top, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
     if top.join(".mantra").exists() {
@@ -92,8 +101,32 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         base_branch,
         git_common_dir: common,
         base_commit,
-        note: if dirty { Some("you have uncommitted changes — agents work from your last commit (commit first, or set isolation = shared)".into()) } else { None },
+        note: match (dirty, initial_commit) {
+            // the files are there but none was ever committed: the worktrees start out empty
+            (true, true) => Some("nothing here was ever committed — agents start from an empty tree (commit your files first, or set isolation = shared)".into()),
+            (true, false) => Some("you have uncommitted changes — agents work from your last commit (commit first, or set isolation = shared)".into()),
+            _ => None,
+        },
+        initial_commit,
     })
+}
+
+/// `git commit --allow-empty` on an unborn HEAD. `--only` with no paths keeps it empty even when
+/// files are already staged: those stay staged and are the user's to commit, not Mantra's. The
+/// repo's own identity is used when it has one; a fresh `git init` on a machine with no
+/// `user.name`/`user.email` gets Mantra's, so the commit does not fail on "please tell me who you are".
+/// `--no-verify`: the repo's hooks are for the user's own commits — a linter or a commit-message
+/// policy has nothing to check in an empty one, and must not stop the run before it starts.
+fn initial_empty_commit(top: &Path) -> Result<(), String> {
+    let mut args: Vec<&str> = vec![];
+    if git(top, &["config", "user.name"]).map(|v| v.is_empty()).unwrap_or(true) {
+        args.extend(["-c", "user.name=Mantra"]);
+    }
+    if git(top, &["config", "user.email"]).map(|v| v.is_empty()).unwrap_or(true) {
+        args.extend(["-c", "user.email=mantra@localhost"]);
+    }
+    args.extend(["commit", "-q", "--allow-empty", "--only", "--no-verify", "-m", "mantra: initial commit"]);
+    git(top, &args).map(|_| ()).map_err(|e| format!("the repository has no commit yet and Mantra could not create one for the worktrees ({e}) — commit once yourself, or set isolation = shared"))
 }
 
 fn ensure_excluded(top: &Path) -> std::io::Result<()> {
@@ -510,7 +543,7 @@ mod tests {
     }
 
     fn test_ws(dir: &Path, base: Option<String>) -> Workspace {
-        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base }
+        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base, initial_commit: false }
     }
 
     #[test]
@@ -585,5 +618,60 @@ mod tests {
         assert!(discard_check_artifacts(&dir, &before).is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "edited by a worker\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git init` and nothing else: the run still gets its worktrees, off an empty commit Mantra
+    /// makes — the shared fallback is only for a directory that is not a repo at all.
+    #[test]
+    fn an_unborn_repo_gets_an_initial_commit_and_isolated_worktrees() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let dir = std::env::temp_dir().join(format!("mantra-git-unborn-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-q"]).unwrap();
+            // no identity configured in this repo: the commit must still go through
+            git(&dir, &["config", "--local", "--unset-all", "user.name"]).ok();
+            git(&dir, &["config", "--local", "--unset-all", "user.email"]).ok();
+            assert!(git(&dir, &["rev-parse", "HEAD"]).is_err(), "the fixture must have no commit");
+            for iso in ["worktree", "auto"] {
+                let ws = setup(&dir, &format!("r-{iso}"), iso).unwrap_or_else(|e| panic!("{iso}: {e}"));
+                assert!(ws.worktree, "{iso}: isolated, not shared");
+                assert!(ws.integ.is_dir() && ws.integ != dir, "{iso}: an integration worktree exists");
+                assert_eq!(ws.initial_commit, iso == "worktree", "{iso}: only the first setup had to create the commit");
+                assert!(ws.base_commit.is_some());
+            }
+            assert_eq!(git(&dir, &["log", "--format=%s", "-1"]).unwrap(), "mantra: initial commit");
+            assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).unwrap(), "1", "one commit, not one per run");
+            // files staged before the first run stay staged: the commit Mantra makes is empty
+            let staged = std::env::temp_dir().join(format!("mantra-git-staged-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&staged);
+            std::fs::create_dir_all(&staged).unwrap();
+            git(&staged, &["init", "-q"]).unwrap();
+            std::fs::write(staged.join("app.py"), "print('hi')\n").unwrap();
+            git(&staged, &["add", "app.py"]).unwrap();
+            // a hook that rejects every commit is the user's policy, not the empty commit's
+            let hook = staged.join(".git").join("hooks").join("pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let ws = setup(&staged, "r-staged", "worktree").unwrap();
+            assert!(ws.worktree && ws.initial_commit);
+            assert_eq!(git(&staged, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap(), "", "an empty commit");
+            assert_eq!(git(&staged, &["status", "--porcelain"]).unwrap(), "A  app.py", "still staged, still the user's");
+            assert!(ws.note.as_deref().map(|n| n.contains("empty tree")).unwrap_or(false), "{:?}", ws.note);
+            let _ = std::fs::remove_dir_all(&staged);
+            // a plain directory (outside any repo) is still shared, and `worktree` still refuses it
+            let plain = std::env::temp_dir().join(format!("mantra-git-plain-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&plain);
+            std::fs::create_dir_all(&plain).unwrap();
+            let ws = setup(&plain, "r-plain", "auto").unwrap();
+            assert!(!ws.worktree && ws.note.as_deref().map(|n| n.contains("not a git repo")).unwrap_or(false), "{:?}", ws.note);
+            assert!(setup(&plain, "r-plain2", "worktree").is_err());
+            let _ = std::fs::remove_dir_all(&plain);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }
