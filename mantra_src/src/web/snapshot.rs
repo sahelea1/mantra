@@ -436,7 +436,8 @@ pub struct RunView {
     pub started_at: u64,
     pub elapsed_ms: u64,
     pub total_tokens: u64,
-    /// Of `total_tokens`, the cached input of the agents still on the run (`ui::run_token_totals`).
+    /// Of `total_tokens`, the cached input of every agent the run has had, retired ones included
+    /// (`ui::run_token_totals`).
     #[serde(default)]
     pub cached_tokens: u64,
     pub busy_count: usize,

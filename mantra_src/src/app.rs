@@ -1075,6 +1075,7 @@ impl App {
         // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
         self.screen = Screen::Stage;
         self.sel = 0;
+        self.sel_follow = None;
     }
 
     /// Record a failed sandbox probe (done once at startup, never in demo mode). The welcome
@@ -1129,6 +1130,7 @@ impl App {
         self.unfinished_runs.retain(|id| *id != r.id);
         self.screen = Screen::Stage;
         self.sel = 0;
+        self.sel_follow = None;
         self.toast(format!("resumed {} at {label}", r.id), Level::Ok);
     }
 
@@ -2107,6 +2109,8 @@ impl App {
                 // 1-9 jump: select the nth node and zoom straight in.
                 let idx = (c as usize) - ('1' as usize);
                 if let Some(a) = nodes.get(idx) {
+                    // the user chose a card: a respawned task no longer pulls the selection back
+                    self.sel_follow = None;
                     self.sel = idx;
                     self.set_screen(Screen::Zoom(*a));
                     self.canvas_focus = false;
@@ -2779,6 +2783,15 @@ mod tests {
         app.run.as_mut().unwrap().workers[3].agent = Some(13);
         app.tick();
         assert_eq!(app.stage_nodes()[app.sel], 10, "the selection stays on p1-api, where ← put it");
+        // and so is a 1–9 jump
+        app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 4, None, WState::Preparing));
+        app.sel_follow = Some("p1-ui".into());
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.stage_nodes()[app.sel], 10);
+        app.run.as_mut().unwrap().workers[4].agent = Some(14);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 10, "the jump is the user choosing too");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the
