@@ -101,14 +101,20 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         base_branch,
         git_common_dir: common,
         base_commit,
-        note: if dirty { Some("you have uncommitted changes — agents work from your last commit (commit first, or set isolation = shared)".into()) } else { None },
+        note: match (dirty, initial_commit) {
+            // the files are there but none was ever committed: the worktrees start out empty
+            (true, true) => Some("nothing here was ever committed — agents start from an empty tree (commit your files first, or set isolation = shared)".into()),
+            (true, false) => Some("you have uncommitted changes — agents work from your last commit (commit first, or set isolation = shared)".into()),
+            _ => None,
+        },
         initial_commit,
     })
 }
 
-/// `git commit --allow-empty` on an unborn HEAD. The repo's own identity is used when it has one;
-/// a fresh `git init` on a machine with no `user.name`/`user.email` gets Mantra's, so the commit
-/// does not fail on "please tell me who you are".
+/// `git commit --allow-empty` on an unborn HEAD. `--only` with no paths keeps it empty even when
+/// files are already staged: those stay staged and are the user's to commit, not Mantra's. The
+/// repo's own identity is used when it has one; a fresh `git init` on a machine with no
+/// `user.name`/`user.email` gets Mantra's, so the commit does not fail on "please tell me who you are".
 fn initial_empty_commit(top: &Path) -> Result<(), String> {
     let mut args: Vec<&str> = vec![];
     if git(top, &["config", "user.name"]).map(|v| v.is_empty()).unwrap_or(true) {
@@ -117,7 +123,7 @@ fn initial_empty_commit(top: &Path) -> Result<(), String> {
     if git(top, &["config", "user.email"]).map(|v| v.is_empty()).unwrap_or(true) {
         args.extend(["-c", "user.email=mantra@localhost"]);
     }
-    args.extend(["commit", "-q", "--allow-empty", "-m", "mantra: initial commit"]);
+    args.extend(["commit", "-q", "--allow-empty", "--only", "-m", "mantra: initial commit"]);
     git(top, &args).map(|_| ())
 }
 
@@ -634,6 +640,19 @@ mod tests {
             }
             assert_eq!(git(&dir, &["log", "--format=%s", "-1"]).unwrap(), "mantra: initial commit");
             assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).unwrap(), "1", "one commit, not one per run");
+            // files staged before the first run stay staged: the commit Mantra makes is empty
+            let staged = std::env::temp_dir().join(format!("mantra-git-staged-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&staged);
+            std::fs::create_dir_all(&staged).unwrap();
+            git(&staged, &["init", "-q"]).unwrap();
+            std::fs::write(staged.join("app.py"), "print('hi')\n").unwrap();
+            git(&staged, &["add", "app.py"]).unwrap();
+            let ws = setup(&staged, "r-staged", "worktree").unwrap();
+            assert!(ws.worktree && ws.initial_commit);
+            assert_eq!(git(&staged, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap(), "", "an empty commit");
+            assert_eq!(git(&staged, &["status", "--porcelain"]).unwrap(), "A  app.py", "still staged, still the user's");
+            assert!(ws.note.as_deref().map(|n| n.contains("empty tree")).unwrap_or(false), "{:?}", ws.note);
+            let _ = std::fs::remove_dir_all(&staged);
             // a plain directory (outside any repo) is still shared, and `worktree` still refuses it
             let plain = std::env::temp_dir().join(format!("mantra-git-plain-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&plain);

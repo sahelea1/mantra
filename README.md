@@ -393,6 +393,8 @@ Three patterns ship in the binary (and load by name, with or without a file of y
 
 Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap, so the backend compacts there — a 500k-token context once let one worker cycle tools for hours (6.8M tokens, mostly cached input) on a single task. `0` is the model's full window; the Studio edits it (`200k`, `off`) under settings.
 
+Worktree isolation (`isolation = worktree`, or `auto` in a git repository) needs a commit to branch from. A repository that has none yet — `git init` and nothing else — gets an empty `mantra: initial commit` (files you already staged stay staged), and the run says so: `⎇ created the initial commit so workers get isolated worktrees`. Only a directory that is not a git repository at all makes `auto` fall back to one shared directory.
+
 A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`, `context_cap`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation; its flow panel shows the manager between the planner and the orchestrator.
 
 Or describe what you want and let the **architect agent** edit the pattern while you watch: *"add a docs writer after security"*, *"make workers cheaper"*, *"put the planner on Claude"*, *"run without a manager"*.
