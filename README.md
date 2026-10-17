@@ -506,7 +506,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 | `←→↑↓` | select a card · `1`–`9` jump to the *n*th and zoom (one card per task: a retried task counts once, and the selection is the attempt the card shows) |
 | `⏎` | zoom in · `esc` back to the overview (esc never interrupts) |
 | `space` | pause / resume the run |
-| `r` | respawn the selected agent · `m` switch its model |
+| `r` | respawn the selected agent (a respawned worker's card stays selected once its new attempt starts) · `m` switch its model |
 | `x` | interrupt · `c` compact · `+/-` effort |
 | `p` | plan · `a` approve · `d` diff · `s` studio |
 | `@name …` | message one agent (`@manager` included); plain text re-prompts the planner — or answers the planner's or the manager's open question |
