@@ -1236,6 +1236,12 @@ Then summarize in 2-4 lines.",
     /// Short "what to do" text for the halted state, shown in the stage header band and the alert.
     pub fn halt_hint(&self) -> String {
         let Some(h) = &self.halt else { return String::new() };
+        // a gateway halt (`halt_for_outage`) is lifted by resuming, whatever its reason: a
+        // respawn would only be refused while the run is halted, and `r` on a task with no
+        // attempt left is the one case its own hint already names
+        if h.message.contains("the model gateway looks down") && !h.message.contains(GATEWAY_DOWN_RETRY_HINT) {
+            return "space resumes once the gateway is back — the workers the outage took are respawned for free".into();
+        }
         match h.reason {
             HaltReason::User => "space resume".into(),
             HaltReason::Auth | HaltReason::UsageLimit => "fix credentials or quota, then space".into(),
@@ -7774,6 +7780,7 @@ mod halt_tests {
         run.on_turn_done(&mut ctx, planner, "failed", Some("502 Bad Gateway".into()), Some(ErrKind::Transient));
         let h = run.halt.as_ref().expect("halted");
         assert!(h.message.ends_with("the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically"), "{}", h.message);
+        assert_eq!(run.halt_hint(), "space resumes once the gateway is back — the workers the outage took are respawned for free", "the band offers no key a halted run refuses");
         assert!(h.full.ends_with("failed workers are respawned automatically"));
     }
 

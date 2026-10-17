@@ -11,7 +11,7 @@ wrong. This release answers that list.
   to count as "could not fix what QA found" and woke the manager, then the planner — both on the
   same dead gateway. Any worker the outage took now halts the run with the gateway wording and
   no escalation; `space` / Resume respawns every such worker where it was, fix workers included,
-  and the halt names the one key that helps.
+  and the halt band names that one key (no `r` a halted run would refuse).
 - **One owner per run.** A run that is open in a live Mantra carries `owner.json`; a second
   process refuses to resume or delete it ("open in another Mantra (pid …) — quit it first, or
   `--take-over`"). A dead owner is a crash and resumes normally; a zombie counts as dead. And

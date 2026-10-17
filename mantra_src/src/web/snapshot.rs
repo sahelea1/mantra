@@ -895,7 +895,7 @@ fn stage_view(s: &Stage) -> StageView {
 /// respawned while the run is halted), so the web band offers Resume, not Retry, for those.
 /// A gate or turn retry is that band's "Retry gate" / "Retry turn" button, not a Resume.
 fn web_hint(hint: &str, reason: &HaltReason) -> String {
-    let h = hint.replace("then space resumes", "then Resume").replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again");
+    let h = hint.replace("space resumes once", "Resume once").replace("then space resumes", "then Resume").replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again");
     let mut h = h.replace("space ", "Resume ").replace("then space", "then Resume");
     if matches!(reason, HaltReason::ProviderRejected | HaltReason::Environment) {
         h = h.replace(" · r retry", ", then Resume").replace("then r retry", "then Resume");
@@ -1622,6 +1622,7 @@ pub(crate) mod tests {
     #[test]
     fn a_provider_or_environment_halt_hint_names_resume_and_an_exhausted_task_keeps_retry() {
         assert_eq!(web_hint("m switch model for w1, then space resumes", &HaltReason::ProviderRejected), "Switch model for w1, then Resume");
+        assert_eq!(web_hint("space resumes once the gateway is back — the workers the outage took are respawned for free", &HaltReason::AgentTurnFailed), "Resume once the gateway is back — the workers the outage took are respawned for free");
         assert_eq!(web_hint("m switch model for w1 · r retry", &HaltReason::ProviderRejected), "Switch model for w1, then Resume", "an older wording");
         assert_eq!(web_hint("fix the environment (see the message above), then space resumes", &HaltReason::Environment), "fix the environment (see the message above), then Resume");
         assert_eq!(web_hint("r retry t2 · type feedback for the planner", &HaltReason::AttemptsExhausted), "Retry t2 · type feedback for the planner");
