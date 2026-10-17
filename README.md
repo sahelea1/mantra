@@ -194,6 +194,7 @@ There is no vague "paused" state. A run that cannot continue **halts** with a ty
 | gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice (a fix worker that is blocked or whose turn fails is an *attempts exhausted* halt on `fix-<round>`) | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
 | attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
+| model gateway down | a worker (a fix worker too) failed on a 5xx / reset connection past its free retries, or an escalation's own error is a transport one | nobody is woken — the manager and the planner run through the same gateway; `space` when it is back, and every worker the outage took is respawned where it was, for free |
 
 **Pause is a hard boundary.** While a run is paused nothing new starts — no next phase, gate round, handoff or finale step. Results that arrive mid-pause (a QA report, gate checks, a cleanup commit) are recorded; the transition they trigger is kept in `state.json` and performed exactly once on resume, even after a restart. The header's `⏱` counts active time only — it stops on every halt, pause included — and freezes at the final duration when the run completes or stops.
 
@@ -349,8 +350,10 @@ Every run writes a typed snapshot as it goes, so closing Mantra — or losing th
 mantra runs                        # title · project · stage · when · id
 mantra runs resume 238330          # an id prefix is enough, from any directory
 mantra runs delete 238330          # worktrees, branches and journal, after a y/N
-mantra --resume-last               # the most recent unfinished run
+mantra --resume-last               # this project's most recent unfinished run (cwd / --cwd)
 ```
+
+`--resume-last` only ever picks a run of the project you are in (with `--demo`, the last demo run); another project's run is resumed by id, with `mantra runs resume`. **A run has one owner.** The Mantra that has a run open writes `owner.json` (pid, host, since) into the run's directory, refreshes it with every state flush and removes it when the run ends or it quits cleanly. Resuming a run whose owner is still alive on this machine is refused — from `/runs`, the CLI, `--resume-last` and the web UI alike — because two processes driving one run would each save `state.json` over the other's. A dead owner is a crash, and resumes as usual; `mantra runs resume <id> --take-over` is for the rare case the check is wrong.
 
 A run has a **title** people can recognise — the plan's title once the planner has submitted it, the goal's first six words before that. It leads the runs list, the TUI header and the web run header; the id (`<seconds>-<slug of the goal>`) stays the stable key and is shown second. Each Codex agent's thread carries the same name, `<title> · <role>`, so a run is easy to find in Codex's own session list (Claude Code sessions have no title API, so they are left alone).
 
@@ -365,7 +368,7 @@ A resume never replays what the old process was in the middle of. It restarts at
 |---|---|
 | planning | the planner is re-attached to its thread and asked to finish the plan |
 | plan review | the saved plan goes straight back up for review |
-| a phase in progress | a fresh orchestrator, briefed with the current status; the manager re-attached to its own thread; running workers re-attach to their own threads when their worktree still exists, otherwise they are re-spawned with the same prompt |
+| a phase in progress | a fresh orchestrator, briefed with the current status; the manager re-attached to its own thread; running workers re-attach to their own threads when their worktree still exists, otherwise they are re-spawned with the same prompt — each on the model it was switched to live, if you switched one (`m`, `ctrl+k`, the web picker: a switch is per agent and survives respawns and resumes; `set_role_model` is the role-wide change) |
 | merging / checks / gate | the merge → checks → gate sequence simply runs again (it is idempotent) |
 | finale | that step starts over, the manager re-attached |
 | finished | opens read-only, so `/land` still works |
@@ -388,7 +391,9 @@ Three patterns ship in the binary (and load by name, with or without a file of y
 
 `mantra-default-claude` is `mantra-default` with the planner, manager and orchestrator on `fable51` and the workers on `sonnet5`. Every built-in role prompt is short and says what it owns, what it never does, when to stop — and not to re-read files it already read or run the full suite more than once a turn unless it failed.
 
-A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation; its flow panel shows the manager between the planner and the orchestrator.
+Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap, so the backend compacts there — a 500k-token context once let one worker cycle tools for hours (6.8M tokens, mostly cached input) on a single task. `0` is the model's full window; the Studio edits it (`200k`, `off`) under settings.
+
+A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`, `context_cap`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation; its flow panel shows the manager between the planner and the orchestrator.
 
 Or describe what you want and let the **architect agent** edit the pattern while you watch: *"add a docs writer after security"*, *"make workers cheaper"*, *"put the planner on Claude"*, *"run without a manager"*.
 

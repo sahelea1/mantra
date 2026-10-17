@@ -46,6 +46,10 @@ pub enum JobOut {
     Text(Result<String, String>),
 }
 
+/// What every halt for a dead model gateway ends with: what to do (nothing but wait and resume)
+/// and what happens then. One text, so the band, the web hint and the journal always agree.
+pub const GATEWAY_DOWN_HINT: &str = "the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically";
+
 pub struct SpawnReq {
     pub name: String,
     pub role_name: String,
@@ -235,6 +239,10 @@ pub struct Worker {
     /// The worker is `Failed` because the model gateway was down, not because of anything it did:
     /// the next resume respawns it (same worktree), and it costs no attempt.
     pub transient: bool,
+    /// The alias this attempt runs on when the user switched it live (`set_agent_model`);
+    /// `None` = the role's model. The next attempt of the same task keeps it (`spawn_task`), and
+    /// so does a resume — a switch made for one task is not a switch for its whole role.
+    pub model: Option<String>,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -497,6 +505,23 @@ pub struct Run {
     yield_interrupted: HashSet<AgentId>,
     /// The last `mantra_status` text each agent was given this turn. Runtime-only.
     last_status: HashMap<AgentId, String>,
+    /// Models the user switched live on a fixed agent, by slot (`planner`, `manager`,
+    /// `orchestrator`, `gate`, `finale`): a respawn of that slot and a resume keep them. Saved
+    /// through `agent_meta` (`AgentState.model_alias`), where a resume reads them back.
+    pub(super) slot_models: HashMap<String, String>,
+    /// What the registry knows, alias → effective context window (`Registry::context_windows`),
+    /// handed in by the app (`set_known_models`): the engine has no registry of its own. Tells a
+    /// saved alias that still exists from one that was deleted, and gives `settings.context_cap`
+    /// a window to be measured against. Empty = never told (tests): every alias is trusted.
+    known_models: HashMap<String, u64>,
+    /// Hash of the pattern as last written to the run dir's `pattern.toml` — a resume reloads from
+    /// there, so a role-level model change (`set_role_model all`) is written back when it differs.
+    pattern_hash: std::sync::atomic::AtomicU64,
+    /// This process, as the run's owner (`<run dir>/owner.json`, see `state::Owner`): written
+    /// with every state flush while the run is live, released when it ends or this `Run` is
+    /// dropped (a clean quit, `/leave`), left behind by a crash — where a dead pid lets the next
+    /// resume go ahead and a live one refuses it.
+    owner: super::state::Owner,
 }
 
 impl Run {
@@ -581,6 +606,10 @@ impl Run {
             yielded: HashSet::new(),
             yield_interrupted: HashSet::new(),
             last_status: HashMap::new(),
+            slot_models: HashMap::new(),
+            known_models: HashMap::new(),
+            pattern_hash: std::sync::atomic::AtomicU64::new(0),
+            owner: super::state::Owner::this_process(),
         }
     }
 
@@ -620,26 +649,43 @@ impl Run {
         }
     }
 
+    /// An agent's place in the run as `state.json` names it: `planner | manager | orchestrator |
+    /// gate | worker:<task>#<attempt> | finale`, empty for an agent that is not part of the run.
+    pub fn slot_of(&self, a: AgentId) -> String {
+        if Some(a) == self.planner {
+            "planner".into()
+        } else if Some(a) == self.manager {
+            "manager".into()
+        } else if Some(a) == self.orchestrator {
+            "orchestrator".into()
+        } else if Some(a) == self.gate_agent {
+            "gate".into()
+        } else if let Some(w) = self.workers.iter().find(|w| w.agent == Some(a)) {
+            format!("worker:{}#{}", w.task.id, w.attempt)
+        } else if Some(a) == self.finale_agent {
+            "finale".into()
+        } else {
+            String::new()
+        }
+    }
+
     /// Persist everything a later `mantra runs resume` needs (see `engine::state`). Cheap: a few
-    /// KB rewritten atomically at every transition.
+    /// KB rewritten atomically at every transition. The owner file goes with it — refreshed while
+    /// the run is live, released once it is over — and so does the run's `pattern.toml` when a
+    /// role-level model change made it differ from the copy on disk.
     pub(super) fn save_state(&self) {
-        let slot_of = |a: AgentId| -> String {
-            if Some(a) == self.planner {
-                "planner".into()
-            } else if Some(a) == self.manager {
-                "manager".into()
-            } else if Some(a) == self.orchestrator {
-                "orchestrator".into()
-            } else if Some(a) == self.gate_agent {
-                "gate".into()
-            } else if let Some(w) = self.workers.iter().find(|w| w.agent == Some(a)) {
-                format!("worker:{}#{}", w.task.id, w.attempt)
-            } else if Some(a) == self.finale_agent {
-                "finale".into()
-            } else {
-                String::new()
-            }
-        };
+        let slot_of = |a: AgentId| self.slot_of(a);
+        if self.is_active() {
+            self.owner.write(&self.dir);
+        } else {
+            self.owner.release(&self.dir);
+        }
+        let toml = self.pattern.to_toml();
+        let hash = fnv1a(&toml);
+        if self.pattern_hash.swap(hash, std::sync::atomic::Ordering::Relaxed) != hash {
+            let _ = std::fs::create_dir_all(&self.dir);
+            let _ = std::fs::write(self.dir.join("pattern.toml"), toml);
+        }
         let workers = self
             .workers
             .iter()
@@ -665,6 +711,7 @@ impl Run {
                     effort: w.effort.clone(),
                     report,
                     transient: w.transient,
+                    model: w.model.clone(),
                 }
             })
             .collect();
@@ -697,6 +744,70 @@ impl Run {
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
         }
         .save(&self.dir);
+    }
+
+    /// What the registry knows (`Registry::context_windows`), from the app: at a run's start, on
+    /// resume and after every live model switch — the only times an alias can enter the run.
+    pub fn set_known_models(&mut self, models: HashMap<String, u64>) {
+        self.known_models = models;
+    }
+
+    /// Is `alias` still in the registry? Trusted blindly when the app never said what it knows.
+    pub(super) fn knows_model(&self, alias: &str) -> bool {
+        self.known_models.is_empty() || self.known_models.contains_key(alias)
+    }
+
+    /// The user switched a run agent's model live (the `m` picker, `ctrl+k`, the web `set_model`):
+    /// remember it for *that agent* — the task's next attempt, the slot's next respawn and a
+    /// resume keep it — and nothing else: the role's other workers go on with the role's model.
+    /// A switch back to the role's model forgets the choice. `set_role_model` (one role, or
+    /// `all`) is the role-level change and writes the pattern copy instead.
+    pub fn set_agent_model(&mut self, a: AgentId, alias: &str) {
+        let slot = self.slot_of(a);
+        if slot.is_empty() {
+            return;
+        }
+        let role_model = self.role_name_of(a).map(|r| self.role(&r).model).unwrap_or_default();
+        let own = (alias != role_model).then(|| alias.to_string());
+        let pinned = own.is_some();
+        if let Some(wi) = self.worker_idx(a) {
+            self.workers[wi].model = own;
+        } else {
+            match own {
+                Some(m) => self.slot_models.insert(slot, m),
+                None => self.slot_models.remove(&slot),
+            };
+        }
+        if let Some(m) = self.agent_meta.get_mut(&a) {
+            m.model_alias = alias.to_string();
+        }
+        let name = self.name_of(a);
+        let scope = if pinned { "this agent only — its respawns and a resume keep it" } else { "the role's model" };
+        self.log("⚙", "blue", format!("{name}: model → {alias} ({scope})"));
+        self.save_state();
+    }
+
+    /// The role as a spawn into `slot` should see it: with the model the user chose live for
+    /// that slot, if any, in place of the role's (`set_agent_model`).
+    fn role_for_slot(&self, slot: &str, role_name: &str) -> Role {
+        let mut role = self.role(role_name);
+        if let Some(m) = self.slot_models.get(slot) {
+            role.model = m.clone();
+        }
+        role
+    }
+
+    /// The context window a spawn is told it has: the attempt's own override (a halved assumed
+    /// window) or the model's, and never more than `settings.context_cap` (0 = no cap) — the
+    /// backend then compacts at the cap instead of letting an agent carry a 500k-token context
+    /// through hours of tool cycling. An alias the registry does not know is capped as it is.
+    fn context_for(&self, alias: &str, over: Option<u64>) -> Option<u64> {
+        let cap = self.pattern.settings.context_cap;
+        if cap == 0 {
+            return over;
+        }
+        let window = over.or_else(|| self.known_models.get(alias).copied());
+        Some(window.map_or(cap, |w| w.min(cap)))
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -961,6 +1072,14 @@ impl Run {
         if self.halted() {
             return;
         }
+        // A failure that is the gateway's (a 5xx, a reset connection — `is_transport_error`) is
+        // nobody's to resolve: the manager and the planner run through the same gateway, so
+        // waking them is just more failed turns. Only a halt that carries a turn's error is read
+        // this way — a gate verdict is the QA agent's prose, where "timeout" means something else.
+        if matches!(reason, HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) && crate::agent::is_transport_error(None, &full) {
+            self.halt_for_outage(ctx, reason, agent, message, full);
+            return;
+        }
         self.halt_full(ctx, reason, agent, message, full.clone());
         let message = full;
         // With a manager in the pattern it is first in line — it has the operational tools
@@ -991,6 +1110,20 @@ impl Run {
         if self.has_manager() && agent != self.manager {
             self.escalate_to_manager(ctx, message, false);
         }
+    }
+
+    /// The model gateway is down: halt for the user and nobody else, with the wording of a dead
+    /// gateway under a planner (`GATEWAY_DOWN_HINT`, so the band and the web hint already fit).
+    /// `reason` is the halt's own — `AgentTurnFailed` for a worker the outage failed, the
+    /// exhausted-attempts one when it came through `halt_and_escalate` — but no rung of the
+    /// chain of command is woken: the manager and the planner would only fail the same way, and
+    /// `resume` respawns every worker the outage took (`respawn_after_outage`).
+    fn halt_for_outage(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
+        if self.halted() {
+            return;
+        }
+        self.halt_full(ctx, reason, agent, format!("{message} — {GATEWAY_DOWN_HINT}"), format!("{full} — {GATEWAY_DOWN_HINT}"));
+        self.log("◈", "amber", "not escalated: the manager and the planner share the outage — resume when the gateway is back");
     }
 
     /// What every escalation prompt carries: the workers, the last gate report, the last checks.
@@ -1477,7 +1610,11 @@ Then summarize in 2-4 lines.",
     pub fn start(&mut self, ctx: &mut dyn Ctx) {
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(self.dir.join("brief.md"), &self.brief);
-        let _ = std::fs::write(self.dir.join("pattern.toml"), self.pattern.to_toml());
+        let toml = self.pattern.to_toml();
+        self.pattern_hash.store(fnv1a(&toml), std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::write(self.dir.join("pattern.toml"), toml);
+        // the run is ours from here: another Mantra must not resume it while this one lives
+        self.owner.write(&self.dir);
         self.log("◈", "saffron", format!("run {} started with pattern {}", self.id, self.pattern.name));
         let project = self.project.clone();
         let id = self.id.clone();
@@ -1492,7 +1629,7 @@ Then summarize in 2-4 lines.",
     /// `resume`: a saved thread/session id to re-attach to (`mantra runs resume`).
     pub(super) fn spawn_planner_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.planner.clone();
-        let role = self.role(&name);
+        let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
         let req = SpawnReq {
             name: "planner".into(),
@@ -1503,7 +1640,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::planner_tools(&wr),
             extra_writable: vec![],
-            context_override: None,
+            context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
@@ -1636,8 +1773,11 @@ Then summarize in 2-4 lines.",
         let queued = running >= self.pattern.settings.max_parallel;
         let tid = task.id.clone();
         let adhoc = task.id.starts_with("fix-");
-        // A halved context from an earlier attempt of the same task carries forward.
-        let context_override = self.workers.iter().rev().find(|w| w.task.id == tid).and_then(|w| w.context_override);
+        // A halved context from an earlier attempt of the same task carries forward, and so does
+        // the model the user switched that attempt to: a retry or a respawn is the same task.
+        let previous = self.workers.iter().rev().find(|w| w.task.id == tid);
+        let context_override = previous.and_then(|w| w.context_override);
+        let model = previous.and_then(|w| w.model.clone());
         self.workers.push(Worker {
             task,
             prompt,
@@ -1658,6 +1798,7 @@ Then summarize in 2-4 lines.",
             budget_flagged: false,
             idle_prompts: vec![],
             transient: false,
+            model,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued (max_parallel = {})", self.pattern.settings.max_parallel));
@@ -1695,6 +1836,10 @@ Then summarize in 2-4 lines.",
         let plan_summary = self.plan.as_ref().map(|p| p.summary.clone()).unwrap_or_default();
         let w = &self.workers[wi];
         let mut role = self.role(&w.task.role);
+        // The model the user switched this task to (`set_agent_model`) outranks the role's.
+        if let Some(m) = &w.model {
+            role.model = m.clone();
+        }
         // Codex's workspace-write sandbox keeps every `.git` read-only whatever the writable roots
         // say, so a fix worker on the integration copy (merging conflicted branches, unstaging a
         // file) could not touch the index. It runs unsandboxed; the worktree still isolates it.
@@ -1718,7 +1863,7 @@ Then summarize in 2-4 lines.",
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
-        let context_override = w.context_override;
+        let context_override = self.context_for(&role.model, w.context_override);
         let resumed = resume.is_some();
         // A fix worker shares the integration copy; it needs the git dir writable only to merge
         // branches that conflicted.
@@ -1881,7 +2026,7 @@ Then summarize in 2-4 lines.",
             self.last_verify_sig = None;
         }
         let name = self.pattern.flow.phase_gate.clone();
-        let role = self.role(&name);
+        let role = self.role_for_slot("gate", &name);
         // Whatever the pattern's gate role says, Mantra never lets the gate agent fix: a writable
         // sandbox is told to hold back (a read-only one cannot write at all).
         let sandbox_note = if role.sandbox == "read-only" {
@@ -1920,7 +2065,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
             extra_writable: self.integ_writable(),
-            context_override: None,
+            context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role: role.clone(),
@@ -2124,7 +2269,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Finale { idx: k };
         self.gate_report = None;
         self.phase_started = Instant::now();
-        let role = self.role(&step.role);
+        let role = self.role_for_slot("finale", &step.role);
         // A read-only finale role (the built-in "planner" step included) needs to be told it cannot
         // write; with `may_spawn` its defects go to fix workers, otherwise into the report. A role
         // that can write is left to its own instructions.
@@ -2169,7 +2314,7 @@ Then summarize in 2-4 lines.",
                 cwd: self.workspace_dir(),
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
                 extra_writable: self.integ_writable(),
-                context_override: None,
+                context_override: self.context_for(&role.model, None),
                 network: self.pattern.settings.network,
                 writable_roots: self.pattern.settings.writable_roots.clone(),
                 role: role.clone(),
@@ -2233,6 +2378,9 @@ Then summarize in 2-4 lines.",
                 Ok(ws) => {
                     if let Some(n) = &ws.note {
                         self.log("ℹ", "amber", n.clone());
+                    }
+                    if ws.initial_commit {
+                        self.log("⎇", "blue", "created the initial commit so workers get isolated worktrees");
                     }
                     self.log("⎇", "blue", if ws.worktree { format!("isolated worktrees on branch {}", ws.branch) } else { "shared workspace".into() });
                     self.ws = Some(ws);
@@ -2528,8 +2676,7 @@ Then summarize in 2-4 lines.",
                     (format!("{n} [{role}] ({alias} via {provider}): {}", trunc(&msg, 120)), format!("{n} [{role}] ({alias} via {provider}): {msg}"))
                 } else if reason == HaltReason::AgentTurnFailed && kind == Some(ErrKind::Transient) && self.gateway_down(ctx, a) {
                     // every agent that was working failed on the transport within the minute
-                    let hint = "the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically";
-                    (format!("{n}: {} — {hint}", trunc(&msg, 120)), format!("{n}: {msg} — {hint}"))
+                    (format!("{n}: {} — {GATEWAY_DOWN_HINT}", trunc(&msg, 120)), format!("{n}: {msg} — {GATEWAY_DOWN_HINT}"))
                 } else {
                     (format!("{n}: {}", trunc(&msg, 120)), format!("{n}: {msg}"))
                 };
@@ -2741,7 +2888,8 @@ Then summarize in 2-4 lines.",
     /// error", a reset connection, …) — an outage, not something the worker did. It never spends
     /// one of `worker_retries`: while the run is going it retries with a short backoff; when the
     /// run is halted (or the outage outlasts the backoff) it is marked failed *because of the
-    /// gateway*, and the next resume respawns it (`respawn_after_outage`).
+    /// gateway* — which halts the run for the user, escalated to nobody (`on_worker_done`) — and
+    /// the next resume respawns it (`respawn_after_outage`).
     fn on_gateway_failure(&mut self, ctx: &mut dyn Ctx, wi: usize, msg: &str) {
         let (a, tid) = match (self.workers[wi].agent, self.workers[wi].paused, &self.workers[wi].state) {
             (Some(a), false, s) if *s != WState::Cancelled => (a, self.workers[wi].task.id.clone()),
@@ -2773,10 +2921,11 @@ Then summarize in 2-4 lines.",
     }
 
     /// `resume`: every worker whose last failure was the gateway's goes back to work in its own
-    /// worktree. The live agent is simply told to carry on; one whose process is gone is started
-    /// again — for free, that outage was not an attempt.
+    /// worktree (a fix worker: on the integration copy, where `spawn_task` puts every `fix-*`).
+    /// The live agent is simply told to carry on; one whose process is gone is started again —
+    /// for free, that outage was not an attempt.
     fn respawn_after_outage(&mut self, ctx: &mut dyn Ctx) {
-        let down: Vec<usize> = self.workers.iter().enumerate().filter(|(_, w)| w.transient && !w.adhoc && matches!(w.state, WState::Failed(_))).map(|(i, _)| i).collect();
+        let down: Vec<usize> = self.workers.iter().enumerate().filter(|(_, w)| w.transient && matches!(w.state, WState::Failed(_))).map(|(i, _)| i).collect();
         for wi in down {
             let tid = self.workers[wi].task.id.clone();
             self.log("↻", "violet", format!("respawning {tid} after the gateway outage"));
@@ -2899,7 +3048,12 @@ Then summarize in 2-4 lines.",
                 let e = error.unwrap_or_else(|| "turn failed".into());
                 self.workers[wi].state = WState::Failed(e.clone());
                 self.log("✗", "red", format!("{tid} failed: {}", trunc(&e, 70)));
-                if let Some(round) = fix_round {
+                if self.workers[wi].transient {
+                    // The gateway outlasted `GATEWAY_RETRIES`: it is down for everyone, so neither
+                    // the orchestrator (a retry would fail the same way) nor — for a fix worker —
+                    // the manager and the planner are asked. The run waits for the gateway.
+                    self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"));
+                } else if let Some(round) = fix_round {
                     self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200)));
                 } else {
                     self.orch_event(ctx, format!("{tid} FAILED: {e}\nUse mantra_retry (optionally with a better prompt)."));
@@ -3484,7 +3638,7 @@ Then summarize in 2-4 lines.",
     /// Spawn the manager agent (no brief yet). `resume`: a saved thread/session id to re-attach to.
     pub(super) fn spawn_manager_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.manager.trim().to_string();
-        let role = self.role(&name);
+        let role = self.role_for_slot("manager", &name);
         let req = SpawnReq {
             name: "manager".into(),
             effort: self.effort_for(None, &name, &role, false),
@@ -3494,7 +3648,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::manager_tools(),
             extra_writable: vec![],
-            context_override: None,
+            context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
@@ -3767,7 +3921,7 @@ Then summarize in 2-4 lines.",
     pub(super) fn spawn_orchestrator(&mut self, ctx: &mut dyn Ctx) -> AgentId {
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
-        let role = self.role(&name);
+        let role = self.role_for_slot("orchestrator", &name);
         let id = ctx.spawn(SpawnReq {
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
@@ -3777,7 +3931,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::orchestrator_tools(),
             extra_writable: vec![],
-            context_override: None,
+            context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
@@ -4447,6 +4601,26 @@ Then summarize in 2-4 lines.",
     }
 }
 
+impl Drop for Run {
+    /// A `Run` that goes away with its process still alive — a clean quit, `/leave`, a delete —
+    /// gives the run back: only its own claim is removed (`Owner::release`), never one another
+    /// Mantra took over in the meantime. A crash skips this, which is what the pid check is for.
+    fn drop(&mut self) {
+        self.owner.release(&self.dir);
+    }
+}
+
+/// FNV-1a of a string: enough to tell "the pattern changed since it was written" without keeping
+/// a second copy of the TOML around (`Run::pattern_hash`).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// A plan title as a run name: one line, single spaces, at most 60 characters.
 pub fn tidy_title(title: &str) -> String {
     trunc(title.split_whitespace().collect::<Vec<_>>().join(" ").trim(), 60)
@@ -4596,6 +4770,8 @@ mod halt_tests {
         thread_name: Option<String>,
         cwd: PathBuf,
         sandbox: String,
+        model: String,
+        context_override: Option<u64>,
     }
     impl TestCtx {
         fn new() -> TestCtx {
@@ -4661,6 +4837,7 @@ mod halt_tests {
             context_override: None,
             idle_prompts: vec![],
             transient: false,
+            model: None,
         }
     }
     impl Ctx for TestCtx {
@@ -4668,7 +4845,7 @@ mod halt_tests {
             let id = self.next;
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
-            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone() });
+            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override });
             self.spawned_instructions.push((id, r.instructions));
             self.spawned_models.push((id, r.role.model));
             id
@@ -5087,8 +5264,8 @@ mod halt_tests {
 
         run.respawn(&mut ctx, gate, None).unwrap();
 
-        match run.stage {
-            Stage::Phase { step: PhaseStep::Gate { round }, .. } => assert_eq!(round, 2, "a respawned gate must keep its round, not reset to 1"),
+        match &run.stage {
+            Stage::Phase { step: PhaseStep::Gate { round }, .. } => assert_eq!(*round, 2, "a respawned gate must keep its round, not reset to 1"),
             other => panic!("expected Phase{{Gate}}, got {other:?}"),
         }
         let new_gate = run.gate_agent.expect("gate agent still set after respawn");
@@ -6562,7 +6739,7 @@ mod halt_tests {
     fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
         let dir = std::env::temp_dir().join(format!("mantra-jobs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None };
+        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
         let mut ctx = TestCtx::new();
         let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
         run.ws = Some(ws);
@@ -6597,7 +6774,7 @@ mod halt_tests {
         sh(&["add", "-A"]);
         sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None };
+        let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
         struct Capture(Vec<JobOut>);
         impl Capture {
             fn run(&mut self, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
@@ -7499,5 +7676,292 @@ mod halt_tests {
         let h = run.halt.as_ref().expect("halted");
         assert!(h.message.ends_with("the model gateway looks down — the run resumes where it was once you press resume (space / Resume); failed workers are respawned automatically"), "{}", h.message);
         assert!(h.full.ends_with("failed workers are respawned automatically"));
+    }
+
+    // A gateway outage under a fix worker ---------------------------------------------------------
+
+    /// A `TestCtx` whose jobs run: the closure's result is kept with its tag, for the test to
+    /// hand back through `on_job` — the way the app's job runner would.
+    struct JobCtx(TestCtx, Vec<(JobTag, JobOut)>);
+    impl Ctx for JobCtx {
+        fn spawn(&mut self, r: SpawnReq) -> AgentId {
+            self.0.spawn(r)
+        }
+        fn prompt(&mut self, a: AgentId, t: String) {
+            self.0.prompt(a, t)
+        }
+        fn prompt_mode(&mut self, a: AgentId, t: String, m: Send) {
+            self.0.prompt_mode(a, t, m)
+        }
+        fn interrupt(&mut self, a: AgentId) {
+            self.0.interrupt(a)
+        }
+        fn compact(&mut self, a: AgentId) {
+            self.0.compact(a)
+        }
+        fn stop(&mut self, a: AgentId, x: bool) {
+            self.0.stop(a, x)
+        }
+        fn tool_result(&mut self, a: AgentId, r: Value, t: String, ok: bool) {
+            self.0.tool_result(a, r, t, ok)
+        }
+        fn set_effort(&mut self, a: AgentId, e: &str) -> String {
+            self.0.set_effort(a, e)
+        }
+        fn agent(&self, a: AgentId) -> Option<&Agent> {
+            self.0.agent(a)
+        }
+        fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
+            self.1.push((tag, f()));
+        }
+        fn notify(&mut self, t: &str) {
+            self.0.notify(t)
+        }
+    }
+
+    /// Phase 1 at gate round 1's fix: a planner that is idle, a fix worker `fix-1` on the
+    /// integration copy `integ`, and a pattern with a manager that has not been spawned yet.
+    fn run_in_fix_round(ctx: &mut TestCtx, integ: &PathBuf) -> (Run, AgentId, AgentId) {
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.dir = scratch_dir("fix-outage");
+        let planner = ctx.add_idle();
+        ready(ctx, planner);
+        run.planner = Some(planner);
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+        run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.clone(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+        let w = ctx.add_idle();
+        let mut fix = mk_worker("fix-1", "worker-small", w, WState::Running);
+        fix.adhoc = true;
+        fix.wt = Some(integ.clone());
+        run.workers.push(fix);
+        (run, planner, w)
+    }
+
+    /// The gateway outlasted the fix worker's retries: the run halts for the user with the
+    /// gateway wording, and neither the manager nor the planner — who run through the same
+    /// gateway — is woken. The resume respawns the fix worker where it was: on the integration
+    /// copy, for free.
+    #[test]
+    fn a_fix_worker_the_gateway_failed_halts_without_waking_anyone_and_is_respawned_on_resume() {
+        let integ = scratch_dir("fix-outage-integ");
+        std::fs::create_dir_all(&integ).unwrap();
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, w) = run_in_fix_round(&mut ctx, &integ);
+        run.gateway_streak.insert(w, Run::GATEWAY_RETRIES);
+        let attempts_before = run.max_attempts();
+        run.on_turn_done(&mut ctx, w, "failed", Some("unexpected status 503 Service Unavailable".into()), Some(ErrKind::Transient));
+
+        let h = run.halt.as_ref().expect("halted");
+        assert_eq!(h.reason, HaltReason::AgentTurnFailed, "the dead-gateway halt, whose band and web hint already fit");
+        assert!(h.message.starts_with("fix-1: unexpected status 503") && h.message.ends_with(GATEWAY_DOWN_HINT), "{}", h.message);
+        assert!(run.workers[0].transient && matches!(run.workers[0].state, WState::Failed(_)));
+        assert!(!ctx.spawns.iter().any(|s| s.name == "manager"), "no manager is spawned for an outage: {:?}", ctx.spawns.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
+        assert!(run.manager_escalation.is_none() && !run.escalation_open, "nobody is escalated to");
+        assert!(ctx.prompts.iter().all(|(a, _)| *a != planner), "the planner is not woken: {:?}", ctx.prompts);
+        assert!(pulse_texts(&run).iter().any(|t| t.starts_with("not escalated")), "{:?}", pulse_texts(&run));
+
+        // the gateway is back; the user presses space — the fix worker's process is gone
+        ctx.agents.get_mut(&w).unwrap().status = Status::Stopped;
+        let mut jobs = JobCtx(ctx, vec![]);
+        run.resume(&mut jobs);
+        assert!(!run.halted());
+        assert_eq!(run.max_attempts(), attempts_before + 1, "the outage's attempt was not one");
+        assert!(pulse_texts(&run).iter().any(|t| t == "respawning fix-1 after the gateway outage"), "{:?}", pulse_texts(&run));
+        let fresh = run.workers.iter().rev().find(|w| w.task.id == "fix-1").expect("a new attempt");
+        assert!(fresh.attempt == 2 && fresh.adhoc && fresh.state == WState::Preparing, "attempt {} {:?}", fresh.attempt, fresh.state);
+        assert_eq!(run.workers[0].state, WState::Cancelled, "the dead attempt is closed");
+        assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "still the same fix round: {:?}", run.stage);
+        // its workspace job answers with the integration copy, not a worker worktree
+        let (tag, out) = jobs.1.pop().expect("the fix worker's workspace job ran");
+        assert!(matches!(&tag, JobTag::WorkerWt { task, attempt: 2 } if task == "fix-1"), "{tag:?}");
+        assert!(matches!(&out, JobOut::Wt(Ok((dir, branch))) if *dir == integ && branch.is_empty()), "the integration copy");
+        run.on_job(&mut jobs, tag, out);
+        let spawned = jobs.0.spawned("fix-1");
+        assert_eq!(spawned.len(), 1, "{:?}", jobs.0.spawns.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
+        assert_eq!(spawned[0].cwd, integ);
+        assert_eq!(spawned[0].sandbox, "danger-full-access", "a fix worker on the integration copy runs unsandboxed");
+        let fresh = run.workers.iter().rev().find(|w| w.task.id == "fix-1").unwrap();
+        assert!(fresh.state == WState::Running && fresh.wt.as_ref() == Some(&integ));
+        assert!(jobs.0.prompts.iter().any(|(a, _)| Some(*a) == fresh.agent), "the fresh fix worker is given its task");
+        let _ = std::fs::remove_dir_all(&run.dir);
+        let _ = std::fs::remove_dir_all(&integ);
+    }
+
+    /// A fix worker that fails for its own reasons is still the chain of command's problem: the
+    /// manager gets it first, as before.
+    #[test]
+    fn a_fix_worker_that_fails_for_its_own_reasons_still_escalates() {
+        let integ = scratch_dir("fix-fail-integ");
+        let mut ctx = TestCtx::new();
+        let (mut run, _planner, w) = run_in_fix_round(&mut ctx, &integ);
+        run.on_turn_done(&mut ctx, w, "failed", Some("the model returned an empty response".into()), None);
+        let h = run.halt.as_ref().expect("halted");
+        assert_eq!(h.reason, HaltReason::AttemptsExhausted);
+        assert!(h.message.contains("fix-1 could not fix what gate round 1 found"), "{}", h.message);
+        assert!(!h.message.contains("gateway looks down"));
+        assert!(!run.workers[0].transient);
+        assert!(ctx.spawns.iter().any(|s| s.name == "manager"), "the manager is spawned and asked");
+        assert!(run.manager_escalation.is_some());
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// `halt_and_escalate` itself, handed a transport error (a task out of attempts whose last
+    /// failure was a 503): the halt stands, with the gateway wording, and nobody is woken — the
+    /// manager and the planner share the outage.
+    #[test]
+    fn an_escalated_halt_over_a_transport_error_wakes_nobody() {
+        for pattern in [Pattern::builtin(), no_manager()] {
+            let mut ctx = TestCtx::new();
+            let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+            run.dir = scratch_dir("escalate-503");
+            let planner = ctx.add_idle();
+            run.planner = Some(planner);
+            let w = ctx.add_idle();
+            let mut worker = mk_worker("t1", "worker-small", w, WState::Failed("unexpected status 503 Service Unavailable".into()));
+            worker.attempt = run.max_attempts();
+            run.workers.push(worker);
+            let out = run.spawn_task(&mut ctx, Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() }, None, None);
+            assert!(out.starts_with("REFUSED"), "{out}");
+            let h = run.halt.as_ref().expect("halted");
+            assert_eq!(h.reason, HaltReason::AttemptsExhausted, "the halt keeps its own reason (the web view offers Retry t1 from it)");
+            assert!(h.message.ends_with(GATEWAY_DOWN_HINT), "{}", h.message);
+            assert!(!run.escalation_open && run.manager_escalation.is_none());
+            assert!(!ctx.spawns.iter().any(|s| s.name == "manager"));
+            assert!(ctx.prompts.iter().all(|(a, _)| *a != planner), "{:?}", ctx.prompts);
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+    }
+
+    // Per-agent model switches ------------------------------------------------------------------
+
+    fn known(aliases: &[(&str, u64)]) -> HashMap<String, u64> {
+        aliases.iter().map(|(a, w)| (a.to_string(), *w)).collect()
+    }
+
+    /// `set_agent_model` is a switch for that agent: the task's next attempt keeps it, the role's
+    /// other tasks do not see it, the pattern copy is untouched, and switching back forgets it.
+    #[test]
+    fn a_live_model_switch_sticks_to_that_task_and_not_to_its_role() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("agent-model");
+        run.set_known_models(known(&[("luna", 200_000), ("nova", 128_000)]));
+        let role_model = run.role("worker-small").model.clone();
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let w = ctx.add_idle();
+        ready(&mut ctx, w);
+        run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+        run.on_ready(&mut ctx, w, false, false);
+        run.set_agent_model(w, "nova");
+        assert_eq!(run.workers[0].model.as_deref(), Some("nova"));
+        assert_eq!(run.pattern.role("worker-small").unwrap().model, role_model, "the role is not rewritten");
+        assert_eq!(run.agent_meta[&w].model_alias, "nova", "state.json carries it");
+        // a respawn of the same task runs on the switched model …
+        run.retry_worker(&mut ctx, w, None);
+        let again = run.workers.iter().rev().find(|w| w.task.id == "t1").map(|w| (w.attempt, w.model.clone())).unwrap();
+        assert_eq!(again, (2, Some("nova".to_string())));
+        run.on_job(&mut ctx, JobTag::WorkerWt { task: "t1".into(), attempt: 2 }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        assert_eq!(ctx.spawned("t1").last().unwrap().model, "nova");
+        // … another task of the same role does not
+        run.spawn_task(&mut ctx, Task { id: "t2".into(), role: "worker-small".into(), ..Default::default() }, None, None);
+        run.on_job(&mut ctx, JobTag::WorkerWt { task: "t2".into(), attempt: 1 }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        assert_eq!(ctx.spawned("t2").last().unwrap().model, role_model);
+        // switching back to the role's model is no longer a choice of its own
+        let a2 = run.workers.iter().rev().find(|w| w.task.id == "t1").and_then(|w| w.agent).unwrap();
+        run.set_agent_model(a2, &role_model);
+        assert_eq!(run.workers.iter().rev().find(|w| w.task.id == "t1").unwrap().model, None);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// A fixed agent's switch belongs to its slot: the planner respawned keeps the model, and
+    /// so does the next orchestrator of the run — not the role's model from the pattern.
+    #[test]
+    fn a_fixed_agents_model_switch_survives_its_respawn() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("slot-model");
+        run.set_known_models(known(&[("astra", 200_000), ("nova", 128_000)]));
+        run.stage = Stage::Planning;
+        let p = run.spawn_planner(&mut ctx);
+        let role_model = run.role(&run.pattern.flow.planner.clone()).model.clone();
+        assert_eq!(ctx.spawned("planner")[0].model, role_model);
+        run.set_agent_model(p, "nova");
+        run.respawn(&mut ctx, p, None).unwrap();
+        assert_eq!(ctx.spawned("planner").last().unwrap().model, "nova", "the respawned planner keeps the switch");
+        // the orchestrator slot is its own
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let o = run.spawn_orchestrator(&mut ctx);
+        assert_eq!(ctx.spawned("orchestrator")[0].model, run.role("orchestrator").model, "untouched by the planner's switch");
+        run.set_agent_model(o, "nova");
+        run.respawn(&mut ctx, o, None).unwrap();
+        assert_eq!(ctx.spawned("orchestrator").last().unwrap().model, "nova");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    // The context cap ---------------------------------------------------------------------------
+
+    /// Every spawn is told `min(model window, context_cap)`: a big model is capped, a small one
+    /// keeps its own window, a halved assumption is capped too, and `0` leaves the window alone.
+    #[test]
+    fn the_context_cap_bounds_the_window_a_spawn_is_told() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("context-cap");
+        assert_eq!(run.pattern.settings.context_cap, 200_000, "the built-in default");
+        let planner_model = run.role(&run.pattern.flow.planner.clone()).model.clone();
+        let worker_model = run.role("worker-small").model.clone();
+        run.set_known_models(known(&[(planner_model.as_str(), 1_000_000), (worker_model.as_str(), 128_000)]));
+        run.stage = Stage::Planning;
+        run.spawn_planner(&mut ctx);
+        assert_eq!(ctx.spawned("planner")[0].context_override, Some(200_000), "a 1M model is told 200k");
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.spawn_task(&mut ctx, Task { id: "t1".into(), role: "worker-small".into(), ..Default::default() }, None, None);
+        run.on_job(&mut ctx, JobTag::WorkerWt { task: "t1".into(), attempt: 1 }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+        assert_eq!(ctx.spawned("t1")[0].context_override, Some(128_000), "a 128k model keeps its window");
+        // a halved assumption from an earlier attempt is still capped
+        assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
+        assert_eq!(run.context_for(&planner_model, Some(400_000)), Some(200_000));
+        assert_eq!(run.context_for("unknown-alias", None), Some(200_000), "nothing known: the cap stands");
+        // 0 = the model's own window, whatever it is
+        run.pattern.settings.context_cap = 0;
+        assert_eq!(run.context_for(&planner_model, None), None);
+        assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
+        run.respawn_orchestrator(&mut ctx, None);
+        assert_eq!(ctx.spawned("orchestrator")[0].context_override, None);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    // The owner file ----------------------------------------------------------------------------
+
+    /// A run claims its directory while it is live, refreshes the claim with every flush, and
+    /// gives it back when it ends — or when the `Run` is dropped by a process that is still alive.
+    #[test]
+    fn a_run_owns_its_directory_while_it_is_live() {
+        use crate::engine::state::Owner;
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("owner");
+        let dir = run.dir.clone();
+        run.start(&mut ctx);
+        let o = Owner::load(&dir).expect("owner.json written at start");
+        assert_eq!(o.pid, std::process::id());
+        assert!(crate::engine::state::live_owner(&dir).is_some(), "a second resume would be refused");
+        run.stage = Stage::Planning;
+        run.save_state();
+        assert!(Owner::load(&dir).is_some(), "refreshed with the flush");
+        run.fail_run(&mut ctx, "boom".into());
+        assert!(Owner::load(&dir).is_none(), "released once the run is over");
+        // a live run dropped by its process (a clean quit) releases it too
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = dir.clone();
+        run.start(&mut ctx);
+        assert!(Owner::load(&dir).is_some());
+        drop(run);
+        assert!(Owner::load(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

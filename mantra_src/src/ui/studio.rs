@@ -19,7 +19,7 @@ const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "max_tokens", "description", "instructions"];
-const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap"];
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -100,6 +100,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "review_minutes" => if s.review_minutes == 0 { "off".into() } else { s.review_minutes.to_string() },
                 "manager_minutes" => if s.manager_minutes == 0 { "off (escalations only)".into() } else { s.manager_minutes.to_string() },
                 "first_token_minutes" => if s.first_token_minutes == 0 { "off".into() } else { s.first_token_minutes.to_string() },
+                "context_cap" => if s.context_cap == 0 { "0 (the model's full window)".into() } else { s.context_cap.to_string() },
                 _ => String::new(),
             }
         }
@@ -203,6 +204,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 "review_minutes" => s.review_minutes = (s.review_minutes as i64 + d as i64).clamp(0, 240) as u64,
                 "manager_minutes" => s.manager_minutes = (s.manager_minutes as i64 + d as i64).clamp(0, 240) as u64,
                 "first_token_minutes" => s.first_token_minutes = (s.first_token_minutes as i64 + d as i64).clamp(0, 240) as u64,
+                "context_cap" => s.context_cap = (s.context_cap as i64 + 25_000 * d as i64).clamp(0, 4_000_000) as u64,
                 _ => return,
             }
         }
@@ -314,6 +316,15 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 ("writable_roots", _) => s.writable_roots = parse_roots(text),
                 ("first_token_minutes", Some(v)) => s.first_token_minutes = v.min(240),
                 ("first_token_minutes", None) if text.trim().eq_ignore_ascii_case("off") => s.first_token_minutes = 0,
+                // `200000`, `200k`, `1m` (the role field's token syntax); off / full = no cap
+                ("context_cap", _) => {
+                    let t = text.trim();
+                    if t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("full") {
+                        s.context_cap = 0;
+                    } else if let Some(v) = parse_tokens(text) {
+                        s.context_cap = v;
+                    }
+                }
                 _ => {}
             }
             app.studio.dirty = true;
@@ -628,6 +639,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
+        "context_cap" => "Tokens of context every agent is told it has, whatever its model's window (the smaller of the two): a huge window lets an agent cycle tools for hours. 0 = the model's full window; 200k is the built-in default.",
         _ => return None,
     })
 }
@@ -1138,6 +1150,30 @@ mod tests {
         assert_eq!(app.studio.pattern.settings.manager_minutes, 7);
         apply_edit(&mut app, &t, "off (escalations only)");
         assert_eq!(app.studio.pattern.settings.manager_minutes, 0);
+    }
+
+    /// The context cap is listed, shown, stepped and typed — as a number, `200k`, or off.
+    #[test]
+    fn the_context_cap_is_a_setting_field_that_takes_k_and_off() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert!(SETTING_FIELDS.contains(&"context_cap"));
+        assert_eq!(get_value(&app, "⚙ settings", "context_cap"), "200000", "the built-in default");
+        assert!(field_hint("context_cap").is_some());
+        let t = EditTarget::Setting("context_cap".into());
+        apply_edit(&mut app, &t, "128k");
+        assert_eq!(app.studio.pattern.settings.context_cap, 128_000);
+        apply_edit(&mut app, &t, "1m");
+        assert_eq!(app.studio.pattern.settings.context_cap, 1_000_000);
+        apply_edit(&mut app, &t, "off");
+        assert_eq!(app.studio.pattern.settings.context_cap, 0);
+        assert_eq!(get_value(&app, "⚙ settings", "context_cap"), "0 (the model's full window)");
+        apply_edit(&mut app, &t, "not a number");
+        assert_eq!(app.studio.pattern.settings.context_cap, 0, "garbage changes nothing");
+        nudge(&mut app, "⚙ settings", "context_cap", 1);
+        assert_eq!(app.studio.pattern.settings.context_cap, 25_000, "←→ step by 25k");
+        nudge(&mut app, "⚙ settings", "context_cap", -2);
+        assert_eq!(app.studio.pattern.settings.context_cap, 0, "never below 0");
     }
 
     /// `auto` leads the effort list, and changing a role's model must not bake it into a level.

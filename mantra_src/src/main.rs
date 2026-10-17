@@ -49,7 +49,8 @@ USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
   mantra run \"<goal>\" [--pattern NAME]  open straight into a Mandala run
   mantra runs                            list every run (all projects): id, stage, when, goal
-  mantra runs resume <id>                reopen a run where it stopped (id prefix is enough)
+  mantra runs resume <id> [--take-over]  reopen a run where it stopped (id prefix is enough);
+                                         refused while another Mantra has it open, unless --take-over
   mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
   mantra doctor                          check codex, login, terminal, config
   mantra --version
@@ -62,7 +63,8 @@ OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
-  --resume-last   reopen the most recent unfinished run (with --demo: the last demo run)
+  --resume-last   reopen this project's most recent unfinished run (cwd / --cwd; with --demo:
+                  the last demo run) — other projects' runs only by id, with `runs resume`
   --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
   --web-listen ADDR:PORT   where the web UI listens (default 127.0.0.1:7777; 8080 = 127.0.0.1:8080)
   --web-password PW        web UI password — needed off localhost and with --headless;
@@ -97,13 +99,15 @@ struct Cli {
     /// `mantra runs resume <id>`.
     resume: Option<String>,
     resume_last: bool,
+    /// `mantra runs resume <id> --take-over`: resume although `owner.json` names a live process.
+    take_over: bool,
     no_sandbox_check: bool,
     web: web::CliWeb,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, no_sandbox_check: false, web: web::CliWeb::default() };
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, take_over: false, no_sandbox_check: false, web: web::CliWeb::default() };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -131,6 +135,7 @@ fn parse_args() -> Result<Option<Cli>> {
             }
             "run" => cli.run_goal = Some(next()?),
             "--resume-last" => cli.resume_last = true,
+            "--take-over" => cli.take_over = true,
             "--no-sandbox-check" => cli.no_sandbox_check = true,
             "--web" => {
                 cli.web.web = true;
@@ -263,15 +268,36 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         demo = true;
     }
     // A resumed run brings its own project directory (it was saved absolute), so `mantra runs
-    // resume <id>` works from anywhere — and with --demo from the previous demo's temp repo.
+    // resume <id>` works from anywhere. `--resume-last` is this project's last unfinished run —
+    // the one in cwd / --cwd; with --demo the previous demo's temp repo — never another
+    // project's: that run belongs to whoever is working there, and may well be open.
     let resume = match (&cli.resume, cli.resume_last) {
         (Some(id), _) => Some(engine::state::find(id).map_err(|e| anyhow::anyhow!(e))?),
         (None, true) => {
-            let pick = engine::state::list_all().into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir() && (!demo || p.to_string_lossy().contains("mantra-demo-"))).unwrap_or(false));
-            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run to resume (mantra runs lists them)"))?)
+            let candidates = if demo {
+                engine::state::list_all().into_iter().filter(|r| r.project().map(|p| p.to_string_lossy().contains("mantra-demo-")).unwrap_or(false)).collect()
+            } else {
+                let here = cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?);
+                engine::state::list_project(&here)
+            };
+            let pick = candidates.into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir()).unwrap_or(false));
+            Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run of this project to resume (mantra runs lists every project's; mantra runs resume <id> takes any)"))?)
         }
         _ => None,
     };
+    // One owner per run: a run another Mantra has open right now (`owner.json`, a live pid on
+    // this host) is refused here, before anything starts, unless the user says the check is
+    // wrong (`--take-over`). A dead owner is a crash and resumes as usual.
+    if let Some(r) = &resume {
+        if let Some(owner) = engine::state::live_owner(&r.dir) {
+            if cli.take_over {
+                eprintln!("mantra: taking run {} over from pid {} on {}", r.id, owner.pid, owner.hostname);
+                engine::state::Owner::clear(&r.dir);
+            } else {
+                anyhow::bail!("{}", owner.refusal(&r.id));
+            }
+        }
+    }
     let project = match &resume {
         Some(r) => {
             let p = r.project().ok_or_else(|| anyhow::anyhow!("run {} cannot be resumed: {}", r.id, r.state.as_ref().err().cloned().unwrap_or_default()))?;

@@ -717,6 +717,14 @@ impl Registry {
         })
     }
 
+    /// Every alias with its effective context window (its own, or the assumed one) — what the
+    /// engine, which has no registry of its own, is handed at a run's start, resume and every live
+    /// model switch (`Run::set_known_models`): it tells a saved alias that still exists from one
+    /// that was deleted, and gives the pattern's `context_cap` a window to be measured against.
+    pub fn context_windows(&self) -> std::collections::HashMap<String, u64> {
+        self.models.iter().map(|m| (m.alias.clone(), m.effective_context())).collect()
+    }
+
     /// The custom provider an alias runs on; `None` for Codex's own account or an unknown alias.
     pub fn provider_of(&self, alias: &str) -> Option<&ProviderEntry> {
         let m = self.get(alias).filter(|m| m.is_custom_provider())?;

@@ -936,7 +936,9 @@ impl App {
     }
 
     /// After switching a run agent's model (e.g. from the halt-band `m` picker), persist the
-    /// choice into this run's own pattern copy so a later spawn of that role picks it up. A
+    /// choice for *that agent* in the run's state (`Run::set_agent_model`): its next attempt or
+    /// respawn and a resume keep it, the role's other agents are not touched. (A role-level
+    /// change is `set_role_model`, one role or `all`, which writes the run's pattern copy.) A
     /// halted run stays halted: the user may want to change more than one model (or look at the
     /// error again) before going on, and resuming as a side effect of a settings change is how a
     /// run restarts unnoticed — so the toast says what is left to do.
@@ -945,12 +947,11 @@ impl App {
             return;
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
+        let known = self.registry.context_windows();
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
-            if let Some(role_name) = run.role_name_of(a) {
-                if let Some(r) = run.pattern.roles.get_mut(&role_name) {
-                    r.model = alias;
-                }
-            }
+            // the switch may bring an alias the run has not seen: refresh what it knows first
+            run.set_known_models(known);
+            run.set_agent_model(a, &alias);
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
             self.toast(MODEL_CHANGED_HALTED, Level::Info);
@@ -1041,6 +1042,8 @@ impl App {
             return;
         }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
+        // the engine has no registry: what it knows about models (windows, which aliases exist)
+        run.set_known_models(self.registry.context_windows());
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
@@ -1073,10 +1076,16 @@ impl App {
         self.overlays.push(Overlay::Runs { sel: 0, list, confirm: false, others: other.len() });
     }
 
-    /// Pick a saved run back up (see `engine::resume`). Refuses while another run is active.
+    /// Pick a saved run back up (see `engine::resume`). Refuses while another run is active, and
+    /// a run another live Mantra has open (`state::live_owner`): two owners of one run would
+    /// each save `state.json` over the other's. A dead owner is a crash, and resumes normally.
     pub fn resume_run(&mut self, r: crate::engine::state::RunSummary) {
         if self.run.as_ref().map(|x| x.is_active()).unwrap_or(false) {
             self.toast("a run is already active — finish or /pause it first", Level::Warn);
+            return;
+        }
+        if let Some(owner) = crate::engine::state::live_owner(&r.dir) {
+            self.toast(owner.refusal(&r.id), Level::Error);
             return;
         }
         let st = match &r.state {
@@ -1100,6 +1109,8 @@ impl App {
         let plan = std::fs::read_to_string(r.dir.join("plan.json")).ok().and_then(|s| serde_json::from_str::<crate::engine::plan::Plan>(&s).ok());
         let label = crate::engine::state::stage_label(&st.stage);
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
+        // before the boot: it decides which saved per-agent models still exist in the registry
+        run.set_known_models(self.registry.context_windows());
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
