@@ -529,7 +529,8 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--b
 .ctx.wide { width: 100%; }
 .ctx.wide .ctx-track { flex: 1; height: 8px; }
 .ctx.wide .ctx-tick { top: -3px; height: 14px; }
-@media (max-width: 400px) { .ctx-tok { display: none; } }
+.ctx-cached { color: var(--dim); }
+@media (max-width: 400px) { .ctx-tok, .ctx-cached { display: none; } }
 
 .tx-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .tx { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
@@ -690,6 +691,7 @@ pre.diff { display: grid; grid-template-columns: minmax(100%, max-content); marg
 .run-branch { font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stat { background: var(--bg-card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; display: flex; flex-direction: column; min-width: 0; }
 .stat-v { font-weight: 700; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stat-sub { font-size: var(--fs-xs); color: var(--dim); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stat-l { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
 .review-card { border-color: color-mix(in srgb, var(--violet) 45%, var(--line)); }
 .review-card .inline-form { margin-top: 10px; }

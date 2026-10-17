@@ -21,6 +21,15 @@
         if (n < 1000000) return Math.round(n / 1000) + 'k';
         return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
     }
+    // "5.9M cached" when the cached share of a token total is worth a word (the same rule as
+    // agent.rs `cached_share`): Codex counts every request's whole input, so a worker in a big
+    // context reads millions of which most was the same prefix served from the cache. Under a
+    // fifth of the total, or under 10k tokens altogether, it is noise and reads as ''.
+    function cached(total, cachedN) {
+        total = Number(total) || 0;
+        cachedN = Math.min(Number(cachedN) || 0, total);
+        return cachedN > 0 && total >= 10000 && cachedN * 5 >= total ? tokens(cachedN) + ' cached' : '';
+    }
     function dur(ms) {
         ms = Math.max(0, Number(ms) || 0);
         const s = Math.floor(ms / 1000);
@@ -271,5 +280,5 @@
             }));
     }
 
-    M.fmt = { colorVar, effortColor, tokens, dur, durShort, ago, clock, trunc, plural, inline, markdown, diffLines, icon };
+    M.fmt = { colorVar, effortColor, tokens, cached, dur, durShort, ago, clock, trunc, plural, inline, markdown, diffLines, icon };
 })(window.Mantra = window.Mantra || {});

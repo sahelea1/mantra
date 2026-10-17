@@ -612,6 +612,10 @@ struct Translator {
     /// semantics: every request's input + output, cache reads included), fed from each
     /// `assistant` message's `usage`.
     total_tokens: u64,
+    /// The cache-read part of `total_tokens` (`cache_read_input_tokens`, summed the same way):
+    /// Codex's `total.cachedInputTokens`, so the cards can say how much of a big total was the
+    /// same prefix served from the cache.
+    cached_tokens: u64,
     /// The last `assistant` message id whose usage was folded into `total_tokens` — the CLI emits
     /// one `assistant` line per content block of the same message, each repeating the usage.
     last_usage_msg: Option<String>,
@@ -657,6 +661,7 @@ impl Translator {
             trust_reported_window,
             reported_window: None,
             total_tokens: 0,
+            cached_tokens: 0,
             last_usage_msg: None,
             last_ctx: (0, 0),
             turn_msgs: 0,
@@ -675,22 +680,30 @@ impl Translator {
         }
     }
 
+    /// The running totals a gauge update carries: (tokens so far, of which cached, window).
+    fn totals(&self) -> (u64, u64, Option<u64>) {
+        (self.total_tokens, self.cached_tokens, self.window())
+    }
+
     /// Fold an API `usage` object (an `assistant` message's, or `result`'s) into the running
     /// totals and emit the gauge update. Returns false when the object carried no counts.
     fn fold_usage(&mut self, usage: Option<&Value>, msg_id: Option<&str>, out: &mut Vec<HubEvent>) -> bool {
         let g = |k: &str| usage.and_then(|u| u.get(k)).and_then(as_u64).unwrap_or(0);
-        let (input, output) = (g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens"), g("output_tokens"));
+        let cached = g("cache_read_input_tokens");
+        let (input, output) = (g("input_tokens") + cached + g("cache_creation_input_tokens"), g("output_tokens"));
         if input + output == 0 {
             return false;
         }
         let repeat = msg_id.is_some() && msg_id == self.last_usage_msg.as_deref();
         if !repeat {
             self.total_tokens += input + output;
+            // Cache writes are billed as input and counted in the total; only reads are "cached".
+            self.cached_tokens += cached;
             self.last_usage_msg = msg_id.map(|s| s.to_string());
         }
         self.last_ctx = (input, output);
         self.turn_msgs += 1;
-        out.push(token_usage(self.agent, input, output, Some((self.total_tokens, self.window()))));
+        out.push(token_usage(self.agent, input, output, Some(self.totals())));
         true
     }
 
@@ -752,11 +765,11 @@ impl Translator {
                 let pre = meta.and_then(|m| m.get("pre_tokens")).and_then(as_u64).unwrap_or(0);
                 let post = meta.and_then(|m| m.get("post_tokens")).and_then(as_u64).unwrap_or(0);
                 let id = format!("cc-compact-{}", v.get("uuid").and_then(|x| x.as_str()).unwrap_or("0"));
-                let (total, window) = (self.total_tokens, self.window());
-                out.push(token_usage(self.agent, pre, 0, Some((total, window))));
+                let totals = self.totals();
+                out.push(token_usage(self.agent, pre, 0, Some(totals)));
                 out.push(HubEvent::Notif { agent: self.agent, method: "item/started".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
                 out.push(HubEvent::Notif { agent: self.agent, method: "item/completed".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
-                out.push(token_usage(self.agent, post, 0, Some((total, window))));
+                out.push(token_usage(self.agent, post, 0, Some(totals)));
                 self.last_ctx = (post, 0);
             }
             "thinking_tokens" => {
@@ -815,7 +828,7 @@ impl Translator {
         // changed what it would show *and* real counts are already there to hang it on.
         if after != before && self.last_ctx != (0, 0) {
             let (input, output) = self.last_ctx;
-            out.push(token_usage(agent, input, output, Some((self.total_tokens, after))));
+            out.push(token_usage(agent, input, output, Some((self.total_tokens, self.cached_tokens, after))));
         }
     }
 
@@ -941,7 +954,7 @@ impl Translator {
                 // The gauge already tracks the last call's context; re-emit it so a window first
                 // learned from this very `result` reaches the agent too.
                 let (input, output) = self.last_ctx;
-                out.push(token_usage(self.agent, input, output, Some((self.total_tokens, self.window()))));
+                out.push(token_usage(self.agent, input, output, Some(self.totals())));
             } else {
                 // No per-call usage came through (an older CLI, or a turn with no assistant
                 // line): `result.usage` is the best available estimate.
@@ -1004,11 +1017,13 @@ fn activity(agent: AgentId, label: Option<&str>) -> HubEvent {
 /// callers fold everything Codex's own `ctx_used = last.inputTokens + last.outputTokens` should
 /// count (input + cache_read + cache_creation, per §10.3) into `last_in` up front, so the sum comes
 /// out exactly right without agent.rs needing to know about Claude's separate cache-token fields.
-fn token_usage(agent: AgentId, last_in: u64, last_out: u64, total_and_window: Option<(u64, Option<u64>)>) -> HubEvent {
+/// A Codex-shaped `thread/tokenUsage/updated`: the last call's context, and the thread's
+/// running totals (tokens, of which cached, context window) when the translator has them.
+fn token_usage(agent: AgentId, last_in: u64, last_out: u64, totals: Option<(u64, u64, Option<u64>)>) -> HubEvent {
     let mut tu = json!({"last": {"inputTokens": last_in, "outputTokens": last_out}});
-    let total = total_and_window.map(|(t, _)| t).unwrap_or(last_in + last_out);
-    tu["total"] = json!({"totalTokens": total});
-    if let Some((_, Some(w))) = total_and_window {
+    let (total, cached) = totals.map(|(t, c, _)| (t, c)).unwrap_or((last_in + last_out, 0));
+    tu["total"] = json!({"totalTokens": total, "cachedInputTokens": cached});
+    if let Some((_, _, Some(w))) = totals {
         tu["modelContextWindow"] = json!(w);
     }
     HubEvent::Notif { agent, method: "thread/tokenUsage/updated".into(), params: json!({"tokenUsage": tu}) }
@@ -1164,6 +1179,7 @@ mod tests {
         assert!(agent.turn_active, "a usage-bearing assistant line opens the turn");
         assert_eq!(agent.ctx_used, 55_300, "context = input + cache read + cache creation + output of the latest call");
         assert_eq!(agent.tokens_total, 55_300, "one message, counted once");
+        assert_eq!(agent.tokens_cached, 50_000, "the cache reads of that one message, counted once");
         assert_eq!(agent.ctx_window, Some(200_000), "the configured window until the CLI reports one");
 
         let call2 = json!({"type": "assistant", "message": {"id": "m2", "usage": {"input_tokens": 200, "cache_read_input_tokens": 55_000, "cache_creation_input_tokens": 900, "output_tokens": 100}, "content": [{"type": "text", "text": "done"}]}});
@@ -1172,6 +1188,8 @@ mod tests {
         feed(&mut tr, &mut agent, &[call2, result]);
         assert_eq!(agent.ctx_used, 56_200, "the last call's context, not the 111k turn sum");
         assert_eq!(agent.tokens_total, 55_300 + 56_200);
+        assert_eq!(agent.tokens_cached, 50_000 + 55_000, "cache reads add up like the total; cache writes are plain input");
+        assert_eq!(agent.cached_share().as_deref(), Some("105.0k cached"), "most of the total was the cached prefix, and the label says so");
         assert_eq!(agent.ctx_window, Some(1_000_000), "subscription auth trusts the window the CLI reports");
         assert!(!agent.turn_active);
     }

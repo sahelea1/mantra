@@ -158,6 +158,8 @@ Press `ctrl+o`, describe the goal, and this happens:
 
 You can talk to anyone: plain text on the stage re-prompts the planner, `@p2-api use axum` messages one worker directly.
 
+Token counts are the backend's running totals — every request's *whole* input plus its output — so a worker that cycles tools in a big context reads millions. Where most of that was the same context served from the cache, the card, the zoom header, the peek strip and the run's `Σ` add `· 5.9M cached` in a muted suffix (the web app's chips and run page do the same), so a big number is read as what it is. A finished card names the model its attempt actually ran on, even after the role's model was changed for the next spawn. The backend's own housekeeping warnings (it could not save its diagnostic logs, say) are a muted line in the agent's log, said once, never the card's line.
+
 </details>
 
 <details>
@@ -508,10 +510,10 @@ The same process that draws the TUI can also serve a small, installable web app 
 | key | does |
 |---|---|
 | `tab` | switch between typing and navigating |
-| `←→↑↓` | select an agent · `1`–`9` jump to the *n*th and zoom |
+| `←→↑↓` | select a card · `1`–`9` jump to the *n*th and zoom (one card per task: a retried task counts once, and the selection is the attempt the card shows) |
 | `⏎` | zoom in · `esc` back to the overview (esc never interrupts) |
 | `space` | pause / resume the run |
-| `r` | respawn the selected agent · `m` switch its model |
+| `r` | respawn the selected agent (a respawned worker's card stays selected once its new attempt starts) · `m` switch its model |
 | `x` | interrupt · `c` compact · `+/-` effort |
 | `p` | plan · `a` approve · `d` diff · `s` studio |
 | `@name …` | message one agent (`@manager` included); plain text re-prompts the planner — or answers the planner's or the manager's open question |

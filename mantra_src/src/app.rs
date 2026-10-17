@@ -209,6 +209,10 @@ pub struct App {
     /// When the halt the stage selection last jumped to began: a new halt about one agent
     /// selects it once, so the band's `m` / `r` act on the agent it names.
     halt_seen: Option<Instant>,
+    /// The task whose card the selection follows across an `r` respawn: the new attempt has no
+    /// agent, so no node, until its worktree is ready, and the selection lands on it when it
+    /// does instead of staying wherever the shorter node list left it.
+    sel_follow: Option<String>,
     pub canvas_focus: bool,
     pub verbose: bool,
     pub side_panel: bool,
@@ -650,6 +654,7 @@ impl App {
             toast: None,
             sel: 0,
             halt_seen: None,
+            sel_follow: None,
             canvas_focus: false,
             verbose: false,
             pulse_panel: true,
@@ -823,14 +828,30 @@ impl App {
         }
     }
 
+    /// The selectable agents of the stage, in card order: the fixed roles, one node per task,
+    /// then the gate and the finale step. `sel` indexes this, so it must count exactly what the
+    /// overview draws: a task retried twice has one card (the newest attempt — `stage::phase`'s
+    /// `worker_of`), and the selection must land on the attempt the card shows, never on a
+    /// cancelled earlier one that would zoom into the wrong log or make ↓ step through
+    /// same-named cards. Earlier attempts stay reachable through the zoomed view's log and the
+    /// pulse. Tasks of the current phase come in plan order; tasks outside it (ad-hoc fix workers,
+    /// the finale's fixes) follow in the order they were started.
     pub fn stage_nodes(&self) -> Vec<AgentId> {
         let Some(r) = &self.run else { return vec![] };
         let mut v = vec![];
         v.extend(r.planner);
         v.extend(r.manager);
         v.extend(r.orchestrator);
+        let mut tasks: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
         for w in &r.workers {
-            if let Some(a) = w.agent {
+            if !tasks.contains(&w.task.id.as_str()) {
+                tasks.push(&w.task.id);
+            }
+        }
+        for id in tasks {
+            // a newest attempt still queued (no agent yet) has no node, like its card
+            let newest = r.workers.iter().rev().find(|w| w.task.id == id).and_then(|w| w.agent);
+            if let Some(a) = newest {
                 if !v.contains(&a) {
                     v.push(a);
                 }
@@ -1057,6 +1078,7 @@ impl App {
         // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
         self.screen = Screen::Stage;
         self.sel = 0;
+        self.sel_follow = None;
     }
 
     /// Record a failed sandbox probe (done once at startup, never in demo mode). The welcome
@@ -1119,6 +1141,7 @@ impl App {
         self.unfinished_runs.retain(|id| *id != r.id);
         self.screen = Screen::Stage;
         self.sel = 0;
+        self.sel_follow = None;
         self.toast(format!("resumed {} at {label}", r.id), Level::Ok);
     }
 
@@ -1387,11 +1410,28 @@ impl App {
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
         if self.run.is_some() {
+            self.follow_respawned_task();
             let n = self.stage_nodes().len();
             if n > 0 && self.sel >= n {
                 self.sel = n - 1;
             }
             self.select_halted_agent();
+        }
+    }
+
+    /// `sel_follow`: once the respawned task's newest attempt has an agent, select its node.
+    fn follow_respawned_task(&mut self) {
+        let Some(task) = &self.sel_follow else { return };
+        let Some(r) = &self.run else { return };
+        let Some(newest) = r.workers.iter().rev().find(|w| &w.task.id == task) else {
+            self.sel_follow = None;
+            return;
+        };
+        if let Some(a) = newest.agent {
+            if let Some(i) = self.stage_nodes().iter().position(|n| *n == a) {
+                self.sel = i;
+            }
+            self.sel_follow = None;
         }
     }
 
@@ -1978,10 +2018,12 @@ impl App {
         if nav {
             match k.code {
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                    self.sel_follow = None;
                     self.sel = self.sel.saturating_sub(1);
                     return true;
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                    self.sel_follow = None;
                     if !nodes.is_empty() {
                         self.sel = (self.sel + 1).min(nodes.len() - 1);
                     }
@@ -2026,7 +2068,11 @@ impl App {
                         self.hub.send(a, Cmd::Restart);
                     } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
                         match res {
-                            Ok(what) => self.toast(what, Level::Info),
+                            Ok(what) => {
+                                // a worker's new attempt has no node until its agent exists
+                                self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
+                                self.toast(what, Level::Info);
+                            }
                             Err(msg) => self.toast(msg, Level::Warn),
                         }
                     }
@@ -2074,6 +2120,8 @@ impl App {
                 // 1-9 jump: select the nth node and zoom straight in.
                 let idx = (c as usize) - ('1' as usize);
                 if let Some(a) = nodes.get(idx) {
+                    // the user chose a card: a respawned task no longer pulls the selection back
+                    self.sel_follow = None;
                     self.sel = idx;
                     self.set_screen(Screen::Zoom(*a));
                     self.canvas_focus = false;
@@ -2671,6 +2719,90 @@ mod tests {
         app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
         app.select_halted_agent();
         assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
+    }
+
+    /// The reported bug: a task retried once had one card on the overview but two entries in
+    /// `stage_nodes`, so the arrows and `1`–`9` counted a card that was not there — selecting the
+    /// visible card zoomed into the cancelled first attempt, and ↓ "moved" to a same-named card.
+    /// One node per task, the attempt the card draws, in plan order.
+    #[test]
+    fn stage_nodes_count_one_node_per_task_the_attempt_its_card_draws() {
+        use crate::engine::plan::{Phase, Plan, Task};
+        use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::worker as attempt;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.orchestrator = Some(3);
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-tooling"), task("p1-api"), task("p1-ui")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        // p1-api was spawned first, then p1-tooling, whose first attempt was cancelled and retried
+        run.workers.push(attempt("p1-api", 1, Some(12), WState::Running));
+        run.workers.push(attempt("p1-tooling", 1, Some(10), WState::Cancelled));
+        run.workers.push(attempt("p1-tooling", 2, Some(11), WState::Running));
+        run.workers.push(attempt("p1-ui", 1, None, WState::Queued));
+        app.run = Some(run);
+        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 12], "one node per task, the newest attempt, in plan order; a queued task has no card and no node");
+        assert_eq!(app.stage_nodes().iter().position(|a| *a == 11), Some(2), "p1-tooling's node is where its card is: right after the fixed roles");
+        // ↓ from p1-tooling lands on p1-api, not on p1-tooling's cancelled attempt
+        app.sel = 2;
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.stage_nodes()[app.sel], 12);
+        // a newest attempt still queued hides the task's older agent as its card would
+        app.run.as_mut().unwrap().workers.push(attempt("p1-api", 2, None, WState::Preparing));
+        assert_eq!(app.stage_nodes(), vec![1, 3, 11]);
+        // a fix worker outside the phase's tasks keeps a node after them, so it stays reachable
+        app.run.as_mut().unwrap().workers.push(attempt("fix-1", 1, Some(20), WState::Running));
+        app.run.as_mut().unwrap().gate_agent = Some(30);
+        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 20, 30]);
+    }
+
+    /// `r` on a worker: its new attempt has no node until its agent exists, so the shorter
+    /// list would leave the selection on a neighbour. It follows the task and lands on the new
+    /// attempt's card when that attempt has an agent; moving the selection meanwhile cancels that.
+    #[test]
+    fn the_selection_follows_a_respawned_task_to_its_new_attempt() {
+        use crate::engine::plan::{Phase, Plan, Task};
+        use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::worker as attempt;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.orchestrator = Some(3);
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-api"), task("p1-ui")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(attempt("p1-api", 1, Some(10), WState::Running));
+        run.workers.push(attempt("p1-ui", 1, Some(11), WState::Cancelled));
+        run.workers.push(attempt("p1-ui", 2, None, WState::Preparing));
+        app.run = Some(run);
+        app.sel = 2;
+        app.sel_follow = Some("p1-ui".into());
+        app.tick();
+        assert_eq!(app.stage_nodes(), vec![3, 10]);
+        assert_eq!(app.sel, 1, "clamped to the last card while the new attempt has none");
+        app.run.as_mut().unwrap().workers[2].agent = Some(12);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 12, "and back on p1-ui once it has");
+        assert_eq!(app.sel_follow, None);
+        // an arrow key in between is the user choosing: nothing follows any more
+        app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 3, None, WState::Preparing));
+        app.sel_follow = Some("p1-ui".into());
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.run.as_mut().unwrap().workers[3].agent = Some(13);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 10, "the selection stays on p1-api, where ← put it");
+        // and so is a 1–9 jump
+        app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 4, None, WState::Preparing));
+        app.sel_follow = Some("p1-ui".into());
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.stage_nodes()[app.sel], 10);
+        app.run.as_mut().unwrap().workers[4].agent = Some(14);
+        app.tick();
+        assert_eq!(app.stage_nodes()[app.sel], 10, "the jump is the user choosing too");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the

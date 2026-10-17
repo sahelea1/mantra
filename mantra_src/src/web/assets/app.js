@@ -395,7 +395,7 @@
             ['Effort', a.effort],
             ['Context', a.ctx_percent !== undefined ? a.ctx_percent + '% of ' + F.tokens(a.ctx_window) + (a.ctx_assumed ? ' (assumed)' : '') : '—'],
             ['Compacts at', a.compact_percent ? a.compact_percent + '%' : null],
-            ['Tokens', F.tokens(a.tokens_total)],
+            ['Tokens', F.tokens(a.tokens_total) + (F.cached(a.tokens_total, a.tokens_cached) ? ' · ' + F.cached(a.tokens_total, a.tokens_cached) : '')],
             ['Turns', String(a.turn_count || 0)],
             w ? ['Task', w.task_id + ' · attempt ' + w.attempt] : null,
             w ? ['Branch', w.branch] : null,

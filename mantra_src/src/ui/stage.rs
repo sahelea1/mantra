@@ -200,11 +200,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 crumbs.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
             let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
-            let tokens = r.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
+            let (tokens, cached) = super::run_token_totals(app, r);
             // The halt band (drawn in the rail, just under this header) already says why and
             // what to do — no separate badge needed here.
             right.push(Span::styled(format!("{} {}", theme::g("⏱", "t"), fmt_dur(r.elapsed())), theme::muted()));
             right.push(Span::styled(format!("  Σ {} tok", fmt_tokens(tokens)), theme::muted()));
+            // how much of Σ was the same context re-read from the cache, when that is most of it
+            right.extend(super::cached_suffix(crate::agent::cached_share(tokens, cached)));
             right.push(Span::styled(format!("  {} {active} active ", theme::g("●", "*")), if active > 0 { theme::fg(theme::GREEN) } else { theme::dim() }));
             // The run's title gets the room the rest leaves (up to 40 columns), with the id as a
             // faint crumb where there is plenty; on a narrow terminal "› overview" and the pattern
@@ -225,7 +227,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 crumbs.remove(1);
             }
             if room(&crumbs, &tail, &right) < 16 {
-                // the token count is the least of what the right side says
+                // the token count is the least of what the right side says — its cached
+                // reading goes first, then the count itself
+                right.retain(|s| !s.content.ends_with("cached") && s.content != " · ");
+            }
+            if room(&crumbs, &tail, &right) < 16 {
                 right.retain(|s| !s.content.contains('Σ'));
             }
             let tw = room(&crumbs, &tail, &right).min(40);
@@ -516,7 +522,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     cv.put(r.x as i32 + r.width as i32 - 3, y, &mark, theme::bold(theme::fg(mcol)));
     let h = r.height as i32;
     // line 1: model · effort · progress
-    let m_alias = a.map(|a| a.model_alias.clone()).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default();
+    let m_alias = attempt_model(a, role);
     let eff = a.map(|a| a.effort.clone()).or_else(|| t.effort.clone()).or_else(|| role.map(|r| r.effort.clone())).unwrap_or_default();
     let (d, tot) = a.map(|a| a.plan_progress()).unwrap_or((0, 0));
     let eff = if app.registry.resolve(&m_alias).efforts().is_empty() { String::new() } else { eff };
@@ -582,21 +588,47 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
         if let (Some(w), Some(a)) = (w, a) {
             let el = w.finished.map(|f| f.duration_since(w.spawned)).unwrap_or_else(|| w.spawned.elapsed());
             l3.push(Span::styled(format!("{} · {}", fmt_dur(el), fmt_tokens(a.tokens_total)), theme::faint()));
+            let mut badges = vec![];
             if w.attempt > 1 {
-                l3.push(Span::styled(format!("  {}{}", theme::g("↻", "r"), w.attempt), theme::fg(theme::AMBER)));
+                badges.push(Span::styled(format!("  {}{}", theme::g("↻", "r"), w.attempt), theme::fg(theme::AMBER)));
             }
             if !w.tripwires.is_empty() {
-                l3.push(Span::styled(format!("  {} scope", theme::g("⚠", "!")), theme::fg(theme::AMBER)));
+                badges.push(Span::styled(format!("  {} scope", theme::g("⚠", "!")), theme::fg(theme::AMBER)));
             }
             if prompting(run, w.agent) {
-                l3.push(Span::styled(format!("  {} prompted", theme::g("◂", "<")), theme::fg(theme::ROSE)));
+                badges.push(Span::styled(format!("  {} prompted", theme::g("◂", "<")), theme::fg(theme::ROSE)));
             }
+            // "· 1.2M cached" reads the count as what it mostly is. The badges, which call for a
+            // look, keep their columns over it; where the count twice does not fit, "· 86%
+            // cached" says the same in fewer columns. On a card too narrow even for that (three
+            // tasks side by side) the elapsed time gives way to it once the count is in the
+            // millions — the bare "6.8M" that misleads; a smaller count keeps the clock.
+            let used = |spans: &[Span<'static>]| spans.iter().map(|s| w_of(&s.content)).sum::<usize>();
+            let room = (iw as usize).saturating_sub(used(&badges));
+            let full = super::cached_suffix(a.cached_share());
+            let short = super::cached_suffix(crate::agent::cached_share_short(a.tokens_total, a.tokens_cached));
+            let bare = vec![Span::styled(fmt_tokens(a.tokens_total), theme::faint())];
+            let big = a.tokens_total >= 1_000_000;
+            let read = [(&l3, full, true), (&l3, short.clone(), true), (&bare, short, big)].into_iter().find(|(count, suffix, ok)| *ok && !suffix.is_empty() && used(count) + used(suffix) <= room);
+            if let Some((count, suffix, _)) = read {
+                l3 = count.iter().cloned().chain(suffix).collect();
+            }
+            l3.extend(badges);
         } else if let Some(sc) = t.scope.first() {
             l3.push(Span::styled(trunc(sc, iw as usize), theme::faint()));
         }
         cv.spans(x, y + 3, &l3, iw);
     }
     let _ = app;
+}
+
+/// The model a task's card names: the alias its attempt's agent runs on, or ran on — a finished
+/// attempt keeps the alias it ran with, since a role's model change only reaches agents that
+/// will run again. The role's model is shown only for an attempt with no agent record: one not
+/// started yet, which will run on it, or a finished one a resume brought back without its agent,
+/// for which nothing better is known.
+fn attempt_model(a: Option<&Agent>, role: Option<&Role>) -> String {
+    a.map(|a| a.model_alias.clone()).or_else(|| role.map(|r| r.model.clone())).unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -999,8 +1031,15 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
             ay += 4;
         }
     }
-    // ad-hoc fix workers spawned by the verifier
-    let adhoc: Vec<&Worker> = run.workers.iter().filter(|w| w.adhoc).collect();
+    // ad-hoc fix workers spawned by the verifier: one card per fix task, its newest attempt, in
+    // the order the tasks were first started — the nodes `App::stage_nodes` selects
+    let mut adhoc: Vec<&Worker> = vec![];
+    for wk in run.workers.iter().filter(|w| w.adhoc) {
+        match adhoc.iter_mut().find(|x| x.task.id == wk.task.id) {
+            Some(x) => *x = wk,
+            None => adhoc.push(wk),
+        }
+    }
     if !adhoc.is_empty() {
         if aw >= 20 {
             ay += 1;
@@ -1043,8 +1082,10 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
         y += 1;
     }
     y += 1;
-    let tokens = run.total_tokens(|a| app.agents.get(&a).map(|x| x.tokens_total).unwrap_or(0));
-    cv.put(x, y, &format!("Σ {} tokens across all agents{}", fmt_tokens(tokens), if app.demo { " (simulated)" } else { "" }), theme::muted());
+    let (tokens, cached) = super::run_token_totals(app, run);
+    let mut sum = vec![Span::styled(format!("Σ {} tokens across all agents{}", fmt_tokens(tokens), if app.demo { " (simulated)" } else { "" }), theme::muted())];
+    sum.extend(super::cached_suffix(crate::agent::cached_share(tokens, cached)));
+    cv.spans(x, y, &sum, area.width as i32 - 6);
     y += 1;
     if let (Some(ws), Stage::Done) = (&run.ws, &run.stage) {
         if ws.worktree {
@@ -1098,11 +1139,13 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
         Status::Crashed(m) => format!("crashed: {}", trunc(m, 30)),
         s => format!("{s:?}").to_lowercase(),
     };
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(format!(" {} {} ", theme::role_glyph(&a.glyph), a.name), theme::bold(theme::fg(col))),
-        Span::styled(format!("{} · {}·{} · {} · {} tok ", a.role, a.model_alias, a.effort, st, fmt_tokens(a.tokens_total)), theme::dim()),
-        Span::styled("⏎ zoom ", theme::faint()),
-    ]);
+        Span::styled(format!("{} · {}·{} · {} · {} tok", a.role, a.model_alias, a.effort, st, fmt_tokens(a.tokens_total)), theme::dim()),
+    ];
+    title.extend(super::cached_suffix(a.cached_share()));
+    title.push(Span::styled(" ⏎ zoom ", theme::faint()));
+    let title = Line::from(title);
     let blk = Block::default().borders(Borders::TOP).border_style(theme::faint()).title(title);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
@@ -1161,6 +1204,109 @@ mod tests {
             cols.push(row[..row.find(&d).unwrap()].chars().count());
         }
         assert!(cols.len() > 2 && cols.windows(2).all(|w| w[0] == w[1]), "{cols:?}");
+    }
+
+    /// Every row of a full frame of `app` at `w`×`h`, trimmed.
+    fn frame(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    /// A phase on the overview: an orchestrator and two workers, `p1-api` done on `sol` and
+    /// `p1-ui` running on `terra`, with `worker-small` since moved to `luna`.
+    fn phase_app() -> App {
+        use crate::engine::plan::{Phase, Plan, Task};
+        use crate::engine::run::{PhaseStep, WState};
+        use crate::web::snapshot::tests::{add_agent, worker};
+        let mut app = app();
+        let mut run = Run::new(PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.title = "Ship it".into();
+        let task = |id: &str| Task { id: id.into(), role: "worker-small".into(), ..Default::default() };
+        run.plan = Some(Plan { phases: vec![Phase { id: "p1".into(), tasks: vec![task("p1-api"), task("p1-ui")], ..Default::default() }], ..Default::default() });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.orchestrator = Some(3);
+        add_agent(&mut app, 3, "orchestrator");
+        for (id, name, alias) in [(10, "p1-api", "sol"), (11, "p1-ui", "terra")] {
+            add_agent(&mut app, id, name);
+            app.agents.get_mut(&id).unwrap().model_alias = alias.into();
+        }
+        run.workers.push(worker("p1-api", 1, Some(10), WState::Done));
+        run.workers.push(worker("p1-ui", 1, Some(11), WState::Running));
+        run.pattern.roles.get_mut("worker-small").unwrap().model = "luna".into();
+        app.run = Some(run);
+        app.screen = crate::app::Screen::Stage;
+        app
+    }
+
+    /// The reported bug: after the role's model was changed, finished cards named the role's
+    /// new alias although their attempt ran on another model. A card names its attempt's own.
+    #[test]
+    fn a_done_card_names_the_model_its_attempt_ran_on_after_a_role_change() {
+        let mut app = phase_app();
+        let rows = frame(&mut app, 120, 36);
+        let all = rows.join("\n");
+        assert!(rows.iter().any(|r| r.contains("p1-api")), "{all}");
+        assert!(all.contains("sol") && all.contains("terra"), "{all}");
+        assert!(!all.contains("luna"), "no card claims the role's new model: {all}");
+        // with no agent record (a resume restores done workers without their agents) the
+        // role's model is all that is known
+        let role = app.run.as_ref().unwrap().pattern.role("worker-small").cloned();
+        assert_eq!(attempt_model(None, role.as_ref()), "luna");
+        assert_eq!(attempt_model(app.agents.get(&10), role.as_ref()), "sol");
+    }
+
+    /// A big total that was mostly cached input says so on the card and in the run header —
+    /// as a count where the columns allow, as a share on a narrow card — and the header drops
+    /// the reading before the count when it runs out of room.
+    #[test]
+    fn cards_and_the_header_read_a_mostly_cached_total() {
+        let usage = serde_json::json!({"tokenUsage": {"total": {"totalTokens": 6_800_000, "cachedInputTokens": 5_900_000}, "last": {"inputTokens": 1000, "outputTokens": 10}}});
+        let mut app = phase_app();
+        app.agents.get_mut(&11).unwrap().apply("thread/tokenUsage/updated", &usage);
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains("Σ 6.80M tok · 5.90M cached"), "{all}");
+        assert!(all.contains("6.80M · 5.90M cached") || all.contains("6.80M · 86% cached"), "{all}");
+        // three tasks side by side: the reading takes the clock's columns for a count in the
+        // millions, and a smaller count keeps its clock
+        use crate::engine::run::WState;
+        let run = app.run.as_mut().unwrap();
+        let mut t = run.plan.as_ref().unwrap().phases[0].tasks[0].clone();
+        t.id = "p1-docs".into();
+        run.plan.as_mut().unwrap().phases[0].tasks.push(t);
+        run.workers.push(crate::web::snapshot::tests::worker("p1-docs", 1, Some(12), WState::Running));
+        crate::web::snapshot::tests::add_agent(&mut app, 12, "p1-docs");
+        let small = serde_json::json!({"tokenUsage": {"total": {"totalTokens": 33_000, "cachedInputTokens": 26_400}, "last": {"inputTokens": 1000, "outputTokens": 10}}});
+        app.agents.get_mut(&12).unwrap().apply("thread/tokenUsage/updated", &small);
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains("│ 6.80M · 86% cached"), "{all}");
+        assert!(all.contains("│ 0s · 33.0k "), "{all}");
+        // where the header runs out of room the reading goes before the count
+        let top = frame(&mut app, 80, 24).remove(0);
+        assert!(top.contains("Σ 6.83M tok") && !top.contains("cached"), "{top}");
+    }
+
+    /// One card per fix task in the finale's side column, the newest attempt — the node the
+    /// selection lands on — never one card per attempt.
+    #[test]
+    fn a_retried_fix_task_has_one_card() {
+        use crate::engine::run::WState;
+        use crate::web::snapshot::tests::{add_agent, worker};
+        let mut app = phase_app();
+        let run = app.run.as_mut().unwrap();
+        run.stage = Stage::Finale { idx: 0 };
+        run.workers.clear();
+        for (attempt, id, state) in [(1, 20, WState::Cancelled), (2, 21, WState::Running)] {
+            let mut w = worker("fix-7", attempt, Some(id), state);
+            w.adhoc = true;
+            run.workers.push(w);
+        }
+        add_agent(&mut app, 20, "fix-7");
+        add_agent(&mut app, 21, "fix-7");
+        let rows = frame(&mut app, 140, 40);
+        assert_eq!(rows.iter().filter(|r| r.contains("fix-7")).count(), 1, "{}", rows.join("\n"));
+        assert!(app.stage_nodes().contains(&21) && !app.stage_nodes().contains(&20));
     }
 
     /// A role asking for an effort its model doesn't offer shows requested→used.

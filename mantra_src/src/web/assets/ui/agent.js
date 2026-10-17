@@ -146,6 +146,7 @@
             h('span', { class: 'dim' }, [
                 a.turn_started_at ? ' · ' + F.dur(now - a.turn_started_at) : '',
                 a.tokens_total ? ' · ' + F.tokens(a.tokens_total) + ' tok' : '',
+                F.cached(a.tokens_total, a.tokens_cached) ? ' · ' + F.cached(a.tokens_total, a.tokens_cached) : '',
                 a.effort ? ' · ' + a.effort : '',
             ].join('')),
             quiet ? h('span', { class: 'quiet' }, ' · quiet ' + F.durShort(a.quiet_ms)) : null);

@@ -160,7 +160,13 @@ pub struct Agent {
     pub turn_count: u32,
     pub plan: Vec<(String, String)>,
     pub files: BTreeMap<String, FileStat>,
+    /// Codex's `total.totalTokens`: every request's whole input plus its output, summed over the
+    /// thread — so a worker that cycles tools in a big context reads millions.
     pub tokens_total: u64,
+    /// How much of `tokens_total` was input served from the cache (`total.cachedInputTokens`):
+    /// the same prefix re-read on every request. Shown next to the total when it is most of it,
+    /// so a big number is read as what it is (see `cached_share`).
+    pub tokens_cached: u64,
     pub ctx_used: u64,
     pub ctx_window: Option<u64>,
     pub last_event: Instant,
@@ -221,6 +227,7 @@ impl Agent {
             plan: vec![],
             files: BTreeMap::new(),
             tokens_total: 0,
+            tokens_cached: 0,
             ctx_used: 0,
             ctx_window: None,
             last_event: Instant::now(),
@@ -278,6 +285,11 @@ impl Agent {
         Some(((self.ctx_used as f64 / w as f64) * 100.0).min(100.0) as u8)
     }
 
+    /// "5.9M cached" when the cached share of this agent's total is worth a word (`cached_share`).
+    pub fn cached_share(&self) -> Option<String> {
+        cached_share(self.tokens_total, self.tokens_cached)
+    }
+
     pub fn plan_progress(&self) -> (usize, usize) {
         let done = self.plan.iter().filter(|(_, s)| s == "completed").count();
         (done, self.plan.len())
@@ -305,6 +317,20 @@ impl Agent {
         self.notice_seq += 1;
         let id = format!("notice-{}", self.notice_seq);
         let mut it = Item::new(id, Kind::Notice { level }, text);
+        it.done = true;
+        self.push(it);
+    }
+
+    /// A muted transcript line about the backend's own housekeeping rather than this agent's
+    /// work (`is_housekeeping_warning`, the fallback-metadata note): an info notice that the
+    /// card and peek lines skip (`tail_lines`), said once per session however often the backend
+    /// repeats it. Its id prefix is what marks it.
+    fn footnote(&mut self, text: String) {
+        if self.items.iter().any(|i| i.id.starts_with(FOOTNOTE) && i.text == text) {
+            return;
+        }
+        self.notice_seq += 1;
+        let mut it = Item::new(format!("{FOOTNOTE}{}", self.notice_seq), Kind::Notice { level: Level::Info }, text);
         it.done = true;
         self.push(it);
     }
@@ -467,6 +493,7 @@ impl Agent {
                 if let Some(t) = p.get("tokenUsage") {
                     let before = self.tokens_total;
                     self.tokens_total = t.pointer("/total/totalTokens").and_then(|x| x.as_u64()).unwrap_or(self.tokens_total);
+                    self.tokens_cached = t.pointer("/total/cachedInputTokens").and_then(|x| x.as_u64()).unwrap_or(self.tokens_cached);
                     if self.tokens_total > before {
                         self.turn_wait_since = None;
                     }
@@ -513,7 +540,12 @@ impl Agent {
                     // Codex ≥ 0.157 says this for every model tag outside its own catalog (any
                     // custom provider). Mantra already passes the context window / compaction limit
                     // itself, so it's expected — one muted line, not an amber alert.
-                    self.notice(Level::Info, fallback_metadata_note(msg));
+                    self.footnote(fallback_metadata_note(msg));
+                } else if is_housekeeping_warning(msg) {
+                    // Codex's own housekeeping (its diagnostic-log database, say) is not this
+                    // agent's work going wrong: a muted footnote in the transcript, never the
+                    // card's line, never amber. The activity label is left alone.
+                    self.footnote(crate::util::trunc(msg, 400));
                 } else if !msg.is_empty() {
                     self.notice(Level::Warn, crate::util::trunc(msg, 400));
                 }
@@ -818,12 +850,17 @@ impl Agent {
         signal
     }
 
-    /// One-line summaries of the latest activity (for peek strips and logs).
+    /// One-line summaries of the latest activity (for peek strips and logs). Footnotes — the
+    /// backend's housekeeping (`footnote`) — are not activity: an idle card's line shows what
+    /// the agent last did or the last real notice, not that Codex could not write its own logs.
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
         let mut out = vec![];
         for it in self.items.iter().rev() {
             if out.len() >= n {
                 break;
+            }
+            if it.id.starts_with(FOOTNOTE) {
+                continue;
             }
             let line = match &it.kind {
                 Kind::User if it.text.starts_with("[mantra") || it.text.starts_with("[from ") => {
@@ -903,6 +940,36 @@ pub fn classify(info: &Value) -> ErrKind {
         "badRequest" => ErrKind::ProviderRejected,
         _ => ErrKind::Other,
     }
+}
+
+/// A Codex warning about its own housekeeping, not about this agent's turn: it could not write
+/// its diagnostic-log database ("Codex couldn't save diagnostic logs to its local database. Use
+/// /feedback …"). Nothing Mantra or the user can act on mid-run, so it never shows as the
+/// agent's line. (The fallback-metadata warning has its own, reworded note.)
+pub fn is_housekeeping_warning(msg: &str) -> bool {
+    msg.to_lowercase().contains("diagnostic log")
+}
+
+/// The item-id prefix of a footnote (`Agent::footnote`).
+const FOOTNOTE: &str = "footnote-";
+
+/// "5.9M cached" for a token total of which `cached` was cached input, when that is worth a
+/// word: Codex's `total.totalTokens` counts every request's whole input, so a worker that
+/// cycles tools in a big context reads "6.8M" of which most was the same prefix served from the
+/// cache. Below a fifth of the total, or under 10k tokens altogether, it is noise rather than a
+/// correction, and nothing is shown.
+pub fn cached_share(total: u64, cached: u64) -> Option<String> {
+    cached_material(total, cached).then(|| format!("{} cached", crate::util::fmt_tokens(cached.min(total))))
+}
+
+/// The same reading as a share, "80% cached", for a card too narrow for the count twice.
+pub fn cached_share_short(total: u64, cached: u64) -> Option<String> {
+    cached_material(total, cached).then(|| format!("{}% cached", cached.min(total).saturating_mul(100) / total))
+}
+
+fn cached_material(total: u64, cached: u64) -> bool {
+    let cached = cached.min(total);
+    cached > 0 && total >= 10_000 && cached.saturating_mul(5) >= total
 }
 
 /// Codex's "Model metadata for `x` not found. Defaulting to fallback metadata; this can degrade
@@ -1124,6 +1191,62 @@ mod tests {
         a.apply("warning", &json!({"message": "something else"}));
         assert!(matches!(a.items.last().unwrap().kind, Kind::Notice { level: Level::Warn }));
     }
+    /// A Codex housekeeping warning (it could not write its own diagnostic logs) is not the
+    /// agent's activity: a muted info line in the transcript, nothing on the card — whose idle
+    /// line shows the last real notice — and the activity label untouched.
+    #[test]
+    fn housekeeping_warnings_are_footnotes_not_the_agents_line() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "orchestrator", std::path::PathBuf::from("."));
+        a.apply("item/completed", &json!({"item": {"type": "commandExecution", "id": "c1", "command": "cargo test", "status": "completed", "exitCode": 0}}));
+        a.activity = "idle".into();
+        a.apply("warning", &json!({"message": "Codex couldn't save diagnostic logs to its local database. Use /feedback to report this issue."}));
+        let it = a.items.last().expect("a notice");
+        assert!(matches!(it.kind, Kind::Notice { level: Level::Info }), "{:?}", it.kind);
+        assert_eq!(a.activity, "idle", "the activity line is not replaced");
+        assert_eq!(a.tail_lines(1), vec!["$ cargo test ✓".to_string()], "the card's line is the last real thing, not the footnote");
+        // Codex repeats it every turn: the transcript says it once
+        let n = a.items.len();
+        a.apply("warning", &json!({"message": "Codex couldn't save diagnostic logs to its local database. Use /feedback to report this issue."}));
+        assert_eq!(a.items.len(), n);
+        // the fallback-metadata note is a footnote too
+        a.apply("warning", &json!({"message": "Model metadata for `testing` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}));
+        assert_eq!(a.tail_lines(1), vec!["$ cargo test ✓".to_string()]);
+        // a real warning still shows, in amber, and is what the card's idle line picks up
+        a.apply("warning", &json!({"message": "tests were skipped"}));
+        assert!(matches!(a.items.last().unwrap().kind, Kind::Notice { level: Level::Warn }));
+        assert_eq!(a.tail_lines(1), vec!["! tests were skipped".to_string()]);
+        // and Mantra's own info notices (a model switch) are real notices, not footnotes
+        a.notice(Level::Info, "model → luna (luna-1)");
+        assert_eq!(a.tail_lines(1), vec!["! model → luna (luna-1)".to_string()]);
+    }
+
+    /// `total.totalTokens` counts every request's whole input, so a worker in a big context
+    /// reads millions of which most was cached: the agent keeps the cached share, and the
+    /// label says so only when that share is material.
+    #[test]
+    fn cached_input_is_tracked_and_named_when_it_is_most_of_the_total() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "worker", std::path::PathBuf::from("."));
+        a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": 6_800_000, "inputTokens": 6_500_000, "cachedInputTokens": 5_900_000, "outputTokens": 300_000}, "last": {"inputTokens": 180_000, "outputTokens": 2_000}}}));
+        assert_eq!((a.tokens_total, a.tokens_cached), (6_800_000, 5_900_000));
+        assert_eq!(a.cached_share().as_deref(), Some("5.90M cached"));
+        // an update without the field keeps the last known share rather than zeroing it
+        a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": 6_900_000}, "last": {"inputTokens": 1, "outputTokens": 1}}}));
+        assert_eq!(a.tokens_cached, 5_900_000);
+        // too small a total, or too small a share, is not worth a word; a share can't exceed the total
+        assert_eq!(cached_share(9_000, 8_000), None);
+        assert_eq!(cached_share(100_000, 19_000), None);
+        assert_eq!(cached_share(100_000, 20_000).as_deref(), Some("20.0k cached"));
+        assert_eq!(cached_share(100_000, 0), None);
+        assert_eq!(cached_share(50_000, 80_000).as_deref(), Some("50.0k cached"));
+        // the short form for a narrow card follows the same rule
+        assert_eq!(cached_share_short(6_800_000, 5_900_000).as_deref(), Some("86% cached"));
+        assert_eq!(cached_share_short(100_000, 19_000), None);
+    }
+
     #[test]
     fn compaction_turn_is_tracked_and_not_counted_as_work() {
         use super::*;
