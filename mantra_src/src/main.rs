@@ -274,29 +274,14 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     let resume = match (&cli.resume, cli.resume_last) {
         (Some(id), _) => Some(engine::state::find(id).map_err(|e| anyhow::anyhow!(e))?),
         (None, true) => {
-            let candidates = if demo {
-                engine::state::list_all().into_iter().filter(|r| r.project().map(|p| p.to_string_lossy().contains("mantra-demo-")).unwrap_or(false)).collect()
-            } else {
-                let here = cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?);
-                engine::state::list_project(&here)
-            };
-            let pick = candidates.into_iter().find(|r| r.unfinished() && r.project().map(|p| p.is_dir()).unwrap_or(false));
+            let here = if demo { None } else { Some(cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)).unwrap_or(std::env::current_dir()?)) };
+            let pick = resume_last_pick(engine::state::list_all(), here.as_deref());
             Some(pick.ok_or_else(|| anyhow::anyhow!("no unfinished run of this project to resume (mantra runs lists every project's; mantra runs resume <id> takes any)"))?)
         }
         _ => None,
     };
-    // One owner per run: a run another Mantra has open right now (`owner.json`, a live pid on
-    // this host) is refused here, before anything starts, unless the user says the check is
-    // wrong (`--take-over`). A dead owner is a crash and resumes as usual.
     if let Some(r) = &resume {
-        if let Some(owner) = engine::state::live_owner(&r.dir) {
-            if cli.take_over {
-                eprintln!("mantra: taking run {} over from pid {} on {}", r.id, owner.pid, owner.hostname);
-                engine::state::Owner::clear(&r.dir);
-            } else {
-                anyhow::bail!("{}", owner.refusal(&r.id));
-            }
-        }
+        claim_for_resume(r, cli.take_over).map_err(|e| anyhow::anyhow!(e))?;
     }
     let project = match &resume {
         Some(r) => {
@@ -1184,6 +1169,112 @@ fn claude_auth_status(cmd0: &str) -> Option<String> {
     }
     let first = t.lines().next().unwrap_or("").trim().to_string();
     (!first.is_empty()).then_some(first)
+}
+
+/// `--resume-last`: the newest unfinished run of the project in `here` (cwd / --cwd) whose
+/// directory still exists — never another project's: that run belongs to whoever is working
+/// there, and may well be open. `None` = `--demo`, where it is the last demo run (each demo has
+/// its own temp repo, so "this project" would never match).
+fn resume_last_pick(all: Vec<engine::state::RunSummary>, here: Option<&std::path::Path>) -> Option<engine::state::RunSummary> {
+    let key = here.map(engine::state::project_key);
+    all.into_iter().filter(|r| r.unfinished()).find(|r| {
+        let Some(p) = r.project().filter(|p| p.is_dir()) else { return false };
+        match &key {
+            Some(k) => r.project_key == *k,
+            None => p.to_string_lossy().contains("mantra-demo-"),
+        }
+    })
+}
+
+/// One owner per run: a run another Mantra has open right now (`owner.json`, a live pid on this
+/// host) is refused before anything starts, unless the user says the check is wrong
+/// (`--take-over`, which clears the claim). A dead owner is a crash and resumes as usual; the
+/// TUI's `/runs` and the web `run_resume` refuse the same way in `App::resume_run`.
+fn claim_for_resume(r: &engine::state::RunSummary, take_over: bool) -> Result<(), String> {
+    let Some(owner) = engine::state::live_owner(&r.dir) else { return Ok(()) };
+    if !take_over {
+        return Err(owner.refusal(&r.id));
+    }
+    eprintln!("mantra: taking run {} over from pid {} on {}", r.id, owner.pid, owner.hostname);
+    engine::state::Owner::clear(&r.dir);
+    Ok(())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use engine::state::{list_in, project_key, Owner, RunState};
+
+    /// A runs root with one unfinished run per project in `projects` (newest last).
+    fn runs_root(tag: &str, projects: &[&std::path::Path]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mantra-resume-last-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (i, p) in projects.iter().enumerate() {
+            let dir = root.join(project_key(p)).join(format!("{i}-run"));
+            RunState { format: engine::state::FORMAT, id: format!("{i}-run"), project: p.to_path_buf(), updated_unix: 100 + i as u64, ..Default::default() }.save(&dir);
+        }
+        root
+    }
+
+    /// `--resume-last` in project A never picks project B's run, however much newer it is; with
+    /// --demo it is the last demo run, wherever the demo repo is.
+    #[test]
+    fn resume_last_only_looks_at_this_projects_runs() {
+        let base = std::env::temp_dir().join(format!("mantra-resume-projects-{}", std::process::id()));
+        let (a, b, demo) = (base.join("alpha"), base.join("beta"), base.join("mantra-demo-x"));
+        for d in [&a, &b, &demo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let root = runs_root("pick", &[&a, &b, &demo]);
+        assert_eq!(resume_last_pick(list_in(&root), Some(&a)).map(|r| r.id), Some("0-run".into()), "A's own run, not B's newer one");
+        assert_eq!(resume_last_pick(list_in(&root), Some(&b)).map(|r| r.id), Some("1-run".into()));
+        assert_eq!(resume_last_pick(list_in(&root), None).map(|r| r.id), Some("2-run".into()), "--demo: the last demo run");
+        assert!(resume_last_pick(list_in(&root), Some(&base)).is_none(), "a project with no run of its own resumes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A resume of a run a live Mantra owns is refused (and names the way around it); a dead
+    /// owner is a crash and goes ahead; `--take-over` clears a live claim.
+    #[test]
+    fn a_resume_is_refused_while_the_owner_lives_and_take_over_clears_it() {
+        let project = std::env::temp_dir().join(format!("mantra-resume-owned-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let root = runs_root("owned", &[&project]);
+        let r = list_in(&root).remove(0);
+        assert!(claim_for_resume(&r, false).is_ok(), "no owner file: nothing to refuse");
+        // this test process is a live Mantra as far as the check can tell
+        Owner::this_process().write(&r.dir);
+        let e = claim_for_resume(&r, false).unwrap_err();
+        assert!(e.contains("open in another Mantra") && e.contains("--take-over"), "{e}");
+        assert!(Owner::load(&r.dir).is_some(), "a refusal leaves the claim alone");
+        assert!(claim_for_resume(&r, true).is_ok());
+        assert!(Owner::load(&r.dir).is_none(), "--take-over clears it");
+        // a crash: the owner's pid is gone
+        Owner { pid: 4_000_000_000, ..Owner::this_process() }.write(&r.dir);
+        assert!(claim_for_resume(&r, false).is_ok(), "a dead owner does not block the resume");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// The TUI's `/runs` and the web `run_resume` go through `App::resume_run`: it refuses a
+    /// live owner the same way, with a toast, and opens nothing.
+    #[test]
+    fn the_app_refuses_to_resume_a_run_another_mantra_has_open() {
+        let project = std::env::temp_dir().join(format!("mantra-resume-app-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let root = runs_root("app", &[&project]);
+        let r = list_in(&root).remove(0);
+        Owner { pid: std::process::id(), hostname: Owner::this_process().hostname, started_unix: 1 }.write(&r.dir);
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.resume_run(r.clone());
+        assert!(app.run.is_none(), "nothing was opened");
+        let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(toast.contains("open in another Mantra"), "{toast}");
+        assert!(Owner::load(&r.dir).is_some(), "the owner's claim stands");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&project);
+    }
 }
 
 #[cfg(test)]
