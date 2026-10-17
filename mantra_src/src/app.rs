@@ -1153,7 +1153,7 @@ impl App {
     /// its worktrees are that process's working copies.
     pub fn delete_run(&mut self, r: &crate::engine::state::RunSummary) -> bool {
         if let Some(owner) = crate::engine::state::live_owner(&r.dir) {
-            self.toast(owner.refusal(&r.id).replace("resume", "delete"), Level::Error);
+            self.toast(owner.delete_refusal(&r.id), Level::Error);
             return false;
         }
         if let Some(cur) = &self.run {

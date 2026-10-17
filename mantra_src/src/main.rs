@@ -526,7 +526,7 @@ fn runs_delete(id: &str, yes: bool) {
     };
     if let Some(owner) = engine::state::live_owner(&r.dir) {
         // its worktrees are that process's working copies
-        eprintln!("mantra: {}", owner.refusal(&r.id).replace("resume", "delete"));
+        eprintln!("mantra: {}", owner.delete_refusal(&r.id));
         std::process::exit(2);
     }
     let where_ = r.project().map(|p| p.display().to_string()).unwrap_or_else(|| r.project_key.clone());

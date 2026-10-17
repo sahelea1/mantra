@@ -155,7 +155,17 @@ impl Owner {
 
     /// Why a resume is refused, with the way around it.
     pub fn refusal(&self, run_id: &str) -> String {
-        format!("run {run_id} is open in another Mantra (pid {} on {}, since {}) — quit it first, or `mantra runs resume {run_id} --take-over` if that process is gone", self.pid, self.hostname, fmt_ago(self.started_unix))
+        format!("{} — quit it first, or `mantra runs resume {run_id} --take-over` if that process is gone", self.open_elsewhere(run_id))
+    }
+
+    /// Why a delete is refused: the run's worktrees are that process's working copies, and
+    /// there is no taking those over.
+    pub fn delete_refusal(&self, run_id: &str) -> String {
+        format!("{} — quit it first", self.open_elsewhere(run_id))
+    }
+
+    fn open_elsewhere(&self, run_id: &str) -> String {
+        format!("run {run_id} is open in another Mantra (pid {} on {}, since {})", self.pid, self.hostname, fmt_ago(self.started_unix))
     }
 }
 
