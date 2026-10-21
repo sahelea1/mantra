@@ -1,0 +1,21 @@
+[package]
+name = "bija"
+version = "0.7.0"
+edition = "2021"
+description = "Bija: Mantra's seed harness — a minimal, resilient coding agent for any OpenAI- or Anthropic-compatible API"
+license = "MIT"
+rust-version = "1.80"
+
+[[bin]]
+name = "bija"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "io-std", "sync", "time", "net", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "1"
+ring = "0.17"
+libc = "0.2"

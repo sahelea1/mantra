@@ -1,0 +1,26 @@
+: the server keeps the connection warm with a comment first
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"reasoning_content":"The user wants "},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"reasoning_content":"a listing."},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"Listing "},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"the files."},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\": \"ls"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" -la\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":48,"total_tokens":1248,"prompt_tokens_details":{"cached_tokens":1024}}}
+
+data: [DONE]
+

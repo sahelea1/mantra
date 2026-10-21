@@ -1,10 +1,16 @@
 [package]
 name = "mantra"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
-description = "Mantra: a terminal UI that runs and orchestrates Codex agents (Solo + Mandala modes)"
+description = "Mantra: a terminal UI that runs and orchestrates coding agents — Codex, Claude Code or its own Bija harness (Solo + Mandala modes)"
 license = "MIT"
 rust-version = "1.80"
+
+# `bija` (bija/) is the second binary shipped with Mantra: the built-in agent harness. Building here
+# builds both (`default-members`); the release profile below applies to it too.
+[workspace]
+members = ["bija"]
+default-members = [".", "bija"]
 
 [dependencies]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
