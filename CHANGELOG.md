@@ -2,6 +2,67 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.7.0 — 2026-10-21
+
+Mantra gets a harness of its own. Until now every agent was a vendor CLI, so a machine without
+Codex had nothing to run; this release ships **Bija**, a second binary beside `mantra`, and makes
+it a third backend for any role — and the default for Solo.
+
+- **`bija`, the seed harness.** One small Rust binary that turns any OpenAI-compatible Chat
+  Completions API, or an Anthropic-compatible Messages API, into a coding agent: read, write,
+  edit and delete files, list/glob/grep, run commands with a timeout or in the background and
+  wait on them. Every retryable API error (connect, timeouts, a broken stream, 429/5xx,
+  overload) is retried with backoff and `Retry-After`; auth, context and bad-request errors are
+  classified once, in the kinds Mantra's halts already understand.
+- **A third backend, `kind = "bija"`.** A provider with a base URL, a `wire` (`openai` or
+  `anthropic`) and an optional key — a local Ollama or vLLM takes none. Pickers label it
+  `via … • bija`; `D` discovers its models; any role can use it. Steering, interrupts,
+  `/compact` and live model or effort switches work as they do on Codex, and Mantra's own
+  tools reach it directly, no bridge. Quitting Mantra gives its bija agents up to 3 s,
+  together, to end their commands and background jobs and close their transcripts.
+- **Solo runs on bija by default.** A built-in `bija` provider on the OpenAI API
+  (`OPENAI_API_KEY`) carries `astra-api`, `sol-api`, `terra-api` and `luna-api` — the Codex
+  aliases' models, reached with a key instead of a login — and a fresh install's Solo starts on
+  `sol-api`. A Codex ChatGPT login still gets `sol`. The new `mantra-default-bija` pattern
+  runs a whole Mandala on the `-api` aliases. A `models.toml` from an earlier version gets the
+  provider and the `-api` aliases once, on load; on a machine without Codex, Solo and the
+  default pattern move to their bija twins (`sol-api`, `mantra-default-bija`).
+- **Built for swarms.** One thread, idle in the kernel between events, a few MB of memory:
+  eighty agents on a laptop. Every message is on disk as it happens
+  (`~/.mantra/bija/sessions/<id>/`); a crashed host resumes each session mid-turn from its
+  transcript, with the tool calls it was in the middle of repaired.
+- **It also runs on its own.** `bija run --provider-url … --model … "<prompt>"` for one turn,
+  `bija sessions`, `bija show <id> -f` to follow a transcript, `bija send <id> "<text>"` to
+  prompt a session served with `--control` over its socket, `--resume <id>` to carry one on. Sandboxing: `read-only`,
+  `workspace-write` or `full`, with bubblewrap around commands where it works (they run
+  unsandboxed, said once, where it doesn't); the provider's key is removed from the environment
+  of every command bija runs.
+- **Shipped together.** Releases carry `bija-<os>-<arch>` beside `mantra-<os>-<arch>`, each
+  with its checksum; `install.sh` installs both side by side (a release without a bija asset
+  still installs mantra), and a source build makes both. `mantra doctor` says which `bija`
+  agents will run, and its version.
+- **The demo drives the real thing.** `mantra --demo --pattern mantra-default-bija` points the
+  `bija` provider at an in-process mock API that streams the provider's own SSE shape (and lists
+  its models, for `D`), so the real binary, wire and transcripts run end to end with no key;
+  `docs/tools/bija-e2e.sh` checks such a run reaches Done. `MANTRA_MOCK_FLAKY=<n>` makes every
+  n-th mock request a 503, to watch the retries.
+- **A swarm pattern, and the width you choose.** `mantra-swarm` is the bija default cut for a
+  wide fan-out: the planner splits the work into many small tasks with disjoint scopes (up to 32
+  a phase) and the orchestrator keeps up to `max_parallel` of them running. `mantra --swarm N
+  "<goal>"` (or `/swarm N <goal>`) starts one with N at once; `mantra run --parallel N` sets N
+  for any pattern. N (1–128) is the run's own, kept in its copy of the pattern for a resume and
+  never written into the saved one; a phase may then hold up to N tasks too, so N at once is
+  reachable; past 32 the journal says the provider's rate limits are now the ceiling.
+- **Akasha: shared notes for agent groups (experimental, off by default).** A pattern's
+  `[[groups]]` give their roles one small shared block of notes — facts about the code, decisions,
+  interfaces, pitfalls — that every member gets at the end of its prompts and edits with
+  `mantra_akasha_read`, `_note`, `_amend` and `_forget`; urgent notes reach busy members
+  mid-turn, and Mantra adds a line when a member's task is done or fails, and the files it
+  changed. Switch it on with `mantra experimental enable akasha` (or `/experimental akasha on`);
+  off, a pattern with groups runs exactly as before. `/akasha` shows the blocks, the web app's
+  run page has a *Shared notes* section, and `docs/tools/swarm-e2e.sh` checks a demo swarm
+  shares a note. Its format and tools may still change.
+
 ## v0.6.2 — 2026-10-17
 
 An outside tester drove Mantra for hours on an OpenAI-compatible gateway and wrote up what went

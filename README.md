@@ -4,8 +4,8 @@
 
 **Run one coding agent — or a whole team of them — from a single terminal.**
 
-Works with **OpenAI Codex** and **Claude Code**, mixed freely, on any model either of them can reach.
-One Rust binary, nothing written into your project — and, one flag away, an installable web UI and end-to-end encrypted remote access, no server of your own required.
+Works with **OpenAI Codex**, **Claude Code** and its own small harness, **Bija**, mixed freely, on any model one of them can reach.
+Two Rust binaries, nothing written into your project — and, one flag away, an installable web UI and end-to-end encrypted remote access, no server of your own required.
 
 [Install](#install) · [Try it in one minute](#try-it-in-one-minute) · [Solo](#solo-one-agent-done-properly) · [Mandala](#mandala-a-team-that-plans-builds-and-checks) · [Anywhere](#anywhere-the-web-ui-and-remote-access) · [Under the hood](#under-the-hood)
 
@@ -24,7 +24,7 @@ You already have a coding agent in your terminal. Mantra is the room you put it 
 | **Solo** | One agent, with everything you actually want on screen: the diff it is writing, its plan, how full its context is, what it is running right now. Type while it works. |
 | **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a fresh read-only QA agent checks the merged work every round and fix workers repair what it finds, a manager watches the whole run and unsticks whatever stalls, and a finale does one QA pass over the diff and a final verification. |
 
-Mantra does not reimplement an agent loop. It drives the official CLIs — `codex app-server` and `claude -p` — one process per agent. Your logins, sandboxes and model access keep working exactly as they do today; you just get a room where several of them can work at once without stepping on each other.
+Mantra drives the official CLIs — `codex app-server` and `claude -p` — one process per agent, so your logins, sandboxes and model access keep working exactly as they do today; you just get a room where several of them can work at once without stepping on each other. Where neither is installed, or for a swarm, it brings its own: `bija`, a small agent harness that ships beside `mantra` and needs nothing but an API key.
 
 **Why you might want it**
 
@@ -51,23 +51,24 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.6.2 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.7.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
-# from a clone (Rust ≥ 1.80)
-cd mantra_src && cargo build --release && cp target/release/mantra ~/.local/bin/
+# from a clone (Rust ≥ 1.80) — one build makes both binaries
+cd mantra_src && cargo build --release && cp target/release/mantra target/release/bija ~/.local/bin/
 ```
 
-The installer verifies a sha256, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and finishes by running `mantra doctor`. Re-running it upgrades in place. If no release binary matches your platform it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent.
+The installer puts two binaries side by side — `mantra` and `bija`, its agent harness — verifies a sha256 for each, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and finishes by running `mantra doctor`. Re-running it upgrades in place. If no release binary matches your platform (or its download or checksum fails) it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent; a release without a `bija` asset still installs `mantra`, and a source build always brings both.
 
 </details>
 
-**You also need at least one agent CLI, logged in:**
+**Agents need a backend.** `bija` is already there: set `OPENAI_API_KEY` and Solo runs on it (the built-in `*-api` models are the OpenAI API), or point it at any other OpenAI- or Anthropic-compatible provider — a local Ollama or vLLM needs no key. The official CLIs are optional:
 
-| CLI | install | notes |
+| backend | install | notes |
 |---|---|---|
-| [Codex](https://github.com/openai/codex) | `npm i -g @openai/codex` then `codex login` | the default backend |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm i -g @anthropic-ai/claude-code` then `claude` once | optional — for Claude models |
+| Bija | ships with Mantra | Solo's default; any role, any compatible API, [below](#models-providers-and-backends) |
+| [Codex](https://github.com/openai/codex) | `npm i -g @openai/codex` then `codex login` | your Codex account and its models |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm i -g @anthropic-ai/claude-code` then `claude` once | for Claude models, by subscription or gateway |
 
 Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
@@ -79,7 +80,8 @@ On a fresh install, if Codex is already signed in with a ChatGPT subscription, M
 - **codex app-server** — launched exactly as an agent launches it (provider args, the default model's key in the environment) and taken through the `initialize` handshake, then shut down cleanly
 - **provider** — the default model's provider: where its key comes from (`$VAR` set, or stored in `models.toml`) and whether the endpoint accepts it, via `GET /models`; no inference is ever sent, and a placeholder URL such as `example.com` gets no request at all
 - **sandbox** — one `true` run through the configured sandbox policy on that app-server, the same exec path agent commands take (`codex sandbox -- true` on servers without `command/exec`)
-- then `codex login status` (only a failure when something actually runs on Codex's own account), `claude`, `git`, the terminal, tmux, and each provider's key source
+- **bija** — which `bija` agents run (`bija_command` as configured — a path, or a name on `PATH` — else the one beside `mantra`, else `$MANTRA_BIJA`) and its version
+- then `codex login status` (only a failure when something actually runs on Codex's own account), `claude`, `git`, the terminal, tmux, and each provider's key source (a Bija provider's URL and wire too)
 
 A failing row quotes Codex's own stderr line, exit code included. An agent that fails the same way at launch (not logged in, a refused flag, a bad gateway) is halted after 3 attempts with that error, instead of burning through the crash budget.
 
@@ -93,11 +95,12 @@ When the sandbox can't start at all (no unprivileged user namespaces), Mantra do
 mantra --demo
 ```
 
-Demo mode replaces both CLIs with a simulated one: real UI, real state machine, scripted agents, **no API calls, no provider key and no cost** (token totals read *simulated*). Press `ctrl+o`, type a goal, and watch a full team run play out in about twenty seconds. Every screenshot in this README is demo mode, captured by `docs/tools/shoot.py`.
+Demo mode replaces the CLIs with simulated ones and points `bija` at a scripted mock API: real UI, real state machine, scripted agents, **no API calls, no provider key and no cost** (token totals read *simulated*). Press `ctrl+o`, type a goal, and watch a full team run play out in about twenty seconds. Every screenshot in this README is demo mode, captured by `docs/tools/shoot.py`.
 
 ```bash
 cd your-project && mantra                       # Solo, in this repo
 mantra run "add OAuth login to the API"         # straight into a team run
+mantra --swarm 16 "port the tests to pytest"    # many small workers, 16 at once
 mantra runs                                     # every run: resume or delete
 mantra doctor                                   # what's installed, what's missing
 ```
@@ -253,17 +256,72 @@ The same chain carries halts: **manager → planner → you**. *Gate exhausted* 
 
 </details>
 
+<details>
+<summary>Experimental: Akasha, shared notes for agent groups</summary>
+
+*Ākāśa* is the space that holds everything. Agents in a **group** share one small block of notes: a fact about the codebase, a decision, an interface one of them created, a pitfall — what an agent working beside them would want to know. Each agent keeps its own context and its own reasoning; the block is the part it chooses to share, plus what Mantra shares for it (a task done or failed, the files it changed). It is experimental: the file format and the tools may change.
+
+**Turning it on.** It is off until you switch it on, and while it is off a pattern with groups runs exactly as if it had none (the journal says so once, at run start):
+
+```bash
+mantra experimental                  # every experimental feature, on or off
+mantra experimental enable akasha    # saved in settings.toml; disable turns it off again
+```
+
+In the app, `/experimental` lists the same and `/experimental akasha on|off` switches it (a run already open keeps what it started with). `mantra --demo` has it on, and `mantra --demo --pattern mantra-swarm` shows notes being shared.
+
+**The pattern** names its groups; `mantra-swarm` ships with one, `builders`, of every worker role:
+
+```toml
+[[groups]]
+name = "builders"
+roles = ["worker-big", "worker-small"]   # roles of this pattern, each in one group at most
+shared_chars = 16384                     # the block's size, in characters (1024–262144)
+push = "urgent"                          # which new notes reach busy members mid-turn: none | urgent | all
+auto = true                              # Mantra adds a line when a member's task ends, and the files it changed
+```
+
+The Studio shows a pattern's groups in its overview, read-only; they are edited in the file, or by the architect.
+
+**What the agents get.** Members have four tools: `mantra_akasha_read`, `mantra_akasha_note` (`text`, `urgent`), `mantra_akasha_amend` (`id`, `text`) and `mantra_akasha_forget` (`id`). Every prompt Mantra sends a member — the spawn brief, a retry, a nudge, a resume — ends with the block as it stands. A note marked urgent goes to every other member that is busy right then, as a steer between its tool calls (at most one every 20 s per agent, the waiting ones joined); a member that is idle is never woken for it and reads it with its next prompt. The block has a hard size: a note that would overflow it is refused with how much is over, and the agent is told to forget what went stale. Mantra's own lines give way first — when the block is full they are dropped, and the journal says so.
+
+**Where you see it.** `/akasha` (or `/akasha builders`) opens the run's blocks as the agents read them, urgent notes marked `!`; the web app's run page has a folded *Shared notes* section; every note, amend and forget is a journal line. The blocks are saved with the run, so a resumed run picks them up where they were.
+
+</details>
+
 ---
 
 ## Models, providers and backends
 
 <img src="docs/img/picker.png" alt="The model picker: alias, model, which backend it runs through, effort, context window" width="960">
 
-An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
+An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`, `via Bija • bija`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
 
 Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
 
 A role can also say `effort = "auto"` (the Studio cycles it first): Mantra then picks per spawn from the role's job — planner, manager, orchestrator and gate `medium`; a worker `low` for `worker-small` and `medium` otherwise; any role running a finale step `high` — and the agent list shows the level it actually runs at. A named effort is always used as it is; `/effort auto` on a live agent does the same pick for its role.
+
+<details>
+<summary>Bija: the built-in harness</summary>
+
+Bija (*bīja*, a seed — the smallest mantra there is) is Mantra's own agent harness: a small Rust binary, installed beside `mantra`, that turns any OpenAI-compatible Chat Completions API — or an Anthropic-compatible Messages API — into a coding agent: file tools, commands with a timeout or in the background, every retryable API error retried with backoff, every message on disk as it happens. No Node, no login: a key, or none for a local server.
+
+Mantra ships a `bija` provider on the OpenAI API (`OPENAI_API_KEY`) with `astra-api`, `sol-api`, `terra-api` and `luna-api` — the Codex aliases' models, reached with a key instead of a Codex login — and a fresh install's Solo starts on `sol-api` (on `sol`, if Codex is already signed in with ChatGPT). A `models.toml` from before Bija gets that provider and those aliases once, when it is loaded. On a machine without Codex, Solo and the default pattern move to their twins for the session: `sol` → `sol-api`, `mantra-default` → `mantra-default-bija`, which is `mantra-default` with every role on an `-api` alias (`mantra --demo --pattern mantra-default-bija` runs it on the real binary against a mock API, no key needed). Anything else is a provider of your own — `D` discovers its models, and any role can use them:
+
+```toml
+[[provider]]
+id = "local"
+kind = "bija"
+base_url = "http://127.0.0.1:11434/v1"   # Ollama, vLLM, a gateway, the OpenAI API…
+wire = "openai"                          # or "anthropic" for a Messages API
+env_key = "LOCAL_API_KEY"                # optional: a local server takes none
+```
+
+Each agent is one `bija` process speaking NDJSON over stdio, its session in `~/.mantra/bija/sessions/<id>/`. Steering lands at the next tool boundary, `x` interrupts (and kills the running command's process group), a model or effort switch applies from the next request without a restart, and a crash resumes the session from its transcript — mid-turn, with the tool call it was in repaired. Mantra's own tools are offered beside the built-ins and answered by the Conductor, as for Codex. The sandbox decides where the file tools may write — nowhere (`read-only`), the agent's directory plus its extra writable roots and the temp dirs (`workspace-write`), or anywhere (`danger-full-access`) — and commands run inside bubblewrap where it works, able to write only there and in the temp dirs; where it doesn't they run unsandboxed, and the agent's log says so once. The key reaches `bija` only through its environment, and is removed from the environment of every command it runs.
+
+`bija` also works on its own — `bija run`, `bija sessions`, `bija show <id> -f` to follow a transcript, `bija send <id> "…"` to prompt a session served with `--control` (Mantra's are not); `bija --help` has the rest, and [`mantra_src/bija/SPEC.md`](mantra_src/bija/SPEC.md) the protocol any orchestrator can drive it with.
+
+</details>
 
 <details>
 <summary>Claude Code as a backend for any role</summary>
@@ -383,13 +441,16 @@ A resume never replays what the old process was in the middle of. It restarts at
 
 <img src="docs/img/studio.png" alt="The Studio: roles with model, effort, sandbox and permission, plus the architect agent" width="920">
 
-Three patterns ship in the binary (and load by name, with or without a file of your own in `~/.mantra/patterns/`):
+Four patterns ship in the binary (and load by name, with or without a file of your own in `~/.mantra/patterns/`):
 
 | pattern | for | shape |
 |---|---|---|
 | `mantra-default` | most work | plan → phases (fresh read-only QA gate every round, automatic fix workers) → **one** `qa-heavy` pass on the diff, with security as a checklist in its prompt → planner verification. Manager on (`manager_minutes = 10`), `review_minutes = 5`, every role on `effort = "auto"`. |
 | `mantra-lean` | small and medium tasks | the same phases and gates (`gate_max_rounds = 2`) but **no manager**, no coordination review, `max_parallel = 3`, and the finale is the planner's verification alone. |
 | `mantra-thorough` | releases, security-sensitive work | the heavy flow: `qa-heavy` → `security` → planner verification (heavy QA and security fix directly), manager every 5 minutes, a review every 3, named efforts up to `max`. |
+| `mantra-swarm` | work that splits wide | `mantra-default-bija` (every role on `bija`) cut for a fan-out: the planner is told to split the work into many small tasks with disjoint scopes, up to 32 a phase, and the orchestrator to keep up to `max_parallel` (8) of them running at once. Start it with `mantra --swarm N "<goal>"` or `/swarm N <goal>`. |
+
+**How many at once is per run.** `mantra --swarm 24 "<goal>"` is `--pattern mantra-swarm --parallel 24`, and `mantra run --parallel N "<goal>"` does the same for any pattern: N (1–128) goes into the run's own copy of the pattern — which a resume reads back — never into the saved one, with room for N tasks a phase when the pattern allows fewer, and the planner and orchestrator are told the run's number. Workers on `bija` are small processes (32 of them are about 150 MB), so past 32 it is the provider's rate limits that bind, and the run's journal says so.
 
 `mantra-default-claude` is `mantra-default` with the planner, manager and orchestrator on `fable51` and the workers on `sonnet5`. Every built-in role prompt is short and says what it owns, what it never does, when to stop — and not to re-read files it already read or run the full suite more than once a turn unless it failed.
 
@@ -523,7 +584,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary>Slash commands</summary>
 
-`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/pattern` `/runs` `/plan` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/web` `/remote` `/help` `/quit` — and `!cmd` runs a shell command.
+`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/swarm` `/pattern` `/experimental` `/runs` `/plan` `/akasha` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/web` `/remote` `/help` `/quit` — and `!cmd` runs a shell command.
 
 </details>
 
@@ -534,7 +595,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary>Architecture in one paragraph</summary>
 
-One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` speaks NDJSON, and both are translated into the same internal events, so the engine and UI have no backend-specific branches. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working. Codex agents Mantra spawns never pick up your own MCP servers — only Mantra's own tools reach them, so a personal MCP setup never changes what a team run can do.
+One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` and `bija` speak NDJSON, and all three are translated into the same internal events, so the engine and UI have no backend-specific branches. `bija` is the one Mantra ships itself: a single-threaded harness that calls the provider's API directly, runs the file tools itself and commands as its own children, and keeps every session on disk so a crash resumes mid-turn; quitting Mantra gives the bija agents up to 3 s, together, to end their commands and close their transcripts. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working. Codex agents Mantra spawns never pick up your own MCP servers — only Mantra's own tools reach them, so a personal MCP setup never changes what a team run can do.
 
 [`DESIGN.md`](DESIGN.md) is the long version: the seam between backends, the MCP bridge, halts, the watchdog, resumable runs, the security model and the testing strategy.
 
@@ -550,6 +611,7 @@ One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC o
 | `~/.mantra/patterns/*.toml` | your patterns |
 | `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs |
 | `~/.mantra/worktrees/<id>/` | per-run worktrees, cleaned up as phases complete |
+| `~/.mantra/bija/sessions/<id>/` | one Bija agent's session: `session.json`, `transcript.jsonl`, the `system.md` and `tools.json` Mantra hands it, background-job logs |
 | `~/.mantra/logs/mantra.log` | debug log |
 | `~/.mantra/web/` | TLS certificate, Web Push keys/subscriptions, web sessions, remote identity (`--web`/`--remote`; `0600`) |
 
@@ -578,8 +640,11 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 <details>
 <summary>How this is tested, and what is not covered</summary>
 
-- `cargo build` with zero warnings, 183 unit tests (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, the Claude gauge against per-call usage, and 50 for the web UI and remote relay: PBKDF2/HKDF/AES-GCM known-answer and round-trip vectors, every protocol message round-tripping, snapshot/delta diffing, TLS certificate reissue rules, login rate-limiting, and the relay — IPv4-only dialling, the one-session-per-IPv4 refusal shown and retried, a fake relay carrying a real browser handshake end to end), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- `cargo build` with zero warnings; 433 unit tests in `mantra` (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, the Claude gauge against per-call usage, and 50 for the web UI and remote relay: PBKDF2/HKDF/AES-GCM known-answer and round-trip vectors, every protocol message round-tripping, snapshot/delta diffing, TLS certificate reissue rules, login rate-limiting, and the relay — IPv4-only dialling, the one-session-per-IPv4 refusal shown and retried, a fake relay carrying a real browser handshake end to end), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
+- `bija`'s own unit tests (the sandbox's path policy, the transcript's repair, both wires against sample streams, the retry policy) and end-to-end tests that drive the real binary against an in-test mock API.
+- `docs/tools/bija-e2e.sh`: a whole Mandala on the real `bija` binary against the demo's mock API (`src/mock_openai.rs`, which streams the provider's own SSE shape) — the run must reach Done with every agent a Bija session on disk and the workers' files on the run branch; `MANTRA_MOCK_FLAKY=<n>` answers every n-th request with a 503 to put bija's retries in the loop.
 - Real runs against live providers with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale (LibertAI, and OpenRouter's `openai/gpt-5.6-luna` through Codex's Responses API), compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
+- Bija against a live OpenAI-compatible gateway (LibertAI through a proxy): a Solo turn, a standalone `bija run` with a file write and a command, a SIGKILL mid-command resumed with `--resume`, a full `mantra-default-bija` Mandala to Done, and a `--swarm 4` run with Akasha on — three workers in parallel, fix workers resolving merge conflicts, 18 shared notes — all producing code whose tests passed. 40 idle `bija` processes measured at 4.7 MB each and no CPU.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
 
 </details>
@@ -617,6 +682,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.6.2** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.7.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

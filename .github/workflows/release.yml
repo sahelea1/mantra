@@ -13,6 +13,10 @@ permissions:
 
 # Binaries are stripped by the release profile in mantra_src/Cargo.toml (strip = true),
 # which also applies inside the `cross` container.
+#
+# Each platform ships two binaries: `mantra` and `bija`, Mantra's built-in agent harness. They
+# are one cargo workspace whose default members are both, so the one build below makes both;
+# each gets its own asset and checksum, and install.sh puts them side by side.
 
 jobs:
   build:
@@ -25,18 +29,22 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_name: mantra-linux-x86_64
+            bija_asset_name: bija-linux-x86_64
             use_cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             asset_name: mantra-linux-aarch64
+            bija_asset_name: bija-linux-aarch64
             use_cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: mantra-macos-arm64
+            bija_asset_name: bija-macos-arm64
             use_cross: false
           - os: macos-latest
             target: x86_64-apple-darwin
             asset_name: mantra-macos-x86_64
+            bija_asset_name: bija-macos-x86_64
             use_cross: false
     steps:
       - name: Checkout
@@ -67,22 +75,28 @@ jobs:
             cargo build --release --target "${{ matrix.target }}"
           fi
 
-      - name: Package asset
+      - name: Package assets
         working-directory: mantra_src
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/mantra"
-          out="${{ matrix.asset_name }}"
-          cp "$bin" "../$out"
-          cd ..
-          chmod +x "$out"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$out" > "$out.sha256"
-          else
-            shasum -a 256 "$out" > "$out.sha256"
-          fi
-          ls -l "$out" "$out.sha256"
+          dir="target/${{ matrix.target }}/release"
+          package() {
+            # package <binary> <asset name>: copy beside the repo root, then checksum it there.
+            cp "$dir/$1" "../$2"
+            (
+              cd ..
+              chmod +x "$2"
+              if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$2" > "$2.sha256"
+              else
+                shasum -a 256 "$2" > "$2.sha256"
+              fi
+              ls -l "$2" "$2.sha256"
+            )
+          }
+          package mantra "${{ matrix.asset_name }}"
+          package bija "${{ matrix.bija_asset_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -91,6 +105,8 @@ jobs:
           path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
+            ${{ matrix.bija_asset_name }}
+            ${{ matrix.bija_asset_name }}.sha256
           if-no-files-found: error
 
   release:

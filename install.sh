@@ -4,9 +4,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 #   wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 #
-# Tries a prebuilt release binary first (Linux x86_64/aarch64, macOS arm64/x86_64),
-# verifies its sha256, and falls back to building from source with cargo. Never uses
-# sudo; installs to a per-user directory and adds it to PATH if needed.
+# Installs two binaries side by side: `mantra`, and `bija`, its built-in agent harness (Mantra
+# finds a `bija` next to its own executable). Tries the prebuilt release binaries first (Linux
+# x86_64/aarch64, macOS arm64/x86_64), verifying each one's sha256, and falls back to building
+# both from source with cargo when there is no mantra binary for the platform or its download or
+# checksum fails. A release without a bija asset (or one that fails its checksum) still installs
+# mantra. Never uses sudo; installs to a per-user directory, adds it to PATH if needed, and runs
+# `mantra doctor` at the end.
 #
 # Environment overrides:
 #   MANTRA_INSTALL_DIR   where to install (default: $HOME/.local/bin)
@@ -70,6 +74,21 @@ fetch() {
     fi
 }
 
+# verify <file> <sha256-file>  — 0 when the checksum matches, 1 when it does not, 2 when no
+# sha256 tool exists to check it with. Sets `expected` and `actual` for the caller's message.
+verify() {
+    expected=$(awk '{print $1}' "$2")
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$1" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$1" | awk '{print $1}')
+    else
+        actual=""
+        return 2
+    fi
+    [ -n "$actual" ] && [ "$expected" = "$actual" ]
+}
+
 # --- detect platform -----------------------------------------------------
 
 os_raw=$(uname -s)
@@ -101,6 +120,7 @@ elif [ -z "$asset" ]; then
 fi
 
 binary_path=""
+bija_path=""
 
 # --- try a release asset --------------------------------------------------
 
@@ -117,25 +137,38 @@ if [ "$use_source" -eq 0 ]; then
     TMP_DIRS="$TMP_DIRS $dl_dir"
     if fetch "$base_url/$asset" "$dl_dir/$asset" && fetch "$base_url/$asset.sha256" "$dl_dir/$asset.sha256"; then
         log "Downloaded $asset; verifying checksum..."
-        expected=$(awk '{print $1}' "$dl_dir/$asset.sha256")
-        if command -v sha256sum >/dev/null 2>&1; then
-            actual=$(sha256sum "$dl_dir/$asset" | awk '{print $1}')
-        elif command -v shasum >/dev/null 2>&1; then
-            actual=$(shasum -a 256 "$dl_dir/$asset" | awk '{print $1}')
-        else
-            err "no sha256sum or shasum found; cannot verify the download. Falling back to building from source."
-            actual=""
-            expected="unverifiable"
-        fi
-        if [ "$expected" = "$actual" ] && [ -n "$actual" ]; then
+        status=0
+        verify "$dl_dir/$asset" "$dl_dir/$asset.sha256" || status=$?
+        if [ "$status" -eq 0 ]; then
             log "Checksum OK."
             chmod +x "$dl_dir/$asset"
             binary_path="$dl_dir/$asset"
+        elif [ "$status" -eq 2 ]; then
+            err "no sha256sum or shasum found; cannot verify the download. Falling back to building from source."
         else
             err "checksum mismatch for $asset (expected $expected, got ${actual:-none}); falling back to building from source."
         fi
     else
         log "No release asset available (or download failed); falling back to building from source."
+    fi
+
+    # bija rides along with mantra; without it mantra still works with Codex or Claude Code,
+    # so a missing or bad bija asset is a note, never a reason to build everything from source.
+    if [ -n "$binary_path" ]; then
+        bija_asset="bija-${asset#mantra-}"
+        if fetch "$base_url/$bija_asset" "$dl_dir/$bija_asset" 2>/dev/null && fetch "$base_url/$bija_asset.sha256" "$dl_dir/$bija_asset.sha256" 2>/dev/null; then
+            status=0
+            verify "$dl_dir/$bija_asset" "$dl_dir/$bija_asset.sha256" || status=$?
+            if [ "$status" -eq 0 ]; then
+                log "Downloaded $bija_asset; checksum OK."
+                chmod +x "$dl_dir/$bija_asset"
+                bija_path="$dl_dir/$bija_asset"
+            else
+                err "could not verify $bija_asset (expected $expected, got ${actual:-none}); not installing it."
+            fi
+        else
+            log "No bija asset for this release; building from source gets it (MANTRA_FROM_SOURCE=1)."
+        fi
     fi
 fi
 
@@ -181,9 +214,14 @@ if [ -z "$binary_path" ]; then
         fi
     fi
 
-    log "Building mantra (cargo build --release)... this can take a few minutes."
-    (cd "$src_dir/mantra/mantra_src" && cargo build --release)
+    log "Building mantra and bija (cargo build --release)... this can take a few minutes."
+    # --target-dir pins the output whatever CARGO_TARGET_DIR the caller has set.
+    (cd "$src_dir/mantra/mantra_src" && cargo build --release --target-dir target)
     binary_path="$src_dir/mantra/mantra_src/target/release/mantra"
+    # Releases before bija have no second binary; the -f check keeps them installable.
+    if [ -f "$src_dir/mantra/mantra_src/target/release/bija" ]; then
+        bija_path="$src_dir/mantra/mantra_src/target/release/bija"
+    fi
 fi
 
 if [ ! -f "$binary_path" ]; then
@@ -197,6 +235,13 @@ mkdir -p "$INSTALL_DIR"
 cp "$binary_path" "$INSTALL_DIR/mantra"
 chmod +x "$INSTALL_DIR/mantra"
 log "Installed mantra to $INSTALL_DIR/mantra"
+if [ -n "$bija_path" ]; then
+    cp "$bija_path" "$INSTALL_DIR/bija"
+    chmod +x "$INSTALL_DIR/bija"
+    log "Installed bija to $INSTALL_DIR/bija"
+elif [ -f "$INSTALL_DIR/bija" ]; then
+    log "Kept the existing $INSTALL_DIR/bija; it may be older than this mantra."
+fi
 
 # --- PATH ---------------------------------------------------------------
 
