@@ -3,6 +3,7 @@
 //! Powers `mantra --demo` (explore the UI without spending tokens) and end-to-end tests.
 //! Agents behave according to the `mantra-role:` marker in their developer instructions.
 
+use crate::mock_mcp::SCENE;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +38,17 @@ struct St {
     ids: AtomicU64,
     threads: Mutex<HashMap<String, Thread>>,
     speed: f64,
+    /// Mantra gave this process the demo's MCP server (`-c mcp_servers.demo.command=…`). A mock
+    /// runs no servers, so its workers show what a call to one looks like instead (`demo_scene`).
+    demo_mcp: bool,
+    /// Whether a worker offered `mantra_screenshot` calls it: only with `$MANTRA_SCREENSHOT_CMD`
+    /// set, so a `--demo` (whose models take images) never captures a real screen by itself.
+    screenshots: bool,
+}
+
+/// Whether the argv carries the demo's MCP server, the way `app::spawn_agent` passes servers.
+fn demo_mcp_in(args: &[String]) -> bool {
+    args.iter().any(|a| a.starts_with("mcp_servers.demo.command="))
 }
 
 impl St {
@@ -89,7 +101,9 @@ pub async fn run() {
             let _ = stdout.flush().await;
         }
     });
-    let st = Arc::new(St { out: out_tx, pending: Mutex::new(HashMap::new()), next: AtomicI64::new(9000), ids: AtomicU64::new(0), threads: Mutex::new(HashMap::new()), speed });
+    let argv: Vec<String> = std::env::args().collect();
+    let screenshots = std::env::var_os("MANTRA_SCREENSHOT_CMD").is_some_and(|c| !c.is_empty());
+    let st = Arc::new(St { out: out_tx, pending: Mutex::new(HashMap::new()), next: AtomicI64::new(9000), ids: AtomicU64::new(0), threads: Mutex::new(HashMap::new()), speed, demo_mcp: demo_mcp_in(&argv), screenshots });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -472,9 +486,26 @@ impl Em {
         let r = self.st.request("item/tool/call", json!({"threadId": self.tid, "turnId": self.turn, "callId": id, "namespace": null, "tool": name, "arguments": args})).await;
         let text = r.get("contentItems").and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         let success = r.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
-        self.item(&json!({"type": "dynamicToolCall", "id": id, "namespace": null, "tool": name, "arguments": args, "status": if success { "completed" } else { "failed" }, "contentItems": [{"type": "inputText", "text": text}], "success": success, "durationMs": 20}), true);
+        // Codex echoes the answer's items on the completed card, an `inputImage` (a screenshot)
+        // among them, which is what the UI's image marker reads.
+        let items = match r.get("contentItems").and_then(|c| c.as_array()) {
+            Some(a) if a.iter().any(|x| x.get("type").and_then(|t| t.as_str()) == Some("inputImage")) => Value::Array(a.clone()),
+            _ => json!([{"type": "inputText", "text": text}]),
+        };
+        self.item(&json!({"type": "dynamicToolCall", "id": id, "namespace": null, "tool": name, "arguments": args, "status": if success { "completed" } else { "failed" }, "contentItems": items, "success": success, "durationMs": 20}), true);
         self.tokens(500 + text.len() as u64);
         text
+    }
+    /// One `scene_info` call on the demo's MCP server, as Codex reports a server's tool call: an
+    /// `mcpToolCall` item started and completed with the server's content. Synthetic — this mock
+    /// starts no servers — but the item is the one a real Codex sends, so the cards show it alike.
+    async fn demo_scene(&self) -> String {
+        let id = self.st.uid("mcp");
+        self.item(&json!({"type": "mcpToolCall", "id": id, "server": "demo", "tool": "scene_info", "arguments": {}, "status": "inProgress", "result": null, "error": null, "durationMs": null}), false);
+        let _ = self.sleep(300).await;
+        self.item(&json!({"type": "mcpToolCall", "id": id, "server": "demo", "tool": "scene_info", "arguments": {}, "status": "completed", "result": {"content": [{"type": "text", "text": SCENE}], "structuredContent": null}, "error": null, "durationMs": 300}), true);
+        self.tokens(500 + SCENE.len() as u64);
+        SCENE.lines().next().unwrap_or("").to_string()
     }
     async fn approve(&self, cmd: &str) -> bool {
         let id = self.st.uid("cmd");
@@ -773,6 +804,8 @@ async fn worker(e: &Em, text: &str) -> Outcome {
         step!(e.sleep(200).await);
         return Outcome::Failed(json!({"responseStreamDisconnected": {"httpStatusCode": 503}}), "unexpected status 503 Service Unavailable".into());
     }
+    // What the worker looked at before writing (the demo's scene, the screen), for its report.
+    let mut saw: Vec<String> = Vec::new();
     if text.contains("[mantra:retry]") || text.contains("[mantra:resume]") {
         step!(e.think("**Resuming**\n\nPicking up where the previous attempt stopped.").await);
     } else if !text.contains("[from") {
@@ -784,7 +817,19 @@ async fn worker(e: &Em, text: &str) -> Outcome {
         if dir == "src/models" && e.offers("mantra_akasha_note") && !text.contains(AKASHA_NOTE) {
             let _ = e.tool("mantra_akasha_note", json!({"text": AKASHA_NOTE})).await;
         }
+        // MCP and vision (`--demo` gives every role the `demo` server and image-taking models):
+        // one look at the scene, one at the screen through Mantra's tool; then on with the work,
+        // whatever they answered.
+        if e.st.demo_mcp {
+            saw.push(format!("the scene through `demo` ({})", e.demo_scene().await));
+            step!(!e.cancelled());
+        }
+        if e.st.screenshots && e.offers("mantra_screenshot") {
+            let shot = e.tool("mantra_screenshot", json!({})).await;
+            saw.push(format!("the screen ({})", crate::util::trunc(shot.lines().next().unwrap_or("").trim(), 120)));
+        }
     }
+    let saw = if saw.is_empty() { String::new() } else { format!("\n\nLooked at {} first.", saw.join(" and ")) };
     if text.contains("(answering your question)") {
         step!(e.think("**Answer received**\n\nCursor pagination it is — writing the handlers accordingly.").await);
         step!(e.write(&format!("{dir}/{}.rs", id.replace('-', "_")), &format!("//! {title}\n\npub struct Page {{ pub next: Option<String> }}\n")).await);
@@ -822,7 +867,7 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     e.plan(&[("Read the relevant code", "completed"), ("Implement", "completed"), ("Verify", "inProgress")]);
     step!(e.command("cargo test --quiet", "running 4 tests\n....\ntest result: ok. 4 passed; 0 failed", 0).await);
     e.plan(&[("Read the relevant code", "completed"), ("Implement", "completed"), ("Verify", "completed")]);
-    step!(e.say(&format!("Implemented **{title}** in `{file}` with a test.\n\nSTATUS: done\nSUMMARY: added {} and its unit test; cargo test passes (4 tests).", camel(&id))).await);
+    step!(e.say(&format!("Implemented **{title}** in `{file}` with a test.{saw}\n\nSTATUS: done\nSUMMARY: added {} and its unit test; cargo test passes (4 tests).", camel(&id))).await);
     Outcome::Done
 }
 
@@ -861,9 +906,118 @@ async fn architect(e: &Em, text: &str) -> Outcome {
 }
 
 /// Shared with `mock_claude.rs` (WP10.6).
+/// What a mock worker's report says of a screenshot it took: the capture's file name
+/// (`p1-models-1.png`), not the tool's whole sentence for the model; the sentence's start when it
+/// names no file (a failed capture).
+pub(crate) fn shot_seen(result: &str) -> String {
+    let file = result.split_whitespace().map(|w| w.trim_matches(|c: char| "[](),;:'\"`".contains(c)).trim_end_matches('.')).find(|w| w.ends_with(".png"));
+    match file {
+        Some(f) => f.rsplit('/').next().unwrap_or(f).to_string(),
+        None => crate::util::trunc(result.lines().next().unwrap_or("").trim(), 80),
+    }
+}
+
 pub(crate) fn camel(s: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|p| !p.is_empty()).map(|p| {
         let mut c = p.chars();
         c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mock process with one worker thread (`p1-models`, offered `tools`) in a scratch dir.
+    fn worker_em(demo_mcp: bool, screenshots: bool, tools: &[&str]) -> (Em, mpsc::UnboundedReceiver<String>, PathBuf) {
+        let (out, rx) = mpsc::unbounded_channel();
+        let st = Arc::new(St { out, pending: Mutex::new(HashMap::new()), next: AtomicI64::new(9000), ids: AtomicU64::new(0), threads: Mutex::new(HashMap::new()), speed: 1000.0, demo_mcp, screenshots });
+        let cwd = std::env::temp_dir().join(format!("mantra-mock-codex-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let dev = "mantra-role: worker\n## Your task: p1-models — Domain models\nScope: src/models/**\n".to_string();
+        let thread = Thread { cwd: cwd.clone(), role: "worker".into(), dev, approval: "never".into(), turn_approval: "never".into(), model: "mock".into(), turns: 1, active: None, tokens: 0, cached: 0, ctx: 9000, tools: tools.iter().map(|t| t.to_string()).collect() };
+        st.threads.lock().unwrap().insert("thr-1".into(), thread);
+        let e = Em { st, tid: "thr-1".into(), turn: "turn-1".into(), cancel: Arc::new(AtomicBool::new(false)), steer: Arc::new(Mutex::new(vec![])), diff: Arc::new(Mutex::new(String::new())) };
+        (e, rx, cwd)
+    }
+
+    /// Runs one worker turn while answering every `item/tool/call` the way Mantra does — a
+    /// screenshot's answer carries the path and the image — and returns every line it sent.
+    async fn run_worker(e: &Em, mut rx: mpsc::UnboundedReceiver<String>) -> Vec<Value> {
+        let st = e.st.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let answering = tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                if v["method"] == "item/tool/call" {
+                    let answer = if v["params"]["tool"] == "mantra_screenshot" {
+                        json!({"contentItems": [{"type": "inputText", "text": "/runs/1-x/screenshots/p1-models-1.png"}, {"type": "inputImage", "imageUrl": "data:image/png;base64,iVBORw0KGgo="}], "success": true})
+                    } else {
+                        json!({"contentItems": [{"type": "inputText", "text": "OK"}], "success": true})
+                    };
+                    if let Some(tx) = st.pending.lock().unwrap().remove(&v["id"].as_i64().unwrap()) {
+                        let _ = tx.send(answer);
+                    }
+                }
+                log.lock().unwrap().push(v);
+            }
+        });
+        assert!(matches!(worker(e, "Add the models.").await, Outcome::Done));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        answering.abort();
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    fn items<'a>(lines: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        lines.iter().filter(|l| l["params"]["item"]["type"] == kind).map(|l| &l["params"]["item"]).collect()
+    }
+
+    #[test]
+    fn the_demo_server_is_read_from_the_argv() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(demo_mcp_in(&argv(&["mantra", "mock-codex", "-c", "mcp_servers.demo.command=\"/usr/bin/mantra\"", "-c", "mcp_servers.demo.args=[\"mock-mcp\"]"])));
+        assert!(!demo_mcp_in(&argv(&["mantra", "mock-codex", "-c", "mcp_servers.node_repl.enabled=false", "-c", "mcp_servers.blender.command=\"uvx\""])));
+        assert!(!demo_mcp_in(&argv(&["mantra", "mock-codex"])));
+    }
+
+    /// Given the demo server, the worker shows one `mcpToolCall{demo, scene_info}` pair, the
+    /// shape Codex reports a server's call in; offered `mantra_screenshot` with a capture set up,
+    /// it calls it once through the dynamic-tool request, the card keeps the image, and the
+    /// report says what both answered.
+    #[tokio::test]
+    async fn a_worker_reads_the_demo_scene_and_takes_one_screenshot() {
+        let (e, rx, cwd) = worker_em(true, true, &["mantra_ask", "mantra_screenshot"]);
+        let lines = run_worker(&e, rx).await;
+        let mcp = items(&lines, "mcpToolCall");
+        assert_eq!(mcp.len(), 2, "{mcp:?}");
+        let methods: Vec<&str> = lines.iter().filter(|l| l["params"]["item"]["type"] == "mcpToolCall").filter_map(|l| l["method"].as_str()).collect();
+        assert_eq!(methods, vec!["item/started", "item/completed"]);
+        assert!(mcp.iter().all(|i| i["server"] == "demo" && i["tool"] == "scene_info" && i["id"] == mcp[0]["id"]), "{mcp:?}");
+        assert_eq!((mcp[0]["status"].as_str(), mcp[1]["status"].as_str()), (Some("inProgress"), Some("completed")));
+        assert!(mcp[1]["result"]["content"][0]["text"].as_str().unwrap().starts_with("Scene \"demo\": 3 objects"), "{}", mcp[1]);
+
+        let calls: Vec<&Value> = lines.iter().filter(|l| l["method"] == "item/tool/call").collect();
+        assert_eq!(calls.iter().map(|c| c["params"]["tool"].as_str().unwrap()).collect::<Vec<_>>(), vec!["mantra_screenshot"]);
+        let shot = items(&lines, "dynamicToolCall").into_iter().find(|i| i["status"] == "completed").unwrap();
+        assert_eq!(shot["contentItems"][1]["type"], "inputImage", "the card keeps the image: {shot}");
+        let report = items(&lines, "agentMessage").into_iter().filter_map(|i| i["text"].as_str()).find(|t| t.contains("STATUS: done")).unwrap();
+        assert!(report.contains("the scene through `demo` (Scene \"demo\": 3 objects)") && report.contains("the screen (/runs/1-x/screenshots/p1-models-1.png)"), "{report}");
+        assert!(cwd.join("src/models/p1_models.rs").is_file());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Without the server in its argv and without a capture set up, the worker does what it
+    /// always did — even with `mantra_screenshot` offered.
+    #[tokio::test]
+    async fn without_the_demo_server_or_a_capture_nothing_is_added() {
+        let (e, rx, cwd) = worker_em(false, false, &["mantra_screenshot"]);
+        let lines = run_worker(&e, rx).await;
+        assert!(items(&lines, "mcpToolCall").is_empty());
+        assert!(!lines.iter().any(|l| l["method"] == "item/tool/call"), "no screenshot without a capture set up");
+        let report = items(&lines, "agentMessage").into_iter().filter_map(|i| i["text"].as_str()).find(|t| t.contains("STATUS: done")).unwrap();
+        assert!(!report.contains("Looked at"), "{report}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 }

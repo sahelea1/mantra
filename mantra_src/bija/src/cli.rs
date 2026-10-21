@@ -9,6 +9,7 @@
 use crate::agent::{self, Agent, Input, Out, Sink, Start};
 use crate::api::{Client, ClientConfig};
 use crate::control::{self, Control};
+use crate::mcp;
 use crate::proto::{Event, Op, TurnStatus};
 use crate::session::{self, Fsync, Meta, Pending, Record, Session};
 use crate::tools::{Runtime, RuntimeConfig, Sandbox};
@@ -64,6 +65,12 @@ Options (serve and run):                                              [default]
   --system-file PATH       the same, read from a file
   --tools-file PATH        JSON array of external tools, answered over the
                            protocol
+  --mcp-file PATH          MCP servers to start with the session, as
+                           {\"mcpServers\": {\"<name>\": {\"command\", \"args\"}}};
+                           their tools are named mcp__<server>__<tool>
+  --vision                 offer screenshot and view_image, for a model that
+                           takes images (screenshot sees this machine's screen)
+                           — this launch only: a resume without it has none
   --sandbox MODE           read-only|workspace-write|full     [workspace-write]
   --writable DIR           an extra writable root (repeatable)
   --network                allow network inside sandboxed commands
@@ -77,6 +84,13 @@ Options (serve and run):                                              [default]
   --fsync turn|always|never   when the transcript is fsynced             [turn]
   -v, --verbose            run: print the events to stderr
 
+MCP servers run in the working directory, outside the sandbox, without the
+API key's variable; their stderr is shown prefixed `mcp <name>:`. One that
+does not answer within 20 s is skipped with a warning. Images (screenshots,
+MCP images) are saved under <session dir>/images/. A capture uses
+$MANTRA_SCREENSHOT_CMD when set (`{out}`: the file to write, `{region}`:
+x,y,w,h), else grim, gnome-screenshot, scrot, import or screencapture.
+
 Exit codes: 0 ok, 1 runtime failure, 2 usage error, 128+N (see Signals).
 
 Signals: SIGTERM and SIGHUP stop at once but leave a running turn open, as a
@@ -87,8 +101,8 @@ and an interrupt for run.
 
 /// The options shared by serve and run (canonical spellings, for `only`).
 const SESSION_OPTIONS: &[&str] = &[
-    "--home", "--session", "--resume", "--cwd", "--provider-url", "--wire", "--api-key-env", "--model", "--effort", "--context-window", "--compact-at", "--max-output-tokens", "--system", "--system-file", "--tools-file", "--sandbox", "--writable",
-    "--network", "--no-bwrap", "--max-retries", "--timeout-secs", "--no-stream", "--name", "--fsync",
+    "--home", "--session", "--resume", "--cwd", "--provider-url", "--wire", "--api-key-env", "--model", "--effort", "--context-window", "--compact-at", "--max-output-tokens", "--system", "--system-file", "--tools-file", "--mcp-file", "--vision",
+    "--sandbox", "--writable", "--network", "--no-bwrap", "--max-retries", "--timeout-secs", "--no-stream", "--name", "--fsync",
 ];
 
 /// An environment lookup: the process environment in `run`, a map in tests.
@@ -133,6 +147,8 @@ struct Flags {
     max_output_tokens: Option<u32>,
     system: Option<SystemSource>,
     tools_file: Option<PathBuf>,
+    mcp_file: Option<PathBuf>,
+    vision: bool,
     sandbox: Option<Sandbox>,
     writable: Vec<PathBuf>,
     network: bool,
@@ -344,6 +360,14 @@ fn parse_flags(args: &[String]) -> Result<(Flags, Vec<String>), String> {
                 f.tools_file = Some(PathBuf::from(value()?));
                 "--tools-file"
             }
+            "--mcp-file" => {
+                f.mcp_file = Some(PathBuf::from(value()?));
+                "--mcp-file"
+            }
+            "--vision" => {
+                f.vision = true;
+                "--vision"
+            }
             "--sandbox" => {
                 let v = value()?;
                 f.sandbox = Some(Sandbox::parse(&v).ok_or_else(|| format!("--sandbox {v}: expected read-only, workspace-write or full"))?);
@@ -422,7 +446,7 @@ fn parse_flags(args: &[String]) -> Result<(Flags, Vec<String>), String> {
     Ok((f, words))
 }
 
-const FLAGS_WITHOUT_VALUE: &[&str] = &["--network", "--no-bwrap", "--no-stream", "--control", "--verbose", "--follow"];
+const FLAGS_WITHOUT_VALUE: &[&str] = &["--network", "--no-bwrap", "--no-stream", "--control", "--verbose", "--follow", "--vision"];
 
 fn set_system(f: &mut Flags, src: SystemSource) -> Result<(), String> {
     if f.system.is_some() {
@@ -495,6 +519,8 @@ fn new_meta(flags: &Flags, env: Env, id: String) -> Result<Meta, Fail> {
         compact_at: flags.compact_at.unwrap_or(d.compact_at),
         max_output_tokens: flags.max_output_tokens,
         tools_file: flags.tools_file.as_deref().map(absolute),
+        mcp_file: flags.mcp_file.as_deref().map(absolute),
+        vision: flags.vision,
         sandbox: flags.sandbox.unwrap_or(Sandbox::WorkspaceWrite).as_str().to_string(),
         writable: flags.writable.iter().map(|p| absolute(p)).collect(),
         network: flags.network,
@@ -534,6 +560,12 @@ fn apply_overrides(meta: &mut Meta, flags: &Flags) -> Result<(), Fail> {
     if let Some(t) = &flags.tools_file {
         meta.tools_file = Some(absolute(t));
     }
+    if let Some(m) = &flags.mcp_file {
+        meta.mcp_file = Some(absolute(m));
+    }
+    // Unlike --network, it follows the launch: whether the model takes images is the model's,
+    // and a resume may bring another one (Mantra says it on every launch). Left out, it is off.
+    meta.vision = flags.vision;
     if let Some(s) = flags.sandbox {
         meta.sandbox = s.as_str().to_string();
     }
@@ -625,18 +657,44 @@ async fn launch(flags: &Flags, env: Env<'_>) -> Result<Launch, Fail> {
         },
         _ => Vec::new(),
     };
+    // Read and checked now, started once the session is open: a bad file leaves nothing behind,
+    // and a session that cannot be opened starts no servers.
+    let mcp_servers = match (&flags.mcp_file, &meta.mcp_file) {
+        (Some(_), Some(path)) => {
+            let (servers, skipped) = mcp::parse_file(&read_text("--mcp-file", path)?).map_err(|e| Fail::Runtime(format!("--mcp-file {}: {e}", path.display())))?;
+            warnings.extend(skipped);
+            servers
+        }
+        (None, Some(path)) => match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| mcp::parse_file(&t)) {
+            Ok((servers, skipped)) => {
+                warnings.extend(skipped);
+                servers
+            }
+            Err(e) => {
+                warnings.push(format!("MCP servers from {} unavailable: {e}", path.display()));
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
     let sandbox = Sandbox::parse(&meta.sandbox).unwrap_or_else(|| {
         warnings.push(format!("unknown sandbox mode {:?} in session.json; using workspace-write", meta.sandbox));
         Sandbox::WorkspaceWrite
     });
-    let jobs_dir = Session::dir_for(&home, &meta.id).join("jobs");
+    let dir = Session::dir_for(&home, &meta.id);
+    let (jobs_dir, images_dir) = (dir.join("jobs"), dir.join("images"));
     // The key's variable (and bija's default one) never reaches a command's environment.
     let scrub_env: Vec<String> = [meta.api_key_env.trim(), session::DEFAULT_KEY_ENV].iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
-    let runtime = Runtime::new(RuntimeConfig { cwd: meta.cwd.clone(), sandbox, writable: meta.writable.clone(), network: meta.network, no_bwrap: flags.no_bwrap, jobs_dir, scrub_env }).await;
-    // The preamble is rebuilt on every launch (cwd, sandbox and bwrap may have changed); the
-    // caller's part is the flag's, or the stored one.
+    let mut runtime = Runtime::new(RuntimeConfig { cwd: meta.cwd.clone(), sandbox, writable: meta.writable.clone(), network: meta.network, no_bwrap: flags.no_bwrap, jobs_dir, scrub_env, vision: meta.vision, images_dir }).await;
+    // The preamble is rebuilt on every launch (cwd, sandbox, bwrap and the servers may have
+    // changed); the caller's part is the flag's, or the stored one.
     let user = user_system.unwrap_or_else(|| agent::user_system(&meta.system).to_string());
-    let system = agent::compose_system(&agent::preamble(&runtime.system_notes()), &user);
+    let mut notes = runtime.system_notes();
+    if let Some(note) = mcp::system_note(&mcp_servers) {
+        notes.push('\n');
+        notes.push_str(&note);
+    }
+    let system = agent::compose_system(&agent::preamble(&notes), &user);
     let (session, pending, resumed) = match opened {
         Opened::Existing(mut s, pending) => {
             s.meta.system = system;
@@ -649,6 +707,7 @@ async fn launch(flags: &Flags, env: Env<'_>) -> Result<Launch, Fail> {
             (Session::create(&home, m, fsync).map_err(|e| session_error(e, &dir))?, false, false)
         }
     };
+    warnings.extend(runtime.start_mcp(mcp_servers).await);
     let api_key = env(&session.meta.api_key_env).filter(|k| !k.trim().is_empty());
     let client = Client::new(ClientConfig {
         base_url: session.meta.provider_url.clone(),
@@ -1204,6 +1263,13 @@ mod tests {
         let before = meta.clone();
         apply_overrides(&mut meta, &Flags::default()).unwrap();
         assert_eq!(meta, before);
+        // --vision is per launch: a session that had it, resumed without it (a switch to a model
+        // that does not take images), has no vision tools; with it, it has them again
+        meta.vision = true;
+        apply_overrides(&mut meta, &Flags::default()).unwrap();
+        assert!(!meta.vision, "left out: off");
+        apply_overrides(&mut meta, &serve_flags(&["--vision"])).unwrap();
+        assert!(meta.vision);
         let flags = serve_flags(&["--model", "new", "--effort", "low", "--compact-at", "70", "--sandbox", "full"]);
         apply_overrides(&mut meta, &flags).unwrap();
         assert_eq!((meta.model.as_str(), meta.effort.as_str(), meta.compact_at, meta.sandbox.as_str()), ("new", "low", 70, "full"));
@@ -1218,7 +1284,7 @@ mod tests {
         let a = Record::Msg { message: Message::Assistant { text: "Looking.".into(), reasoning: String::new(), tool_calls: vec![call] }, at: 0 };
         assert_eq!(render(&a), "Looking.\n  → bash {\"command\":\"ls\"}");
         let long: String = (1..=12).map(|i| format!("line {i}\n")).collect();
-        let t = Record::Msg { message: Message::Tool { call_id: "c".into(), name: "bash".into(), text: long, is_error: true }, at: 0 };
+        let t = Record::Msg { message: Message::Tool { images: vec![], call_id: "c".into(), name: "bash".into(), text: long, is_error: true }, at: 0 };
         let r = render(&t);
         assert!(r.starts_with("  ← bash (error): line 1\n    line 2") && r.ends_with("… (4 more lines)"), "{r}");
         assert_eq!(render(&Record::Turn { n: 2, status: "completed".into(), at: 0 }), "  [turn 2 completed]");

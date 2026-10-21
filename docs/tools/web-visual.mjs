@@ -5,6 +5,7 @@
 //
 //   MANTRA_HOME=$(mktemp -d) MANTRA_WEB_PASSWORD=test mantra --demo --headless --web --web-listen 127.0.0.1:7788
 //   MANTRA_E2E_OUT=/tmp/shots node docs/tools/web-visual.mjs [prefix]
+//   … node docs/tools/web-visual.mjs [prefix] mcp [pattern]   # MCP + screenshot cards (see below)
 //
 // It asserts nothing beyond what it needs to reach each screen; the shots are for a human.
 // Env vars as in web-e2e.mjs (MANTRA_E2E_BASE, MANTRA_E2E_PASS, MANTRA_E2E_OUT, MANTRA_E2E_PW_MODULES).
@@ -57,6 +58,35 @@ async function main() {
 
     const desk = await newPage(false);
     const phone = await newPage(true);
+
+    // `mcp [pattern]`: a run whose workers call the demo's MCP server and take a screenshot (start
+    // the server with MANTRA_SCREENSHOT_CMD set) — the run screen, and a worker's screen with its
+    // `scene_info` card open and the screenshot's image marker.
+    if (process.argv[3] === 'mcp') {
+        const pattern = process.argv[4] || 'mantra-default-bija';
+        await desk.evaluate((pt) => window.Mantra.act.cmd('start_run', { goal: 'build a tiny todo CLI', pattern: pt }), pattern);
+        await desk.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 120000 });
+        await nav(desk, '/run');
+        await desk.click('button:has-text("Approve plan")');
+        await desk.waitForFunction(() => [...window.Mantra.store.S.agents.values()].some((a) => a.role_kind === 'worker'), null, { timeout: 90000 });
+        const w = await desk.evaluate(() => [...window.Mantra.store.S.agents.values()].find((a) => a.role_kind === 'worker').id);
+        await nav(desk, '/agent/' + w);
+        await desk.waitForSelector('.tool-image', { timeout: 90000 });
+        await desk.waitForTimeout(1500);
+        await both('mcp-run', async (p) => { await nav(p, '/run'); await p.waitForTimeout(600); });
+        await both('mcp-worker', async (p) => {
+            await nav(p, '/agent/' + w);
+            await p.waitForSelector('.tool-image', { timeout: 10000 });
+            const scene = p.locator('.item.tool .item-head:has-text("scene_info")').first();
+            if (await scene.count()) { await scene.click(); await p.waitForTimeout(300); }
+            await p.locator('.tool-image').first().scrollIntoViewIfNeeded();
+            await p.waitForTimeout(400);
+        });
+        await b.close();
+        console.log('SCREENSHOTS\n' + shots.join('\n'));
+        console.log(errs.length ? 'ERRORS\n' + errs.join('\n') : 'no errors');
+        process.exit(errs.length ? 1 : 0);
+    }
 
     // 1. the model picker on the Solo agent
     await both('model-picker', async (p) => {

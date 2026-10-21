@@ -33,7 +33,9 @@ pub enum Kind {
     Plan,
     Command { cmd: String, output: String, exit: Option<i64>, status: String, dur_ms: Option<u64> },
     Files { changes: Vec<FileChange>, status: String },
-    Tool { name: String, args: String, result: String, status: String },
+    /// `image`: the result carried an image (a screenshot, an MCP render) — its path when the
+    /// result names one, `""` when it does not. Nothing draws it; the transcript marks it.
+    Tool { name: String, args: String, result: String, status: String, image: Option<String> },
     Web { query: String },
     Notice { level: Level },
     Compaction { from: u64, to: Option<u64> },
@@ -812,11 +814,22 @@ impl Agent {
                         .map(|a| a.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
                         .unwrap_or_default()
                 } else {
-                    // A plain-text result (bija's built-ins) reads as text, not as a JSON string.
-                    item.get("result").map(|r| r.as_str().map(|t| crate::util::trunc(t, 400)).unwrap_or_else(|| compact_json(r, 400))).unwrap_or_default()
+                    // A plain-text result (bija's built-ins) reads as text, not as a JSON string;
+                    // MCP content (`{"content":[{"type":"text"…},{"type":"image"…}]}`, Codex's and
+                    // the Claude translator's) as its text parts — an image is the card's marker
+                    // (`tool_image`), never base64 on screen.
+                    let texts = |parts: &[Value]| parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n");
+                    item.get("result")
+                        .map(|r| match (r.as_str(), r.get("content").and_then(|c| c.as_array()).or(r.as_array())) {
+                            (Some(t), _) => crate::util::trunc(t, 400),
+                            (None, Some(parts)) => crate::util::trunc(&texts(parts), 400),
+                            (None, None) => compact_json(r, 400),
+                        })
+                        .unwrap_or_default()
                 };
-                let it = self.get_or_insert(&id, Kind::Tool { name: name.clone(), args: String::new(), result: String::new(), status: String::new() });
-                if let Kind::Tool { name: n, args: a, result: r, status: st } = &mut it.kind {
+                let image = tool_image(item);
+                let it = self.get_or_insert(&id, Kind::Tool { name: name.clone(), args: String::new(), result: String::new(), status: String::new(), image: None });
+                if let Kind::Tool { name: n, args: a, result: r, status: st, image: im } = &mut it.kind {
                     *n = name.clone();
                     if !args.is_empty() {
                         *a = args;
@@ -825,6 +838,9 @@ impl Agent {
                         *r = result;
                     }
                     *st = status;
+                    if image.is_some() {
+                        *im = image;
+                    }
                 }
                 it.done = done;
                 it.touch();
@@ -1152,6 +1168,39 @@ pub fn split_diff(diff: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Did a tool item's result carry an image, and where is it? Three backends feed this, each its
+/// own way: `contentItems` with an `inputImage` (Mantra's vision tools; any `image` entry), a
+/// Codex `mcpToolCall` result whose MCP `content` holds an `image` part, or an `images` list. The
+/// path comes from the item when it has one, else from its text — Mantra's tools and bija both
+/// write it there (`[image: <path>]`). `Some("")`: an image, no path known.
+fn tool_image(item: &Value) -> Option<String> {
+    let is_image = |x: &Value| matches!(x.get("type").and_then(|t| t.as_str()), Some("inputImage" | "image" | "input_image"));
+    // bija's own tools put the saved file in `imageUrl`; a `data:` URL names no file
+    let own_path = |x: &Value| ["path", "imagePath", "imageUrl"].iter().find_map(|k| x.get(*k).and_then(|p| p.as_str()).filter(|p| !p.starts_with("data:"))).map(str::to_string);
+    let mut parts: Vec<&Value> = vec![];
+    for list in [item.get("contentItems"), item.pointer("/result/content"), item.get("result").filter(|r| r.is_array()), item.get("content")].into_iter().flatten() {
+        parts.extend(list.as_array().into_iter().flatten());
+    }
+    let mut found = parts.iter().any(|x| is_image(x));
+    let mut path = parts.iter().filter(|x| is_image(x)).find_map(|x| own_path(x));
+    if let Some(Value::Array(images)) = item.get("images") {
+        found |= !images.is_empty();
+        path = path.or_else(|| images.iter().find_map(|x| x.as_str().map(str::to_string).or_else(|| own_path(x))));
+    }
+    if !found {
+        return None;
+    }
+    let texts = parts.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).chain(item.get("result").and_then(|r| r.as_str()));
+    let path = path.or_else(|| texts.flat_map(|t| t.split_whitespace()).map(|w| w.trim_matches(|c: char| "[](),;:'\"`".contains(c)).trim_end_matches('.')).find(|w| image_file_name(w)).map(str::to_string));
+    Some(path.unwrap_or_default())
+}
+
+/// `shot.png`, `/run/screenshots/p1-ui-2.jpeg` — a word that names an image file.
+fn image_file_name(w: &str) -> bool {
+    let lower = w.to_ascii_lowercase();
+    w.len() > 4 && [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| lower.ends_with(e))
+}
+
 fn compact_json(v: &Value, max: usize) -> String {
     crate::util::trunc(&v.to_string(), max)
 }
@@ -1472,5 +1521,44 @@ mod tests {
         // a read-only role refusing a write is its own scope, not a broken environment
         assert!(!super::looks_like_broken_sandbox("Failed to write file: README.md"));
         assert!(!super::looks_like_broken_sandbox("tests failed: 2 assertions"));
+    }
+
+    /// A tool item whose result carried an image keeps that it did and where the image is, from
+    /// each backend's shape: Mantra's `inputImage` beside the path in the text, bija's
+    /// `[image: …]` line, a Codex MCP result's `image` part (no path), an `images` list.
+    #[test]
+    fn a_tool_result_with_an_image_keeps_its_path() {
+        let image_of = |a: &Agent, id: &str| match &a.items.iter().find(|i| i.id == id).expect("item").kind {
+            Kind::Tool { image, .. } => image.clone(),
+            _ => panic!("not a tool"),
+        };
+        let mut a = Agent::new(1, "t", "solo", PathBuf::from("/p"));
+        a.apply("item/started", &json!({"item": {"type": "dynamicToolCall", "id": "s1", "tool": "mantra_screenshot", "arguments": {}, "status": "inProgress"}}));
+        assert_eq!(image_of(&a, "s1"), None, "nothing yet");
+        a.apply("item/completed", &json!({"item": {"type": "dynamicToolCall", "id": "s1", "tool": "mantra_screenshot", "status": "completed", "contentItems": [
+            {"type": "inputText", "text": "Screenshot of the screen of the machine Mantra runs on, saved to /home/me/.mantra/screenshots/solo-1.png (image/png, 5x3 px, 76 B, via grim)."},
+            {"type": "inputImage", "imageUrl": "data:image/png;base64,iVBORw0KGgo="}]}}));
+        assert_eq!(image_of(&a, "s1").as_deref(), Some("/home/me/.mantra/screenshots/solo-1.png"));
+        a.apply("item/completed", &json!({"item": {"type": "dynamicToolCall", "id": "b1", "tool": "screenshot", "status": "completed", "contentItems": [
+            {"type": "text", "text": "Screenshot (image/png, 1x1 px)\n[image: /s/images/call_1-1.png]"}, {"type": "image", "mime": "image/png"}]}}));
+        assert_eq!(image_of(&a, "b1").as_deref(), Some("/s/images/call_1-1.png"));
+        a.apply("item/completed", &json!({"item": {"type": "mcpToolCall", "id": "m1", "server": "blender", "tool": "get_viewport_screenshot", "status": "completed",
+            "result": {"content": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}}}));
+        assert_eq!(image_of(&a, "m1").as_deref(), Some(""), "an image, no path to show");
+        let result_of = |a: &Agent, id: &str| match &a.items.iter().find(|i| i.id == id).expect("item").kind {
+            Kind::Tool { result, .. } => result.clone(),
+            _ => panic!("not a tool"),
+        };
+        assert_eq!(result_of(&a, "m1"), "", "no base64 or JSON on the card");
+        a.apply("item/completed", &json!({"item": {"type": "mcpToolCall", "id": "m3", "server": "blender", "tool": "render", "status": "completed",
+            "result": {"content": [{"type": "text", "text": "rendered the cube"}, {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}}}));
+        assert_eq!((result_of(&a, "m3").as_str(), image_of(&a, "m3").is_some()), ("rendered the cube", true));
+        a.apply("item/completed", &json!({"item": {"type": "mcpToolCall", "id": "m4", "server": "x", "tool": "y", "status": "completed", "result": {"structured": 1}}}));
+        assert_eq!(result_of(&a, "m4"), r#"{"structured":1}"#, "anything else still shows as JSON");
+        a.apply("item/completed", &json!({"item": {"type": "mcpToolCall", "id": "m2", "server": "demo", "tool": "render_preview", "status": "completed", "result": "rendered", "images": ["/s/images/m2-1.png"]}}));
+        assert_eq!(image_of(&a, "m2").as_deref(), Some("/s/images/m2-1.png"));
+        // text that names a .png is not an image by itself
+        a.apply("item/completed", &json!({"item": {"type": "dynamicToolCall", "id": "t1", "tool": "mantra_log", "status": "completed", "contentItems": [{"type": "inputText", "text": "wrote logo.png"}]}}));
+        assert_eq!(image_of(&a, "t1"), None);
     }
 }

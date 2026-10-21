@@ -18,15 +18,16 @@
 
 use crate::api::Client;
 use crate::control::Fanout;
-use crate::proto::{Event, Op, TurnStatus};
+use crate::proto::{Event, ImageRef, Op, TurnStatus};
 use crate::session::{self, Fsync, Meta, OpenTurn, Session};
 use crate::tools::{args, Runtime};
-use crate::types::{estimate_tokens, prefix, sent_chars, str_at, suffix, ApiError, Delta, ErrorKind, Message, Request, Response, RetryNote, ToolCall, ToolDef, ToolOutcome, Usage};
+use crate::types::{estimate_tokens, image_ext, image_from_base64, prefix, sent_chars, str_at, suffix, ApiError, Delta, ErrorKind, Image, ImageData, Message, Request, Response, RetryNote, ToolCall, ToolDef, ToolOutcome, Usage};
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
@@ -346,6 +347,8 @@ pub struct Agent {
     /// Everything offered to the model: the built-ins, then the external tools.
     tools: Vec<ToolDef>,
     external: HashSet<String>,
+    /// The external tools as given, for `sync_vision` to offer again around the vision tools.
+    external_defs: Vec<ToolDef>,
     ctl: Ctl,
     warnings: Vec<String>,
     report: Option<TurnReport>,
@@ -353,22 +356,28 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(session: Session, client: Client, runtime: Runtime, external: Vec<ToolDef>, out: Out) -> Agent {
-        let mut tools = runtime.defs();
-        let mut names: HashSet<String> = tools.iter().map(|d| d.name.clone()).collect();
-        let mut ext = HashSet::new();
-        let mut warnings = Vec::new();
-        for d in external {
-            if runtime.is_builtin(&d.name) || names.contains(&d.name) {
-                warnings.push(format!("external tool {} ignored: the name is already taken", d.name));
-                continue;
-            }
-            names.insert(d.name.clone());
-            ext.insert(d.name.clone());
-            tools.push(d);
-        }
+        let (tools, ext, warnings) = offer(&runtime, &external);
         let measured = session.messages.len();
         let ctl = Ctl { out, phase: Phase::Idle, turn: None, queue: VecDeque::new(), steer: Vec::new(), compact_requested: false, shutdown: false, terminated: None, shell_seq: 0, measured, disk_warned: false };
-        Agent { session, client, runtime, tools, external: ext, ctl, warnings, report: None }
+        Agent { session, client, runtime, tools, external: ext, external_defs: external, ctl, warnings, report: None }
+    }
+
+    /// The vision tools follow `meta.vision`, which a `set` may have changed since the last model
+    /// call (Mantra's live switch to a model that does or does not take images): they come or go
+    /// here, at the next call, like a new model or effort. A call to one already in flight is
+    /// unaffected; one after it is refused as a tool that does not exist.
+    fn sync_vision(&mut self) {
+        let want = self.session.meta.vision;
+        if self.runtime.cfg.vision == want {
+            return;
+        }
+        self.runtime.cfg.vision = want;
+        let (tools, ext, _) = offer(&self.runtime, &self.external_defs);
+        for gone in self.external.difference(&ext) {
+            self.ctl.warn(format!("external tool {gone} ignored: the name is already taken"));
+        }
+        self.tools = tools;
+        self.external = ext;
     }
 
     /// Queues a prompt to run as soon as the agent is idle (`bija run`).
@@ -460,7 +469,7 @@ impl Agent {
             }
             Op::Interrupt => {}
             Op::Compact => self.ctl.compact_requested = true,
-            Op::Set { model, effort, name } => apply_set(&mut self.ctl, &mut self.session.meta, &self.session.dir, self.session.fsync, model, effort, name),
+            Op::Set { model, effort, name, vision } => apply_set(&mut self.ctl, &mut self.session.meta, &self.session.dir, self.session.fsync, Set { model, effort, name, vision }),
             Op::Shell { command } => self.run_shell(command, inbox).await,
             Op::ToolResult { id, .. } => self.ctl.warn(format!("tool_result for unknown call id {id}: ignored")),
             Op::Status => {
@@ -512,6 +521,7 @@ impl Agent {
                 }
             }
             let ids = RoundIds::new(t.messages + 1);
+            self.sync_vision();
             let result = self.complete(inbox, &t.id, Ask::Round(&ids)).await;
             t.messages = ids.last(matches!(result, Ok(Ok(_))));
             let resp = match result {
@@ -559,7 +569,7 @@ impl Agent {
         let unfinished = if interrupted { "interrupted" } else { "not run: the turn ended before this tool ran" };
         if let Some(f) = t.in_flight.take() {
             let outcome = ToolOutcome { duration_ms: f.started.elapsed().as_millis() as u64, ..ToolOutcome::err(unfinished) };
-            self.ctl.out.emit(&tool_done(&t.id, f.id, f.name, outcome));
+            self.ctl.out.emit(&tool_done(&t.id, f.id, f.name, outcome, &[]));
         }
         let r = self.session.repair(unfinished);
         self.ctl.persisted(r);
@@ -615,7 +625,12 @@ impl Agent {
         let snap = self.snapshot();
         let call = self.client.complete(&req, &mut on_delta, &mut on_retry);
         let (ctl, meta, dir, fsync) = (&mut self.ctl, &mut self.session.meta, self.session.dir.as_path(), self.session.fsync);
-        drive(call, inbox, |input| on_busy_input(ctl, meta, dir, fsync, snap, input)).await
+        let got = drive(call, inbox, |input| on_busy_input(ctl, meta, dir, fsync, snap, input)).await;
+        // What the request had to leave out (an image file gone since), said once per file.
+        for w in self.client.take_warnings() {
+            self.ctl.warn(w);
+        }
+        got
     }
 
     /// Pushes the assistant reply (call ids made usable first), emits its `message`, and returns
@@ -652,9 +667,10 @@ impl Agent {
         t.in_flight = Some(InFlight { id: call.id.clone(), name: call.name.clone(), started });
         let outcome = if self.external.contains(&call.name) {
             self.ctl.out.emit(&Event::ToolCall { turn: t.id.clone(), id: call.id.clone(), name: call.name.clone(), args: call.args.clone() });
-            let (ok, text) = self.await_external(&call.id, inbox).await?;
-            ToolOutcome { ok, text, duration_ms: started.elapsed().as_millis() as u64, ..ToolOutcome::default() }
-        } else if self.runtime.is_builtin(&call.name) {
+            let (ok, mut text, refs) = self.await_external(&call.id, inbox).await?;
+            let images = decode_images(refs, &mut text);
+            ToolOutcome { ok, text, images, duration_ms: started.elapsed().as_millis() as u64, ..ToolOutcome::default() }
+        } else if self.runtime.handles(&call.name) {
             self.emit_started(&t.id, &call);
             self.run_builtin(&t.id, &call, inbox).await?
         } else {
@@ -671,10 +687,45 @@ impl Agent {
         self.ctl.out.emit(&Event::ToolStarted { turn: turn.to_string(), id: call.id.clone(), name: call.name.clone(), args: call.args.clone() });
     }
 
-    fn finish_call(&mut self, turn: &str, call: ToolCall, outcome: ToolOutcome) {
-        let r = self.session.push(Message::Tool { call_id: call.id.clone(), name: call.name.clone(), text: outcome.text.clone(), is_error: !outcome.ok });
+    fn finish_call(&mut self, turn: &str, call: ToolCall, mut outcome: ToolOutcome) {
+        let images = self.save_images(&call.id, std::mem::take(&mut outcome.images), &mut outcome.text);
+        let paths: Vec<String> = images.iter().map(|i| i.path.display().to_string()).collect();
+        let r = self.session.push(Message::Tool { images, call_id: call.id.clone(), name: call.name.clone(), text: outcome.text.clone(), is_error: !outcome.ok });
         self.ctl.persisted(r);
-        self.ctl.out.emit(&tool_done(turn, call.id, call.name, outcome));
+        self.ctl.out.emit(&tool_done(turn, call.id, call.name, outcome, &paths));
+    }
+
+    /// A result's images as files, `<session dir>/images/<call id>-<n>.<ext>` (SPEC §5): the
+    /// transcript keeps only the paths, and each path is also written into the result text, so the
+    /// model can name the file (and still knows of it on a wire that dropped the image). A name
+    /// already taken — a provider that reuses `call_0` in every turn — gets `-2`, `-3`… on it
+    /// (`write_new_image`): an earlier record still points at the first file.
+    fn save_images(&mut self, call_id: &str, images: Vec<ImageData>, text: &mut String) -> Vec<Image> {
+        if images.is_empty() {
+            return Vec::new();
+        }
+        let dir = self.session.dir.join("images");
+        let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+        let mut saved = Vec::with_capacity(images.len());
+        for (n, img) in images.into_iter().enumerate() {
+            let stem = format!("{}-{}", file_safe(call_id), n + 1);
+            let line = match made.as_ref().map_err(|e| e.to_string()).and_then(|_| write_new_image(&dir, &stem, image_ext(&img.mime), &img.bytes).map_err(|e| e.to_string())) {
+                Ok(path) => {
+                    let line = format!("[image: {}]", path.display());
+                    saved.push(Image { mime: img.mime, path });
+                    line
+                }
+                Err(e) => {
+                    self.ctl.warn(format!("an image of call {call_id} could not be saved to {}: {e}", dir.display()));
+                    format!("[an image could not be saved: {e}]")
+                }
+            };
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
+        }
+        saved
     }
 
     async fn run_builtin(&mut self, turn: &str, call: &ToolCall, inbox: &mut Inbox) -> Result<ToolOutcome, Stop> {
@@ -687,15 +738,15 @@ impl Agent {
     }
 
     /// Waits for the `tool_result` of an external call while serving every other op.
-    async fn await_external(&mut self, call_id: &str, inbox: &mut Inbox) -> Result<(bool, String), Stop> {
+    async fn await_external(&mut self, call_id: &str, inbox: &mut Inbox) -> Result<(bool, String, Vec<ImageRef>), Stop> {
         let snap = self.snapshot();
         let (tx, rx) = oneshot::channel();
         let mut answer = Some(tx);
         let (ctl, meta, dir, fsync) = (&mut self.ctl, &mut self.session.meta, self.session.dir.as_path(), self.session.fsync);
         let got = drive(rx, inbox, |input| match input {
-            Input::Op(Op::ToolResult { id, ok, text }) if id == call_id => {
+            Input::Op(Op::ToolResult { id, ok, text, images }) if id == call_id => {
                 if let Some(tx) = answer.take() {
-                    let _ = tx.send((ok, text));
+                    let _ = tx.send((ok, text, images));
                 }
                 None
             }
@@ -703,7 +754,7 @@ impl Agent {
         })
         .await?;
         // The sender lives in the closure until `drive` returns, so this cannot be a closed channel.
-        Ok(got.unwrap_or_else(|_| (false, "no result arrived".to_string())))
+        Ok(got.unwrap_or_else(|_| (false, "no result arrived".to_string(), Vec::new())))
     }
 
     /// `Op::Shell`: the user's own command, idle only, seen by the model as a note.
@@ -726,7 +777,7 @@ impl Agent {
             }
         };
         let note = format!("$ {command}\n{}", outcome.text);
-        self.ctl.out.emit(&tool_done("", id, "bash".into(), outcome));
+        self.ctl.out.emit(&tool_done("", id, "bash".into(), outcome, &[]));
         let r = self.session.note(&note);
         self.ctl.persisted(r);
         self.ctl.phase = Phase::Idle;
@@ -916,7 +967,7 @@ fn on_busy_input(ctl: &mut Ctl, meta: &mut Meta, dir: &Path, fsync: Fsync, snap:
         Op::Interrupt => return Some(Stop::Interrupt),
         Op::Compact if ctl.phase == Phase::Compacting => {}
         Op::Compact => ctl.compact_requested = true,
-        Op::Set { model, effort, name } => apply_set(ctl, meta, dir, fsync, model, effort, name),
+        Op::Set { model, effort, name, vision } => apply_set(ctl, meta, dir, fsync, Set { model, effort, name, vision }),
         Op::Shell { .. } => ctl.error("busy"),
         Op::ToolResult { id, .. } => ctl.warn(format!("tool_result for unknown call id {id}: ignored")),
         Op::Status => ctl.out.emit(&status_event(ctl, meta, snap)),
@@ -925,8 +976,21 @@ fn on_busy_input(ctl: &mut Ctl, meta: &mut Meta, dir: &Path, fsync: Fsync, snap:
     None
 }
 
-/// `Op::Set`: takes effect at the next model call; persisted right away.
-fn apply_set(ctl: &mut Ctl, meta: &mut Meta, dir: &Path, fsync: Fsync, model: Option<String>, effort: Option<String>, name: Option<String>) {
+/// What an `Op::Set` changes (each field optional).
+struct Set {
+    model: Option<String>,
+    effort: Option<String>,
+    name: Option<String>,
+    vision: Option<bool>,
+}
+
+/// `Op::Set`: takes effect at the next model call (`vision` through `Agent::sync_vision`);
+/// persisted right away.
+fn apply_set(ctl: &mut Ctl, meta: &mut Meta, dir: &Path, fsync: Fsync, set: Set) {
+    let Set { model, effort, name, vision } = set;
+    if let Some(vision) = vision {
+        meta.vision = vision;
+    }
     if let Some(model) = model {
         match model.trim() {
             "" => ctl.error("set: model must not be empty"),
@@ -961,8 +1025,75 @@ fn status_event(ctl: &Ctl, meta: &Meta, snap: Snapshot) -> Event {
     }
 }
 
-fn tool_done(turn: &str, id: String, name: String, o: ToolOutcome) -> Event {
-    Event::ToolDone { turn: turn.to_string(), id, name, ok: o.ok, result: o.text, exit_code: o.exit_code, duration_ms: o.duration_ms, changes: o.changes }
+fn tool_done(turn: &str, id: String, name: String, o: ToolOutcome, images: &[String]) -> Event {
+    Event::ToolDone { turn: turn.to_string(), id, name, ok: o.ok, result: o.text, exit_code: o.exit_code, duration_ms: o.duration_ms, changes: o.changes, images: images.to_vec() }
+}
+
+/// The images of an external result (`tool_result.images`, base64) as image data; one that is not
+/// base64, too big or not an image of a type the providers take is named in the text instead.
+fn decode_images(refs: Vec<ImageRef>, text: &mut String) -> Vec<ImageData> {
+    let mut out = Vec::new();
+    for r in refs {
+        match image_from_base64(&r.b64, &r.mime) {
+            Ok(img) => out.push(img),
+            Err(why) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("[an image was left out: {why}]"));
+            }
+        }
+    }
+    out
+}
+
+/// A call id as part of a file name: providers' ids are tame, but nothing guarantees it.
+/// Writes `bytes` to the first free `<stem>.<ext>`, `<stem>-2.<ext>`, … in `dir`, never over a
+/// file that is there (`create_new`), owner-only like the directory.
+fn write_new_image(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    for k in 1..=10_000 {
+        let path = if k == 1 { dir.join(format!("{stem}.{ext}")) } else { dir.join(format!("{stem}-{k}.{ext}")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("no free name for {stem}.{ext}")))
+}
+
+/// What the model is offered: the runtime's tools (built-ins, the vision tools when on, the MCP
+/// servers'), then each external tool whose name is still free — with the external names taken
+/// and a warning for each one left out.
+fn offer(runtime: &Runtime, external: &[ToolDef]) -> (Vec<ToolDef>, HashSet<String>, Vec<String>) {
+    let mut tools = runtime.defs();
+    let mut names: HashSet<String> = tools.iter().map(|d| d.name.clone()).collect();
+    let mut ext = HashSet::new();
+    let mut warnings = Vec::new();
+    for d in external {
+        if runtime.is_builtin(&d.name) || names.contains(&d.name) {
+            warnings.push(format!("external tool {} ignored: the name is already taken", d.name));
+            continue;
+        }
+        names.insert(d.name.clone());
+        ext.insert(d.name.clone());
+        tools.push(d.clone());
+    }
+    (tools, ext, warnings)
+}
+
+fn file_safe(id: &str) -> String {
+    let s: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let s = prefix(&s, 80);
+    if s.is_empty() {
+        "call".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn turn_id(n: u64) -> String {
@@ -1075,7 +1206,7 @@ fn for_summary(m: &Message) -> Message {
                 })
                 .collect(),
         },
-        Message::Tool { call_id, name, text, is_error } => Message::Tool { call_id: call_id.clone(), name: name.clone(), text: head_tail(text, CLIP_TOOL), is_error: *is_error },
+        Message::Tool { call_id, name, text, is_error, .. } => Message::Tool { images: vec![], call_id: call_id.clone(), name: name.clone(), text: head_tail(text, CLIP_TOOL), is_error: *is_error },
     }
 }
 
@@ -1275,6 +1406,26 @@ mod tests {
         assert_eq!(n, 4);
     }
 
+    /// A provider that calls every turn's first tool `call_0`: turn 3's image gets a name of its
+    /// own instead of replacing turn 1's, which the earlier record still points at; both are
+    /// owner-only.
+    #[test]
+    fn a_reused_call_id_never_overwrites_an_earlier_image() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bija-images-{}", uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = write_new_image(&dir, "call_0-1", "png", b"turn 1").unwrap();
+        let again = write_new_image(&dir, "call_0-1", "png", b"turn 3").unwrap();
+        let third = write_new_image(&dir, "call_0-1", "png", b"turn 5").unwrap();
+        assert_eq!(first, dir.join("call_0-1.png"));
+        assert_eq!(again, dir.join("call_0-1-2.png"));
+        assert_eq!(third, dir.join("call_0-1-3.png"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"turn 1");
+        assert_eq!(std::fs::read(&again).unwrap(), b"turn 3");
+        assert_eq!(std::fs::metadata(&again).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unparsable_arguments_become_an_error_for_the_model() {
         assert_eq!(bad_arguments(&call("c", "bash", json!({"command": "ls"}), "")), None);
@@ -1395,7 +1546,7 @@ mod tests {
         let m = vec![
             Message::User { text: "abcd".into() },
             Message::Assistant { text: "ef".into(), reasoning: "not sent back".into(), tool_calls: vec![call("c", "bash", json!({"a": 1}), "")] },
-            Message::Tool { call_id: "c".into(), name: "bash".into(), text: "xyz".into(), is_error: false },
+            Message::Tool { images: vec![], call_id: "c".into(), name: "bash".into(), text: "xyz".into(), is_error: false },
         ];
         let summary = compaction_history(&m, u64::MAX);
         assert_eq!(summary.len(), 4);
@@ -1419,7 +1570,7 @@ mod tests {
         let mut m = vec![Message::User { text: "the goal".into() }];
         for i in 0..6 {
             m.push(Message::Assistant { text: format!("step {i}"), reasoning: "r".repeat(10_000), tool_calls: vec![call(&format!("c{i}"), "write_file", json!({"path": "a.rs", "content": big}), "")] });
-            m.push(Message::Tool { call_id: format!("c{i}"), name: "read_file".into(), text: big.clone(), is_error: false });
+            m.push(Message::Tool { call_id: format!("c{i}"), name: "read_file".into(), text: big.clone(), is_error: false, images: vec![] });
         }
         assert!(estimate_tokens(sent_chars(&m)) > 180_000);
         let all = compaction_history(&m, u64::MAX);
@@ -1455,7 +1606,7 @@ mod tests {
             Message::User { text: "build the parser".into() },
             Message::Assistant { text: "first".into(), reasoning: String::new(), tool_calls: vec![] },
             Message::Assistant { text: "parser done, tests next".into(), reasoning: String::new(), tool_calls: vec![call("c", "bash", json!({}), "")] },
-            Message::Tool { call_id: "c".into(), name: "bash".into(), text: "ok".into(), is_error: false },
+            Message::Tool { images: vec![], call_id: "c".into(), name: "bash".into(), text: "ok".into(), is_error: false },
         ];
         let s = mechanical_summary(&m);
         assert!(s.contains("build the parser") && s.contains("parser done, tests next") && !s.contains("first\n"), "{s}");
@@ -1474,7 +1625,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let session = Session::create(&home, meta, Fsync::Never).unwrap();
         let client = Client::new(crate::api::ClientConfig { base_url: url, wire: Default::default(), api_key: None, max_retries: 0, timeout: std::time::Duration::from_secs(30), stream: true, user_agent: "t".into() });
-        let cfg = crate::tools::RuntimeConfig { cwd: home.clone(), sandbox: crate::tools::Sandbox::WorkspaceWrite, writable: vec![], network: false, no_bwrap: true, jobs_dir: home.join("jobs"), scrub_env: vec![] };
+        let cfg = crate::tools::RuntimeConfig { cwd: home.clone(), sandbox: crate::tools::Sandbox::WorkspaceWrite, writable: vec![], network: false, no_bwrap: true, jobs_dir: home.join("jobs"), scrub_env: vec![], vision: false, images_dir: home.join("images") };
         let runtime = Runtime::new(cfg).await;
         let fanout = Fanout::default();
         let mut lines = fanout.subscribe();

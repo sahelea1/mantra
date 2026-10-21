@@ -5,13 +5,17 @@
 //! and turns every call into a `ToolOutcome` — a malformed argument, a refused path or a command
 //! that cannot start all come back as `ok: false` text the model can act on, never as a panic or
 //! an aborted turn. The file tools live in `fs.rs`, commands and jobs in `shell.rs`, the policy and
-//! the wrapper in `sandbox.rs`; `args.rs` shapes every call's arguments to its schema first.
+//! the wrapper in `sandbox.rs`, the vision tools in `vision.rs`; `args.rs` shapes every call's
+//! arguments to its schema first. The tools of MCP servers (`crate::mcp`) are dispatched here too,
+//! so the agent sees one toolbox and one shutdown.
 
 pub mod args;
 pub mod fs;
 pub mod sandbox;
 pub mod shell;
+pub mod vision;
 
+use crate::mcp::{Mcp, ServerConfig};
 use crate::types::{absolute, ToolDef, ToolOutcome};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -56,6 +60,10 @@ pub struct RuntimeConfig {
     /// command that could print the key would put it in the transcript, the events and the next
     /// request.
     pub scrub_env: Vec<String>,
+    /// `--vision`: offer `screenshot` and `view_image`.
+    pub vision: bool,
+    /// `<session dir>/images` — where a capture is written before it becomes the call's image.
+    pub images_dir: PathBuf,
 }
 
 /// Every built-in, in the order the model sees them.
@@ -249,6 +257,7 @@ pub struct Runtime {
     isolation: sandbox::Isolation,
     shell: PathBuf,
     jobs: shell::Jobs,
+    mcp: Mcp,
 }
 
 impl Runtime {
@@ -261,25 +270,52 @@ impl Runtime {
         let isolation = sandbox::Isolation::detect(&policy, cfg.no_bwrap, cfg.network).await;
         let fs = fs::Fs { cwd: cfg.cwd.clone(), policy, diff: which("diff").is_some(), rg: which("rg") };
         let jobs = shell::Jobs::new(cfg.jobs_dir.clone());
-        Runtime { cfg, fs, isolation, shell: shell::default_shell(), jobs }
+        Runtime { cfg, fs, isolation, shell: shell::default_shell(), jobs, mcp: Mcp::default() }
     }
 
-    /// The built-in tools offered to the model (write tools left out in read-only).
+    /// Starts the session's MCP servers (SPEC §10); what could not start comes back as warnings.
+    pub async fn start_mcp(&mut self, servers: Vec<ServerConfig>) -> Vec<String> {
+        if servers.is_empty() {
+            return Vec::new();
+        }
+        let (mcp, warnings) = Mcp::start(servers, &self.cfg.cwd, &self.cfg.scrub_env).await;
+        self.mcp = mcp;
+        warnings
+    }
+
+    /// The tools offered to the model: the built-ins (write tools left out in read-only), the
+    /// vision tools with `--vision`, then the MCP servers' tools.
     pub fn defs(&self) -> Vec<ToolDef> {
         let read_only = self.fs.policy.read_only();
-        BUILTINS.iter().filter(|n| !(read_only && WRITE_TOOLS.contains(n))).filter_map(|n| builtin_def(n)).collect()
+        let mut defs: Vec<ToolDef> = BUILTINS.iter().filter(|n| !(read_only && WRITE_TOOLS.contains(n))).filter_map(|n| builtin_def(n)).collect();
+        if self.cfg.vision {
+            defs.extend(vision::TOOLS.iter().filter_map(|n| vision::def(n)));
+        }
+        defs.extend(self.mcp.defs());
+        defs
     }
 
     /// True for every built-in name, offered or not: a write tool called by name in read-only mode
-    /// gets a clear refusal from `call`, not "unknown tool".
+    /// gets a clear refusal from `call`, not "unknown tool". The vision tools count only with
+    /// `--vision`: without it they do not exist.
     pub fn is_builtin(&self, name: &str) -> bool {
-        BUILTINS.contains(&name)
+        BUILTINS.contains(&name) || (self.cfg.vision && vision::TOOLS.contains(&name))
     }
 
-    /// Runs one built-in tool. `progress` gets streamed command output chunks. Cancel-safe: dropping
-    /// the future kills a running command's process group.
+    /// Whether `call` runs this tool: a built-in or an MCP server's.
+    pub fn handles(&self, name: &str) -> bool {
+        self.is_builtin(name) || self.mcp.offers(name)
+    }
+
+    /// Runs one tool. `progress` gets streamed command output chunks. Cancel-safe: dropping the
+    /// future kills a running command's process group, or cancels an MCP call.
     pub async fn call(&mut self, name: &str, args: &Value, progress: Option<UnboundedSender<String>>) -> ToolOutcome {
         let started = Instant::now();
+        if self.mcp.offers(name) {
+            let mut out = self.mcp.call(name, args).await;
+            out.duration_ms = started.elapsed().as_millis() as u64;
+            return out;
+        }
         let mut out = match self.dispatch(name, args, progress.as_ref()).await {
             Ok(o) => o,
             Err(e) => ToolOutcome::err(format!("{name}: {e}")),
@@ -303,6 +339,8 @@ impl Runtime {
             "grep" => self.fs.grep(&a).await,
             "bash" => self.bash(&a, progress).await,
             "job" => self.job(&a).await,
+            "screenshot" if self.cfg.vision => vision::screenshot(&a, &self.cfg.images_dir, &self.cfg.scrub_env).await,
+            "view_image" if self.cfg.vision => vision::view_image(&a, &self.fs.cwd),
             _ => Err(format!("unknown tool; the built-in tools are {}", BUILTINS.join(", "))),
         }
     }
@@ -368,7 +406,11 @@ impl Runtime {
             Sandbox::WorkspaceWrite => format!("Sandbox: workspace-write — file tools may write only under {}.", self.fs.policy.roots_display()),
             Sandbox::Full => "Sandbox: full access.".to_string(),
         };
-        format!("Working directory: {}\n{mode}\n{}", self.cfg.cwd.display(), self.isolation.note())
+        let mut notes = format!("Working directory: {}\n{mode}\n{}", self.cfg.cwd.display(), self.isolation.note());
+        if self.cfg.vision {
+            notes.push_str("\nscreenshot shows you this machine's screen and view_image an image file; each image costs context.");
+        }
+        notes
     }
 
     /// A warning to emit once at start, if any ("bwrap unavailable — commands run unsandboxed").
@@ -376,10 +418,11 @@ impl Runtime {
         self.isolation.warning()
     }
 
-    /// Ends every background job and leftover command group (SIGTERM, a 1 s grace, SIGKILL);
-    /// called at shutdown, once the session is on disk.
+    /// Ends every background job, leftover command group and MCP server (SIGTERM, a 1 s grace,
+    /// SIGKILL — all at once, so the grace is paid once); called at shutdown, once the session is
+    /// on disk.
     pub async fn shutdown(&mut self) {
-        self.jobs.shutdown().await;
+        tokio::join!(self.jobs.shutdown(), self.mcp.shutdown());
     }
 }
 
@@ -395,7 +438,7 @@ mod tests {
     }
 
     async fn runtime(dir: &Path, sandbox: Sandbox) -> Runtime {
-        let cfg = RuntimeConfig { cwd: dir.to_path_buf(), sandbox, writable: vec![], network: false, no_bwrap: true, jobs_dir: dir.join(".jobs"), scrub_env: vec!["BIJA_RT_TEST_KEY".into()] };
+        let cfg = RuntimeConfig { cwd: dir.to_path_buf(), sandbox, writable: vec![], network: false, no_bwrap: true, jobs_dir: dir.join(".jobs"), scrub_env: vec!["BIJA_RT_TEST_KEY".into()], vision: false, images_dir: dir.join(".images") };
         Runtime::new(cfg).await
     }
 
@@ -427,6 +470,30 @@ mod tests {
             assert!(!t.description.is_empty() && rt.is_builtin(&t.name));
         }
         assert!(!rt.is_builtin("web_search"));
+    }
+
+    /// The vision tools exist only with `--vision`: not offered, not runnable by name, and not in
+    /// the notes without it.
+    #[tokio::test]
+    async fn vision_tools_come_only_with_the_flag() {
+        let d = scratch("vision");
+        std::fs::write(d.join("a.png"), b"\x89PNG\r\n\x1a\nxx").unwrap();
+        let mut plain = runtime(&d, Sandbox::ReadOnly).await;
+        assert!(!names(&plain).iter().any(|n| vision::TOOLS.contains(&n.as_str())));
+        assert!(!plain.is_builtin("screenshot") && !plain.handles("view_image"));
+        let refused = plain.call("view_image", &json!({"path": "a.png"}), None).await;
+        assert!(!refused.ok && refused.images.is_empty() && refused.text.contains("unknown tool"), "{}", refused.text);
+        assert!(!plain.system_notes().contains("screenshot"));
+
+        let mut rt = runtime(&d, Sandbox::ReadOnly).await;
+        rt.cfg.vision = true;
+        let offered = names(&rt);
+        assert_eq!(&offered[offered.len() - 2..], ["screenshot", "view_image"]);
+        assert!(rt.handles("screenshot") && rt.system_notes().contains("screenshot shows you this machine's screen"));
+        let seen = rt.call("view_image", &json!({"path": "a.png"}), None).await;
+        assert!(seen.ok && seen.images.len() == 1 && seen.text.starts_with("a.png: image/png"), "{}", seen.text);
+        let bad = rt.call("view_image", &json!({}), None).await;
+        assert!(!bad.ok && bad.text == "view_image: `path` is required", "{}", bad.text);
     }
 
     #[tokio::test]
@@ -472,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn the_real_policy_includes_writable_roots_and_tmp() {
         let ws = scratch("cfg");
-        let cfg = RuntimeConfig { cwd: ws.clone(), sandbox: Sandbox::WorkspaceWrite, writable: vec![PathBuf::from("/opt/bija-extra")], network: false, no_bwrap: true, jobs_dir: ws.join("jobs"), scrub_env: vec![] };
+        let cfg = RuntimeConfig { cwd: ws.clone(), sandbox: Sandbox::WorkspaceWrite, writable: vec![PathBuf::from("/opt/bija-extra")], network: false, no_bwrap: true, jobs_dir: ws.join("jobs"), scrub_env: vec![], vision: false, images_dir: ws.join("images") };
         let rt = Runtime::new(cfg).await;
         let notes = rt.system_notes();
         assert!(notes.contains(&ws.display().to_string()) && notes.contains("/opt/bija-extra") && notes.contains("/tmp"), "{notes}");
@@ -632,7 +699,7 @@ mod tests {
             eprintln!("skipped: bwrap is not installed");
             return None;
         }
-        let cfg = RuntimeConfig { cwd: dir.to_path_buf(), sandbox: Sandbox::WorkspaceWrite, writable: vec![], network: false, no_bwrap: false, jobs_dir: dir.join(".jobs"), scrub_env: vec![] };
+        let cfg = RuntimeConfig { cwd: dir.to_path_buf(), sandbox: Sandbox::WorkspaceWrite, writable: vec![], network: false, no_bwrap: false, jobs_dir: dir.join(".jobs"), scrub_env: vec![], vision: false, images_dir: dir.join(".images") };
         let rt = Runtime::new(cfg).await;
         if !matches!(rt.isolation, Isolation::Bwrap { .. }) {
             eprintln!("skipped: bwrap is installed but cannot create its namespaces here");

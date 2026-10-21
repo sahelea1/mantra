@@ -20,6 +20,8 @@ pub struct Found {
     pub context: Option<u64>,
     /// Whether the API says the model takes a reasoning effort (None = not stated).
     pub reasoning: Option<bool>,
+    /// The API says the model takes images (`vision_of`).
+    pub vision: bool,
 }
 
 /// Keys different providers use for the context window (OpenRouter, Together, vLLM, Groq, Mistral, LiteLLM, Gemini, llama.cpp …).
@@ -141,6 +143,23 @@ fn reasoning_of(item: &Value) -> Option<bool> {
     None
 }
 
+/// Does a catalogue entry say the model takes images? Providers say it every which way:
+/// OpenRouter `architecture.input_modalities`, LiteLLM-style `supports_vision`, a `capabilities`
+/// object with `vision`, or a `modalities` / `input_modalities` / `inputModalities` list (Codex's
+/// own `model/list` among them) holding `"image"`. Saying nothing is no.
+pub fn vision_of(item: &Value) -> bool {
+    let has_image = |v: Option<&Value>| match v {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).any(|m| m.eq_ignore_ascii_case("image")),
+        // `modalities: {"input": [...], "output": [...]}`, and OpenRouter's older "text+image->text"
+        Some(Value::Object(o)) => o.get("input").and_then(|i| i.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).any(|m| m.eq_ignore_ascii_case("image"))).unwrap_or(false),
+        Some(Value::String(m)) => m.split("->").next().map(|input| input.split(['+', ',']).any(|x| x.trim().eq_ignore_ascii_case("image"))).unwrap_or(false),
+        _ => false,
+    };
+    let flag = |o: &Value| ["vision", "supports_vision", "supportsVision"].iter().any(|k| o.get(*k).and_then(|v| v.as_bool()) == Some(true));
+    let lists = |o: &Value| ["input_modalities", "inputModalities", "modalities", "modality"].iter().any(|k| has_image(o.get(*k)));
+    [Some(item), item.get("architecture"), item.get("capabilities"), item.get("features"), item.get("metadata")].into_iter().flatten().any(|o| flag(o) || lists(o))
+}
+
 /// Accepts `{"data":[…]}`, `{"models":[…]}` or a bare array; items may be objects or strings.
 pub fn parse_models(body: &str) -> Option<Vec<Found>> {
     let v: Value = serde_json::from_str(body.trim()).ok()?;
@@ -161,7 +180,7 @@ pub fn parse_models(body: &str) -> Option<Vec<Found>> {
             // LibertAI/OpenRouter-style catalogues often say nothing about reasoning but name
             // the thinking variant in the id (`glm-5.3-thinking`): those accept an effort.
             let reasoning = reasoning_of(item).or_else(|| lower.contains("thinking").then_some(true));
-            out.push(Found { context: context_of(item), reasoning, id });
+            out.push(Found { context: context_of(item), reasoning, vision: vision_of(item), id });
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -203,6 +222,8 @@ pub struct Candidate {
     pub efforts: Vec<String>,
     pub default_effort: String,
     pub note: String,
+    /// The catalogue says the model takes images (`ModelEntry.vision` for a new entry).
+    pub vision: bool,
     pub state: CState,
     pub selected: bool,
 }
@@ -221,7 +242,7 @@ pub fn claude_defaults(provider_id: &str) -> Vec<Candidate> {
         .into_iter()
         .map(|m| {
             let efforts = m.efforts();
-            Candidate { provider: provider_id.to_string(), model: m.model, context: m.context_window, context_known: true, efforts, default_effort: m.default_effort, note: m.note, state: CState::New, selected: false }
+            Candidate { provider: provider_id.to_string(), model: m.model, context: m.context_window, context_known: true, efforts, default_effort: m.default_effort, note: m.note, vision: m.vision, state: CState::New, selected: false }
         })
         .collect()
 }
@@ -236,7 +257,8 @@ pub fn from_provider(provider: &str, f: &Found) -> Candidate {
         context_known: f.context.is_some(),
         efforts: if reasoning { strs(&["low", "medium", "high"]) } else { vec![] },
         default_effort: if reasoning { "medium".into() } else { String::new() },
-        note: format!("{provider} · ctx {}", if f.context.is_some() { "from API" } else { "assumed 200k" }),
+        note: format!("{provider} · ctx {}{}", if f.context.is_some() { "from API" } else { "assumed 200k" }, if f.vision { " · vision" } else { "" }),
+        vision: f.vision,
         state: CState::New,
         selected: false,
     }
@@ -257,6 +279,7 @@ pub fn from_codex(v: &Value) -> Option<Candidate> {
         default_effort: v.get("defaultReasoningEffort").and_then(|x| x.as_str()).unwrap_or("medium").to_string(),
         efforts,
         note: v.get("description").and_then(|x| x.as_str()).unwrap_or("").chars().take(60).collect(),
+        vision: vision_of(v),
         state: CState::New,
         selected: false,
     })
@@ -292,7 +315,9 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
         match c.state {
             CState::New if existing(reg, c).is_none() => {
                 let taken: Vec<String> = reg.models.iter().map(|m| m.alias.clone()).collect();
+                // vision only on a new entry: a `false` the user set reads the same as one never set
                 reg.models.push(ModelEntry {
+                    vision: c.vision,
                     alias: unique_alias(&c.model, &c.provider, &taken),
                     provider: c.provider.clone(),
                     model: c.model.clone(),
@@ -380,7 +405,7 @@ mod tests {
         let bare = r#"["a","b"]"#;
         assert_eq!(parse_models(bare).unwrap().len(), 2);
         let google = r#"{"models":[{"name":"models/gemini-x","inputTokenLimit":1048576}]}"#;
-        assert_eq!(parse_models(google).unwrap()[0], Found { id: "gemini-x".into(), context: Some(1048576), reasoning: None });
+        assert_eq!(parse_models(google).unwrap()[0], Found { id: "gemini-x".into(), context: Some(1048576), reasoning: None, vision: false });
         assert!(parse_models("<html>nope</html>").is_none());
     }
     #[test]
@@ -405,7 +430,7 @@ mod tests {
     fn apply_adds_and_fills_without_clobbering() {
         let mut reg = Registry::defaults();
         let n = reg.models.len();
-        let mut a = from_provider("zai", &Found { id: "glm-5.2".into(), context: None, reasoning: Some(true) });
+        let mut a = from_provider("zai", &Found { id: "glm-5.2".into(), context: None, reasoning: Some(true), vision: false });
         classify(&reg, &mut a);
         assert_eq!(a.state, CState::New);
         a.selected = true;
@@ -417,11 +442,52 @@ mod tests {
         assert_eq!(a.state, CState::Configured, "second discovery doesn't duplicate");
         // user-set context survives
         reg.models.last_mut().unwrap().context_window = Some(128_000);
-        let mut b = from_provider("zai", &Found { id: "glm-5.2".into(), context: Some(999_999), reasoning: Some(true) });
+        let mut b = from_provider("zai", &Found { id: "glm-5.2".into(), context: Some(999_999), reasoning: Some(true), vision: false });
         classify(&reg, &mut b);
         b.selected = true;
         apply(&mut reg, &[b]);
         assert_eq!(reg.models.last().unwrap().context_window, Some(128_000));
+    }
+    #[test]
+    fn vision_is_read_from_every_catalogue_shape() {
+        let body = r#"{"data":[
+            {"id":"or/vl","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}},
+            {"id":"or/old","architecture":{"modality":"text+image->text"}},
+            {"id":"or/text","architecture":{"input_modalities":["text"],"modality":"text->text"}},
+            {"id":"lite","supports_vision":true},
+            {"id":"lite-no","supports_vision":false},
+            {"id":"caps","capabilities":{"vision":true,"function_calling":true}},
+            {"id":"mods","modalities":["text","image"]},
+            {"id":"mods-io","modalities":{"input":["text","image"],"output":["text"]}},
+            {"id":"mods-out","modalities":{"input":["text"],"output":["image"]}},
+            {"id":"inmods","input_modalities":["IMAGE"]},
+            {"id":"silent"}
+        ]}"#;
+        let m = parse_models(body).unwrap();
+        let sees: Vec<&str> = m.iter().filter(|f| f.vision).map(|f| f.id.as_str()).collect();
+        assert_eq!(sees, vec!["caps", "inmods", "lite", "mods", "mods-io", "or/old", "or/vl"]);
+        // a candidate carries it into a new entry, and says so in its note
+        let vl = m.iter().find(|f| f.id == "or/vl").unwrap();
+        let mut c = from_provider("or", vl);
+        assert!(c.vision && c.note.ends_with(" · vision"), "{}", c.note);
+        assert!(!from_provider("or", m.iter().find(|f| f.id == "silent").unwrap()).vision);
+        let mut reg = Registry::defaults();
+        classify(&reg, &mut c);
+        c.selected = true;
+        apply(&mut reg, &[c]);
+        assert!(reg.models.last().unwrap().vision);
+        // the backend catalogue (`model/list`) says inputModalities; every built-in default sees
+        let codex = serde_json::json!({"id": "m-sees", "inputModalities": ["text", "image"]});
+        assert!(from_codex(&codex).unwrap().vision);
+        assert!(!from_codex(&serde_json::json!({"id": "m-text", "inputModalities": ["text"]})).unwrap().vision);
+        assert!(claude_defaults("claude").iter().all(|c| c.vision));
+        assert!(Registry::defaults().models.iter().all(|m| m.vision), "every built-in alias takes images");
+        // a discovered model that says nothing does not
+        let mut quiet = from_provider("or", m.iter().find(|f| f.id == "silent").unwrap());
+        classify(&reg, &mut quiet);
+        quiet.selected = true;
+        apply(&mut reg, &[quiet]);
+        assert!(!reg.models.last().unwrap().vision);
     }
     #[test]
     fn aliases_are_unique() {

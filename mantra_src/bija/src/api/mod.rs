@@ -10,7 +10,9 @@
 //! optional request feature — a reasoning control it does not know, `stream_options`, automatic
 //! prompt caching — the wire drops that feature for the rest of the session and the request is
 //! sent again at once. That is not a retry (nothing transient happened, so no wait and no
-//! `on_retry`), and it is bounded: every adaptation switches a feature off for good.
+//! `on_retry`), and it is bounded: every adaptation switches a feature off for good. Images are
+//! one such feature: once a result's image is in the history every request carries it, so a
+//! provider that refuses images would otherwise fail every turn from then on.
 //!
 //! When the provider reports no usage, the response carries a `chars / 4` estimate flagged
 //! `estimated` (SPEC §3), so the agent's bookkeeping never sees an unexplained zero.
@@ -19,8 +21,11 @@ pub mod anthropic;
 pub mod http;
 pub mod openai;
 
-use crate::types::{clip, estimate_tokens, random_bytes, sent_chars, ApiError, Delta, ErrorKind, Message, Request, Response, RetryNote, ToolCall, Usage, Wire};
+use crate::types::{base64_encode, clip, estimate_tokens, human_size, random_bytes, sent_chars, sniff_image, ApiError, Delta, ErrorKind, Image, Message, Request, Response, RetryNote, ToolCall, Usage, Wire, IMAGE_MAX_BYTES};
 use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Error bodies are short; past this they are cut (the message is all we need from them).
@@ -176,6 +181,14 @@ impl Client {
             }
         }
         Ok(headers)
+    }
+
+    /// What the wires had to leave out of the requests since the last call (an image file that is
+    /// gone), each said once, for the agent to report as `warning` events.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        let mut w = self.chat.images.take_warnings();
+        w.extend(self.messages.images.take_warnings());
+        w
     }
 
     /// A uniform draw in `[-1, 1)`.
@@ -395,6 +408,58 @@ pub(crate) fn malformed(what: &str, e: impl std::fmt::Display) -> ApiError {
 }
 
 // ------------------------------------------------------------------------------ shared wiring
+
+/// Reads the images a request carries from their files: the transcript keeps only paths (SPEC
+/// §2.4), so every request reads them again — no copy lives in memory between requests. A file
+/// that is gone, grew past the cap or no longer holds an image is left out (its text still goes)
+/// and reported once. `body` builds requests from `&self`, hence the cells.
+#[derive(Debug, Default)]
+pub(crate) struct ImageFiles {
+    reported: RefCell<HashSet<PathBuf>>,
+    warnings: RefCell<Vec<String>>,
+}
+
+impl ImageFiles {
+    /// `(media type, base64)` of the image, or `None` when it cannot go. `max_b64` is the wire's
+    /// own limit on one encoded image, if it has one.
+    pub(crate) fn load(&self, img: &Image, max_b64: Option<usize>) -> Option<(&'static str, String)> {
+        let read = std::fs::metadata(&img.path).and_then(|m| {
+            if m.len() > IMAGE_MAX_BYTES {
+                return Err(std::io::Error::other(format!("{} is over the {} limit", human_size(m.len()), human_size(IMAGE_MAX_BYTES))));
+            }
+            std::fs::read(&img.path)
+        });
+        let problem = match read {
+            Err(e) => e.to_string(),
+            Ok(bytes) => match sniff_image(&bytes) {
+                None => "the file is no longer a PNG, JPEG, GIF or WebP image".to_string(),
+                Some(mime) => {
+                    let b64 = base64_encode(&bytes);
+                    match max_b64 {
+                        Some(max) if b64.len() > max => format!("{} encoded is more than this provider takes ({})", human_size(b64.len() as u64), human_size(max as u64)),
+                        _ => return Some((mime, b64)),
+                    }
+                }
+            },
+        };
+        if self.reported.borrow_mut().insert(img.path.clone()) {
+            self.warnings.borrow_mut().push(format!("image {} left out of the request: {problem}", img.path.display()));
+        }
+        None
+    }
+
+    fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.warnings.borrow_mut())
+    }
+}
+
+/// A provider's 400 about the images in a request: a model that takes none, or a size or format
+/// it refuses. Both wires then send tool results as text only for the rest of the session — the
+/// result text names the image's path, so the model still knows what it missed.
+pub(crate) fn refuses_images(err: &ApiError, sent_images: bool) -> bool {
+    let m = err.message.to_ascii_lowercase();
+    sent_images && err.kind == ErrorKind::BadRequest && ["image", "vision", "multimodal", "modalit"].iter().any(|w| m.contains(w))
+}
 
 /// Tool calls and results as plain text, for a request that offers no tools (the compaction
 /// call): providers refuse tool blocks in a history when the request defines no tools.

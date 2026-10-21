@@ -32,6 +32,10 @@ pub enum JobTag {
     Cleanup { phase: usize },
     Finish,
     Land,
+    /// A vision tool call (`mantra_screenshot` / `mantra_view_image`), answered when the capture
+    /// or the read is done — never on the event loop, where a capture tool that hangs would
+    /// freeze every agent for its whole timeout.
+    Vision { agent: AgentId, req: Value, tool: String, name: String },
 }
 
 pub enum JobOut {
@@ -44,6 +48,13 @@ pub enum JobOut {
     /// The phase commit's outcome, plus the run's diff so far (what the finale reviews).
     Cleanup(Result<String, String>, git::ReviewDiff),
     Text(Result<String, String>),
+    /// A vision tool's `contentItems` and whether it worked (`tools::vision_call`).
+    Vision(Vec<Value>, bool),
+}
+
+/// The aliases of `reg` whose model takes images — what `Run::set_vision_models` is handed.
+pub fn vision_aliases(reg: &crate::config::Registry) -> HashSet<String> {
+    reg.models.iter().filter(|m| m.vision).map(|m| m.alias.clone()).collect()
 }
 
 /// What every halt for a dead model gateway ends with: what to do (nothing but wait and resume)
@@ -73,6 +84,9 @@ pub struct SpawnReq {
     /// What the agent's session is called in the backend (`<run title> · <role name>`), where the
     /// backend can name a session.
     pub thread_name: Option<String>,
+    /// The MCP servers the agent asks for: the role's `mcp` (names, or `"*"`), set by `Run::role_req`
+    /// — the one funnel every spawn goes through. The app resolves them against its settings.
+    pub mcp: Vec<String>,
 }
 
 /// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
@@ -104,6 +118,14 @@ pub trait Ctx {
     fn compact(&mut self, a: AgentId);
     fn stop(&mut self, a: AgentId, archive: bool);
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool);
+    /// A tool result with more than text: the `contentItems` as they are (`inputText`, and an
+    /// `inputImage` for the vision tools). The default keeps the text alone, for a `Ctx` that has
+    /// nowhere to send an image.
+    fn tool_result_items(&mut self, a: AgentId, req: Value, items: Vec<Value>, ok: bool) {
+        let text: Vec<&str> = items.iter().filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("inputText")).filter_map(|i| i.get("text").and_then(|t| t.as_str())).collect();
+        let text = text.join("\n");
+        self.tool_result(a, req, text, ok);
+    }
     fn set_effort(&mut self, a: AgentId, effort: &str) -> String;
     fn agent(&self, a: AgentId) -> Option<&Agent>;
     fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>);
@@ -526,6 +548,10 @@ pub struct Run {
     /// saved alias that still exists from one that was deleted, and gives `settings.context_cap`
     /// a window to be measured against. Empty = never told (tests): every alias is trusted.
     known_models: HashMap<String, u64>,
+    /// The aliases whose model takes images (`ModelEntry.vision`), from the app beside
+    /// `known_models` (`set_vision_models`). Empty = none: unlike `known_models`, never trusted
+    /// blindly — a screenshot tool reaches an agent only when its model is known to see.
+    known_vision: HashSet<String>,
     /// Hash of the pattern as last written to the run dir's `pattern.toml` — a resume reloads from
     /// there, so a role-level model change (`set_role_model all`) is written back when it differs.
     pattern_hash: std::sync::atomic::AtomicU64,
@@ -623,6 +649,7 @@ impl Run {
             last_status: HashMap::new(),
             slot_models: HashMap::new(),
             known_models: HashMap::new(),
+            known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
             owner: super::state::Owner::this_process(),
         }
@@ -766,6 +793,30 @@ impl Run {
     /// resume and after every live model switch — the only times an alias can enter the run.
     pub fn set_known_models(&mut self, models: HashMap<String, u64>) {
         self.known_models = models;
+    }
+
+    /// Which aliases take images (`vision_aliases`), from the app at the same moments as
+    /// `set_known_models`.
+    pub fn set_vision_models(&mut self, aliases: HashSet<String>) {
+        self.known_vision = aliases;
+    }
+
+    /// Does `alias`'s model take images? Only when the app said so.
+    pub(super) fn sees(&self, alias: &str) -> bool {
+        self.known_vision.contains(alias)
+    }
+
+    /// The last step of every spawn (fresh, respawned, re-attached on resume): the role's MCP
+    /// servers, the Akasha tools of a group member, and the vision tools when the model takes
+    /// images. Tools are fixed at spawn — a live switch to a model that sees gets them with the
+    /// agent's next respawn, not mid-thread.
+    pub(super) fn role_req(&self, req: SpawnReq) -> SpawnReq {
+        let mut req = self.akasha_req(req);
+        req.mcp = req.role.mcp.clone();
+        if self.sees(&req.role.model) {
+            req.tools.extend(tools::vision_tools());
+        }
+        req
     }
 
     /// Is `alias` still in the registry? Trusted blindly when the app never said what it knows.
@@ -1675,9 +1726,10 @@ Then summarize in 2-4 lines.",
             context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
+            mcp: vec![],
             role,
         };
-        let req = self.akasha_req(req);
+        let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -1903,8 +1955,8 @@ Then summarize in 2-4 lines.",
         let extra_writable = if w.adhoc { self.integ_writable() } else { vec![] };
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
-        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone() };
-        let req = self.akasha_req(req);
+        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -2090,7 +2142,7 @@ Then summarize in 2-4 lines.",
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
         };
-        let id = ctx.spawn(self.akasha_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq {
             name: name.clone(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2102,6 +2154,7 @@ Then summarize in 2-4 lines.",
             context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
+            mcp: vec![],
             role: role.clone(),
         }));
         self.gate_agent = Some(id);
@@ -2344,7 +2397,7 @@ Then summarize in 2-4 lines.",
             }
             p
         } else {
-            ctx.spawn(self.akasha_req(SpawnReq {
+            ctx.spawn(self.role_req(SpawnReq {
                 name: step.role.clone(),
                 effort,
                 thread_name: self.thread_name(&step.role),
@@ -2356,6 +2409,7 @@ Then summarize in 2-4 lines.",
                 context_override: self.context_for(&role.model, None),
                 network: self.pattern.settings.network,
                 writable_roots: self.pattern.settings.writable_roots.clone(),
+                mcp: vec![],
                 role: role.clone(),
             }))
         };
@@ -2538,6 +2592,11 @@ Then summarize in 2-4 lines.",
                 Ok(m) => self.log("⇲", "green", m),
                 Err(e) => self.alert(ctx, e),
             },
+            (JobTag::Vision { agent, req, tool, name }, JobOut::Vision(items, ok)) => {
+                let what = if tool == "mantra_screenshot" { "took a screenshot" } else { "looked at an image" };
+                self.log("▣", "blue", format!("{name} {what}{}", if ok { "" } else { " — failed" }));
+                ctx.tool_result_items(agent, req, items, ok);
+            }
             (JobTag::Finish, _) => {}
             _ => {}
         }
@@ -3742,9 +3801,10 @@ Then summarize in 2-4 lines.",
             context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
+            mcp: vec![],
             role,
         };
-        let req = self.akasha_req(req);
+        let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -4015,7 +4075,7 @@ Then summarize in 2-4 lines.",
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
         let role = self.role_for_slot("orchestrator", &name);
-        let id = ctx.spawn(self.akasha_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq {
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4027,6 +4087,7 @@ Then summarize in 2-4 lines.",
             context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
+            mcp: vec![],
             role,
         }));
         self.orchestrator = Some(id);
@@ -4194,8 +4255,35 @@ Then summarize in 2-4 lines.",
     // ───────────────────────────── tools ─────────────────────────────
 
     pub fn on_tool_call(&mut self, ctx: &mut dyn Ctx, a: AgentId, req: Value, tool: &str, args: &Value) {
+        if tools::VISION_TOOLS.contains(&tool) && !self.yielded.contains(&a) {
+            self.vision_tool(ctx, a, req, tool, args);
+            return;
+        }
         let (text, ok) = self.handle_tool(ctx, a, tool, args);
         ctx.tool_result(a, req, text, ok);
+    }
+
+    /// `mantra_screenshot` / `mantra_view_image`: only for an agent whose model takes images (the
+    /// tools are offered to no one else, so a call from any other is a thread that outlived a
+    /// model switch — refused at once). Captures go to `<run dir>/screenshots/<agent>-<n>.png`;
+    /// an image path is read relative to the agent's own working directory. The capture or the
+    /// read runs as a job (`JobTag::Vision`), and `on_job` answers the call.
+    fn vision_tool(&mut self, ctx: &mut dyn Ctx, a: AgentId, req: Value, tool: &str, args: &Value) {
+        let model = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
+        if !self.sees(&model) {
+            ctx.tool_result_items(a, req, vec![tools::text_item(&format!("{model} does not take images here, so {tool} is not available."))], false);
+            return;
+        }
+        let name = self.name_of(a);
+        let cwd = ctx.agent(a).map(|x| x.cwd.clone()).unwrap_or_else(|| self.workspace_dir());
+        let (call, args, shots, stem) = (tool.to_string(), args.clone(), self.dir.join("screenshots"), name.clone());
+        ctx.job(
+            JobTag::Vision { agent: a, req, tool: tool.to_string(), name },
+            Box::new(move || {
+                let (items, ok) = tools::vision_call(&call, &args, &cwd, &shots, &stem);
+                JobOut::Vision(items, ok)
+            }),
+        );
     }
 
     fn handle_tool(&mut self, ctx: &mut dyn Ctx, a: AgentId, tool: &str, args: &Value) -> (String, bool) {
@@ -4846,7 +4934,8 @@ mod halt_tests {
         spawned_instructions: Vec<(AgentId, String)>,
         /// Every `ctx.spawn`: who it was for and with what effort / thread name / working dir.
         spawns: Vec<Spawned>,
-        /// The tag of every background job the engine asked for (the closures are never run).
+        /// The tag of every background job the engine asked for (the closures are never run, but
+        /// for the vision tools': see `finished`).
         jobs: Vec<String>,
         stopped: Vec<AgentId>,
         efforts_set: Vec<(AgentId, String)>,
@@ -4855,6 +4944,10 @@ mod halt_tests {
         spawned_models: Vec<(AgentId, String)>,
         /// What `ctx.notify` was told, in order.
         notified: Vec<String>,
+        /// Every `ctx.tool_result_items`: to whom, the `contentItems`, whether it worked.
+        items: Vec<(AgentId, Vec<Value>, bool)>,
+        /// The vision jobs, run as they were asked for (on this thread), waiting for `settle`.
+        finished: Vec<(JobTag, JobOut)>,
     }
     #[derive(Clone, Debug)]
     struct Spawned {
@@ -4868,10 +4961,18 @@ mod halt_tests {
         context_override: Option<u64>,
         /// The names of the tools it was offered.
         tools: Vec<String>,
+        /// The MCP servers it asked for.
+        mcp: Vec<String>,
     }
     impl TestCtx {
         fn new() -> TestCtx {
-            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![] }
+            TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
+        }
+        /// Hands every finished vision job back to `run`, as the app's event loop would.
+        fn settle(&mut self, run: &mut Run) {
+            for (tag, out) in std::mem::take(&mut self.finished) {
+                run.on_job(self, tag, out);
+            }
         }
         fn spawned(&self, name: &str) -> Vec<Spawned> {
             self.spawns.iter().filter(|s| s.name == name).cloned().collect()
@@ -4942,7 +5043,7 @@ mod halt_tests {
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
             let tools = r.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from)).collect();
-            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools });
+            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools, mcp: r.mcp.clone() });
             self.spawned_instructions.push((id, r.instructions));
             self.spawned_models.push((id, r.role.model));
             id
@@ -4964,6 +5065,9 @@ mod halt_tests {
             self.stopped.push(a);
         }
         fn tool_result(&mut self, _a: AgentId, _req: Value, _text: String, _ok: bool) {}
+        fn tool_result_items(&mut self, a: AgentId, _req: Value, items: Vec<Value>, ok: bool) {
+            self.items.push((a, items, ok));
+        }
         fn set_effort(&mut self, a: AgentId, effort: &str) -> String {
             self.efforts_set.push((a, effort.to_string()));
             effort.to_string()
@@ -4974,8 +5078,11 @@ mod halt_tests {
         fn agent(&self, a: AgentId) -> Option<&Agent> {
             self.agents.get(&a)
         }
-        fn job(&mut self, tag: JobTag, _f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
+        fn job(&mut self, tag: JobTag, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
             self.jobs.push(format!("{tag:?}"));
+            if matches!(tag, JobTag::Vision { .. }) {
+                self.finished.push((tag, f()));
+            }
         }
         fn notify(&mut self, text: &str) {
             self.notified.push(text.to_string());
@@ -8650,5 +8757,146 @@ mod halt_tests {
         drop(run);
         assert!(Owner::load(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // MCP servers and vision ------------------------------------------------------------------
+
+    /// Every way an agent of a role comes to be hands the role's `mcp` on: planner, orchestrator,
+    /// manager, workers, the phase gate, a finale step, and one re-attached on resume.
+    #[test]
+    fn every_spawn_carries_its_roles_mcp_servers() {
+        let mut ctx = TestCtx::new();
+        let mut p = Pattern::builtin();
+        for (name, r) in p.roles.iter_mut() {
+            r.mcp = vec![format!("{name}-tools"), "*".into()];
+        }
+        let mut run = Run::new(PathBuf::from("."), p, "test".into());
+        run.plan = Some(mixed_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.spawn_planner(&mut ctx);
+        run.spawn_orchestrator(&mut ctx);
+        run.ensure_manager(&mut ctx);
+        for t in mixed_phase().phases[0].tasks.clone() {
+            launch(&mut ctx, &mut run, t, None);
+        }
+        run.spawn_gate(&mut ctx, 0);
+        run.planner = Some(ctx.add_idle());
+        run.start_finale(&mut ctx, 0);
+        run.spawn_planner_with(&mut ctx, Some("thread-1".into()));
+        let names: Vec<&str> = ctx.spawns.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["planner", "orchestrator", "manager", "s1", "b1", "qa", "qa-heavy", "planner"]);
+        for s in &ctx.spawns {
+            assert_eq!(s.mcp, vec![format!("{}-tools", s.role_name), "*".to_string()], "{}", s.name);
+        }
+        // a role that asks for none (every built-in one) gets none
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.spawn_planner(&mut ctx);
+        assert!(ctx.spawned("planner")[0].mcp.is_empty());
+    }
+
+    /// The screenshot and view-image tools reach an agent only when the app said its model takes
+    /// images — never by default, never for the other roles.
+    #[test]
+    fn the_vision_tools_go_only_to_a_model_that_sees() {
+        let has_vision = |s: &Spawned| tools::VISION_TOOLS.iter().all(|t| s.tools.iter().any(|x| x == t));
+        let has_any = |s: &Spawned| s.tools.iter().any(|x| tools::VISION_TOOLS.contains(&x.as_str()));
+        let mut p = Pattern::builtin();
+        p.roles.get_mut("worker-small").expect("worker-small").model = "eye".into();
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), p, "test".into());
+        run.plan = Some(mixed_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        // never told what sees: nobody gets them
+        launch(&mut ctx, &mut run, Task { id: "s0".into(), role: "worker-small".into(), ..Default::default() }, None);
+        assert!(!has_any(&ctx.spawned("s0")[0]), "{:?}", ctx.spawned("s0")[0].tools);
+        run.set_vision_models(["eye".to_string()].into_iter().collect());
+        for t in mixed_phase().phases[0].tasks.clone() {
+            launch(&mut ctx, &mut run, t, None);
+        }
+        assert!(has_vision(&ctx.spawned("s1")[0]), "{:?}", ctx.spawned("s1")[0].tools);
+        assert!(ctx.spawned("s1")[0].tools.contains(&"mantra_ask".to_string()), "beside the role's own tools");
+        assert!(!has_any(&ctx.spawned("b1")[0]), "worker-big's model does not see");
+        run.spawn_planner(&mut ctx);
+        assert!(!has_any(&ctx.spawned("planner")[0]));
+        // a role whose model sees gets them on every path, the planner's included
+        let planner_model = run.role("planner").model;
+        run.set_vision_models([planner_model].into_iter().collect());
+        run.spawn_planner_with(&mut ctx, Some("thread-1".into()));
+        assert!(has_vision(ctx.spawned("planner").last().unwrap()));
+    }
+
+    /// `mantra_screenshot` and `mantra_view_image` answer with the text and an `inputImage`: the
+    /// capture via `$MANTRA_SCREENSHOT_CMD` (here a script copying a generated PNG), saved as
+    /// `<run dir>/screenshots/<agent>-<n>.png`; an image read from the agent's cwd within its caps.
+    #[test]
+    fn a_screenshot_and_an_image_come_back_as_input_images() {
+        let dir = scratch_dir("vision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = crate::util::tests::tiny_png(5, 3);
+        std::fs::write(dir.join("src.png"), &png).unwrap();
+        let script = dir.join("shot.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncp {} \"$1\"\n", dir.join("src.png").display())).unwrap();
+        // the only test that sets it: every other capture test passes its template explicitly
+        std::env::set_var(crate::util::SCREENSHOT_VAR, format!("sh {} {{out}}", script.display()));
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
+        run.dir = dir.join("run");
+        run.set_vision_models(["eye".to_string()].into_iter().collect());
+        let a = ctx.add_idle();
+        if let Some(ag) = ctx.agents.get_mut(&a) {
+            ag.model_alias = "eye".into();
+            ag.cwd = dir.clone();
+        }
+        run.workers.push(mk_worker("p1-ui", "worker-small", a, WState::Running));
+        let want_url = format!("data:image/png;base64,{}", crate::util::b64(&png));
+
+        run.on_tool_call(&mut ctx, a, json!(1), "mantra_screenshot", &json!({}));
+        assert!(ctx.items.is_empty() && ctx.jobs.iter().any(|j| j.starts_with("Vision")), "captured as a job, off the event loop: {:?}", ctx.jobs);
+        ctx.settle(&mut run);
+        let (who, items, ok) = ctx.items.last().cloned().expect("an answer");
+        assert!(ok && who == a, "{items:?}");
+        let text = items[0]["text"].as_str().unwrap_or_default().to_string();
+        let shot = run.dir.join("screenshots").join("p1-ui-1.png");
+        assert!(text.contains(&format!("{}", std::fs::canonicalize(&shot).unwrap().display())) && text.contains("image/png, 5x3 px") && text.contains("via MANTRA_SCREENSHOT_CMD"), "{text}");
+        assert_eq!(items[1], json!({"type": "inputImage", "imageUrl": want_url}));
+        assert_eq!(std::fs::read(&shot).unwrap(), png);
+        {
+            // the host's screen is nobody else's to read: an owner-only directory and file
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!((mode(&run.dir.join("screenshots")), mode(&shot)), (0o700, 0o600));
+        }
+        run.on_tool_call(&mut ctx, a, json!(2), "mantra_screenshot", &json!({"region": "0,0,5,3"}));
+        ctx.settle(&mut run);
+        assert!(run.dir.join("screenshots").join("p1-ui-2.png").exists(), "the next capture gets the next number");
+        assert!(ctx.items.last().unwrap().0 == a && ctx.items.last().unwrap().2);
+        assert!(run.pulse.iter().any(|l| l.text.contains("p1-ui took a screenshot")), "journaled");
+
+        // view_image: relative to the agent's cwd, by its bytes, within 8 MB
+        run.on_tool_call(&mut ctx, a, json!(3), "mantra_view_image", &json!({"path": "src.png"}));
+        ctx.settle(&mut run);
+        let (_, items, ok) = ctx.items.last().cloned().unwrap();
+        assert!(ok && items[0]["text"].as_str().unwrap_or_default().contains("src.png (image/png, 5x3 px"), "{items:?}");
+        assert_eq!(items[1]["imageUrl"], json!(want_url));
+        std::fs::write(dir.join("notes.png"), "not an image").unwrap();
+        let big = std::fs::File::create(dir.join("big.png")).unwrap();
+        big.set_len(crate::util::IMAGE_MAX_BYTES + 1).unwrap();
+        for (args, says) in [(json!({"path": "notes.png"}), "is not a PNG, JPEG, GIF or WebP image"), (json!({"path": "big.png"}), "images go up to 8.0 MiB"), (json!({}), "path is required"), (json!({"path": "gone.png"}), "cannot read")] {
+            run.on_tool_call(&mut ctx, a, json!(4), "mantra_view_image", &args);
+            ctx.settle(&mut run);
+            let (_, items, ok) = ctx.items.last().cloned().unwrap();
+            assert!(!ok && items.len() == 1 && items[0]["text"].as_str().unwrap_or_default().contains(says), "{args}: {items:?}");
+        }
+
+        // an agent whose model does not see is refused, and nothing is captured
+        let b = ctx.add_idle();
+        run.workers.push(mk_worker("p1-api", "worker-small", b, WState::Running));
+        let jobs = ctx.jobs.len();
+        run.on_tool_call(&mut ctx, b, json!(5), "mantra_screenshot", &json!({}));
+        assert_eq!(ctx.jobs.len(), jobs, "refused at once, no job");
+        let (_, items, ok) = ctx.items.last().cloned().unwrap();
+        assert!(!ok && items[0]["text"].as_str().unwrap_or_default().contains("does not take images"), "{items:?}");
+        assert!(!run.dir.join("screenshots").join("p1-api-1.png").exists());
     }
 }

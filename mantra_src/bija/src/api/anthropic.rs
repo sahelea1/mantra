@@ -22,7 +22,7 @@
 //! whole history on every request.
 
 use super::http::SseEvent;
-use super::{call_as_text, embedded_error, malformed, parse_args, result_as_text, truncated_stream};
+use super::{call_as_text, embedded_error, malformed, parse_args, refuses_images, result_as_text, truncated_stream, ImageFiles};
 use crate::types::{str_at, ApiError, Delta, ErrorKind, Finish, Message, Request, Response, ToolCall, Usage};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -38,6 +38,9 @@ const ANSWER_HEADROOM: u32 = 4096;
 const MIN_BUDGET: u32 = 1024;
 /// Words in a 400 that mean "the reasoning controls are the problem".
 const REASONING_FIELDS: &[&str] = &["thinking", "budget_tokens", "adaptive", "output_config", "effort"];
+/// The API's limit on one image, counted in base64 bytes: a bigger one is left out up front
+/// rather than costing the session its images (`no_images`) on the 400 it would bring.
+const MAX_IMAGE_B64: usize = 5 * 1024 * 1024;
 
 pub fn endpoint(base: &str) -> String {
     let base = base.trim().trim_end_matches('/');
@@ -94,6 +97,7 @@ struct Sent {
     cache_control: bool,
     replayed: bool,
     raised_max_tokens: bool,
+    images: bool,
 }
 
 /// What this wire carries from one request to the next (module docs).
@@ -106,6 +110,9 @@ pub struct Memory {
     no_raise: bool,
     /// Adaptive thinking without `display: "summarized"` (reasoning then streams empty).
     no_display: bool,
+    /// Tool results go as text only: the provider refused an image.
+    no_images: bool,
+    pub(crate) images: ImageFiles,
     sent: Sent,
 }
 
@@ -120,6 +127,10 @@ impl Memory {
         if self.sent.replayed && m.contains("signature") {
             self.replays.clear();
             return Some("the provider refused a replayed thinking block; resending without the earlier thinking".into());
+        }
+        if refuses_images(err, self.sent.images) {
+            self.no_images = true;
+            return Some("the provider refused an image; tool results go as text only from now on".into());
         }
         if self.sent.cache_control && m.contains("cache_control") {
             self.no_cache_control = true;
@@ -168,12 +179,12 @@ fn replay_key(text: &str, calls: &[ToolCall]) -> u64 {
 /// message unchanged.
 pub fn body(req: &Request<'_>, stream: bool, memory: &mut Memory) -> Value {
     let plain = req.tools.is_empty();
-    let (messages, replayed) = messages_json(req.messages, plain, memory);
+    let (messages, replayed, images) = messages_json(req.messages, plain, memory);
     if !plain {
         // Entries whose message is gone (compacted away) are never needed again.
         memory.replays.retain(|key, _| replayed.contains(key));
     }
-    let mut sent = Sent { replayed: !replayed.is_empty(), ..Sent::default() };
+    let mut sent = Sent { replayed: !replayed.is_empty(), images, ..Sent::default() };
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
     let configured = req.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1);
@@ -245,13 +256,14 @@ fn budget_for(effort: &str) -> u32 {
     }
 }
 
-/// `(messages, keys of the assistant messages whose thinking was replayed)`. Roles must
-/// alternate, so consecutive same-role messages merge (tool results and a steer that followed
-/// them become one user message, results first); empty text is left out, since the API refuses
-/// empty text blocks.
-fn messages_json(messages: &[Message], plain: bool, memory: &Memory) -> (Vec<Value>, Vec<u64>) {
+/// `(messages, keys of the assistant messages whose thinking was replayed, whether an image
+/// went)`. Roles must alternate, so consecutive same-role messages merge (tool results and a steer
+/// that followed them become one user message, results first); empty text is left out, since the
+/// API refuses empty text blocks.
+fn messages_json(messages: &[Message], plain: bool, memory: &Memory) -> (Vec<Value>, Vec<u64>, bool) {
     let mut turns: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(messages.len());
     let mut replayed = Vec::new();
+    let mut sent_images = false;
     for m in messages {
         let (role, blocks): (&'static str, Vec<Value>) = match m {
             Message::User { text } => ("user", text_block(text).into_iter().collect()),
@@ -275,7 +287,11 @@ fn messages_json(messages: &[Message], plain: bool, memory: &Memory) -> (Vec<Val
                 ("assistant", blocks)
             }
             Message::Tool { name, text, is_error, .. } if plain => ("user", text_block(&result_as_text(name, text, *is_error)).into_iter().collect()),
-            Message::Tool { call_id, text, is_error, .. } => ("user", vec![tool_result(call_id, text, *is_error)]),
+            Message::Tool { call_id, text, is_error, images, .. } => {
+                let pictures: Vec<(&str, String)> = if memory.no_images { Vec::new() } else { images.iter().filter_map(|img| memory.images.load(img, Some(MAX_IMAGE_B64))).collect() };
+                sent_images |= !pictures.is_empty();
+                ("user", vec![tool_result(call_id, text, *is_error, &pictures)])
+            }
         };
         if blocks.is_empty() {
             continue;
@@ -289,7 +305,7 @@ fn messages_json(messages: &[Message], plain: bool, memory: &Memory) -> (Vec<Val
         turns.insert(0, ("user", vec![json!({"type": "text", "text": "(continuing an earlier conversation)"})]));
     }
     let messages = turns.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect();
-    (messages, replayed)
+    (messages, replayed, sent_images)
 }
 
 fn text_block(text: &str) -> Option<Value> {
@@ -318,12 +334,20 @@ fn assistant_blocks(text: &str, calls: &[ToolCall], replay: &[Replay]) -> Vec<Va
     blocks
 }
 
-fn tool_result(call_id: &str, text: &str, is_error: bool) -> Value {
-    let content = if text.trim().is_empty() { "(no output)" } else { text };
+/// A result block: its text, and the images (media type, base64) beside it in its content.
+fn tool_result(call_id: &str, text: &str, is_error: bool, images: &[(&str, String)]) -> Value {
+    let text = if text.trim().is_empty() { "(no output)" } else { text };
+    let content = if images.is_empty() {
+        json!(text)
+    } else {
+        let mut parts = vec![json!({"type": "text", "text": text})];
+        parts.extend(images.iter().map(|(mime, b64)| json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})));
+        Value::Array(parts)
+    };
     let mut block = Map::new();
     block.insert("type".into(), json!("tool_result"));
     block.insert("tool_use_id".into(), json!(call_id));
-    block.insert("content".into(), json!(content));
+    block.insert("content".into(), content);
     if is_error {
         block.insert("is_error".into(), json!(true));
     }
@@ -631,7 +655,7 @@ mod tests {
         let (resp, _) = feed(FIXTURE, &mut memory);
         let assistant = resp.expect("ok").message;
         let tools = tools();
-        let history = vec![Message::User { text: "look around".into() }, assistant, Message::Tool { call_id: "toolu_1".into(), name: "list_dir".into(), text: "src/\nCargo.toml".into(), is_error: false }];
+        let history = vec![Message::User { text: "look around".into() }, assistant, Message::Tool { images: vec![], call_id: "toolu_1".into(), name: "list_dir".into(), text: "src/\nCargo.toml".into(), is_error: false }];
         let b = body(&request(&history, &tools, "high"), true, &mut memory);
         assert_eq!(
             b["messages"][1],
@@ -674,7 +698,7 @@ mod tests {
         let history = vec![
             Message::User { text: "go".into() },
             Message::Assistant { text: String::new(), reasoning: String::new(), tool_calls: vec![ToolCall { id: "t1".into(), name: "list_dir".into(), args: Value::Null, raw: "{oops".into() }] },
-            Message::Tool { call_id: "t1".into(), name: "list_dir".into(), text: "bad arguments".into(), is_error: true },
+            Message::Tool { images: vec![], call_id: "t1".into(), name: "list_dir".into(), text: "bad arguments".into(), is_error: true },
             Message::User { text: "[note] also check tests/".into() },
             Message::User { text: "  ".into() },
         ];
@@ -762,7 +786,7 @@ mod tests {
         assert!(b.get("cache_control").is_none());
 
         let (resp, _) = feed(FIXTURE, &mut m);
-        let history = vec![Message::User { text: "look".into() }, resp.expect("ok").message, Message::Tool { call_id: "toolu_1".into(), name: "list_dir".into(), text: "x".into(), is_error: false }];
+        let history = vec![Message::User { text: "look".into() }, resp.expect("ok").message, Message::Tool { images: vec![], call_id: "toolu_1".into(), name: "list_dir".into(), text: "x".into(), is_error: false }];
         let tools = tools();
         body(&request(&history, &tools, ""), true, &mut m);
         assert!(m.adapt(&bad_request("messages.1.content.0: Invalid `signature` in `thinking` block")).is_some());
@@ -797,6 +821,44 @@ mod tests {
         assert_eq!((&tool_calls[0].args, tool_calls[0].raw.as_str()), (&json!({"path": "b.rs"}), ""), "an input sent as its JSON text is unwrapped");
         let err = parse_response(br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 300000 tokens > 200000 maximum"}}"#, &mut memory).expect_err("error body");
         assert_eq!(err.kind, ErrorKind::Context);
+    }
+
+    /// A result's images go inside its `tool_result` block, read from their files; one too big
+    /// for the API is left out up front, and a refused image turns images off for the session.
+    #[test]
+    fn images_go_in_the_tool_result_block() {
+        let dir = std::env::temp_dir().join(format!("bija-messages-img-{}", crate::types::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("c1-1.png");
+        let bytes = b"\x89PNG\r\n\x1a\nsmall".to_vec();
+        std::fs::write(&small, &bytes).unwrap();
+        let big = dir.join("c1-2.jpg");
+        let mut huge = vec![0xFF, 0xD8, 0xFF];
+        huge.resize(MAX_IMAGE_B64, 0);
+        std::fs::write(&big, &huge).unwrap();
+        let images = vec![crate::types::Image { mime: "image/png".into(), path: small.clone() }, crate::types::Image { mime: "image/jpeg".into(), path: big.clone() }];
+        let assistant = Message::Assistant { text: String::new(), reasoning: String::new(), tool_calls: vec![ToolCall { id: "toolu_1".into(), name: "mcp__demo__render".into(), args: json!({}), raw: String::new() }] };
+        let history = vec![Message::User { text: "render".into() }, assistant, Message::Tool { images, call_id: "toolu_1".into(), name: "mcp__demo__render".into(), text: "rendered".into(), is_error: false }];
+        let tools = tools();
+        let mut memory = Memory::default();
+        let b = body(&request(&history, &tools, ""), true, &mut memory);
+        assert_eq!(
+            b["messages"][2],
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "text", "text": "rendered"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": crate::types::base64_encode(&bytes)}},
+            ]}]})
+        );
+        let warnings = memory.images.take_warnings();
+        assert!(warnings.len() == 1 && warnings[0].contains("c1-2.jpg") && warnings[0].contains("more than this provider takes"), "{warnings:?}");
+        // Without tools (a compaction) the result is plain text.
+        assert!(!body(&request(&history, &[], ""), true, &mut memory).to_string().contains("\"image\""));
+
+        body(&request(&history, &tools, ""), true, &mut memory);
+        assert!(memory.adapt(&bad_request("messages.2.content.0.content.1.image.source.base64: image exceeds 5 MB maximum")).is_some());
+        let b = body(&request(&history, &tools, ""), true, &mut memory);
+        assert_eq!(b["messages"][2]["content"][0]["content"], "rendered", "text only from now on");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

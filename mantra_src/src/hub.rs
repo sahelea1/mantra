@@ -19,6 +19,7 @@ use tokio::process::{Child, ChildStderr};
 use tokio::sync::mpsc;
 
 pub use crate::config::ProviderKind as Backend;
+use crate::config::McpServer;
 pub use bija::{sandbox_mode as bija_sandbox, BijaSpawn};
 pub use claude::ClaudeSpawn;
 
@@ -51,6 +52,11 @@ pub struct SpawnSpec {
     pub claude: Option<ClaudeSpawn>,
     /// Bija-only spawn config; `None` for the other backends.
     pub bija: Option<BijaSpawn>,
+    /// The MCP servers this agent gets, already resolved from settings (`Settings::mcp_for`) by
+    /// `app::spawn_agent`'s callers; empty = none, which leaves every backend's launch as it was.
+    /// Codex gets them as `-c mcp_servers.<name>…` (`codex_mcp_args`), Claude Code beside
+    /// `mantra` in `--mcp-config`, bija as `mcp.json` (`--mcp-file`).
+    pub mcp: Vec<(String, McpServer)>,
 }
 
 #[derive(Debug)]
@@ -65,6 +71,11 @@ pub enum Cmd {
     Shell { command: String },
     SetEffort(String),
     SetModel(String),
+    /// After a `SetModel`: whether the new model takes images. bija offers or withdraws its own
+    /// vision tools (`set{vision}`) and launches with or without `--vision` from then on; Codex
+    /// and Claude Code have no tools of their own to switch (Mantra's `mantra_*` vision tools
+    /// refuse a model that does not see).
+    SetVision(bool),
     SetApproval(String),
     /// Rename the agent's thread (the run's title changed). Codex and bija; a Claude Code session
     /// has no name to set.
@@ -134,6 +145,10 @@ pub struct Hub {
     /// `ClaudeCode` provider exists (`enable_bridge = false` in `Hub::new`), or when the socket
     /// couldn't be created (logged, never fatal — Claude agents just run without dynamic tools).
     bridge_sock: Option<PathBuf>,
+    /// Why the bridge socket could not be made, when it was wanted and could not be: every Claude
+    /// Code agent then runs without Mantra's tools, which the user must hear about from the app —
+    /// not only from `mantra.log` (`Hub::bridge_problem`).
+    bridge_problem: Option<String>,
     /// Cloned into every bija agent's task, which drops it once its process is reaped; nothing is
     /// ever sent. `shutdown_all` lets go of the Hub's own and waits on `bija_gone`, which closes
     /// when the last clone is gone.
@@ -146,9 +161,20 @@ impl Hub {
     /// the registry has at least one `ClaudeCode`-kind provider (WP10.4); computed by the caller
     /// (`main.rs`) so `Hub` itself never has to know about `config::Registry`.
     pub fn new(codex_cmd: Vec<String>, claude_cmd: Vec<String>, bija_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>, enable_bridge: bool) -> Hub {
-        let bridge_sock = if enable_bridge { setup_bridge(ev.clone()) } else { None };
+        // No Claude Code provider is not a problem: nothing would have used the socket.
+        let (bridge_sock, bridge_problem) = match enable_bridge.then(|| setup_bridge(ev.clone())) {
+            Some(Ok(path)) => (Some(path), None),
+            Some(Err(why)) => (None, Some(why)),
+            None => (None, None),
+        };
         let (alive, gone) = mpsc::channel(1);
-        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bija_alive: Some(alive), bija_gone: Some(gone) }
+        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bridge_problem, bija_alive: Some(alive), bija_gone: Some(gone) }
+    }
+
+    /// Why Claude Code agents have no bridge to Mantra's tools, if the socket was wanted and could
+    /// not be made (the directory, the bind, or no short path when the home's is too long).
+    pub fn bridge_problem(&self) -> Option<String> {
+        self.bridge_problem.clone()
     }
 
     /// The bridge socket path a Claude agent's `--mcp-config` should point `mantra mcp-bridge` at,
@@ -245,26 +271,54 @@ impl Stopping {
 }
 
 /// Opens the Hub's one MCP-bridge Unix socket at `$MANTRA_HOME/run/<pid>.sock` and spawns the
-/// accept loop (WP10.4). Returns `None` (logged, never fatal) if the directory or the socket
-/// itself can't be created — Claude agents then just run without the `mantra_*` dynamic tools
-/// (`hub::claude::build_args` only adds `--mcp-config` when this returned `Some`).
-fn setup_bridge(ev: mpsc::UnboundedSender<HubEvent>) -> Option<PathBuf> {
+/// accept loop (WP10.4). Never fatal: when the directory or the socket itself can't be created the
+/// reason is logged and returned — Claude agents then run without the `mantra_*` dynamic tools
+/// (`hub::claude::build_args` only adds `--mcp-config` with a socket), and `App` says so.
+fn setup_bridge(ev: mpsc::UnboundedSender<HubEvent>) -> Result<PathBuf, String> {
+    let fail = |why: String| {
+        crate::mlog!("mcp bridge: {why}");
+        Err(why)
+    };
     let dir = crate::config::home().join("run");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        crate::mlog!("mcp bridge: couldn't create {}: {e}", dir.display());
-        return None;
+        return fail(format!("couldn't create {}: {e}", dir.display()));
     }
-    let path = dir.join(format!("{}.sock", std::process::id()));
+    let Some(path) = bridge_sock_path(&dir, std::process::id()) else {
+        return fail(format!("{} is too long for a socket path, and no short directory of our own in /tmp", dir.display()));
+    };
     let _ = std::fs::remove_file(&path); // stale socket from an unclean exit; pid-scoped so this is rare
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
-        Err(e) => {
-            crate::mlog!("mcp bridge: bind {}: {e}", path.display());
-            return None;
-        }
+        Err(e) => return fail(format!("couldn't open the socket {}: {e}", path.display())),
     };
     tokio::spawn(bridge_accept_loop(listener, ev));
-    Some(path)
+    Ok(path)
+}
+
+/// The longest socket path that binds everywhere: `sun_path` is 108 bytes on Linux and 104 on
+/// macOS, the closing NUL included.
+const SUN_PATH_MAX: usize = 100;
+
+/// `<run>/<pid>.sock` when it fits a socket address; else (a long `$MANTRA_HOME` or home
+/// directory, where the bind would fail and every Claude agent would go without Mantra's tools)
+/// `/tmp/mantra-<uid>/<pid>.sock`, in a directory only this user can enter. `None` when that
+/// directory is not ours (another user's, a symlink) or cannot be made.
+fn bridge_sock_path(run: &std::path::Path, pid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let name = format!("{pid}.sock");
+    let path = run.join(&name);
+    if path.as_os_str().len() <= SUN_PATH_MAX {
+        return Some(path);
+    }
+    let uid = std::fs::metadata(run).ok()?.uid();
+    let dir = PathBuf::from(format!("/tmp/mantra-{uid}"));
+    let _ = std::fs::create_dir(&dir);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() || meta.uid() != uid {
+        return None;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir.join(name))
 }
 
 async fn bridge_accept_loop(listener: UnixListener, ev: mpsc::UnboundedSender<HubEvent>) {
@@ -352,6 +406,8 @@ async fn agent_task(
     let mut effort = spec.effort.clone();
     let mut model = spec.model.clone();
     let mut approval = spec.approval.clone();
+    // bija only: `--vision` for the next launch, which a live model switch changes (`SetVision`).
+    let mut vision = spec.bija.as_ref().is_some_and(|b| b.vision);
     let mut restarts: u32 = 0;
     let mut launch_failures: u32 = 0;
     let mut window = Instant::now();
@@ -370,7 +426,7 @@ async fn agent_task(
         let started = match spec.backend {
             Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
             Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
-            Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn, &mut turn_cut).await,
+            Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut vision, &mut replay, &mut last_turn, &mut turn_cut).await,
         };
         let launch_failure = matches!(started, Exit::LaunchFailed(_));
         match started {
@@ -416,6 +472,7 @@ async fn agent_task(
                                 None | Some(Cmd::Shutdown) => { let _ = ev.send(HubEvent::Exited { agent: id }); return; }
                                 Some(Cmd::SetEffort(e)) => effort = e,
                                 Some(Cmd::SetModel(m)) => model = m,
+                                Some(Cmd::SetVision(v)) => vision = v,
                                 Some(Cmd::SetApproval(a)) => approval = a,
                                 Some(Cmd::Restart) => continue 'outer,
                                 // Held, not failed: the retry is still coming, so this text still has
@@ -442,6 +499,11 @@ async fn agent_task(
                         Some(Cmd::Turn { text }) | Some(Cmd::Steer { text }) => {
                             let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "agent is down (press r to restart)".into(), text: Some(text) });
                         }
+                        // A model picked while it is down is the one the restart launches.
+                        Some(Cmd::SetEffort(e)) => effort = e,
+                        Some(Cmd::SetModel(m)) => model = m,
+                        Some(Cmd::SetVision(v)) => vision = v,
+                        Some(Cmd::SetApproval(a)) => approval = a,
                         _ => {}
                     }
                 }
@@ -618,6 +680,7 @@ async fn run_process(
                     Some(Cmd::RespondErr { id: rid, message }) => conn.respond_err(rid, -32000, &message),
                     Some(Cmd::SetEffort(e)) => *effort = e,
                     Some(Cmd::SetModel(m)) => *model = m,
+                    Some(Cmd::SetVision(_)) => {}
                     Some(Cmd::SetName(n)) => fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": n}), "name", None),
                     Some(Cmd::SetApproval(a)) => {
                         // Apply to the live thread now (not just the next turn/start we send).
@@ -716,6 +779,84 @@ fn fire(conn: &Conn, ev: &mpsc::UnboundedSender<HubEvent>, id: AgentId, method: 
             let _ = ev.send(HubEvent::CmdFailed { agent: id, what, error: e.message, text });
         }
     });
+}
+
+// ── MCP servers and images, for every backend ─────────────────────────────────────────────────
+
+/// `-c` overrides that give a Codex process the agent's MCP servers: `mcp_servers.<name>.command`,
+/// `.args`, `.enabled=true` and, when there is one, `.env`, each value a TOML literal. Codex
+/// launches and speaks to them itself; their calls come back as `mcpToolCall` items under the
+/// server's own name. `-c` merges at dotted leaf paths, so a same-named server in
+/// `~/.codex/config.toml` keeps its other keys (its timeouts) and takes these — `enabled` among
+/// them, or one switched off there would stay off, silently, for an agent given it here. The env
+/// values ride on argv, as with Claude Code's `--mcp-config`: a secret is better kept in the
+/// environment Mantra itself starts with.
+pub fn codex_mcp_args(servers: &[(String, McpServer)]) -> Vec<String> {
+    let mut out = vec![];
+    for (name, s) in servers {
+        let base = format!("mcp_servers.{name}");
+        out.push("-c".into());
+        out.push(format!("{base}.command={}", toml_quote(&s.command)));
+        out.push("-c".into());
+        out.push(format!("{base}.args=[{}]", s.args.iter().map(|a| toml_quote(a)).collect::<Vec<_>>().join(",")));
+        out.push("-c".into());
+        out.push(format!("{base}.enabled=true"));
+        if !s.env.is_empty() {
+            let pairs: Vec<String> = s.env.iter().map(|(k, v)| format!("{}={}", toml_quote(k), toml_quote(v))).collect();
+            out.push("-c".into());
+            out.push(format!("{base}.env={{{}}}", pairs.join(",")));
+        }
+    }
+    out
+}
+
+/// A TOML basic string, every control character escaped too: Codex parses a `-c` value as TOML
+/// and takes one that does not parse as a plain string, so an argument with a newline in it would
+/// quietly arrive with its quotes rather than fail.
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `mcp__<server>__<tool>` → `(server, tool)`: how Claude Code and bija name an MCP server's
+/// tools. A server name never holds `__` (`config::mcp_name_problem`), so the first `__` after the
+/// prefix ends it; the tool may be called anything.
+fn mcp_tool_name(name: &str) -> Option<(&str, &str)> {
+    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
+}
+
+/// `data:<mime>;base64,<data>` → `(mime, data)`: an `inputImage` item's `imageUrl` as the engine
+/// builds it (spec §2.3). Anything else — a remote URL — is not an image Mantra can hand on.
+pub fn data_url_parts(url: &str) -> Option<(&str, &str)> {
+    let (head, data) = url.strip_prefix("data:")?.split_once(',')?;
+    let mime = head.strip_suffix(";base64")?;
+    (mime.starts_with("image/") && !data.is_empty()).then_some((mime, data))
+}
+
+/// `(mime, base64)` of every `inputImage` item in an engine answer (`{"contentItems":[…],
+/// "success":…}`); none for the answers that carry only text, which is nearly all of them.
+fn answer_images(result: &Value) -> Vec<(String, String)> {
+    let Some(items) = result.get("contentItems").and_then(|c| c.as_array()) else { return vec![] };
+    items
+        .iter()
+        .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("inputImage"))
+        .filter_map(|i| i.get("imageUrl").and_then(|u| u.as_str()).and_then(data_url_parts))
+        .map(|(mime, data)| (mime.to_string(), data.to_string()))
+        .collect()
 }
 
 // ── shared by the NDJSON backends (`hub/claude.rs`, `hub/bija.rs`) ──────────────────────────────
@@ -899,6 +1040,49 @@ mod tests {
         assert_eq!(stagger(None, t0), (Duration::ZERO, t0));
     }
 
+    /// A `$MANTRA_HOME` too long for a socket address (a deep project dir, a CI scratch dir) moves
+    /// the bridge socket to `/tmp/mantra-<uid>/`, owner-only, instead of failing the bind and
+    /// leaving every Claude agent without Mantra's tools; a short one keeps it under `run/`.
+    #[test]
+    fn the_bridge_socket_moves_to_a_short_dir_when_the_home_is_too_long() {
+        use std::os::unix::fs::PermissionsExt;
+        let short = PathBuf::from(format!("/tmp/mantra-hub-test-{}", std::process::id()));
+        std::fs::create_dir_all(&short).unwrap();
+        assert_eq!(bridge_sock_path(&short, 42), Some(short.join("42.sock")));
+        let deep = short.join("a-rather-long-directory-name-".repeat(4)).join("run");
+        std::fs::create_dir_all(&deep).unwrap();
+        let p = bridge_sock_path(&deep, 42).unwrap();
+        assert!(p.as_os_str().len() <= SUN_PATH_MAX && p.file_name().unwrap() == "42.sock" && !p.starts_with(&deep), "{}", p.display());
+        let dir = p.parent().unwrap();
+        assert!(dir.to_string_lossy().starts_with("/tmp/mantra-"));
+        assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+        // and it binds
+        let _l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&short);
+    }
+
+    /// A bridge socket that cannot be made is a reason the app can show, not only a log line; a Hub
+    /// that never wanted one (no Claude Code provider) has no problem to report. The home sits
+    /// under a regular file, which no one — root included — can make a directory in.
+    #[tokio::test]
+    async fn a_bridge_socket_that_cannot_be_made_is_a_reason_the_hub_gives() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let file = crate::config::home().join("not-a-dir");
+            std::fs::write(&file, "").unwrap();
+            let home = std::env::var("MANTRA_HOME").unwrap();
+            std::env::set_var("MANTRA_HOME", file.join("home"));
+            let (ev, _rx) = mpsc::unbounded_channel();
+            let hub = Hub::new(vec![], vec![], vec![], ev.clone(), true);
+            let quiet = Hub::new(vec![], vec![], vec![], ev, false);
+            std::env::set_var("MANTRA_HOME", home);
+            let why = hub.bridge_problem().expect("the socket could not be made");
+            assert!(why.contains("couldn't create") && why.contains("not-a-dir"), "{why}");
+            assert_eq!(hub.bridge_sock(), None);
+            assert_eq!(quiet.bridge_problem(), None, "no bridge wanted, no problem");
+        });
+    }
+
     #[test]
     fn launch_failures_stop_after_a_short_budget_while_crashes_keep_the_long_one() {
         // A process that never comes up: 3 attempts in all (2 restarts), quick backoff between them.
@@ -961,6 +1145,7 @@ mod tests {
             envs: vec![],
             claude: None,
             bija: None,
+            mcp: vec![],
         };
         let cmd: Vec<String> = ["sh", "-c", "echo 'ERROR codex_app_server: cannot read /proc/self/exe (simulated)' >&2; exit 3"].iter().map(|s| s.to_string()).collect();
         let (ev, mut rx) = mpsc::unbounded_channel();
@@ -1028,6 +1213,7 @@ done"#;
             envs: vec![("NAMES_LOG".into(), log.to_string_lossy().to_string())],
             claude: None,
             bija: None,
+            mcp: vec![],
         };
         let cmd: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
         let (ev, mut rx) = mpsc::unbounded_channel();
@@ -1116,5 +1302,64 @@ done"#;
         assert_eq!(shapes[3].1["tokenUsage"]["last"]["inputTokens"], 3_000);
         let no_window = token_usage(3, 1, 2, Totals { window: None, ..totals });
         assert!(matches!(no_window, HubEvent::Notif { params, .. } if params["tokenUsage"].get("modelContextWindow").is_none()), "no window is no window, never 0");
+    }
+
+    fn mcp_server(command: &str, args: &[&str], env: &[(&str, &str)]) -> McpServer {
+        McpServer { command: command.into(), args: args.iter().map(|a| a.to_string()).collect(), env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), enabled: true }
+    }
+
+    /// Each server is four `-c` lines at most — command, args as a TOML array, `enabled=true` (a
+    /// same-named server switched off in ~/.codex/config.toml must not stay off), env as an inline
+    /// table only when it has one — with every value a TOML string Codex parses back as written,
+    /// spaces, quotes, backslashes and newlines included.
+    #[test]
+    fn codex_gets_each_mcp_server_as_toml_overrides() {
+        let servers = vec![
+            ("blender".to_string(), mcp_server("uvx", &["blender-mcp"], &[])),
+            ("files".to_string(), mcp_server("/opt/my tools/fs", &["--root", "/tmp/a b", "say \"hi\"", "C:\\dir", "two\nlines"], &[("TOKEN", "s\"3"), ("A_B", "x")])),
+        ];
+        let args = codex_mcp_args(&servers);
+        assert_eq!(&args[..6], &["-c", "mcp_servers.blender.command=\"uvx\"", "-c", "mcp_servers.blender.args=[\"blender-mcp\"]", "-c", "mcp_servers.blender.enabled=true"]);
+        assert_eq!(args.iter().filter(|a| *a == "-c").count(), 7, "no env line for a server without env: {args:?}");
+        let values: HashMap<&str, &str> = args.iter().filter(|a| *a != "-c").filter_map(|a| a.split_once('=')).collect();
+        // what Codex does with `-c key=value`: the value is parsed as TOML
+        let parse = |key: &str| -> toml::Value {
+            let text = format!("v = {}", values.get(key).unwrap_or_else(|| panic!("{key} missing: {args:?}")));
+            toml::from_str::<toml::Table>(&text).unwrap_or_else(|e| panic!("{key}: {e}"))["v"].clone()
+        };
+        assert_eq!(parse("mcp_servers.files.command").as_str(), Some("/opt/my tools/fs"));
+        let fs_args: Vec<String> = parse("mcp_servers.files.args").as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(fs_args, vec!["--root", "/tmp/a b", "say \"hi\"", "C:\\dir", "two\nlines"]);
+        assert_eq!(parse("mcp_servers.files.enabled").as_bool(), Some(true));
+        let env = parse("mcp_servers.files.env");
+        assert_eq!((env["TOKEN"].as_str(), env["A_B"].as_str()), (Some("s\"3"), Some("x")));
+        assert!(codex_mcp_args(&[]).is_empty(), "no servers, no arguments");
+        assert_eq!(toml_quote("bell\u{7}"), "\"bell\\u0007\"");
+    }
+
+    #[test]
+    fn mcp_tool_names_split_into_server_and_tool() {
+        assert_eq!(mcp_tool_name("mcp__blender__get_scene_info"), Some(("blender", "get_scene_info")));
+        assert_eq!(mcp_tool_name("mcp__demo__render__preview"), Some(("demo", "render__preview")), "the tool keeps the rest");
+        assert_eq!(mcp_tool_name("mcp__my-files__read"), Some(("my-files", "read")));
+        for not in ["mcp__blender", "mcp____x", "mcp__x__", "Read", "mantra_status", "mcp_blender__x"] {
+            assert_eq!(mcp_tool_name(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn an_answers_images_are_its_data_url_input_images() {
+        assert_eq!(data_url_parts("data:image/png;base64,iVBORw0K"), Some(("image/png", "iVBORw0K")));
+        for not in ["https://example.com/a.png", "data:image/png,raw", "data:text/plain;base64,aGk=", "data:image/png;base64,"] {
+            assert_eq!(data_url_parts(not), None, "{not}");
+        }
+        let answer = json!({"contentItems": [
+            {"type": "inputText", "text": "saved /tmp/s.png"},
+            {"type": "inputImage", "imageUrl": "data:image/jpeg;base64,/9j/4AAQ"},
+            {"type": "inputImage", "imageUrl": "https://example.com/elsewhere.png"},
+        ], "success": true});
+        assert_eq!(answer_images(&answer), vec![("image/jpeg".to_string(), "/9j/4AAQ".to_string())]);
+        assert!(answer_images(&json!({"contentItems": [{"type": "inputText", "text": "ok"}], "success": true})).is_empty());
+        assert!(answer_images(&json!({"action": "decline"})).is_empty());
     }
 }

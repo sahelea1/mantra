@@ -303,9 +303,16 @@ fn clean_env(cmd: &mut Command) {
 
 impl Bija {
     fn spawn(args: &[String]) -> Bija {
+        Bija::spawn_with(args, &[])
+    }
+
+    /// The same, with these variables added to bija's environment.
+    fn spawn_with(args: &[String], env: &[(&str, &str)]) -> Bija {
         let mut cmd = Command::new(BIJA);
         cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         clean_env(&mut cmd);
+        cmd.env_remove("MANTRA_SCREENSHOT_CMD");
+        cmd.envs(env.iter().copied());
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, events) = mpsc::channel();
@@ -1198,6 +1205,342 @@ fn an_interrupted_idle_compaction_is_reported() {
     let (seen, code) = b.shutdown();
     assert_eq!(code, 0);
     assert!(!seen.iter().any(|e| e["ev"] == "compacted"), "nothing was compacted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MCP servers and images
+
+/// Set in a server's environment, this turns the test binary itself into a stdio MCP server
+/// (`mcp_server_mode`): a real process speaking the real protocol, with nothing to install.
+const MCP_MODE: &str = "BIJA_E2E_MCP_SERVER";
+/// A file each server start appends its pid to: evidence of (re)spawns and of their end.
+const MCP_MARKER: &str = "BIJA_E2E_MCP_MARKER";
+
+/// A real 2x2 RGB PNG (stored deflate block, CRCs and all).
+fn png() -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        let body = [&kind[..], data].concat();
+        out.extend(&body);
+        out.extend(crc32(&body).to_be_bytes());
+    }
+    let raw: Vec<u8> = [[0u8, 255, 0, 0, 0, 255, 0], [0, 0, 0, 255, 255, 255, 255]].concat();
+    let mut z = vec![0x78, 0x01, 0x01];
+    z.extend((raw.len() as u16).to_le_bytes());
+    z.extend((!(raw.len() as u16)).to_le_bytes());
+    z.extend(&raw);
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend(((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut out, b"IHDR", &[0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            s.push(if i <= c.len() { A[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    s
+}
+
+/// The MCP server this binary becomes (see `MCP_MODE`): `scene_info` (text), `render` (text and
+/// an image), `fail` (`isError`), listed over two pages; it says hello on stderr, records its pid,
+/// and exits when bija closes its stdin.
+#[test]
+fn mcp_server_mode() {
+    if std::env::var_os(MCP_MODE).is_none() {
+        return;
+    }
+    if let Some(marker) = std::env::var_os(MCP_MARKER) {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(marker).unwrap();
+        writeln!(f, "{}", std::process::id()).unwrap();
+    }
+    eprintln!("demo server up");
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Some(id) = msg.get("id").cloned() else { continue };
+        let text = |t: &str| json!({"type": "text", "text": t});
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "demo", "version": "1"}}),
+            "tools/list" if msg["params"]["cursor"].is_null() => json!({"tools": [
+                {"name": "scene_info", "description": "Describe the open scene.", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "render", "description": "Render a preview.", "inputSchema": {"type": "object", "properties": {"size": {"type": "integer"}}}},
+            ], "nextCursor": "more"}),
+            "tools/list" => json!({"tools": [{"name": "fail", "description": "Always fails."}]}),
+            "tools/call" => match msg["params"]["name"].as_str().unwrap_or("") {
+                "scene_info" => json!({"content": [text("Cube, Light"), text("Camera")]}),
+                "render" => json!({"content": [text(&format!("rendered at size {}", msg["params"]["arguments"]["size"])), {"type": "image", "data": b64(&png()), "mimeType": "image/png"}]}),
+                _ => json!({"content": [text("Blender is not running")], "isError": true}),
+            },
+            _ => json!({}),
+        };
+        writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+        out.flush().unwrap();
+    }
+    std::process::exit(0);
+}
+
+impl Scratch {
+    /// An `--mcp-file` with the demo server (this binary, see `mcp_server_mode`) and `extra`
+    /// servers beside it; returns it and the demo's pid marker file.
+    fn mcp_file(&self, extra: Value) -> (PathBuf, PathBuf) {
+        let marker = self.home.join("mcp-pids.txt");
+        let exe = std::env::current_exe().unwrap();
+        let mut servers = json!({"demo": {
+            "command": path(&exe),
+            "args": ["-q", "--exact", "mcp_server_mode", "--nocapture"],
+            "env": {MCP_MODE: "1", MCP_MARKER: path(&marker)},
+        }});
+        if let (Some(all), Value::Object(more)) = (servers.as_object_mut(), extra) {
+            all.extend(more);
+        }
+        let p = self.home.join("mcp.json");
+        std::fs::create_dir_all(&self.home).unwrap();
+        std::fs::write(&p, json!({"mcpServers": servers}).to_string()).unwrap();
+        (p, marker)
+    }
+}
+
+fn pids(marker: &Path) -> Vec<i32> {
+    std::fs::read_to_string(marker).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+/// Alive and not a zombie.
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| s.rsplit(')').next().is_some_and(|rest| !rest.trim_start().starts_with('Z'))).unwrap_or(false)
+}
+
+/// The image parts of the user message(s) a Chat Completions request carries after tool results.
+fn image_urls(req: &Value) -> Vec<String> {
+    messages(req)
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_array().cloned())
+        .flatten()
+        .filter_map(|p| p["image_url"]["url"].as_str().map(String::from))
+        .collect()
+}
+
+/// An MCP server's tools are offered under `mcp__<server>__<tool>` and called over the real
+/// protocol: text joined, `isError` a failed call, an image saved under the session and sent to
+/// the model after the results. A server that cannot start is a warning; the rest go on. The
+/// server's stderr reaches bija's, and shutdown ends it.
+#[test]
+fn mcp_tools_are_offered_called_and_their_images_reach_the_model() {
+    let mock = Mock::start(|req, _| {
+        if tool_results(req).is_empty() {
+            tool_reply(&[("call_s", "mcp__demo__scene_info", json!({})), ("call_r", "mcp__demo__render", json!({"size": "64"})), ("call_f", "mcp__demo__fail", json!({}))], 100)
+        } else {
+            text_reply("Seen the scene.", 140)
+        }
+    });
+    let s = Scratch::new();
+    let (mcp, marker) = s.mcp_file(json!({"broken": {"command": "/nonexistent/bija-mcp-server"}}));
+    let mut b = Bija::spawn(&s.args(&mock, &["--mcp-file", path(&mcp)]));
+    let id = b.ev("ready")["session"].as_str().unwrap().to_string();
+    let warning = b.ev("warning");
+    assert!(warning["message"].as_str().unwrap().starts_with("mcp broken: cannot start `/nonexistent/bija-mcp-server`"), "{}", b.dump());
+    assert_eq!(pids(&marker).len(), 1, "the demo server started with the session");
+
+    b.send(json!({"op": "prompt", "text": "what is in the scene?"}));
+    let started = b.ev("tool_started");
+    assert_eq!((started["name"].as_str(), &started["args"]), (Some("mcp__demo__scene_info"), &json!({})));
+    let scene = b.ev("tool_done");
+    assert_eq!((scene["name"].as_str(), scene["ok"].as_bool(), scene["result"].as_str()), (Some("mcp__demo__scene_info"), Some(true), Some("Cube, Light\nCamera")));
+    assert_eq!(b.ev("tool_started")["args"], json!({"size": 64}), "MCP arguments are shaped to the server's schema like any tool's");
+    let render = b.ev("tool_done");
+    let saved = s.home.join("sessions").join(&id).join("images").join("call_r-1.png");
+    assert_eq!(render["images"], json!([path(&saved)]), "{}", b.dump());
+    assert_eq!(render["result"], format!("rendered at size 64\n[image: {}]", saved.display()));
+    assert_eq!(std::fs::read(&saved).unwrap(), png());
+    let fail = b.ev("tool_done");
+    assert_eq!((fail["name"].as_str(), fail["ok"].as_bool(), fail["result"].as_str()), (Some("mcp__demo__fail"), Some(false), Some("Blender is not running")));
+    assert_eq!(b.ev("turn_done")["status"], "completed");
+
+    let reqs = mock.requests();
+    let offered = tool_names(&reqs[0].body);
+    for name in ["mcp__demo__scene_info", "mcp__demo__render", "mcp__demo__fail", "read_file"] {
+        assert!(offered.contains(&name.to_string()), "{name} not in {offered:?}");
+    }
+    assert!(!offered.iter().any(|n| n.contains("broken")));
+    let render_def = reqs[0].body["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "mcp__demo__render").unwrap().clone();
+    assert_eq!(render_def["function"]["description"], "Render a preview.");
+    assert_eq!(render_def["function"]["parameters"]["properties"]["size"]["type"], "integer");
+    assert!(content(&messages(&reqs[0].body)[0]).contains("MCP servers broken, demo"), "the system prompt names the servers");
+    // The results, then the image in a user message of its own.
+    let msgs = messages(&reqs[1].body);
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap_or("")).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool", "tool", "tool", "user"]);
+    assert_eq!(content(&msgs[4]), format!("rendered at size 64\n[image: {}]", saved.display()));
+    assert_eq!(msgs[6]["content"][0]["text"], format!("image from mcp__demo__render: {}", saved.display()));
+    assert_eq!(image_urls(&reqs[1].body), [format!("data:image/png;base64,{}", b64(&png()))]);
+
+    let t = s.transcript(&id);
+    let rec = t.iter().find(|r| r["call_id"] == "call_r").unwrap();
+    assert_eq!(rec["images"], json!([{"mime": "image/png", "path": path(&saved)}]), "the transcript keeps the path, never the bytes");
+    assert!(!std::fs::read_to_string(s.home.join("sessions").join(&id).join("transcript.jsonl")).unwrap().contains(&b64(&png())));
+    assert_eq!(s.meta(&id)["mcp_file"], path(&mcp));
+
+    let stderr = b.stderr.clone();
+    wait_until("the server's stderr is forwarded", Duration::from_secs(5), || stderr.lock().unwrap().contains("mcp demo: demo server up"));
+    let server = pids(&marker)[0];
+    assert!(alive(server));
+    let (_, code) = b.shutdown();
+    assert_eq!(code, 0);
+    wait_until("the MCP server ends with bija", Duration::from_secs(5), || !alive(server));
+}
+
+/// `--resume` starts the stored servers again, and an image already in the history goes to the
+/// model again, read from its file.
+#[test]
+fn a_resumed_session_respawns_its_mcp_servers() {
+    let mock = Mock::start(|req, _| {
+        let last = messages(req).last().map(content).unwrap_or_default();
+        match (last.as_str(), tool_results(req).len()) {
+            ("render it", 0) => tool_reply(&[("call_r", "mcp__demo__render", json!({"size": 2}))], 100),
+            ("and again", 1) => tool_reply(&[("call_s", "mcp__demo__scene_info", json!({}))], 100),
+            _ => text_reply("Done.", 120),
+        }
+    });
+    let s = Scratch::new();
+    let (mcp, marker) = s.mcp_file(json!({}));
+    let mut a = Bija::spawn(&s.args(&mock, &["--mcp-file", path(&mcp)]));
+    let id = a.ev("ready")["session"].as_str().unwrap().to_string();
+    a.send(json!({"op": "prompt", "text": "render it"}));
+    assert_eq!(a.ev("turn_done")["status"], "completed");
+    assert_eq!(a.shutdown().1, 0);
+    let first = pids(&marker);
+    wait_until("the first server is gone", Duration::from_secs(5), || !alive(first[0]));
+
+    // No --mcp-file: the servers come from the stored meta.
+    let mut b = Bija::spawn(&s.args(&mock, &["--resume", &id]));
+    assert_eq!(b.ev("ready")["resumed"], true);
+    let respawned = pids(&marker);
+    assert_eq!(respawned.len(), 2, "a second start: {respawned:?}");
+    assert!(alive(respawned[1]));
+    b.send(json!({"op": "prompt", "text": "and again"}));
+    let done = b.ev("tool_done");
+    assert_eq!((done["name"].as_str(), done["result"].as_str()), (Some("mcp__demo__scene_info"), Some("Cube, Light\nCamera")), "{}", b.dump());
+    assert_eq!(b.ev("turn_done")["status"], "completed");
+    let reqs = mock.requests();
+    let last = &reqs.last().unwrap().body;
+    assert!(tool_names(last).contains(&"mcp__demo__render".to_string()));
+    assert_eq!(image_urls(last), [format!("data:image/png;base64,{}", b64(&png()))], "the earlier render goes again");
+    assert_eq!(b.shutdown().1, 0);
+    wait_until("the respawned server is gone", Duration::from_secs(5), || !alive(respawned[1]));
+}
+
+/// The vision tools exist only with `--vision`; then `screenshot` captures through
+/// `$MANTRA_SCREENSHOT_CMD` and `view_image` reads a file relative to the cwd, and both images go
+/// to the model.
+#[test]
+fn vision_tools_come_with_the_flag_and_send_their_images() {
+    let mock = Mock::start(|req, _| {
+        if tool_names(req).iter().all(|n| n != "screenshot") {
+            return text_reply("No eyes.", 50);
+        }
+        if tool_results(req).is_empty() {
+            tool_reply(&[("call_shot", "screenshot", json!({"region": "0,0,2,2"})), ("call_view", "view_image", json!({"path": "art/pic.png"})), ("call_txt", "view_image", json!({"path": "notes.txt"}))], 100)
+        } else {
+            text_reply("I see two pictures.", 140)
+        }
+    });
+    let s = Scratch::new();
+    let fixture = s.home.join("screen.png");
+    std::fs::create_dir_all(&s.home).unwrap();
+    std::fs::write(&fixture, png()).unwrap();
+    std::fs::create_dir_all(s.work.join("art")).unwrap();
+    let mut pic = png();
+    pic.extend(b"trailing");
+    std::fs::write(s.work.join("art/pic.png"), &pic).unwrap();
+    std::fs::write(s.work.join("notes.txt"), "just text").unwrap();
+    let capture = format!("cp {} {{out}}", fixture.display());
+
+    let mut blind = Bija::spawn_with(&s.args(&mock, &[]), &[("MANTRA_SCREENSHOT_CMD", &capture)]);
+    blind.ev("ready");
+    blind.send(json!({"op": "prompt", "text": "look"}));
+    assert_eq!(blind.ev("message")["text"], "No eyes.");
+    assert_eq!(blind.shutdown().1, 0);
+    let offered = tool_names(&mock.requests()[0].body);
+    assert!(!offered.iter().any(|n| n == "screenshot" || n == "view_image"), "{offered:?}");
+
+    let mut b = Bija::spawn_with(&s.args(&mock, &["--vision"]), &[("MANTRA_SCREENSHOT_CMD", &capture)]);
+    let id = b.ev("ready")["session"].as_str().unwrap().to_string();
+    b.send(json!({"op": "prompt", "text": "look"}));
+    let shot = b.ev("tool_done");
+    let said = shot["result"].as_str().unwrap_or("");
+    assert!(shot["ok"] == true && said.contains("image/png, 2x2 px") && said.contains("via MANTRA_SCREENSHOT_CMD), region 0,0,2,2."), "{}", b.dump());
+    let view = b.ev("tool_done");
+    assert!(view["ok"] == true && view["result"].as_str().unwrap().starts_with("art/pic.png: image/png, 2x2 px"), "{}", b.dump());
+    let txt = b.ev("tool_done");
+    assert_eq!((txt["ok"].as_bool(), txt["result"].as_str()), (Some(false), Some("view_image: notes.txt: not a PNG, JPEG, GIF or WebP image")));
+    assert_eq!(b.ev("turn_done")["status"], "completed");
+    let images = s.home.join("sessions").join(&id).join("images");
+    assert_eq!(shot["images"], json!([path(&images.join("call_shot-1.png"))]));
+    assert_eq!(std::fs::read(images.join("call_view-1.png")).unwrap(), pic);
+    let reqs = mock.requests();
+    let last = &reqs.last().unwrap().body;
+    assert_eq!(image_urls(last), [format!("data:image/png;base64,{}", b64(&png())), format!("data:image/png;base64,{}", b64(&pic))]);
+    assert!(content(&messages(last)[0]).contains("screenshot shows you this machine's screen"));
+    assert_eq!(s.meta(&id)["vision"], true);
+    // a live switch to a model without vision (Mantra's `set`): the tools are gone from the next
+    // model call on, and the session says so for a later resume
+    b.send(json!({"op": "set", "vision": false}));
+    b.send(json!({"op": "prompt", "text": "look again"}));
+    assert_eq!(b.ev("message")["text"], "No eyes.", "{}", b.dump());
+    assert_eq!(b.ev("turn_done")["status"], "completed");
+    assert_eq!(s.meta(&id)["vision"], false);
+    let offered = tool_names(&mock.requests().last().unwrap().body);
+    assert!(!offered.iter().any(|n| n == "screenshot" || n == "view_image"), "{offered:?}");
+    assert_eq!(b.shutdown().1, 0);
+}
+
+/// Images in an external tool's result (`tool_result.images`, what Mantra sends for its own
+/// screenshot) are saved and sent like any other; one that is not an image is named instead.
+#[test]
+fn an_external_results_images_are_kept_and_sent() {
+    let mock = Mock::start(|req, _| match tool_results(req).last() {
+        None => tool_reply(&[("call_x", "mantra_ping", json!({"word": "shot"}))], 100),
+        Some(_) => text_reply("Got the picture.", 120),
+    });
+    let s = Scratch::new();
+    let tools = s.tools_file();
+    let mut b = Bija::spawn(&s.args(&mock, &["--tools-file", path(&tools)]));
+    let id = b.ev("ready")["session"].as_str().unwrap().to_string();
+    b.send(json!({"op": "prompt", "text": "take one"}));
+    b.ev("tool_call");
+    let images = json!([{"mime": "image/png", "b64": format!("data:image/png;base64,{}", b64(&png()))}, {"mime": "text/plain", "b64": b64(b"hello")}]);
+    b.send(json!({"op": "tool_result", "id": "call_x", "ok": true, "text": "/m/screenshots/w-1.png", "images": images}));
+    let done = b.ev("tool_done");
+    let saved = s.home.join("sessions").join(&id).join("images").join("call_x-1.png");
+    assert_eq!(done["result"], format!("/m/screenshots/w-1.png\n[an image was left out: text/plain is not a PNG, JPEG, GIF or WebP image]\n[image: {}]", saved.display()));
+    assert_eq!(done["images"], json!([path(&saved)]));
+    assert_eq!(b.ev("turn_done")["status"], "completed");
+    assert_eq!(image_urls(&mock.requests()[1].body), [format!("data:image/png;base64,{}", b64(&png()))]);
+    assert_eq!(b.shutdown().1, 0);
 }
 
 // ---------------------------------------------------------------------------------------------

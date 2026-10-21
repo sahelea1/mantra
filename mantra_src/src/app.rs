@@ -22,6 +22,9 @@ pub enum AppEvent {
     Discovered { source: String, result: Result<Vec<crate::discover::Candidate>, String> },
     /// A command from a web client (`--web` / `--remote`), executed by `App::web_command`.
     Web(crate::web::Inbound),
+    /// The answer to an agent's tool call worked out off the event loop (Solo's screenshot), for
+    /// `on_event` to hand on as `Cmd::Respond`.
+    ToolAnswer { agent: AgentId, id: Value, result: Value },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -177,6 +180,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/swarm", "start a swarm run, N workers at once: /swarm <N> <goal>"),
     ("/pattern", "choose the pattern for new runs"),
     ("/experimental", "experimental features: /experimental [name on|off]"),
+    ("/mcp", "MCP servers, and which Solo gets: /mcp [solo <name|*|none>]"),
     ("/runs", "this project's runs: resume or delete"),
     ("/plan", "show the run's plan"),
     ("/akasha", "the run's shared notes: /akasha [group]"),
@@ -207,6 +211,8 @@ pub struct App {
     pub overlays: Vec<Overlay>,
     pub input: Input,
     pub solo: Option<AgentId>,
+    /// The MCP servers the current Solo agent was started with (`/mcp` says which).
+    pub solo_mcp: Vec<String>,
     pub run: Option<Run>,
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
@@ -279,6 +285,82 @@ pub struct AgentOpts {
     pub resume_thread: Option<String>,
     /// What the backend calls this agent's thread (`<run title> · <role name>`), where it can.
     pub thread_name: Option<String>,
+    /// The MCP servers this agent gets, resolved by the caller (`Settings::mcp_for` on Solo's
+    /// `solo_mcp` or the role's `mcp`); empty for everything else (architect, probes).
+    pub mcp: Vec<(String, crate::config::McpServer)>,
+}
+
+/// The name `--demo` registers its stand-in MCP server under (`mantra mock-mcp`).
+pub const DEMO_MCP: &str = "demo";
+
+/// One journal line per role and MCP server it asks for that settings.toml does not have, or
+/// names in a way that cannot work (`Settings::mcp_refused`): the role runs without it, as it
+/// would if it had never asked — never a halt over a missing extra.
+fn mcp_missing_lines(settings: &Settings, pattern: &Pattern) -> Vec<String> {
+    let mut out = vec![];
+    for (name, role) in pattern.ordered_roles() {
+        for missing in settings.mcp_missing(&role.mcp) {
+            out.push(format!("mcp: role {name} asks for `{missing}`, which is not configured — skipped"));
+        }
+        for (server, why) in settings.mcp_refused(&role.mcp) {
+            out.push(format!("mcp: role {name} gets `{server}`, whose name in settings.toml cannot work — skipped ({why})"));
+        }
+    }
+    out
+}
+
+/// What every Claude Code agent goes without when the Hub's MCP-bridge socket could not be made
+/// (`Hub::bridge_problem`): the toast at startup, the journal line of a run that has one.
+fn bridge_problem_line(why: &str) -> String {
+    format!("Claude Code agents have no Mantra tools: {why}")
+}
+
+/// Whether any role of `pattern` runs on Claude Code — its model, or the fallback it may switch to.
+fn pattern_uses_claude_code(registry: &Registry, pattern: &Pattern) -> bool {
+    let on_claude = |alias: &str| registry.backend_of(&registry.resolve(alias)) == crate::config::ProviderKind::ClaudeCode;
+    pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback.as_deref().is_some_and(|f| !f.trim().is_empty() && on_claude(f)))
+}
+
+/// settings.toml's `[mcp_servers]` when the file is there and parses (`App::refresh_mcp_servers`).
+fn on_disk_mcp_servers() -> Option<BTreeMap<String, crate::config::McpServer>> {
+    if !crate::config::home().join("settings.toml").exists() {
+        return None;
+    }
+    Settings::load_on_disk().ok().map(|s| s.mcp_servers)
+}
+
+/// Solo's toast for the servers `solo_mcp` would give it whose names cannot work, if any.
+fn mcp_refused_toast(settings: &Settings) -> Option<String> {
+    let refused = settings.mcp_refused(&settings.solo_mcp);
+    let first = refused.first()?;
+    let more = if refused.len() > 1 { format!(" (and {} more)", refused.len() - 1) } else { String::new() };
+    Some(format!("MCP server `{}` skipped: {}{more} — rename it in settings.toml", first.0, first.1))
+}
+
+/// `/mcp`'s one line: every configured server (`off` when disabled), what the current Solo agent
+/// was started with, and how to change that.
+fn mcp_summary(settings: &Settings, solo_has: &[String]) -> String {
+    if settings.mcp_servers.is_empty() {
+        return "no MCP servers — add one with `mantra mcp add <name> -- <command> [args…]`".into();
+    }
+    let list: Vec<String> = settings.mcp_servers.iter().map(|(name, s)| if s.enabled { name.clone() } else { format!("{name} (off)") }).collect();
+    let solo = if solo_has.is_empty() { "none".to_string() } else { solo_has.join(", ") };
+    format!("MCP: {} · Solo has: {solo} · /mcp solo <name|*|none>", list.join(", "))
+}
+
+/// `/mcp solo <arg>` → the new `solo_mcp`: `*` every enabled server, `none` none, else the names
+/// (space- or comma-separated), each of which must be configured.
+fn parse_solo_mcp(settings: &Settings, arg: &str) -> Result<Vec<String>, String> {
+    let words: Vec<&str> = arg.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
+    match words.as_slice() {
+        [] => Err("usage: /mcp solo <name|*|none>".into()),
+        ["*"] => Ok(vec!["*".into()]),
+        ["none"] => Ok(vec![]),
+        names => match names.iter().find(|n| !settings.mcp_servers.contains_key(**n)) {
+            Some(unknown) => Err(format!("no MCP server named {unknown} — `mantra mcp` lists them")),
+            None => Ok(names.iter().map(|n| n.to_string()).collect()),
+        },
+    }
 }
 
 /// `mantra experimental` and `/experimental`: every experimental feature, on or off, with its line.
@@ -347,6 +429,24 @@ fn sandbox_overrides(sandbox: &str, network: bool, extra: &[PathBuf], pattern: &
     out
 }
 
+/// The Codex `-c` overrides for MCP servers. Mantra's own tools reach the agent as
+/// `dynamic_tools` (`SpawnSpec.dynamic_tools`); the user's own `~/.codex/config.toml` MCP servers
+/// (`user_servers`) are never on that path, so the model can only call them with a name the
+/// app-server can't route — the log's "unsupported call: mcp__…". `-c mcp_servers={}` doesn't
+/// clear an already-populated table (`-c` merges at dotted leaf paths, never replaces a table
+/// wholesale), so each of the user's servers is disabled by name instead — all but the ones this
+/// agent is given (`given`, from settings.toml), which come with their command, args and env,
+/// and which Codex runs itself and reports as `mcpToolCall` items.
+fn codex_mcp_overrides(user_servers: &[String], given: &[(String, crate::config::McpServer)]) -> Vec<String> {
+    let mut out = vec![];
+    for name in user_servers.iter().filter(|n| !given.iter().any(|(g, _)| g == *n)) {
+        out.push("-c".into());
+        out.push(format!("mcp_servers.{name}.enabled=false"));
+    }
+    out.extend(crate::hub::codex_mcp_args(given));
+    out
+}
+
 /// The extra writable roots a Bija agent is launched with: for `workspace-write`, the spawn's own
 /// roots and the pattern's (existing directories, `~` expanded) — the set Codex gets, minus the
 /// toolchain caches, which bija opens by itself. `full` writes everywhere and `read-only`
@@ -363,6 +463,14 @@ fn bija_writable_roots(sandbox: &str, extra: &[PathBuf], pattern: &[String], hom
         }
     }
     roots
+}
+
+/// Whether a Claude Code agent runs under `--strict-mcp-config` (`ClaudeSpawn::strict_mcp`): one
+/// with a toolset of Mantra's beyond the vision tools (a run's agents, the architect) or with
+/// servers of Mantra's. Solo, with at most the vision tools, keeps the user's own `claude mcp`
+/// servers as it always had them.
+fn claude_strict_mcp(o: &AgentOpts) -> bool {
+    !o.mcp.is_empty() || o.tools.iter().any(|t| !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| tools::VISION_TOOLS.contains(&n)))
 }
 
 /// A Bija agent's spawn config and child environment. Like the Claude arm of `spawn_agent`,
@@ -383,6 +491,7 @@ fn bija_spawn(reg: &Registry, m: &crate::config::ModelEntry, o: &AgentOpts, cw: 
         sandbox: crate::hub::bija_sandbox(&o.sandbox).into(),
         writable_roots: bija_writable_roots(&o.sandbox, &o.extra_writable, &o.writable_roots, dirs::home_dir().as_deref()),
         network: o.network,
+        vision: reg.vision(&m.alias),
     };
     (spawn, key.into_iter().collect())
 }
@@ -412,22 +521,14 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
                 envs.push(("ANTHROPIC_API_KEY".to_string(), key));
             }
         }
-        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }), None)
+        let strict_mcp = claude_strict_mcp(&o);
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock(), strict_mcp }), None)
     } else if backend == crate::hub::Backend::Bija {
         let (spawn, envs) = bija_spawn(reg, &m, &o, cw, compact_pct);
         (vec![], envs, None, Some(spawn))
     } else {
         let mut extra = reg.provider_args();
-        // Mantra's own tools reach the agent as `dynamic_tools` (`SpawnSpec.dynamic_tools`
-        // above); the user's own `~/.codex/config.toml` MCP servers are never on that path, so
-        // the model can only call them with a name the app-server can't route — the log's
-        // "unsupported call: mcp__…". `-c mcp_servers={}` doesn't clear an already-populated
-        // table (`-c` merges at dotted leaf paths, never replaces a table wholesale), so each of
-        // the user's servers is disabled by name instead.
-        for name in crate::config::codex_user_mcp_server_names() {
-            extra.push("-c".into());
-            extra.push(format!("mcp_servers.{name}.enabled=false"));
-        }
+        extra.extend(codex_mcp_overrides(&crate::config::codex_user_mcp_server_names(), &o.mcp));
         extra.push("-c".into());
         extra.push(format!("model_context_window={cw}"));
         extra.push("-c".into());
@@ -475,6 +576,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         envs,
         claude,
         bija,
+        mcp: o.mcp.clone(),
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
     a.glyph = o.glyph;
@@ -560,6 +662,8 @@ pub struct Ctxt<'a> {
     pub hub: &'a mut Hub,
     pub agents: &'a mut BTreeMap<AgentId, Agent>,
     pub registry: &'a Registry,
+    /// For what a spawn resolves from settings: the role's MCP servers.
+    pub settings: &'a Settings,
     pub tx: &'a UnboundedSender<AppEvent>,
     pub notes: &'a mut Vec<String>,
 }
@@ -618,6 +722,7 @@ impl Ctx for Ctxt<'_> {
                 context_override: r.context_override,
                 resume_thread: None,
                 thread_name: r.thread_name,
+                mcp: self.settings.mcp_for(&r.mcp),
             },
         )
     }
@@ -646,6 +751,7 @@ impl Ctx for Ctxt<'_> {
                 context_override: r.context_override,
                 resume_thread: Some(thread),
                 thread_name: r.thread_name,
+                mcp: self.settings.mcp_for(&r.mcp),
             },
         )
     }
@@ -680,6 +786,9 @@ impl Ctx for Ctxt<'_> {
     }
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool) {
         self.hub.send(a, Cmd::Respond { id: req, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}) });
+    }
+    fn tool_result_items(&mut self, a: AgentId, req: Value, items: Vec<Value>, ok: bool) {
+        self.hub.send(a, Cmd::Respond { id: req, result: json!({"contentItems": items, "success": ok}) });
     }
     fn set_effort(&mut self, a: AgentId, effort: &str) -> String {
         let Some(ag) = self.agents.get_mut(&a) else { return effort.to_string() };
@@ -720,7 +829,8 @@ impl App {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        App {
+        let bridge_problem = hub.bridge_problem();
+        let mut app = App {
             side_panel: settings.side_panel,
             settings,
             registry,
@@ -732,6 +842,7 @@ impl App {
             overlays: vec![],
             input: Input::default(),
             solo: None,
+            solo_mcp: vec![],
             run: None,
             approvals: vec![],
             toast: None,
@@ -759,7 +870,13 @@ impl App {
             force_clear: false,
             flash_screen: None,
             web: None,
+        };
+        // Said once, here: only mantra.log would know otherwise, and a Claude Code agent without
+        // its tools just looks like one that will not use them.
+        if let Some(why) = bridge_problem {
+            app.toast(bridge_problem_line(&why), Level::Warn);
         }
+        app
     }
 
     pub fn toast(&mut self, text: impl Into<String>, level: Level) {
@@ -784,7 +901,7 @@ impl App {
     pub(crate) fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
         let mut run = self.run.take()?;
         let r = {
-            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             f(&mut run, &mut ctx)
         };
         self.run = Some(run);
@@ -802,8 +919,11 @@ impl App {
             self.hub.shutdown(old);
             self.agents.remove(&old);
         }
+        self.refresh_mcp_servers();
         let backend = self.registry.backend_of(&self.registry.resolve(&self.settings.default_model));
         let sandbox = role_sandbox(&self.settings.sandbox, backend);
+        let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
+        let mcp_names: Vec<String> = mcp.iter().map(|(name, _)| name.clone()).collect();
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -819,16 +939,22 @@ impl App {
                 approval: self.settings.approval_mode.clone(),
                 sandbox,
                 instructions: String::new(),
-                tools: vec![],
+                // the vision tools when Solo's model takes images (`on_request` runs them)
+                tools: if self.registry.vision(&self.settings.default_model) { tools::vision_tools() } else { vec![] },
                 extra_writable: vec![],
                 network: true,
                 writable_roots: vec![],
                 context_override: None,
                 resume_thread: None,
                 thread_name: None,
+                mcp,
             },
         );
         self.solo = Some(id);
+        self.solo_mcp = mcp_names;
+        if let Some(t) = mcp_refused_toast(&self.settings) {
+            self.toast(t, Level::Warn);
+        }
         if let Some(why) = self.model_problem(&self.settings.default_model) {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, &why);
@@ -838,6 +964,19 @@ impl App {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, "sandbox unavailable here: Codex agents run with danger-full-access; git worktrees still keep workers apart");
             }
+        }
+        // the startup toast goes away; Solo's own log keeps it where its missing tools show
+        if let Some(why) = self.hub.bridge_problem().filter(|_| backend == crate::config::ProviderKind::ClaudeCode) {
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.notice(Level::Warn, &bridge_problem_line(&why));
+            }
+        }
+    }
+
+    /// The run's journal line for a lost bridge, when one of its roles runs on Claude Code.
+    fn journal_bridge_problem(&self, run: &mut Run) {
+        if let Some(why) = self.hub.bridge_problem().filter(|_| pattern_uses_claude_code(&self.registry, &run.pattern)) {
+            run.log("⚠", "amber", bridge_problem_line(&why));
         }
     }
 
@@ -854,11 +993,31 @@ impl App {
     /// Saves the session's settings to settings.toml — except in demo mode, whose settings point
     /// at its mocks and have Akasha switched on in memory: a shift+tab or a model pick in the demo
     /// must not leave `mock-codex` or `experimental = ["akasha"]` behind for every real session.
+    ///
+    /// `[mcp_servers]` is written as the file has it now, not as this session read it: `mantra mcp
+    /// add` from another terminal while the app is open must survive the next model pick.
     pub(crate) fn save_settings(&self) {
         if self.demo {
             return;
         }
-        let _ = self.settings.save();
+        let mut s = self.settings.clone();
+        if let Some(servers) = on_disk_mcp_servers() {
+            s.mcp_servers = servers;
+        }
+        let _ = s.save();
+    }
+
+    /// Takes `[mcp_servers]` from settings.toml as it is now, so a `mantra mcp add|remove|enable|
+    /// disable` made while the app is open reaches the next Solo (`/new`), the next run and
+    /// `/mcp`. The demo keeps its own (the stand-in server, in memory only); no file, or one that
+    /// does not parse, keeps what the session has.
+    pub(crate) fn refresh_mcp_servers(&mut self) {
+        if self.demo {
+            return;
+        }
+        if let Some(servers) = on_disk_mcp_servers() {
+            self.settings.mcp_servers = servers;
+        }
     }
 
     /// `Registry::preflight` with the same demo-mode exemption as `model_problem`.
@@ -1040,6 +1199,8 @@ impl App {
         let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).map(|r| r.pattern.settings.context_cap).filter(|c| *c > 0);
         self.hub.send(a, Cmd::SetModel(new.model.clone()));
         self.hub.send(a, Cmd::SetEffort(effort.clone()));
+        // bija's own screenshot and view_image follow the model (Mantra's refuse a blind one)
+        self.hub.send(a, Cmd::SetVision(self.registry.vision(&new.alias)));
         if let Some(ag) = self.agents.get_mut(&a) {
             ag.model_alias = new.alias.clone();
             ag.model = new.model.clone();
@@ -1067,9 +1228,11 @@ impl App {
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
         let known = self.registry.context_windows();
+        let sees = crate::engine::run::vision_aliases(&self.registry);
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
             // the switch may bring an alias the run has not seen: refresh what it knows first
             run.set_known_models(known);
+            run.set_vision_models(sees);
             run.set_agent_model(a, &alias);
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
@@ -1149,6 +1312,7 @@ impl App {
             self.toast("a run is already active — re-prompt it from the stage, or /pause", Level::Warn);
             return;
         }
+        self.refresh_mcp_servers();
         let mut pattern = match Pattern::load(pattern.unwrap_or(&self.pattern_name), &self.project) {
             Ok(p) => p,
             Err(e) => {
@@ -1159,6 +1323,13 @@ impl App {
         let (from_pattern, tasks_from_pattern) = (pattern.settings.max_parallel, pattern.settings.max_tasks_per_phase);
         if let Some(n) = max_parallel {
             pattern.set_parallel(n);
+        }
+        if self.demo {
+            // Every demo role gets the stand-in server (`mantra mock-mcp`, registered by main.rs)
+            // and nothing else — a pattern of the user's that names a real one never starts it.
+            for role in pattern.roles.values_mut() {
+                role.mcp = vec![DEMO_MCP.to_string()];
+            }
         }
         let problems = self.preflight(&pattern);
         if !problems.is_empty() {
@@ -1175,15 +1346,20 @@ impl App {
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows());
+        run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
-            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
         }
         if let Some(w) = &self.sandbox_warning {
             run.log("⚠", "amber", format!("sandbox: {}", crate::util::trunc(w, 140)));
             run.log("⚠", "amber", "sandbox unavailable here: Codex agents run with danger-full-access; git worktrees still keep workers apart");
         }
+        for line in mcp_missing_lines(&self.settings, &run.pattern) {
+            run.log("⚠", "amber", line);
+        }
+        self.journal_bridge_problem(&mut run);
         if let Some(n) = max_parallel.filter(|n| *n != from_pattern) {
             let tasks = if n > tasks_from_pattern { format!(", and up to {n} tasks a phase (it says {tasks_from_pattern})") } else { String::new() };
             run.log("⚙", "blue", format!("up to {n} workers at once for this run (the pattern says {from_pattern}){tasks}"));
@@ -1228,6 +1404,7 @@ impl App {
             self.toast(owner.refusal(&r.id), Level::Error);
             return;
         }
+        self.refresh_mcp_servers();
         let st = match &r.state {
             Ok(s) => s.clone(),
             Err(e) => {
@@ -1251,12 +1428,14 @@ impl App {
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows());
+        run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         // before the boot too: the members it re-attaches get the akasha tools back
         run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
-            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
+            let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
         }
+        self.journal_bridge_problem(&mut run);
         self.run = Some(run);
         self.unfinished_runs.retain(|id| *id != r.id);
         self.screen = Screen::Stage;
@@ -1316,6 +1495,7 @@ impl App {
                 context_override: None,
                 resume_thread: None,
                 thread_name: None,
+                mcp: vec![],
             },
         );
         self.studio.architect = Some(id);
@@ -1368,6 +1548,7 @@ impl App {
                 context_override: None,
                 resume_thread: None,
                 thread_name: None,
+                mcp: vec![],
             },
         );
         self.probes.insert(id, (alias.to_string(), Instant::now()));
@@ -1520,6 +1701,7 @@ impl App {
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
             AppEvent::Web(i) => self.web_command(i),
+            AppEvent::ToolAnswer { agent, id, result } => self.hub.send(agent, Cmd::Respond { id, result }),
         }
     }
 
@@ -1776,6 +1958,21 @@ impl App {
                     self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}) });
                 } else if self.in_run(agent) {
                     self.with_run(|r, c| r.on_tool_call(c, agent, id, &tool, &args));
+                } else if let Some(a) = self.agents.get(&agent).filter(|_| tools::VISION_TOOLS.contains(&tool.as_str())) {
+                    // Solo's vision tools: captures under ~/.mantra/screenshots, for a model that
+                    // (still) takes images — a live switch to one that does not keeps the tools.
+                    // The capture runs off the event loop (a capture tool can take seconds, or
+                    // hang to its timeout) and comes back as `AppEvent::ToolAnswer`.
+                    if self.registry.vision(&a.model_alias) {
+                        let (cwd, name, tx, shots) = (a.cwd.clone(), a.name.clone(), self.tx.clone(), crate::config::home().join("screenshots"));
+                        tokio::task::spawn_blocking(move || {
+                            let (items, ok) = tools::vision_call(&tool, &args, &cwd, &shots, &name);
+                            let _ = tx.send(AppEvent::ToolAnswer { agent, id, result: json!({"contentItems": items, "success": ok}) });
+                        });
+                    } else {
+                        let items = vec![tools::text_item(&format!("{} does not take images here, so {tool} is not available.", a.model_alias))];
+                        self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": items, "success": false}) });
+                    }
                 } else {
                     self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": "tool not available"}], "success": false}) });
                 }
@@ -2526,6 +2723,7 @@ impl App {
                 }
             }
             "/experimental" => self.experimental_command(arg),
+            "/mcp" => self.mcp_command(arg),
             "/runs" => self.open_runs(),
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
             "/akasha" => crate::ui::overlays::open_akasha(self, arg),
@@ -2595,6 +2793,40 @@ impl App {
                 self.toast(format!("{name} {what}{tail}"), Level::Ok);
             }
             Err(e) => self.toast(e, Level::Warn),
+        }
+    }
+
+    /// `/mcp` names the configured servers and the ones the current Solo agent has; `/mcp solo
+    /// <name|*|none>` sets `solo_mcp` in settings.toml (in memory only in the demo). The running
+    /// Solo keeps its servers — its backend launched them with it — so the change is for the next.
+    fn mcp_command(&mut self, arg: &str) {
+        self.refresh_mcp_servers();
+        let (sub, rest) = arg.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
+        match sub {
+            "" => self.toast(mcp_summary(&self.settings, &self.solo_mcp), Level::Info),
+            "solo" => {
+                let list = match parse_solo_mcp(&self.settings, rest) {
+                    Ok(l) => l,
+                    Err(e) => return self.toast(e, Level::Warn),
+                };
+                if !self.demo {
+                    let saved = Settings::load_on_disk().and_then(|mut s| {
+                        s.solo_mcp = list.clone();
+                        s.save().map_err(|e| format!("could not save settings.toml: {e}"))
+                    });
+                    if let Err(e) = saved {
+                        return self.toast(e, Level::Warn);
+                    }
+                }
+                let what = match list.as_slice() {
+                    [] => "none".to_string(),
+                    [all] if all == "*" => "every enabled server".to_string(),
+                    names => names.join(", "),
+                };
+                self.settings.solo_mcp = list;
+                self.toast(format!("Solo MCP: {what} — applies to the next agent (/new)"), Level::Ok);
+            }
+            _ => self.toast("usage: /mcp [solo <name|*|none>]", Level::Info),
         }
     }
 
@@ -2811,6 +3043,7 @@ mod tests {
             thread_name: Some("Notes sync · worker-small".into()),
             network: true,
             writable_roots: vec![],
+            mcp: vec![],
         };
         let a = spawn_agent(&mut hub, &mut agents, &reg, opts(Some("auto")));
         assert_eq!(agents[&a].effort, "medium", "auto that reaches the spawn means the middle of the road");
@@ -2949,6 +3182,7 @@ mod tests {
             context_override: None,
             resume_thread: None,
             thread_name: None,
+            mcp: vec![],
         };
         let (s, envs) = bija_spawn(&reg, &reg.resolve("big"), &o, 128_000, 80);
         assert_eq!((s.base_url.as_str(), s.wire.as_str(), s.api_key_env.as_deref()), ("https://gw.dev/v1", "anthropic", Some("MANTRA_GW_API_KEY")));
@@ -3069,7 +3303,7 @@ mod tests {
         assert!(!app.clocks_visible(), "nothing on screen shows a clock");
         assert!(!app.animating());
         let mut run = a_run();
-        let mut ctx = Ctxt { hub: &mut app.hub, agents: &mut app.agents, registry: &app.registry, tx: &app.tx, notes: &mut app.notes };
+        let mut ctx = Ctxt { hub: &mut app.hub, agents: &mut app.agents, registry: &app.registry, settings: &app.settings, tx: &app.tx, notes: &mut app.notes };
         run.toggle_pause(&mut ctx);
         // the "run paused" pulse line fades for a moment; the bug shows once that is over
         for p in run.pulse.iter_mut() {
@@ -3353,5 +3587,267 @@ mod tests {
         assert!(keys.contains("esc"), "{keys:?}");
         let row = rows.iter().find(|l| l.contains("longalias9")).expect("model row");
         assert!(row.contains("medium") && row.contains("ctx"), "{row:?}");
+    }
+
+    fn mcp_server(command: &str, args: &[&str], enabled: bool) -> crate::config::McpServer {
+        crate::config::McpServer { command: command.into(), args: args.iter().map(|a| a.to_string()).collect(), env: Default::default(), enabled }
+    }
+
+    /// The user's own Codex servers stay off as before — all but one this agent is given, which
+    /// gets its command and args instead of `enabled=false`.
+    #[test]
+    fn codex_keeps_the_users_servers_off_but_the_ones_the_agent_is_given() {
+        let user = vec!["node_repl".to_string(), "blender".to_string()];
+        assert_eq!(codex_mcp_overrides(&user, &[]), vec!["-c", "mcp_servers.node_repl.enabled=false", "-c", "mcp_servers.blender.enabled=false"], "no servers given: exactly as before");
+        let out = codex_mcp_overrides(&user, &[("blender".into(), mcp_server("uvx", &["blender-mcp"], true))]);
+        assert_eq!(out, vec!["-c", "mcp_servers.node_repl.enabled=false", "-c", "mcp_servers.blender.command=\"uvx\"", "-c", "mcp_servers.blender.args=[\"blender-mcp\"]", "-c", "mcp_servers.blender.enabled=true"], "switched on even when config.toml has it off");
+    }
+
+    /// Solo starts with `solo_mcp`'s servers — on the real spawn path, read back from the argv a
+    /// stand-in Codex was started with — and `/mcp` says which; `/mcp solo` changes it on disk for
+    /// the next Solo, refusing a server that is not configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solo_gets_its_mcp_servers_and_slash_mcp_switches_them() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let dir = crate::config::home().join("solo-mcp");
+            std::fs::create_dir_all(&dir).unwrap();
+            let argv = |n: u32| dir.join(format!("argv-{n}"));
+            // each launch writes its arguments to the next free argv-<n>, then waits to be killed
+            let script = format!("n=1; while [ -e '{0}/argv-'$n ]; do n=$((n+1)); done; printf '%s\\n' \"$@\" > '{0}/argv-'$n; exec sleep 30", dir.display());
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec!["sh".into(), "-c".into(), script, "sh".into()], vec![], vec![], ev_tx, false);
+            let mut settings = Settings { default_model: "sol".into(), ..Settings::default() };
+            settings.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
+            settings.mcp_servers.insert("off".into(), mcp_server("x", &[], false));
+            // on disk too, as outside the demo they always are: the app reads them back from there
+            settings.save().unwrap();
+            let mut app = App::new(settings, Registry::defaults(), dir.clone(), hub, tx, false);
+            let read = |n: u32| {
+                for _ in 0..200 {
+                    if let Ok(t) = std::fs::read_to_string(argv(n)) {
+                        if !t.is_empty() {
+                            return t;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                panic!("launch {n} never wrote its argv");
+            };
+            app.start_solo();
+            assert_eq!(app.solo_mcp, vec!["blender".to_string()], "every enabled server, the disabled one not");
+            let first = read(1);
+            assert!(first.lines().any(|l| l == "mcp_servers.blender.command=\"uvx\""), "{first}");
+            assert!(!first.contains("mcp_servers.off."), "{first}");
+
+            app.command("/mcp");
+            let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert!(toast.contains("blender, off (off)") && toast.contains("Solo has: blender"), "{toast}");
+            app.command("/mcp solo nope");
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("no MCP server named nope")));
+            assert_eq!(app.settings.solo_mcp, vec!["*".to_string()], "refused, unchanged");
+            app.command("/mcp solo none");
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("Solo MCP: none") && t.0.contains("/new")));
+            assert!(Settings::load_on_disk().unwrap().solo_mcp.is_empty(), "saved");
+            assert_eq!(app.solo_mcp, vec!["blender".to_string()], "the running Solo keeps what it started with");
+            app.command("/new");
+            assert!(app.solo_mcp.is_empty());
+            assert!(!read(2).contains("mcp_servers.blender"), "the next Solo has none");
+            app.command("/mcp solo blender, off");
+            assert_eq!(app.settings.solo_mcp, vec!["blender".to_string(), "off".to_string()]);
+            let _ = app.shutdown();
+        });
+        assert_eq!(mcp_summary(&Settings::default(), &[]), "no MCP servers — add one with `mantra mcp add <name> -- <command> [args…]`");
+    }
+
+    /// A server added with `mantra mcp add` while the app is open (written to settings.toml behind
+    /// its back here) survives the app's next settings save — a model pick — instead of being
+    /// written over with the table the app started with, and `/mcp solo` takes it; one removed on
+    /// disk is gone from `/mcp` too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn servers_changed_on_disk_while_the_app_runs_are_seen_and_kept() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
+            Settings::default().save().unwrap();
+            let mut app = App::new(Settings::load_on_disk().unwrap(), Registry::defaults(), PathBuf::from("."), hub, tx, false);
+            let toast = |app: &App| app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            // another terminal: mantra mcp add blender -- uvx blender-mcp
+            let mut disk = Settings::load_on_disk().unwrap();
+            disk.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
+            disk.save().unwrap();
+            app.settings.default_model = "luna".into();
+            app.save_settings();
+            let saved = Settings::load_on_disk().unwrap();
+            assert_eq!(saved.default_model, "luna", "the app's own change is saved");
+            assert!(saved.mcp_servers.contains_key("blender"), "and the server added meanwhile kept");
+            app.command("/mcp solo blender");
+            assert!(toast(&app).contains("Solo MCP: blender"), "{}", toast(&app));
+            app.command("/mcp");
+            assert!(toast(&app).contains("MCP: blender"), "{}", toast(&app));
+            // mantra mcp remove blender
+            let mut disk = Settings::load_on_disk().unwrap();
+            disk.mcp_servers.clear();
+            disk.save().unwrap();
+            app.command("/mcp");
+            assert!(toast(&app).starts_with("no MCP servers"), "{}", toast(&app));
+            let _ = app.shutdown();
+        });
+    }
+
+    /// Solo's vision tools run off the event loop: the request returns at once, and the answer
+    /// comes back as `AppEvent::ToolAnswer` for `on_event` to hand on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solo_looks_at_an_image_off_the_event_loop() {
+        let dir = std::env::temp_dir().join(format!("mantra-solo-vision-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pic.png"), crate::util::tests::tiny_png(2, 2)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
+        let reg = Registry::defaults();
+        let eye = reg.models.iter().find(|m| m.vision).map(|m| m.alias.clone()).expect("a built-in alias that sees");
+        let mut app = App::new(Settings::default(), reg, dir.clone(), hub, tx, true);
+        let mut a = Agent::new(7, "solo", "solo", dir.clone());
+        a.model_alias = eye;
+        app.agents.insert(7, a);
+        let call = json!({"tool": "mantra_view_image", "arguments": {"path": "pic.png"}});
+        app.on_event(AppEvent::Hub(crate::hub::HubEvent::Request { agent: 7, id: json!(1), method: "item/tool/call".into(), params: call }));
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(AppEvent::ToolAnswer { agent, id, result }) = rx.recv().await {
+                    return (agent, id, result);
+                }
+            }
+        })
+        .await
+        .expect("an answer from off the loop");
+        assert_eq!((answer.0, answer.1.clone()), (7, json!(1)));
+        assert_eq!(answer.2["success"], json!(true), "{}", answer.2);
+        assert_eq!(answer.2["contentItems"][1]["type"], json!("inputImage"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Claude Code runs strict (`--strict-mcp-config`) for a toolset of Mantra's — a run's agents,
+    /// the architect — and for servers of Mantra's; a Solo agent with only the vision tools keeps
+    /// the user's own `claude mcp` servers, as it had them before the vision tools came.
+    #[test]
+    fn claude_is_strict_except_for_solo_with_the_vision_tools_alone() {
+        let o = |tools: Vec<Value>, mcp: Vec<(String, crate::config::McpServer)>| AgentOpts {
+            name: "solo".into(),
+            role: "solo".into(),
+            glyph: "●".into(),
+            color: "saffron".into(),
+            model_alias: "sonnet".into(),
+            effort: None,
+            cwd: PathBuf::from("."),
+            approval: "never".into(),
+            sandbox: "workspace-write".into(),
+            instructions: String::new(),
+            tools,
+            extra_writable: vec![],
+            context_override: None,
+            resume_thread: None,
+            thread_name: None,
+            network: true,
+            writable_roots: vec![],
+            mcp,
+        };
+        assert!(!claude_strict_mcp(&o(vec![], vec![])), "nothing of Mantra's at all");
+        assert!(!claude_strict_mcp(&o(tools::vision_tools(), vec![])), "Solo with the vision tools");
+        assert!(claude_strict_mcp(&o(tools::vision_tools(), vec![("blender".into(), mcp_server("uvx", &["blender-mcp"], true))])), "servers of Mantra's");
+        let mut run_tools = tools::vision_tools();
+        run_tools.extend(tools::worker_tools());
+        assert!(claude_strict_mcp(&o(run_tools, vec![])), "a run's worker");
+    }
+
+    /// A server whose hand-written name cannot work reaches nobody: the journal names it for each
+    /// role it would have reached, Solo's toast for Solo.
+    #[test]
+    fn a_server_name_that_cannot_work_is_journaled_and_toasted() {
+        let mut s = Settings::default();
+        s.mcp_servers.insert("blender.v2".into(), mcp_server("uvx", &["blender-mcp"], true));
+        let mut p = Pattern::builtin();
+        let first = p.roles.keys().next().cloned().unwrap();
+        p.roles.get_mut(&first).unwrap().mcp = vec!["*".into()];
+        let lines = mcp_missing_lines(&s, &p);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(&format!("role {first} gets `blender.v2`")) && lines[0].contains("no /, spaces or dots"), "{}", lines[0]);
+        assert!(mcp_refused_toast(&s).is_some_and(|t| t.contains("`blender.v2` skipped")), "Solo asks for * by default");
+        s.solo_mcp = vec![];
+        assert_eq!(mcp_refused_toast(&s), None);
+    }
+
+    /// A role asking for a server settings.toml does not have gets one journal line at the run's
+    /// start and runs without it; in the demo every role gets the stand-in server, and only it.
+    #[tokio::test]
+    async fn a_role_asking_for_an_unconfigured_server_is_journaled_once_and_the_demo_gives_its_own() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("mcp-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut p = Pattern::builtin();
+            p.name = "mcp-asks".into();
+            let first = p.roles.keys().next().cloned().unwrap();
+            for (name, r) in p.roles.iter_mut() {
+                r.mcp = if *name == first { vec!["blender".into(), "nope".into(), "nope".into()] } else { vec!["*".into()] };
+            }
+            p.save().unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project.clone();
+            app.demo = false;
+            app.settings.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
+            app.start_run_with("build it", Some("mcp-asks"), None);
+            let run = app.run.as_ref().expect("the run started");
+            let lines: Vec<String> = run.pulse.iter().filter(|l| l.text.starts_with("mcp:")).map(|l| l.text.clone()).collect();
+            assert_eq!(lines, vec![format!("mcp: role {first} asks for `nope`, which is not configured — skipped")]);
+            assert_eq!(run.pattern.roles[&first].mcp, vec!["blender".to_string(), "nope".into(), "nope".into()], "the run's pattern is the pattern");
+            app.run = None;
+            app.demo = true;
+            app.start_run_with("build it", Some("mcp-asks"), None);
+            let run = app.run.as_ref().expect("the demo run started");
+            assert!(run.pattern.roles.values().all(|r| r.mcp == vec![DEMO_MCP.to_string()]), "{:?}", run.pattern.roles.values().map(|r| r.mcp.clone()).collect::<Vec<_>>());
+            app.run = None;
+            let _ = std::fs::remove_dir_all(&project);
+        });
+    }
+
+    /// A Hub that could not make its bridge socket says so: a toast when the app starts, and one
+    /// journal line for a run with a role on Claude Code — none for a run without one.
+    #[tokio::test]
+    async fn a_lost_bridge_is_toasted_at_startup_and_journaled_by_a_run_on_claude_code() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("bridge-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let file = crate::config::home().join("not-a-dir");
+            std::fs::write(&file, "").unwrap();
+            let home = std::env::var("MANTRA_HOME").unwrap();
+            std::env::set_var("MANTRA_HOME", file.join("home"));
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec![], vec![], vec![], ev_tx, true);
+            std::env::set_var("MANTRA_HOME", home);
+            let mut reg = Registry::defaults();
+            reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude Code".into(), kind: crate::config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+            reg.models.push(crate::config::ModelEntry { alias: "cc-model".into(), provider: "cc".into(), model: "cc-model".into(), ..Default::default() });
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(Settings::default(), reg, project.clone(), hub, tx, true);
+            let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert!(toast.starts_with("Claude Code agents have no Mantra tools: couldn't create") && toast.contains("not-a-dir"), "{toast}");
+            let journaled = |app: &App| app.run.as_ref().expect("the run started").pulse.iter().filter(|l| l.text.starts_with("Claude Code agents have no Mantra tools")).count();
+            let mut p = Pattern::builtin();
+            p.name = "no-claude".into();
+            p.save().unwrap();
+            app.start_run_with("build it", Some("no-claude"), None);
+            assert_eq!(journaled(&app), 0, "no role on Claude Code, nothing it lacks");
+            app.run = None;
+            let first = p.roles.keys().next().cloned().unwrap();
+            p.roles.get_mut(&first).unwrap().fallback = Some("cc-model".into());
+            p.name = "claude-fallback".into();
+            p.save().unwrap();
+            app.start_run_with("build it", Some("claude-fallback"), None);
+            assert_eq!(journaled(&app), 1, "a fallback on Claude Code counts");
+            app.run = None;
+            let _ = std::fs::remove_dir_all(&project);
+        });
     }
 }

@@ -7,12 +7,15 @@
 //! the test at the bottom of this file.
 //!
 //! WP10.4 adds the MCP bridge on top: when the Hub has a bridge socket (`hub::bridge_sock`,
-//! non-`None` only while a `ClaudeCode` provider exists), every Claude agent gets
-//! `--strict-mcp-config --mcp-config '…'` pointing `claude` at `mantra mcp-bridge --sock <path>
-//! --agent <id>`, spawned by `claude` itself as an MCP stdio server. That subprocess connects back
-//! to the same socket and identifies itself; `Hub`'s accept loop (`hub.rs`) routes the resulting
-//! `Cmd::Bridge(UnixStream)` to *this* agent's own command channel (never a shared listener the
-//! per-agent task can't reach — see `v02plan.md` §10.4), and this file owns the connection from
+//! non-`None` only while a `ClaudeCode` provider exists), every Claude agent with tools gets
+//! `--mcp-config '…'` pointing `claude` at `mantra mcp-bridge --sock <path> --agent <id>`, spawned
+//! by `claude` itself as an MCP stdio server — under `--strict-mcp-config` for a run's agents and
+//! the architect, and for any agent given servers of Mantra's (`ClaudeSpawn::strict_mcp`); a Solo
+//! agent bridged only for its vision tools keeps the user's own `claude mcp` servers beside it.
+//! That subprocess connects back to the same socket and identifies itself; `Hub`'s accept loop
+//! (`hub.rs`) routes the resulting `Cmd::Bridge(UnixStream)` to *this* agent's own command channel
+//! (never a shared listener the per-agent task can't reach — see `v02plan.md` §10.4), and this
+//! file owns the connection from
 //! there: it answers `{"list":true}` with the role's tool array (already sitting in
 //! `spec.dynamic_tools`, the very same JSON schemas Codex's `dynamicTools` gets) and turns
 //! `{"call":…,"tool":…,"args":…}` into the same `HubEvent::Request{method:"item/tool/call"}` the
@@ -51,6 +54,11 @@ pub struct ClaudeSpawn {
     /// `mantra_*` dynamic tools at all rather than pointing `--mcp-config` at a socket nothing
     /// listens on.
     pub mcp_sock: Option<PathBuf>,
+    /// `--strict-mcp-config` with the config: no MCP server the user set up for `claude` itself
+    /// comes along. True for a run's agents and the architect (Mantra's own toolset); false for a
+    /// Solo agent, which has always had the user's servers. An agent given servers of Mantra's
+    /// (`SpawnSpec.mcp`) is strict either way.
+    pub strict_mcp: bool,
 }
 
 /// Runs one `claude` process for the lifetime of a single spawn attempt (a crash returns
@@ -89,7 +97,7 @@ pub(super) async fn run_claude_process(
     command.args(&args).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     apply_env(&mut command, spec, &cs);
 
-    crate::mlog!("claude {id}: spawn {} {}", prog, args.join(" "));
+    crate::mlog!("claude {id}: spawn {} {}", prog, logged_args(&args).join(" "));
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Exit::LaunchFailed(format!("failed to start `{}`: {e}", claude_cmd.join(" "))),
@@ -190,6 +198,8 @@ pub(super) async fn run_claude_process(
                     }
                     // Claude Code sessions have no title API: the run's name stays on Mantra's side.
                     Cmd::SetName(_) => {}
+                    // No vision tools of its own: Mantra's refuse a model that does not see.
+                    Cmd::SetVision(_) => {}
                     Cmd::SetApproval(_) => {
                         // Only "never" (--dangerously-skip-permissions) is modeled until Role.permission
                         // (WP3) lands in a later batch; every Claude agent runs unattended for now.
@@ -202,14 +212,17 @@ pub(super) async fn run_claude_process(
                         if let Some(call) = rid.as_str().and_then(|s| s.strip_prefix("cc-call-")) {
                             let success = result.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
                             let text = result.pointer("/contentItems/0/text").and_then(|t| t.as_str()).unwrap_or("");
-                            reply_bridge_call(&mut bridge_write, call, success, text, id).await;
+                            // An answer with an image (a screenshot) hands the bridge its items, which
+                            // it turns into MCP image content; every other answer is the text alone.
+                            let items = result.get("contentItems").filter(|_| !super::answer_images(&result).is_empty());
+                            reply_bridge_call(&mut bridge_write, call, success, text, items, id).await;
                         }
                         // else: not a bridge call id — nothing else on the Claude backend consumes
                         // `Cmd::Respond` yet (there's no other kind of request it ever originates).
                     }
                     Cmd::RespondErr { id: rid, message } => {
                         if let Some(call) = rid.as_str().and_then(|s| s.strip_prefix("cc-call-")) {
-                            reply_bridge_call(&mut bridge_write, call, false, &message, id).await;
+                            reply_bridge_call(&mut bridge_write, call, false, &message, None, id).await;
                         }
                     }
                     Cmd::Bridge(stream) => {
@@ -323,14 +336,19 @@ async fn stop_child(stdin: &mut ChildStdin, child: &mut Child) {
 }
 
 /// Answers one pending bridge call: `{"call": <n>, "ok": <bool>, "text": <string>}`, per §10.4's
-/// wire shape between `mantra mcp-bridge` and the Hub. Silently dropped (logged) if the bridge
-/// connection isn't there right now — the restart race §10.4 calls out explicitly: the bridge
-/// subprocess sees its request time out and the agent gets re-prompted by the existing
-/// `CmdFailed` path once `claude` itself reports the tool call failed.
-async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str, ok: bool, text: &str, agent: AgentId) {
+/// wire shape between `mantra mcp-bridge` and the Hub, plus the engine's `contentItems` as
+/// `items` when the answer has an image in it (the bridge makes MCP image content of those).
+/// Silently dropped (logged) if the bridge connection isn't there right now — the restart race
+/// §10.4 calls out explicitly: the bridge subprocess sees its request time out and the agent gets
+/// re-prompted by the existing `CmdFailed` path once `claude` itself reports the tool call failed.
+async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str, ok: bool, text: &str, items: Option<&Value>, agent: AgentId) {
     match bridge_write.as_mut() {
         Some(w) => {
-            let _ = write_line(w, &json!({"call": call, "ok": ok, "text": text})).await;
+            let mut line = json!({"call": call, "ok": ok, "text": text});
+            if let Some(items) = items {
+                line["items"] = items.clone();
+            }
+            let _ = write_line(w, &line).await;
         }
         None => crate::mlog!("agent {agent}: mcp bridge reply for call {call} dropped (no bridge connection)"),
     }
@@ -383,10 +401,10 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
         a.push("--autocompact".into());
         a.push(cs.autocompact.to_string());
     }
-    let mcp = cs.mcp_sock.as_ref().filter(|_| !spec.dynamic_tools.is_empty());
-    if !cs.system_prompt.is_empty() || mcp.is_some() {
+    let bridge = cs.mcp_sock.as_deref().filter(|_| !spec.dynamic_tools.is_empty());
+    if !cs.system_prompt.is_empty() || bridge.is_some() {
         let mut sp = cs.system_prompt.clone();
-        if mcp.is_some() {
+        if bridge.is_some() {
             // Tell the agent what its `mantra_*` tools are actually called once exposed as MCP
             // tools (§10.4) — the role protocol text (`engine/tools.rs`) only knows the bare names.
             sp.push_str("\n\nYour mantra_* tools are exposed as MCP tools named `mcp__mantra__<name>` (e.g. `mcp__mantra__mantra_status`). Call them by that full name.");
@@ -394,10 +412,16 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
         a.push("--append-system-prompt".into());
         a.push(sp);
     }
-    if let Some(sock) = mcp {
-        a.push("--strict-mcp-config".into());
+    // The agent's own MCP servers (`SpawnSpec.mcp`) ride in the same config as the bridge, and
+    // `--strict-mcp-config` keeps every other server the user has set up for `claude` away — but
+    // not from a Solo agent bridged only for its vision tools: `claude` merges the config with
+    // the user's own servers, as Solo always had them (`ClaudeSpawn::strict_mcp`).
+    if bridge.is_some() || !spec.mcp.is_empty() {
+        if cs.strict_mcp || !spec.mcp.is_empty() {
+            a.push("--strict-mcp-config".into());
+        }
         a.push("--mcp-config".into());
-        a.push(mcp_config_json(id, sock).to_string());
+        a.push(mcp_config_json(id, bridge, &spec.mcp).to_string());
     }
     a.extend(sandbox_args(&spec.sandbox, &spec.cwd));
     if cs.auth == "api_key" {
@@ -407,13 +431,36 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
 }
 
 /// `{"mcpServers":{"mantra":{"command":"<this mantra binary>","args":["mcp-bridge","--sock",<sock>,
-/// "--agent",<id>]}}}` — spawned by `claude` itself as a stdio MCP server (§10.1, §10.4). Falls back
-/// to the literal `"mantra"` on the vanishingly unlikely chance `util::self_exe()` fails; `claude`
-/// would then report that server as failed to start, which is a much clearer signal than silently
-/// skipping `--mcp-config` and leaving the agent's tool calls unexplained.
-fn mcp_config_json(id: AgentId, sock: &Path) -> Value {
-    let exe = crate::util::self_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "mantra".into());
-    json!({"mcpServers": {"mantra": {"command": exe, "args": ["mcp-bridge", "--sock", sock.to_string_lossy(), "--agent", id.to_string()]}}})
+/// "--agent",<id>]}, "<name>":{"command","args","env"}…}}` — every entry spawned by `claude` itself
+/// as a stdio MCP server (§10.1, §10.4): the bridge when there is one, and the agent's own servers
+/// beside it. The bridge goes in last, so a hand-edited server called `mantra` cannot take its
+/// place. Falls back to the literal `"mantra"` on the vanishingly unlikely chance
+/// `util::self_exe()` fails; `claude` would then report that server as failed to start, which is a
+/// much clearer signal than silently skipping `--mcp-config` and leaving the agent's tool calls
+/// unexplained.
+fn mcp_config_json(id: AgentId, bridge: Option<&Path>, servers: &[(String, crate::config::McpServer)]) -> Value {
+    let mut all = serde_json::Map::new();
+    for (name, s) in servers {
+        all.insert(name.clone(), json!({"command": s.command, "args": s.args, "env": s.env}));
+    }
+    if let Some(sock) = bridge {
+        let exe = crate::util::self_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "mantra".into());
+        all.insert("mantra".into(), json!({"command": exe, "args": ["mcp-bridge", "--sock", sock.to_string_lossy(), "--agent", id.to_string()]}));
+    }
+    json!({"mcpServers": all})
+}
+
+/// The spawn's arguments as `mantra.log` gets them: `--mcp-config`'s value can hold a server's
+/// `env` (a token), so it is shown as its server names only.
+fn logged_args(args: &[String]) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(i) = out.iter().position(|a| a == "--mcp-config") {
+        if let Some(v) = out.get_mut(i + 1) {
+            let names = serde_json::from_str::<Value>(v).ok().and_then(|c| c.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.keys().cloned().collect::<Vec<_>>().join(","))).unwrap_or_default();
+            *v = format!("<servers: {names}>");
+        }
+    }
+    out
 }
 
 /// Sandbox → Claude's own tool restrictions (git worktrees still isolate workers regardless).
@@ -530,12 +577,13 @@ fn as_u64(v: &Value) -> Option<u64> {
 }
 
 /// What kind of item a `tool_use` id started as, carrying just enough to build a matching
-/// `item/completed` payload once the `tool_result` arrives.
+/// `item/completed` payload once the `tool_result` arrives — the tool's name included, since
+/// `Agent::apply_item` takes it from whichever event it is applying.
 enum ToolOpen {
     Command,
     File(String),
-    DynamicMantra,
-    Mcp,
+    DynamicMantra(String),
+    Mcp { server: String, tool: String },
 }
 
 impl Translator {
@@ -801,14 +849,31 @@ impl Translator {
             let is_error = block.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
             let status = if is_error { "failed" } else { "completed" };
             let text = tool_result_text(block, v.get("tool_use_result"));
-            let open = self.open_tools.remove(tool_id).unwrap_or(ToolOpen::Mcp);
+            let open = self.open_tools.remove(tool_id).unwrap_or(ToolOpen::Mcp { server: String::new(), tool: String::new() });
+            let images = tool_result_images(block);
             let item = match open {
                 ToolOpen::Command => json!({"id": tool_id, "type": "commandExecution", "status": status, "aggregatedOutput": text}),
                 // Resend the path: `apply_item` only turns this into `Signal::FilesChanged` when
                 // *this* event's `changes` array is non-empty, not from what `item/started` said.
                 ToolOpen::File(path) => json!({"id": tool_id, "type": "fileChange", "status": status, "changes": [{"path": path, "kind": {"type": "modified"}, "diff": ""}]}),
-                ToolOpen::DynamicMantra => json!({"id": tool_id, "type": "dynamicToolCall", "status": status, "contentItems": [{"type": "text", "text": text}]}),
-                ToolOpen::Mcp => json!({"id": tool_id, "type": "mcpToolCall", "status": status, "result": text}),
+                // An image the tool returned (a screenshot through the bridge, a render from a
+                // server) is described the way Codex describes one: an `inputImage` content item
+                // beside the text for a dynamic tool, MCP content for a server's tool.
+                ToolOpen::DynamicMantra(tool) => {
+                    let mut items = vec![json!({"type": "text", "text": text})];
+                    items.extend(images.iter().map(|(mime, data)| json!({"type": "inputImage", "imageUrl": format!("data:{mime};base64,{data}")})));
+                    json!({"id": tool_id, "type": "dynamicToolCall", "tool": tool, "status": status, "contentItems": items})
+                }
+                ToolOpen::Mcp { server, tool } => {
+                    let result = if images.is_empty() {
+                        json!(text)
+                    } else {
+                        let mut content = vec![json!({"type": "text", "text": text})];
+                        content.extend(images.iter().map(|(mime, data)| json!({"type": "image", "mimeType": mime, "data": data})));
+                        json!({"content": content})
+                    };
+                    json!({"id": tool_id, "type": "mcpToolCall", "server": server, "tool": tool, "status": status, "result": result})
+                }
             };
             out.push(HubEvent::Notif { agent: self.agent, method: "item/completed".into(), params: json!({"item": item}) });
         }
@@ -912,7 +977,8 @@ fn classify_claude_error(v: &Value, msg: &str) -> Option<&'static str> {
 /// Classifies one `assistant` `tool_use` block into the synthetic item shape `Agent::apply_item`
 /// expects, per §10.3: `Bash` → `commandExecution`, `Edit|Write|MultiEdit|NotebookEdit` →
 /// `fileChange`, `mcp__mantra__*` → `dynamicToolCall` (name stripped to `mantra_*`; not reachable
-/// without the WP10.4 bridge, but translated correctly once it exists), everything else →
+/// without the WP10.4 bridge, but translated correctly once it exists), another server's
+/// `mcp__<server>__<tool>` → `mcpToolCall{server, tool}` as Codex reports one, everything else →
 /// `mcpToolCall` (server labelled `"claude"` for its built-in tools, since there's no real
 /// originating MCP server name to report).
 fn started_item(id: &str, name: &str, input: &Value) -> (ToolOpen, Value) {
@@ -923,10 +989,28 @@ fn started_item(id: &str, name: &str, input: &Value) -> (ToolOpen, Value) {
         let path = input.get("file_path").or_else(|| input.get("notebook_path")).and_then(|x| x.as_str()).unwrap_or("").to_string();
         (ToolOpen::File(path.clone()), json!({"id": id, "type": "fileChange", "status": "inProgress", "changes": [{"path": path, "kind": {"type": "modified"}, "diff": ""}]}))
     } else if let Some(mantra_name) = name.strip_prefix("mcp__mantra__") {
-        (ToolOpen::DynamicMantra, json!({"id": id, "type": "dynamicToolCall", "tool": mantra_name, "arguments": input, "status": "inProgress"}))
+        (ToolOpen::DynamicMantra(mantra_name.to_string()), json!({"id": id, "type": "dynamicToolCall", "tool": mantra_name, "arguments": input, "status": "inProgress"}))
     } else {
-        (ToolOpen::Mcp, json!({"id": id, "type": "mcpToolCall", "server": "claude", "tool": name, "arguments": input, "status": "inProgress"}))
+        let (server, tool) = super::mcp_tool_name(name).unwrap_or(("claude", name));
+        (ToolOpen::Mcp { server: server.to_string(), tool: tool.to_string() }, json!({"id": id, "type": "mcpToolCall", "server": server, "tool": tool, "arguments": input, "status": "inProgress"}))
     }
+}
+
+/// The `(media type, base64)` of each image block in a `tool_result`'s content
+/// (`{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`, the API's own image shape
+/// Claude Code echoes back).
+fn tool_result_images(block: &Value) -> Vec<(String, String)> {
+    let Some(items) = block.get("content").and_then(|c| c.as_array()) else { return vec![] };
+    items
+        .iter()
+        .filter(|it| it.get("type").and_then(|t| t.as_str()) == Some("image"))
+        .filter_map(|it| {
+            let src = it.get("source")?;
+            let mime = src.get("media_type").and_then(|m| m.as_str()).filter(|m| m.starts_with("image/"))?;
+            let data = src.get("data").and_then(|d| d.as_str()).filter(|d| !d.is_empty())?;
+            Some((mime.to_string(), data.to_string()))
+        })
+        .collect()
 }
 
 fn tool_result_text(block: &Value, tool_use_result: Option<&Value>) -> String {
@@ -965,8 +1049,9 @@ mod tests {
             envs: vec![],
             claude: None,
             bija: None,
+            mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None };
+        let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
         let args = build_args(1, &spec, &cs, "sonnet5", "high", "abc-123", true, &[]);
         assert!(args.windows(2).any(|w| w == ["--resume".to_string(), "abc-123".to_string()]));
         assert!(!args.contains(&"--session-id".to_string()));
@@ -998,10 +1083,14 @@ mod tests {
             envs: vec![],
             claude: None,
             bija: None,
+            mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")) };
+        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
         let args = build_args(7, &spec, &cs, "sonnet5", "high", "abc-123", false, &[]);
         assert!(args.contains(&"--strict-mcp-config".to_string()));
+        // Solo bridged for its vision tools alone keeps the user's own `claude mcp` servers
+        let solo = build_args(7, &spec, &ClaudeSpawn { strict_mcp: false, ..cs.clone() }, "sonnet5", "high", "abc-123", false, &[]);
+        assert!(solo.contains(&"--mcp-config".to_string()) && !solo.contains(&"--strict-mcp-config".to_string()), "{solo:?}");
         let i = args.iter().position(|a| a == "--mcp-config").expect("--mcp-config present");
         let cfg: Value = serde_json::from_str(&args[i + 1]).expect("--mcp-config value must be valid JSON");
         assert_eq!(cfg.pointer("/mcpServers/mantra/args/1").and_then(|v| v.as_str()), Some("--sock"));
@@ -1013,6 +1102,105 @@ mod tests {
         no_tools.dynamic_tools = vec![];
         let args2 = build_args(7, &no_tools, &cs, "sonnet5", "high", "abc-123", false, &[]);
         assert!(!args2.contains(&"--mcp-config".to_string()), "an empty tool list must not wire up a bridge either");
+    }
+
+    fn mcp_server(command: &str, args: &[&str], env: &[(&str, &str)]) -> crate::config::McpServer {
+        crate::config::McpServer { command: command.into(), args: args.iter().map(|a| a.to_string()).collect(), env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), enabled: true }
+    }
+
+    /// The agent's own servers go into `--mcp-config` beside the bridge — or alone, with no bridge
+    /// — always under `--strict-mcp-config` (Solo's too); a server called `mantra` never displaces the bridge,
+    /// and the log line shows the server names, not their env.
+    #[test]
+    fn mcp_config_carries_the_agents_servers_beside_the_bridge() {
+        let mut spec = SpawnSpec {
+            cwd: std::path::PathBuf::from("/work"),
+            model: String::new(),
+            provider: String::new(),
+            effort: String::new(),
+            approval: "never".into(),
+            sandbox: "workspace-write".into(),
+            developer_instructions: String::new(),
+            dynamic_tools: vec![],
+            config: serde_json::Map::new(),
+            extra_args: vec![],
+            resume_thread: None,
+            thread_name: None,
+            backend: crate::config::ProviderKind::ClaudeCode,
+            envs: vec![],
+            claude: None,
+            bija: None,
+            mcp: vec![("blender".into(), mcp_server("uvx", &["blender-mcp"], &[("BLENDER_TOKEN", "s3cret")]))],
+        };
+        let config_of = |args: &[String]| -> Value {
+            let i = args.iter().position(|a| a == "--mcp-config").expect("--mcp-config present");
+            serde_json::from_str(&args[i + 1]).expect("valid JSON")
+        };
+        // no bridge (Solo, or no tools): the servers alone, and no word about mcp__mantra__
+        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false };
+        let args = build_args(3, &spec, &cs, "m", "", "s-1", false, &[]);
+        assert!(args.contains(&"--strict-mcp-config".to_string()), "servers of Mantra's: strict even for Solo");
+        let cfg = config_of(&args);
+        assert_eq!(cfg["mcpServers"]["blender"], json!({"command": "uvx", "args": ["blender-mcp"], "env": {"BLENDER_TOKEN": "s3cret"}}));
+        assert!(cfg["mcpServers"].get("mantra").is_none());
+        assert!(!args.iter().any(|a| a.contains("mcp__mantra__")) && !args.contains(&"--append-system-prompt".to_string()));
+        let logged = logged_args(&args).join(" ");
+        assert!(logged.contains("<servers: blender>") && !logged.contains("s3cret"), "{logged}");
+        // with the bridge: both; a hand-edited `mantra` server is replaced by the bridge
+        spec.dynamic_tools = vec![json!({"type": "function", "name": "mantra_status", "description": "status", "inputSchema": {"type": "object"}})];
+        spec.mcp.push(("mantra".into(), mcp_server("evil", &[], &[])));
+        let cs = ClaudeSpawn { mcp_sock: Some(std::path::PathBuf::from("/tmp/m.sock")), ..cs };
+        let cfg = config_of(&build_args(3, &spec, &cs, "m", "", "s-1", false, &[]));
+        assert_eq!(cfg.pointer("/mcpServers/blender/command").and_then(|c| c.as_str()), Some("uvx"));
+        assert_eq!(cfg.pointer("/mcpServers/mantra/args/0").and_then(|c| c.as_str()), Some("mcp-bridge"));
+        // no servers and no bridge: no MCP flags at all, as before
+        spec.mcp.clear();
+        spec.dynamic_tools.clear();
+        let args = build_args(3, &spec, &cs, "m", "", "s-1", false, &[]);
+        assert!(!args.contains(&"--mcp-config".to_string()) && !args.contains(&"--strict-mcp-config".to_string()));
+    }
+
+    /// `mcp__<server>__<tool>` is that server's tool, as Codex reports one; the completed item
+    /// says the name again, and an image in the result is kept the way Codex describes it.
+    #[test]
+    fn mcp_tools_are_named_by_their_server_and_image_results_are_kept() {
+        let mut tr = Translator::new(1, 200_000, false);
+        let mut agent = Agent::new(1, "t", "solo", std::path::PathBuf::from("/tmp/ccmcp"));
+        let png = "iVBORw0KGgo=";
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}});
+        let mut items = vec![];
+        let lines = [
+            json!({"type": "assistant", "message": {"id": "m1", "content": [
+                {"type": "tool_use", "id": "tu1", "name": "mcp__blender__get_scene_info", "input": {}},
+                {"type": "tool_use", "id": "tu2", "name": "mcp__blender__get_viewport_screenshot", "input": {"max_size": 400}},
+                {"type": "tool_use", "id": "tu3", "name": "mcp__mantra__mantra_screenshot", "input": {}},
+                {"type": "tool_use", "id": "tu4", "name": "Read", "input": {"file_path": "/a"}},
+            ]}}),
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "content": [{"type": "text", "text": "3 objects"}]},
+                {"type": "tool_result", "tool_use_id": "tu2", "content": [{"type": "text", "text": "viewport"}, image.clone()]},
+                {"type": "tool_result", "tool_use_id": "tu3", "content": [{"type": "text", "text": "saved /tmp/s.png"}, image]},
+                {"type": "tool_result", "tool_use_id": "tu4", "content": "file text"},
+            ]}}),
+        ];
+        for l in &lines {
+            for e in tr.on_line(l, false) {
+                if let HubEvent::Notif { method, params, .. } = e {
+                    items.push((method.clone(), params["item"].clone()));
+                    agent.apply(&method, &params);
+                }
+            }
+        }
+        let started = |id: &str| items.iter().find(|(m, i)| m == "item/started" && i["id"] == id).map(|(_, i)| i.clone()).unwrap();
+        let done = |id: &str| items.iter().find(|(m, i)| m == "item/completed" && i["id"] == id).map(|(_, i)| i.clone()).unwrap();
+        assert_eq!((started("tu1")["server"].as_str(), started("tu1")["tool"].as_str()), (Some("blender"), Some("get_scene_info")));
+        assert_eq!((done("tu1")["server"].as_str(), done("tu1")["tool"].as_str(), done("tu1")["result"].as_str()), (Some("blender"), Some("get_scene_info"), Some("3 objects")));
+        assert_eq!(done("tu2")["result"], json!({"content": [{"type": "text", "text": "viewport"}, {"type": "image", "mimeType": "image/png", "data": png}]}));
+        assert_eq!(done("tu3")["tool"].as_str(), Some("mantra_screenshot"));
+        assert_eq!(done("tu3")["contentItems"], json!([{"type": "text", "text": "saved /tmp/s.png"}, {"type": "inputImage", "imageUrl": format!("data:image/png;base64,{png}")}]));
+        assert_eq!((done("tu4")["server"].as_str(), done("tu4")["tool"].as_str(), done("tu4")["result"].as_str()), (Some("claude"), Some("Read"), Some("file text")), "a built-in stays claude's, its result plain text");
+        let names: Vec<String> = agent.items.iter().filter_map(|i| if let Kind::Tool { name, .. } = &i.kind { Some(name.clone()) } else { None }).collect();
+        assert_eq!(names, vec!["blender.get_scene_info", "blender.get_viewport_screenshot", "mantra_screenshot", "claude.Read"], "completion keeps every card's name");
     }
 
     /// Drives `Translator` output into an `Agent` and returns it, for gauge assertions.

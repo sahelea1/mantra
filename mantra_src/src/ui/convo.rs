@@ -181,7 +181,7 @@ fn build(it: &Item, width: usize, verbose: bool) -> Vec<Line<'static>> {
             }
             out
         }
-        Kind::Tool { name, args, result, status } => {
+        Kind::Tool { name, args, result, status, image } => {
             let mark = match status.as_str() {
                 "inProgress" => anim::spinner().to_string(),
                 "failed" => theme::g("✗", "x").to_string(),
@@ -197,9 +197,15 @@ fn build(it: &Item, width: usize, verbose: bool) -> Vec<Line<'static>> {
             ])];
             if !result.is_empty() {
                 let keep = if verbose { 30 } else { 2 };
-                for l in result.lines().take(keep) {
+                let path = image.as_deref().unwrap_or("");
+                for l in result.lines().filter_map(|l| beside_image(l, path)).take(keep) {
+                    let l = l.as_str();
                     out.push(Line::from(vec![pad(2), Span::styled(format!("{} ", theme::g("⎿", "|")), theme::faint()), Span::styled(trunc(l, inner.saturating_sub(4)), theme::dim())]));
                 }
+            }
+            // an image went to the model: say so and where it is (nothing here draws it)
+            if let Some(path) = image {
+                out.push(Line::from(vec![pad(2), Span::styled(image_marker(path, inner.saturating_sub(2)), theme::fg(theme::BLUE))]));
             }
             out
         }
@@ -292,4 +298,81 @@ pub fn draw(f: &mut Frame, area: Rect, agent: &mut Agent, verbose: bool, footer:
 
 fn agent_kind_prev(_lines: &[Line]) -> bool {
     false
+}
+
+/// A result line as the card shows it under an image marker that names `path`: the marker says
+/// where the file is, so a line that names it keeps only what follows — `(image/png, 1920x1080
+/// px, 812 KiB, via grim)` reads `image/png, 1920x1080 px, 812 KiB, via grim` — and a line that
+/// only named it (bija's `[image: …]`) goes. The model was told the whole sentence; this is the card.
+fn beside_image(line: &str, path: &str) -> Option<String> {
+    let Some(at) = (!path.is_empty()).then(|| line.find(path)).flatten() else {
+        return Some(line.to_string());
+    };
+    let rest = line[at + path.len()..].trim_start_matches(']').trim();
+    // `(what, size, via) more.` → `what, size, via more`; a following sentence joins with ` · `
+    let (inside, after) = rest.strip_prefix('(').and_then(|r| r.split_once(')')).unwrap_or(("", rest));
+    let after = after.trim_end_matches('.');
+    let after = match after.strip_prefix(". ") {
+        Some(next) => format!(" · {next}"),
+        None => after.to_string(),
+    };
+    let shown = format!("{inside}{after}").trim().to_string();
+    (!shown.is_empty()).then_some(shown)
+}
+
+/// `▣ image  /run/screenshots/solo-1.png` (ASCII `[img] …`): a tool result that carried an
+/// image. A long path keeps its end — the file name is what tells two captures apart. (Not 🖼:
+/// half the terminals paint it two cells wide, and the side panel's border moves over by one.)
+pub fn image_marker(path: &str, width: usize) -> String {
+    let mark = theme::g("▣ image", "[img]");
+    if path.is_empty() {
+        return mark.to_string();
+    }
+    // "..." in ASCII: a lone "." (the frame's ASCII pass for "…") would read as a hidden file
+    let more = theme::g("…", "...");
+    let room = width.saturating_sub(w_of(mark) + 2);
+    let shown = if w_of(path) <= room {
+        path.to_string()
+    } else {
+        let mut tail: Vec<char> = vec![];
+        let mut w = w_of(more);
+        for c in path.chars().rev() {
+            w += w_of(c.encode_utf8(&mut [0; 4]));
+            if w > room {
+                break;
+            }
+            tail.push(c);
+        }
+        format!("{more}{}", tail.into_iter().rev().collect::<String>())
+    };
+    format!("{mark}  {shown}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under an image marker a result line does not name the file again: Mantra's screenshot and
+    /// view-image sentences keep their details, bija's `[image: …]` line goes, others stay.
+    #[test]
+    fn a_result_line_beside_an_image_keeps_what_the_marker_does_not_say() {
+        let p = "/home/me/.mantra/runs/x/screenshots/p1-ui-1.png";
+        let shot = |tail: &str| format!("Screenshot of the screen of the machine Mantra runs on, saved to {p} (image/png, 1x1 px, 67 B, via grim){tail}");
+        assert_eq!(beside_image(&shot("."), p).as_deref(), Some("image/png, 1x1 px, 67 B, via grim"));
+        assert_eq!(beside_image(&shot(", region 0,0,10,10."), p).as_deref(), Some("image/png, 1x1 px, 67 B, via grim, region 0,0,10,10"));
+        assert_eq!(beside_image(&shot(". Note: the region was ignored."), p).as_deref(), Some("image/png, 1x1 px, 67 B, via grim · Note: the region was ignored"));
+        assert_eq!(beside_image(&format!("{p} (image/png, 5x3 px, 76 B)"), p).as_deref(), Some("image/png, 5x3 px, 76 B"));
+        assert_eq!(beside_image(&format!("[image: {p}]"), p), None);
+        assert_eq!(beside_image("Rendered a 64×64 preview.", p).as_deref(), Some("Rendered a 64×64 preview."));
+        assert_eq!(beside_image(&shot("."), "").as_deref(), Some(shot(".").as_str()), "no path known: the line as it is");
+    }
+
+    #[test]
+    fn an_image_marker_names_the_file_and_keeps_its_end() {
+        let m = image_marker("/home/me/.mantra/screenshots/solo-1.png", 80);
+        assert!(m.ends_with("  /home/me/.mantra/screenshots/solo-1.png") && (m.starts_with("▣ image") || m.starts_with("[img]")), "{m}");
+        let short = image_marker("/home/me/.mantra/screenshots/solo-1.png", 24);
+        assert!(short.ends_with("solo-1.png") && (short.contains('…') || short.contains("...")) && w_of(&short) <= 24, "{short}");
+        assert!(["▣ image", "[img]"].contains(&image_marker("", 80).as_str()));
+    }
 }

@@ -4,6 +4,7 @@ mod agent;
 mod api;
 mod cli;
 mod control;
+mod mcp;
 mod proto;
 mod session;
 mod tools;

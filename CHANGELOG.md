@@ -62,6 +62,23 @@ it a third backend for any role — and the default for Solo.
   off, a pattern with groups runs exactly as before. `/akasha` shows the blocks, the web app's
   run page has a *Shared notes* section, and `docs/tools/swarm-e2e.sh` checks a demo swarm
   shares a note. Its format and tools may still change.
+- **MCP servers for every backend.** `[mcp_servers.<name>]` in `settings.toml` (or
+  `mantra mcp add blender -- uvx blender-mcp`, then `mantra mcp test blender`) hands any stdio
+  MCP server to agents: Solo gets the ones `solo_mcp` names (all of them by default; `/mcp`
+  shows them, `/mcp solo` changes it), a pattern role only the ones its `mcp = [...]` lists.
+  Codex gets them as `-c mcp_servers.…`, Claude Code beside Mantra's own server in
+  `--mcp-config`, bija through a new `--mcp-file` and its own MCP client; every call shows on the
+  card as `<server>.<tool>`. A settings file or pattern from before gives agents no server, as
+  before. `--demo` brings a stand-in (`mantra mock-mcp`), and `docs/tools/mcp-e2e.sh` checks it
+  end to end on bija and the Claude Code mock.
+- **Seeing the screen.** A model marked `vision` in `/models` (the built-in aliases are in a new
+  `models.toml`, an older one needs it switched on there, and discovery marks the models it adds)
+  gets `mantra_screenshot` — the host's screen, or a region of
+  it, saved under the run's `screenshots/` — and `mantra_view_image` for a picture in its
+  working directory; nothing is captured unless the model asks. Images reach Codex, Claude Code
+  and bija the way each takes them; bija keeps them as files under the session's `images/` and
+  has its own `screenshot` and `view_image` behind `--vision`. `MANTRA_SCREENSHOT_CMD` replaces
+  the capture tool (`grim`, `gnome-screenshot`, `scrot`, `import`, `screencapture`).
 
 ## v0.6.2 — 2026-10-17
 

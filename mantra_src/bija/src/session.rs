@@ -62,6 +62,10 @@ pub struct Meta {
     pub max_output_tokens: Option<u32>,
     pub system: String,
     pub tools_file: Option<PathBuf>,
+    /// `--mcp-file`: the MCP servers started with the session (again on every resume).
+    pub mcp_file: Option<PathBuf>,
+    /// `--vision`: the `screenshot` and `view_image` tools are offered.
+    pub vision: bool,
     pub sandbox: String,
     pub writable: Vec<PathBuf>,
     pub network: bool,
@@ -90,6 +94,8 @@ impl Default for Meta {
             max_output_tokens: None,
             system: String::new(),
             tools_file: None,
+            mcp_file: None,
+            vision: false,
             sandbox: "workspace-write".into(),
             writable: vec![],
             network: false,
@@ -350,7 +356,7 @@ impl Session {
         let missing = unanswered_calls(&self.messages);
         let n = missing.len();
         for (call_id, name) in missing {
-            self.push(Message::Tool { call_id, name, text: text.to_string(), is_error: true })?;
+            self.push(Message::Tool { call_id, name, text: text.to_string(), is_error: true, images: vec![] })?;
         }
         Ok(n)
     }
@@ -568,7 +574,7 @@ mod tests {
         Message::Assistant { text: t.into(), reasoning: String::new(), tool_calls: calls.iter().map(|(id, name)| ToolCall { id: (*id).into(), name: (*name).into(), args: json!({}), raw: String::new() }).collect() }
     }
     fn tool(id: &str, t: &str) -> Message {
-        Message::Tool { call_id: id.into(), name: "bash".into(), text: t.into(), is_error: false }
+        Message::Tool { images: vec![], call_id: id.into(), name: "bash".into(), text: t.into(), is_error: false }
     }
 
     fn transcript(home: &Home, id: &str) -> String {
@@ -627,7 +633,7 @@ mod tests {
         let (s, pending) = Session::open(&home.0, "d", Fsync::Never).unwrap();
         assert_eq!(pending, Pending::Turn);
         assert_eq!(s.messages.len(), 4);
-        assert_eq!(s.messages[3], Message::Tool { call_id: "c2".into(), name: "read_file".into(), text: RESTART_RESULT.into(), is_error: true });
+        assert_eq!(s.messages[3], Message::Tool { images: vec![], call_id: "c2".into(), name: "read_file".into(), text: RESTART_RESULT.into(), is_error: true });
         assert_eq!(s.open_turn(), OpenTurn { assistant_messages: 1, tool_calls: 2 });
         drop(s);
         // The repair was written down: a second open finds nothing left to repair.
@@ -673,7 +679,7 @@ mod tests {
         let (s, pending) = Session::open(&home.0, "n", Fsync::Never).unwrap();
         assert_eq!(pending, Pending::None);
         assert_eq!(s.messages.last(), Some(&Message::User { text: "[note] $ ls\na.txt".into() }));
-        assert_eq!(s.messages[2], Message::Tool { call_id: "c1".into(), name: "bash".into(), text: "interrupted".into(), is_error: true });
+        assert_eq!(s.messages[2], Message::Tool { images: vec![], call_id: "c1".into(), name: "bash".into(), text: "interrupted".into(), is_error: true });
     }
 
     #[test]
@@ -747,6 +753,8 @@ mod tests {
         m.writable = vec!["/tmp/x".into()];
         m.max_output_tokens = Some(1234);
         m.tools_file = Some("/s/tools.json".into());
+        m.mcp_file = Some("/s/mcp.json".into());
+        m.vision = true;
         let mut s = Session::create(&home.0, m, Fsync::Always).unwrap();
         s.meta.usage_total = Usage { input: 10, output: 2, cached: 4, estimated: false };
         s.meta.turns = 7;
@@ -762,6 +770,7 @@ mod tests {
         drop(s);
         let (s, _) = Session::open(&home.0, "m", Fsync::Never).unwrap();
         assert_eq!((s.meta.model.as_str(), s.meta.context_window, s.meta.compact_at), ("x", 200_000, 85));
+        assert_eq!((s.meta.mcp_file.as_deref(), s.meta.vision), (None, false), "a session from before MCP has none");
     }
 
     #[test]

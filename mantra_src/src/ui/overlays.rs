@@ -304,8 +304,14 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         }
         let dup = if notes && w_of(&dup) <= left { dup } else { String::new() };
         left = left.saturating_sub(w_of(&dup));
-        if notes && !is_cur && !m.note.is_empty() && left >= 9 {
-            row.push(Span::styled(format!(" {}", trunc(&m.note, left - 1)), theme::faint()));
+        // a model that takes images says so: its agents get the screenshot tools
+        let note = match (m.note.is_empty(), m.vision) {
+            (_, false) => m.note.clone(),
+            (true, true) => "vision".to_string(),
+            (false, true) => format!("vision · {}", m.note),
+        };
+        if notes && !is_cur && !note.is_empty() && left >= 9 {
+            row.push(Span::styled(format!(" {}", trunc(&note, left - 1)), theme::faint()));
         }
         if !dup.is_empty() {
             row.push(Span::styled(dup, theme::faint()));
@@ -908,7 +914,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 if app.run.as_ref().map(|r| r.stage == Stage::Review).unwrap_or(false) {
                     let mut run = app.run.take();
                     if let Some(r) = run.as_mut() {
-                        let mut ctx = crate::app::Ctxt { hub: &mut app.hub, agents: &mut app.agents, registry: &app.registry, tx: &app.tx, notes: &mut app.notes };
+                        let mut ctx = crate::app::Ctxt { hub: &mut app.hub, agents: &mut app.agents, registry: &app.registry, settings: &app.settings, tx: &app.tx, notes: &mut app.notes };
                         r.approve_plan(&mut ctx);
                     }
                     app.run = run;

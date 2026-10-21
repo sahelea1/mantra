@@ -8,10 +8,14 @@
 //! passed through exactly as streamed.
 //!
 //! The request side is strict the other way: it sends only what SPEC §7.3 lists, and the few
-//! optional fields (`stream_options`, `reasoning_effort`, `max_tokens`) are dropped or renamed
-//! for the session when a provider rejects them ([`Quirks`]).
+//! optional fields (`stream_options`, `reasoning_effort`, `max_tokens`, images) are dropped or
+//! renamed for the session when a provider rejects them ([`Quirks`]).
+//!
+//! Images are the one thing Chat Completions cannot put where they belong: a `tool` message is
+//! text only. So a result's images ride in a `user` message after the results — after *all* of
+//! them, because every call of an assistant turn must be answered before anything else is said.
 
-use super::{call_as_text, embedded_error, malformed, parse_args, result_as_text, truncated_stream};
+use super::{call_as_text, embedded_error, malformed, parse_args, refuses_images, result_as_text, truncated_stream, ImageFiles};
 use crate::types::{str_at, ApiError, Delta, ErrorKind, Finish, Message, Request, Response, ToolCall, Usage};
 use serde_json::{json, Map, Value};
 
@@ -27,6 +31,9 @@ pub struct Quirks {
     max_completion_tokens: bool,
     /// `""` instead of `null` as the content of an assistant turn that only calls tools.
     empty_content: bool,
+    /// Tool results go as text only: the provider refused an image.
+    no_images: bool,
+    pub(crate) images: ImageFiles,
     sent: Sent,
 }
 
@@ -36,6 +43,7 @@ struct Sent {
     effort: bool,
     max_tokens: bool,
     null_content: bool,
+    images: bool,
 }
 
 impl Quirks {
@@ -49,6 +57,10 @@ impl Quirks {
         if self.sent.stream_options && m.contains("stream_options") {
             self.no_stream_options = true;
             return Some("the provider rejects `stream_options`; streaming without usage reports".into());
+        }
+        if refuses_images(err, self.sent.images) {
+            self.no_images = true;
+            return Some("the provider refused an image; tool results go as text only from now on".into());
         }
         if self.sent.max_tokens && !self.max_completion_tokens && m.contains("max_completion_tokens") {
             self.max_completion_tokens = true;
@@ -75,7 +87,30 @@ pub fn body(req: &Request<'_>, stream: bool, quirks: &mut Quirks) -> Value {
         messages.push(json!({"role": "system", "content": req.system}));
     }
     let null_content = if quirks.empty_content { json!("") } else { Value::Null };
-    messages.extend(req.messages.iter().map(|m| message_json(m, plain, &null_content)));
+    // The image parts of the run of tool results being written, sent once the run ends.
+    let mut pictures: Vec<Value> = Vec::new();
+    let mut sent_images = false;
+    for m in req.messages {
+        if !matches!(m, Message::Tool { .. }) && !pictures.is_empty() {
+            messages.push(json!({"role": "user", "content": std::mem::take(&mut pictures)}));
+        }
+        messages.push(message_json(m, plain, &null_content));
+        match m {
+            Message::Tool { name, images, .. } if !plain && !quirks.no_images => {
+                for img in images {
+                    if let Some((mime, b64)) = quirks.images.load(img, None) {
+                        pictures.push(json!({"type": "text", "text": format!("image from {name}: {}", img.path.display())}));
+                        pictures.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}));
+                        sent_images = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !pictures.is_empty() {
+        messages.push(json!({"role": "user", "content": pictures}));
+    }
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
     body.insert("messages".into(), Value::Array(messages));
@@ -83,7 +118,7 @@ pub fn body(req: &Request<'_>, stream: bool, quirks: &mut Quirks) -> Value {
         let tools = req.tools.iter().map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}})).collect();
         body.insert("tools".into(), Value::Array(tools));
     }
-    let mut sent = Sent { null_content: !plain && !quirks.empty_content && req.messages.iter().any(only_calls), ..Sent::default() };
+    let mut sent = Sent { null_content: !plain && !quirks.empty_content && req.messages.iter().any(only_calls), images: sent_images, ..Sent::default() };
     if stream {
         body.insert("stream".into(), json!(true));
         if !quirks.no_stream_options {
@@ -459,8 +494,8 @@ mod tests {
         vec![
             Message::User { text: "list".into() },
             Message::Assistant { text: String::new(), reasoning: "secret".into(), tool_calls: vec![ToolCall { id: "c1".into(), name: "bash".into(), args: json!({"command": "ls"}), raw: String::new() }, ToolCall { id: "c2".into(), name: "bash".into(), args: Value::Null, raw: "{bad".into() }] },
-            Message::Tool { call_id: "c1".into(), name: "bash".into(), text: "a.rs".into(), is_error: false },
-            Message::Tool { call_id: "c2".into(), name: "bash".into(), text: "bad arguments".into(), is_error: true },
+            Message::Tool { images: vec![], call_id: "c1".into(), name: "bash".into(), text: "a.rs".into(), is_error: false },
+            Message::Tool { images: vec![], call_id: "c2".into(), name: "bash".into(), text: "bad arguments".into(), is_error: true },
             Message::Assistant { text: "done".into(), reasoning: String::new(), tool_calls: vec![] },
         ]
     }
@@ -550,6 +585,64 @@ mod tests {
         let mut q = Quirks::default();
         body(&Request { messages: &plain_history, ..req }, true, &mut q);
         assert!(q.adapt(&bad).is_none(), "nothing null was sent");
+    }
+
+    /// A PNG on disk (only its signature matters to the wire) and the image record pointing at it.
+    fn png_file(tag: &str) -> (crate::types::Image, Vec<u8>) {
+        let path = std::env::temp_dir().join(format!("bija-chat-{tag}-{}.png", crate::types::uuid_v4()));
+        let bytes = b"\x89PNG\r\n\x1a\nnot really pixels".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        (crate::types::Image { mime: "image/png".into(), path }, bytes)
+    }
+
+    /// The tool message stays text; the image follows in a user message once every call of the
+    /// turn is answered — before a steer that came after the results, never between two results.
+    #[test]
+    fn images_follow_the_tool_results_in_a_user_message() {
+        let (img, bytes) = png_file("img");
+        let mut messages = history();
+        if let Message::Tool { images, .. } = &mut messages[2] {
+            images.push(img.clone());
+        }
+        messages.insert(4, Message::User { text: "also look at b.rs".into() });
+        let tools = tools();
+        let req = Request { model: "m1", effort: "", system: "", messages: &messages, tools: &tools, max_output_tokens: None };
+        let mut q = Quirks::default();
+        let b = body(&req, true, &mut q);
+        let roles: Vec<&str> = b["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "user", "user", "assistant"]);
+        assert_eq!(b["messages"][2], json!({"role": "tool", "tool_call_id": "c1", "content": "a.rs"}));
+        let url = format!("data:image/png;base64,{}", crate::types::base64_encode(&bytes));
+        assert_eq!(
+            b["messages"][4],
+            json!({"role": "user", "content": [
+                {"type": "text", "text": format!("image from bash: {}", img.path.display())},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]})
+        );
+        assert_eq!(b["messages"][5], json!({"role": "user", "content": "also look at b.rs"}));
+        // The compaction request (no tools) carries no images.
+        let plain = body(&Request { tools: &[], ..req }, true, &mut q);
+        assert!(!plain.to_string().contains("image_url"));
+
+        // A provider that takes no images: dropped for good, the text stays.
+        let bad = ApiError { kind: ErrorKind::BadRequest, status: Some(400), message: "Invalid content type. image_url is only supported by certain models.".into(), retry_after_ms: None };
+        body(&req, true, &mut q);
+        assert!(q.adapt(&bad).is_some());
+        let b = body(&req, true, &mut q);
+        assert!(!b.to_string().contains("image_url") && b["messages"][2]["content"] == "a.rs");
+        assert!(q.adapt(&bad).is_none(), "nothing left to drop");
+
+        // A file gone since: left out, reported once, the text still goes.
+        std::fs::remove_file(&img.path).unwrap();
+        let mut q = Quirks::default();
+        let b = body(&req, true, &mut q);
+        body(&req, true, &mut q);
+        assert!(!b.to_string().contains("image_url"));
+        let warnings = q.images.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&img.path.display().to_string()), "{warnings:?}");
+        assert!(q.adapt(&bad).is_none(), "no image went, so a 400 is not about one");
     }
 
     #[test]

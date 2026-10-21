@@ -21,6 +21,9 @@ pub enum Op {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// The model takes images (`--vision`'s tools offered) or not — Mantra's live switch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision: Option<bool>,
     },
     Shell { command: String },
     ToolResult {
@@ -29,9 +32,19 @@ pub enum Op {
         ok: bool,
         #[serde(default)]
         text: String,
+        /// Images beside the text (base64), e.g. a screenshot Mantra took for the model.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     Status,
     Shutdown,
+}
+
+/// An image in a `tool_result` op: its media type and base64 bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageRef {
+    pub mime: String,
+    pub b64: String,
 }
 
 fn default_true() -> bool {
@@ -86,6 +99,10 @@ pub enum Event {
         duration_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<FileChange>,
+        /// The images the result carried, as the files bija saved them to (`<session
+        /// dir>/images/…`); the model got them beside `result`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     ToolCall { turn: String, id: String, name: String, args: Value },
     Usage { turn: String, last_in: u64, last_out: u64, total: u64, cached: u64, window: u64, estimated: bool },
@@ -133,8 +150,9 @@ mod tests {
     fn ops_parse_the_documented_lines() {
         assert_eq!(Op::parse(r#"{"op":"prompt","text":"hi"}"#).unwrap(), Op::Prompt { text: "hi".into() });
         assert_eq!(Op::parse(r#"{"op":"interrupt"}"#).unwrap(), Op::Interrupt);
-        assert_eq!(Op::parse(r#"{"op":"set","effort":"high"}"#).unwrap(), Op::Set { model: None, effort: Some("high".into()), name: None });
-        assert_eq!(Op::parse(r#"{"op":"tool_result","id":"c1","text":"done"}"#).unwrap(), Op::ToolResult { id: "c1".into(), ok: true, text: "done".into() });
+        assert_eq!(Op::parse(r#"{"op":"set","effort":"high"}"#).unwrap(), Op::Set { model: None, effort: Some("high".into()), name: None, vision: None });
+        assert_eq!(Op::parse(r#"{"op":"set","vision":false}"#).unwrap(), Op::Set { model: None, effort: None, name: None, vision: Some(false) });
+        assert_eq!(Op::parse(r#"{"op":"tool_result","id":"c1","text":"done"}"#).unwrap(), Op::ToolResult { id: "c1".into(), ok: true, text: "done".into(), images: vec![] });
         assert!(Op::parse("nope").unwrap_err().starts_with("bad op"));
         assert!(Op::parse(r#"{"op":"dance"}"#).is_err());
     }
@@ -145,8 +163,12 @@ mod tests {
         assert_eq!(e.line(), r#"{"ev":"turn_done","turn":"t1","status":"completed","error":null}"#);
         let e = Event::Compacted { turn: None, from: 10, to: 2 };
         assert_eq!(e.line(), r#"{"ev":"compacted","from":10,"to":2}"#);
-        let e = Event::ToolDone { turn: "t1".into(), id: "c".into(), name: "bash".into(), ok: true, result: "x".into(), exit_code: Some(0), duration_ms: 5, changes: vec![] };
-        assert!(e.line().contains("\"exit_code\":0") && !e.line().contains("changes"));
+        let e = Event::ToolDone { turn: "t1".into(), id: "c".into(), name: "bash".into(), ok: true, result: "x".into(), exit_code: Some(0), duration_ms: 5, changes: vec![], images: vec![] };
+        assert!(e.line().contains("\"exit_code\":0") && !e.line().contains("changes") && !e.line().contains("images"));
+        let e = Event::ToolDone { turn: "t1".into(), id: "c".into(), name: "mcp__demo__render".into(), ok: true, result: "x".into(), exit_code: None, duration_ms: 5, changes: vec![], images: vec!["/s/images/c-1.png".into()] };
+        assert!(e.line().ends_with(r#""images":["/s/images/c-1.png"]}"#), "{}", e.line());
+        let op = Op::parse(r#"{"op":"tool_result","id":"c1","text":"shot","images":[{"mime":"image/png","b64":"iVBO"}]}"#).unwrap();
+        assert_eq!(op, Op::ToolResult { id: "c1".into(), ok: true, text: "shot".into(), images: vec![ImageRef { mime: "image/png".into(), b64: "iVBO".into() }] });
         for s in [TurnStatus::Completed, TurnStatus::Failed, TurnStatus::Interrupted] {
             assert_eq!(serde_json::to_value(&s).unwrap(), s.as_str(), "the record and the event spell it alike");
         }

@@ -583,6 +583,10 @@ button.item-head:hover { background: var(--bg-hover); }
 .tool-name { color: var(--text); font-family: var(--mono); font-size: 13px; }
 .tool.bad .tool-name { color: var(--red); }
 .tool-body { border-top: 1px solid var(--line); }
+.tool-image { display: flex; gap: 8px; align-items: baseline; padding: 0 12px 8px; font-size: 12px; min-width: 0; }
+.tool-image-mark { color: var(--blue); white-space: nowrap; display: inline-flex; gap: 4px; align-items: center; align-self: center; }
+.tool-image-mark .ic { width: 14px; height: 14px; }
+.tool-image-path { color: var(--dim); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; min-width: 0; }
 .tool-label { padding: 8px 12px 0; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 700; background: var(--code-bg); }
 .tool-body .cmd-out { border-top: 0; }
 .item-line { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: var(--fs-sm); }

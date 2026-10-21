@@ -473,8 +473,291 @@ pub fn expand_tilde(p: &str, home: Option<&Path>) -> PathBuf {
     p.strip_prefix("~/").map(|rest| h.join(rest)).unwrap_or_else(|| PathBuf::from(p))
 }
 
+// ───────────────────────────── images ─────────────────────────────
+
+/// The variable naming a screen capture command template: `{out}` is the PNG to write, `{region}`
+/// (optional) the `x,y,w,h` asked for. Tests use it, and so can anyone with a tool of their own.
+pub const SCREENSHOT_VAR: &str = "MANTRA_SCREENSHOT_CMD";
+
+/// The largest image `read_image` hands a model: past this an image is mostly context spent.
+pub const IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// One capture attempt at most: a tool that waits for a click (a portal dialog) is not one that
+/// works. (Captures run as background jobs, never on the event loop — `tools::vision_call`.)
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a capture left behind: the PNG, the tool that wrote it, and anything the model should
+/// know about how it was taken (a region that could not be applied).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    pub path: PathBuf,
+    pub via: &'static str,
+    pub note: Option<&'static str>,
+}
+
+/// A screen area in pixels, from `"x,y,w,h"`.
+fn parse_region(s: &str) -> Result<[u32; 4], String> {
+    let bad = || format!("region must be \"x,y,w,h\" in pixels, e.g. \"0,0,800,600\" (got {s:?})");
+    let n: Vec<u32> = s.split(',').map(|p| p.trim().parse::<u32>()).collect::<Result<_, _>>().map_err(|_| bad())?;
+    match n[..] {
+        [x, y, w, h] if w > 0 && h > 0 => Ok([x, y, w, h]),
+        _ => Err(bad()),
+    }
+}
+
+/// `s` as one word for `sh`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Capture the screen of the machine Mantra runs on into `out` (a PNG): the first that works of
+/// `$MANTRA_SCREENSHOT_CMD`, grim (Wayland), gnome-screenshot, scrot, ImageMagick's import (X11)
+/// and screencapture (macOS) — the list bija's own `screenshot` tries, so both see the same. None
+/// working → the error says what was tried and what to install.
+pub fn screenshot(region: Option<&str>, display: Option<&str>, out: &Path) -> Result<Capture, String> {
+    let template = std::env::var(SCREENSHOT_VAR).ok();
+    capture_with(template.as_deref(), region, display, out, &which)
+}
+
+type Attempt = (&'static str, Result<std::process::Command, String>, Option<&'static str>);
+
+/// `find` stands in for `which` so tests can leave every real capture tool out.
+fn capture_with(template: Option<&str>, region: Option<&str>, display: Option<&str>, out: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Result<Capture, String> {
+    use std::process::Command;
+    let region = region.map(str::trim).filter(|r| !r.is_empty()).map(parse_region).transpose()?;
+    let display = display.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let csv = region.map(|[x, y, w, h]| format!("{x},{y},{w},{h}"));
+    let installed = |name: &str| find(name).map(Command::new).ok_or_else(|| "not installed".to_string());
+    let x11 = |mut c: Command| {
+        if let Some(d) = display {
+            c.env("DISPLAY", d);
+        }
+        c
+    };
+    let attempts: Vec<Attempt> = vec![
+        (
+            SCREENSHOT_VAR,
+            match template.map(str::trim).filter(|t| !t.is_empty()) {
+                None => Err("not set".into()),
+                Some(t) if !t.contains("{out}") => Err("has no {out} in it".into()),
+                Some(t) => {
+                    let line = t.replace("{out}", &sh_quote(&out.to_string_lossy())).replace("{region}", &csv.as_deref().map(sh_quote).unwrap_or_default());
+                    let mut c = Command::new("sh");
+                    c.arg("-c").arg(line);
+                    Ok(x11(c))
+                }
+            },
+            None,
+        ),
+        (
+            "grim",
+            installed("grim").map(|mut c| {
+                if let Some(d) = display {
+                    c.arg("-o").arg(d);
+                }
+                if let Some([x, y, w, h]) = region {
+                    c.arg("-g").arg(format!("{x},{y} {w}x{h}"));
+                }
+                c.arg(out);
+                c
+            }),
+            None,
+        ),
+        (
+            "gnome-screenshot",
+            installed("gnome-screenshot").map(|mut c| {
+                c.arg("-f").arg(out);
+                x11(c)
+            }),
+            region.map(|_| "the region was not applied: gnome-screenshot captures the whole screen"),
+        ),
+        (
+            "scrot",
+            installed("scrot").map(|mut c| {
+                if let Some(r) = &csv {
+                    c.arg("-a").arg(r);
+                }
+                c.arg(out);
+                x11(c)
+            }),
+            None,
+        ),
+        (
+            "import",
+            installed("import").map(|mut c| {
+                c.arg("-window").arg("root");
+                if let Some([x, y, w, h]) = region {
+                    c.arg("-crop").arg(format!("{w}x{h}+{x}+{y}"));
+                }
+                c.arg(out);
+                x11(c)
+            }),
+            None,
+        ),
+        (
+            "screencapture",
+            installed("screencapture").map(|mut c| {
+                c.arg("-x");
+                if let Some(r) = &csv {
+                    c.arg("-R").arg(r);
+                }
+                if let Some(d) = display {
+                    c.arg("-D").arg(d);
+                }
+                c.arg(out);
+                c
+            }),
+            None,
+        ),
+    ];
+    let mut tried = vec![];
+    for (via, cmd, note) in attempts {
+        let failure = match cmd {
+            Err(why) => why,
+            Ok(cmd) => {
+                let _ = std::fs::remove_file(out);
+                match run_capped(cmd, CAPTURE_TIMEOUT) {
+                    Err(e) => e,
+                    Ok((Some(0), _)) => match std::fs::read(out) {
+                        Ok(bytes) if image_mime(&bytes).is_some() => return Ok(Capture { path: out.to_path_buf(), via, note }),
+                        Ok(bytes) if bytes.is_empty() => "wrote an empty file".into(),
+                        Ok(_) => "wrote something that is not an image".into(),
+                        Err(_) => "exit code 0, no image written".into(),
+                    },
+                    Ok((code, said)) => match said {
+                        Some(said) => format!("exit code {}: {said}", code.unwrap_or(-1)),
+                        None => format!("exit code {}, no image written", code.unwrap_or(-1)),
+                    },
+                }
+            }
+        };
+        let _ = std::fs::remove_file(out);
+        tried.push(format!("{via} ({failure})"));
+    }
+    let mut msg = String::from("no screen capture worked here. ");
+    if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        msg.push_str("No display is set (DISPLAY, WAYLAND_DISPLAY). ");
+    }
+    msg.push_str(&format!("Tried: {}. Install grim (Wayland), scrot or ImageMagick (X11), or set {SCREENSHOT_VAR} to a command that writes a PNG to {{out}}.", tried.join("; ")));
+    Err(msg)
+}
+
+/// Run a capture command to its end or `limit`, whichever comes first: its exit code and the last
+/// line it printed on stderr. Its output never reaches the terminal (the TUI owns it), and on
+/// Unix it gets a process group of its own, so a timeout ends the `sh -c` template's children too.
+fn run_capped(mut cmd: std::process::Command, limit: Duration) -> Result<(Option<i32>, Option<String>), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("cannot start: {e}"))?;
+    // read on the side: a chatty tool must not block on a full pipe while we wait for it
+    let reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            s
+        })
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                #[cfg(unix)]
+                let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no capture within {} s", limit.as_secs()));
+            }
+            Err(e) => return Err(format!("lost track of it: {e}")),
+        }
+    };
+    let said = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    let last = said.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| trunc(l, 200));
+    Ok((code, last))
+}
+
+/// An image's media type from its first bytes (never from its name): PNG, JPEG, GIF or WebP.
+pub fn image_mime(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Read an image for a model: its media type and bytes. PNG, JPEG, GIF or WebP, at most
+/// `IMAGE_MAX_BYTES` — the size it claims is checked before anything is read, and the read itself
+/// stops one byte past the cap: a /proc file says it is empty and reads on for gigabytes.
+pub fn read_image(path: &Path) -> Result<(&'static str, Vec<u8>), String> {
+    use std::io::Read;
+    let too_big = |n: u64| format!("{} is {} — images go up to {}", path.display(), human_bytes(n), human_bytes(IMAGE_MAX_BYTES));
+    let md = std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !md.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    if md.len() > IMAGE_MAX_BYTES {
+        return Err(too_big(md.len()));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(IMAGE_MAX_BYTES + 1).read_to_end(&mut bytes)).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > IMAGE_MAX_BYTES {
+        return Err(format!("{} reads on past {} — images go up to that", path.display(), human_bytes(IMAGE_MAX_BYTES)));
+    }
+    match image_mime(&bytes) {
+        Some(mime) => Ok((mime, bytes)),
+        None => Err(format!("{} is not a PNG, JPEG, GIF or WebP image", path.display())),
+    }
+}
+
+/// `812 B`, `40.2 KiB`, `3.1 MiB`.
+pub fn human_bytes(n: u64) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.1} KiB", n as f64 / 1024.0),
+        _ => format!("{:.1} MiB", n as f64 / 1_048_576.0),
+    }
+}
+
+/// A PNG's width and height, from its IHDR chunk.
+pub fn png_size(b: &[u8]) -> Option<(u32, u32)> {
+    if image_mime(b) != Some("image/png") || b.len() < 24 || &b[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    Some((be(16), be(20)))
+}
+
+/// Standard base64 with padding — what a `data:` URL carries.
+pub fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn toolchain_roots_are_the_existing_caches_overrides_and_flutter_sdk_each_once() {
@@ -699,6 +982,97 @@ mod tests {
         assert_eq!(strip_ansi("a\u{1b}]0;title\u{1b}\\b"), "ab");
         assert_eq!(strip_ansi("a\u{1b}b"), "ab");
         assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+
+    /// A real (if tiny) PNG: `w`×`h` gray pixels, encoded as the demo's MCP server encodes its preview.
+    pub(crate) fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        crate::mock_mcp::encode_png(w, h, &vec![0x80; (w * h * 3) as usize])
+    }
+
+    #[test]
+    fn images_are_known_by_their_bytes_and_capped_before_reading() {
+        let dir = scratch("images");
+        let png = tiny_png(3, 2);
+        assert_eq!((image_mime(&png), png_size(&png)), (Some("image/png"), Some((3, 2))));
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"GIF89a.."), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_mime(b"%PDF-1.7"), None);
+        // the name says nothing: a PNG called .jpg is a PNG, a text file called .png is refused
+        std::fs::write(dir.join("shot.jpg"), &png).unwrap();
+        assert_eq!(read_image(&dir.join("shot.jpg")).map(|(m, b)| (m, b.len())), Ok(("image/png", png.len())));
+        std::fs::write(dir.join("notes.png"), "hello").unwrap();
+        assert!(read_image(&dir.join("notes.png")).unwrap_err().contains("is not a PNG, JPEG, GIF or WebP image"));
+        assert!(read_image(&dir.join("missing.png")).unwrap_err().starts_with("cannot read"));
+        assert!(read_image(&dir).unwrap_err().ends_with("is not a file"));
+        // one byte over the cap is refused on its size alone (a sparse file: nothing is written)
+        let big = std::fs::File::create(dir.join("big.png")).unwrap();
+        big.set_len(IMAGE_MAX_BYTES + 1).unwrap();
+        let e = read_image(&dir.join("big.png")).unwrap_err();
+        assert!(e.contains("8.0 MiB — images go up to 8.0 MiB"), "{e}");
+        // a /proc file says it is empty and reads on for gigabytes: the read stops past the cap
+        let pagemap = Path::new("/proc/self/pagemap");
+        // (it takes reads of 8 bytes at a time only, so the cap's one extra byte may be refused as
+        // an invalid argument instead — a refusal either way, never a read to its end)
+        if std::fs::File::open(pagemap).is_ok() {
+            let e = read_image(pagemap).unwrap_err();
+            assert!(e.contains("reads on past 8.0 MiB") || e.contains("Invalid argument"), "{e}");
+        }
+    }
+
+    #[test]
+    fn base64_is_the_padded_standard_alphabet() {
+        assert_eq!(b64(b""), "");
+        assert_eq!(b64(b"f"), "Zg==");
+        assert_eq!(b64(b"fo"), "Zm8=");
+        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(&[0xFB, 0xFF]), "+/8=");
+    }
+
+    #[test]
+    fn a_capture_tries_the_template_first_then_names_what_it_tried() {
+        let dir = scratch("capture");
+        let src = dir.join("src.png");
+        std::fs::write(&src, tiny_png(4, 4)).unwrap();
+        let out = dir.join("shots").join("solo-1.png");
+        let nothing = |_: &str| None;
+        // the template, its region quoted for sh
+        let t = format!("cp {} {{out}} && echo {{region}} > {}", src.display(), dir.join("region.txt").display());
+        let got = capture_with(Some(&t), Some("10, 20,300,200"), None, &out, &nothing).unwrap();
+        assert_eq!((got.path.clone(), got.via, got.note), (out.clone(), SCREENSHOT_VAR, None));
+        assert_eq!(std::fs::read(&out).unwrap(), tiny_png(4, 4));
+        assert_eq!(std::fs::read_to_string(dir.join("region.txt")).unwrap().trim(), "10,20,300,200");
+        // a bad region is refused before anything runs
+        assert!(capture_with(Some(&t), Some("10,20"), None, &out, &nothing).unwrap_err().starts_with("region must be"));
+        // nothing works: every tool is named with why, and what to install
+        let e = capture_with(Some("false"), None, None, &out, &nothing).unwrap_err();
+        assert!(e.contains("MANTRA_SCREENSHOT_CMD (has no {out} in it)") && e.contains("grim (not installed)") && e.contains("screencapture (not installed)"), "{e}");
+        assert!(e.contains("Install grim (Wayland), scrot or ImageMagick (X11)"), "{e}");
+        let e = capture_with(Some("echo nope >&2; exit 3 # {out}"), None, None, &out, &nothing).unwrap_err();
+        assert!(e.contains("MANTRA_SCREENSHOT_CMD (exit code 3: nope)"), "{e}");
+        let e = capture_with(Some("echo text > {out}"), None, None, &out, &nothing).unwrap_err();
+        assert!(e.contains("wrote something that is not an image") && !out.exists(), "{e}");
+        let e = capture_with(None, None, None, &out, &nothing).unwrap_err();
+        assert!(e.contains("MANTRA_SCREENSHOT_CMD (not set)"), "{e}");
+    }
+
+    #[test]
+    fn a_found_tool_gets_the_region_its_own_way() {
+        let dir = scratch("capture-tool");
+        // a stand-in `scrot` that records its arguments and writes a PNG to the last one
+        let bin = dir.join("scrot");
+        std::fs::write(dir.join("src.png"), tiny_png(1, 1)).unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\necho \"$@\" > {}\nfor a; do last=$a; done\ncp {} \"$last\"\n", dir.join("args").display(), dir.join("src.png").display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let find = |n: &str| (n == "scrot").then(|| bin.clone());
+        let out = dir.join("x.png");
+        let got = capture_with(None, Some("1,2,3,4"), None, &out, &find).unwrap();
+        assert_eq!(got.via, "scrot");
+        assert_eq!(std::fs::read_to_string(dir.join("args")).unwrap().trim(), format!("-a 1,2,3,4 {}", out.display()));
     }
 }
 

@@ -1,6 +1,7 @@
 //! Tools Mantra gives agents (Codex "dynamic tools", executed by Mantra itself).
 
 use serde_json::{json, Value};
+use std::path::Path;
 
 fn tool(name: &str, description: &str, props: Value, required: &[&str]) -> Value {
     json!({
@@ -212,6 +213,127 @@ pub fn architect_tools() -> Vec<Value> {
     ]
 }
 
+/// The tools that hand a model an image: offered only to an agent whose model takes images
+/// (`ModelEntry.vision`), executed by Mantra, answered with an `inputImage` beside the text.
+pub const VISION_TOOLS: [&str; 2] = ["mantra_screenshot", "mantra_view_image"];
+
+pub fn vision_tools() -> Vec<Value> {
+    vec![
+        tool(
+            "mantra_screenshot",
+            "Capture the screen of the machine Mantra runs on (the host, where the user sees their apps) and see it as an image; the PNG's path comes back too. Each capture costs context (a thousand tokens or more), so capture when you need to look, and pass region when you know where to look.",
+            json!({
+                "region": {"type": "string", "description": "only this part of the screen: \"x,y,w,h\" in pixels, e.g. \"0,0,800,600\""},
+                "display": {"type": "string", "description": "which display or output to capture (an X11 display such as \":0\", or a Wayland output name); default: the current one"}
+            }),
+            &[],
+        ),
+        tool(
+            "mantra_view_image",
+            "Look at an image file: PNG, JPEG, GIF or WebP, at most 8 MB. Returns the image and its size. The path is relative to your working directory, or absolute.",
+            json!({"path": {"type": "string", "description": "path of the image file"}}),
+            &["path"],
+        ),
+    ]
+}
+
+/// A `contentItems` text entry (the Codex app-server `ContentItem` shape).
+pub fn text_item(text: &str) -> Value {
+    json!({"type": "inputText", "text": text})
+}
+
+/// A `contentItems` image entry: the bytes as a `data:` URL.
+pub fn image_item(mime: &str, bytes: &[u8]) -> Value {
+    json!({"type": "inputImage", "imageUrl": format!("data:{mime};base64,{}", crate::util::b64(bytes))})
+}
+
+/// Run a vision tool for one agent (a run agent, or Solo): the `contentItems` to answer with and
+/// whether it worked. `cwd` is what a relative `path` is read against; a capture is saved as the
+/// next free `<stem>-<n>.png` in `shots`, owner-only (the host's desktop is nobody else's to
+/// read). The path is always in the text as well, absolute, so a model can come back to the file
+/// with its backend's own tools. Blocking (a capture can take seconds): callers run it as a job.
+pub fn vision_call(tool: &str, args: &Value, cwd: &Path, shots: &Path, stem: &str) -> (Vec<Value>, bool) {
+    let arg = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+    let got = match tool {
+        "mantra_screenshot" => {
+            // One capture at a time in the process: two at once would both take the first free
+            // `<stem>-<n>.png` (and there is one screen to capture anyway).
+            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            private_dir(shots).and_then(|()| crate::util::screenshot(arg("region"), arg("display"), &next_shot(shots, stem))).and_then(|cap| {
+                owner_only(&cap.path);
+                let (mime, bytes) = crate::util::read_image(&cap.path)?;
+                let path = std::fs::canonicalize(&cap.path).unwrap_or(cap.path.clone());
+                let mut text = format!("Screenshot of the screen of the machine Mantra runs on, saved to {} ({}, via {})", path.display(), describe(mime, &bytes), cap.via);
+                if let Some(r) = arg("region").filter(|_| cap.note.is_none()) {
+                    text.push_str(&format!(", region {r}"));
+                }
+                text.push('.');
+                if let Some(note) = cap.note {
+                    text.push_str(&format!(" Note: {note}."));
+                }
+                Ok((text, mime, bytes))
+            })
+        }
+        "mantra_view_image" => match arg("path") {
+            None => Err("path is required: the image file to look at".to_string()),
+            Some(p) => {
+                let path = cwd.join(crate::util::expand_tilde(p, dirs::home_dir().as_deref()));
+                crate::util::read_image(&path).map(|(mime, bytes)| (format!("{} ({})", path.display(), describe(mime, &bytes)), mime, bytes))
+            }
+        },
+        other => Err(format!("{other} is not a vision tool")),
+    };
+    match got {
+        Ok((text, mime, bytes)) => (vec![text_item(&text), image_item(mime, &bytes)], true),
+        Err(e) => (vec![text_item(&e)], false),
+    }
+}
+
+/// `image/png, 1920x1080 px, 812.3 KiB` (the pixel size where the header says it).
+fn describe(mime: &str, bytes: &[u8]) -> String {
+    let size = crate::util::human_bytes(bytes.len() as u64);
+    match crate::util::png_size(bytes) {
+        Some((w, h)) => format!("{mime}, {w}x{h} px, {size}"),
+        None => format!("{mime}, {size}"),
+    }
+}
+
+/// `dir`, created owner-only (0700) — and made so if it was there already: it is Mantra's own
+/// (`<run dir>/screenshots`, `~/.mantra/screenshots`), whatever the umask or the home's mode.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    let failed = |e: std::io::Error| format!("cannot create {}: {e}", dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(failed)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(failed)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).map_err(failed)
+}
+
+/// A capture the tool wrote at the umask's mode, made owner-only (0600).
+fn owner_only(file: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
+/// `<shots>/<stem>-<n>.png` with the first `n` not taken: numbering needs no state, and a resumed
+/// run never writes over an earlier capture.
+fn next_shot(shots: &Path, stem: &str) -> std::path::PathBuf {
+    let stem = match crate::util::slug(stem) {
+        s if s.is_empty() => "agent".to_string(),
+        s => s,
+    };
+    (1..).map(|n| shots.join(format!("{stem}-{n}.png"))).find(|p| !p.exists()).unwrap_or_else(|| shots.join(format!("{stem}.png")))
+}
+
 pub const PLANNER_PROTOCOL: &str = r#"
 mantra-role: planner
 ## Mantra protocol
@@ -330,6 +452,8 @@ planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]]
 context_cap (the most tokens of context any agent is told it has, 200000 in the built-ins; 0 = the model's full window).
 A role may also set fallback = alias: the model that takes over when an agent of that role sits through
 settings.first_token_minutes (default 4; 0 = off) twice with no output at all.
+A role may also set mcp = ["name", …]: the MCP servers (from the user's settings.toml [mcp_servers]) its
+agents get, e.g. mcp = ["blender"] for a role that drives Blender; ["*"] = every enabled server; unset = none.
 Optional [[groups]] (Akasha, experimental: roles that share one block of notes) have name, roles (each role in
 one group at most), shared_chars (1024-262144, default 16384), push = none|urgent|all (default urgent), auto (default true).
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.

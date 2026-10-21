@@ -33,11 +33,16 @@ pub struct Role {
     /// `settings.first_token_minutes` with no output at all (a gateway that accepts the turn and
     /// never answers). Unset: the second time goes to the manager like any other watchdog case.
     pub fallback: Option<String>,
+    /// MCP servers this role's agents get (names from `settings.mcp_servers`, or `"*"` for every
+    /// enabled one). Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
 }
 
 impl Default for Role {
     fn default() -> Self {
         Role {
+            mcp: vec![],
             kind: "worker".into(),
             glyph: "◇".into(),
             color: "teal".into(),
@@ -1166,6 +1171,26 @@ mod tests {
         assert_eq!(p.groups, vec![Group { name: "builders".into(), roles: vec!["worker-small".into()], ..Group::default() }]);
         assert_eq!((p.groups[0].shared_chars, p.groups[0].push.as_str(), p.groups[0].auto), (16_384, "urgent", true));
         assert_eq!(Pattern::from_toml(&p.to_toml()).unwrap(), p, "a group round-trips");
+    }
+
+    /// A role's `mcp` round-trips through the pattern's TOML; a pattern from before it (every
+    /// built-in) loads with none on every role and writes no `mcp` key back.
+    #[test]
+    fn role_mcp_round_trips_and_old_patterns_are_unchanged() {
+        for p in all_builtins() {
+            assert!(p.roles.values().all(|r| r.mcp.is_empty()), "{}", p.name);
+            assert!(!p.to_toml().lines().any(|l| l.trim_start().starts_with("mcp =")), "{}: nothing new in an old pattern's file", p.name);
+        }
+        let mut p = Pattern::builtin();
+        let first = p.roles.keys().next().cloned().unwrap();
+        p.roles.get_mut(&first).unwrap().mcp = vec!["blender".into(), "*".into()];
+        let toml = p.to_toml();
+        assert!(toml.lines().any(|l| l.starts_with("mcp = [")), "{toml}");
+        let back = Pattern::from_toml(&toml).unwrap();
+        assert_eq!(back.roles[&first].mcp, vec!["blender".to_string(), "*".into()]);
+        assert_eq!(back, p);
+        assert_eq!(Pattern::from_toml(&back.to_toml()).unwrap(), p, "and again");
+        assert!(back.roles.iter().filter(|(n, _)| **n != first).all(|(_, r)| r.mcp.is_empty()), "the other roles keep none");
     }
 
     #[test]

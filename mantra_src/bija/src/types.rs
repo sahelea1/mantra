@@ -29,7 +29,27 @@ pub enum Message {
         text: String,
         #[serde(default)]
         is_error: bool,
+        /// Images the tool returned (a screenshot, an MCP image), kept as files under the session
+        /// dir and sent to the model by each wire its own way.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
+}
+
+/// An image a tool returned, stored as a file beside the transcript (never inlined).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Image {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    pub path: std::path::PathBuf,
+}
+
+/// An image a tool produced, still in memory: the agent writes it under the session dir and the
+/// message keeps only the path (`Image`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ImageData {
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 /// A tool call the model made. `args` is the parsed JSON object, or `Value::Null` when the model's
@@ -203,6 +223,10 @@ pub struct ToolOutcome {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<FileChange>,
+    /// Images for the model beside the text (a screenshot, an MCP image). Never serialized: the
+    /// agent saves them as files and the transcript records the paths.
+    #[serde(skip)]
+    pub images: Vec<ImageData>,
 }
 
 impl ToolOutcome {
@@ -222,9 +246,121 @@ impl Message {
         match self {
             Message::User { text } => text.len(),
             Message::Assistant { text, tool_calls, .. } => text.len() + tool_calls.iter().map(|c| c.name.len() + if c.raw.is_empty() { c.args.to_string().len() } else { c.raw.len() }).sum::<usize>(),
-            Message::Tool { name, text, .. } => name.len() + text.len(),
+            Message::Tool { name, text, images, .. } => name.len() + text.len() + images.len() * IMAGE_CHARS,
         }
     }
+}
+
+/// What one image counts for in a `chars / 4` estimate: about a thousand tokens, the order of
+/// what providers charge for a screen-sized picture.
+pub const IMAGE_CHARS: usize = 4000;
+
+/// The largest image a tool may hand the model (a file, a capture, an MCP result).
+pub const IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The media type of an image by its first bytes: PNG, JPEG, GIF or WebP — the four every
+/// provider that takes images accepts. `None` for anything else.
+pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Bytes as a tool's image: at most `IMAGE_MAX_BYTES`, and a PNG, JPEG, GIF or WebP by what the
+/// bytes are rather than what they were said to be (`claimed`, which only names them in the error).
+pub fn image_from(bytes: Vec<u8>, claimed: &str) -> Result<ImageData, String> {
+    if bytes.len() as u64 > IMAGE_MAX_BYTES {
+        return Err(format!("{} is over the {} limit", human_size(bytes.len() as u64), human_size(IMAGE_MAX_BYTES)));
+    }
+    match sniff_image(&bytes) {
+        Some(mime) => Ok(ImageData { mime: mime.to_string(), bytes }),
+        None if claimed.trim().is_empty() => Err("not a PNG, JPEG, GIF or WebP image".into()),
+        None => Err(format!("{} is not a PNG, JPEG, GIF or WebP image", claimed.trim())),
+    }
+}
+
+/// `image_from` for base64 data (a `data:` URL too).
+pub fn image_from_base64(data: &str, claimed: &str) -> Result<ImageData, String> {
+    image_from(base64_decode(data).ok_or("its data is not base64")?, claimed)
+}
+
+/// The file extension an image of this media type is saved under.
+pub fn image_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
+/// A size for people: `512 B`, `12.3 KiB`, `4.1 MiB`.
+pub fn human_size(n: u64) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.1} KiB", n as f64 / 1024.0),
+        _ => format!("{:.1} MiB", n as f64 / 1_048_576.0),
+    }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding (what a `data:` URL and both wires' image blocks carry).
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8) | u32::from(chunk.get(2).copied().unwrap_or(0));
+        for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() { B64[(n >> shift) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// Decodes base64 — standard or URL-safe, padded or not, whitespace ignored; a `data:…;base64,`
+/// prefix is skipped (some senders pass the whole URL). `None` when it is not base64.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    let text = match text.strip_prefix("data:") {
+        Some(url) => url.split_once(";base64,")?.1,
+        None => text,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits, mut ended) = (0u32, 0u32, false);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => {
+                ended = true;
+                continue;
+            }
+            c if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        if ended {
+            return None;
+        }
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// `Message::sent_chars` over a history.
@@ -340,7 +476,7 @@ mod tests {
         let m = vec![
             Message::User { text: "abcd".into() },
             Message::Assistant { text: "ef".into(), reasoning: "not sent back".into(), tool_calls: vec![ToolCall { id: "c".into(), name: "bash".into(), args: serde_json::json!({"a": 1}), raw: String::new() }] },
-            Message::Tool { call_id: "c".into(), name: "bash".into(), text: "xyz".into(), is_error: false },
+            Message::Tool { images: vec![], call_id: "c".into(), name: "bash".into(), text: "xyz".into(), is_error: false },
         ];
         assert_eq!(sent_chars(&m), 4 + (2 + 4 + 7) + (4 + 3));
         let unparsed = ToolCall { id: "c".into(), name: "x".into(), args: Value::Null, raw: "{oops".into() };
@@ -374,6 +510,37 @@ mod tests {
         random_bytes(&mut a);
         random_bytes(&mut b);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn base64_round_trips_and_reads_every_common_spelling() {
+        for data in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0u8, 255, 254, 3, 128]] {
+            let enc = base64_encode(data);
+            assert_eq!(base64_decode(&enc).as_deref(), Some(data), "{enc}");
+        }
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_decode("Zm8").as_deref(), Some(&b"fo"[..]), "padding is optional");
+        assert_eq!(base64_decode(" Zm9v\nYmFy ").as_deref(), Some(&b"foobar"[..]));
+        assert_eq!(base64_decode("data:image/png;base64,Zm9v").as_deref(), Some(&b"foo"[..]));
+        assert_eq!(base64_decode("-_8").as_deref(), base64_decode("+/8").as_deref(), "URL-safe alphabet");
+        assert_eq!(base64_decode("Zm9v!"), None);
+        assert_eq!(base64_decode("Zm8=Zm8="), None, "nothing after the padding");
+        assert_eq!(base64_decode("data:text/plain,hello"), None);
+    }
+
+    #[test]
+    fn images_are_known_by_their_first_bytes() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
+        assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a.."), Some("image/gif"));
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(sniff_image(b"<svg xmlns"), None);
+        assert_eq!((image_ext("image/jpeg"), image_ext("image/png"), image_ext("image/webp")), ("jpg", "png", "webp"));
+        assert_eq!((human_size(512), human_size(2048), human_size(3 * 1024 * 1024)), ("512 B".to_string(), "2.0 KiB".to_string(), "3.0 MiB".to_string()));
+        let with_image = Message::Tool { images: vec![Image { mime: "image/png".into(), path: "/x.png".into() }], call_id: "c".into(), name: "ab".into(), text: "cd".into(), is_error: false };
+        assert_eq!(estimate_tokens(with_image.sent_chars()), 1001, "an image counts about a thousand tokens");
     }
 
     #[test]

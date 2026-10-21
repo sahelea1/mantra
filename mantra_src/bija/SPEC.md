@@ -11,7 +11,8 @@ role, or runs on its own.
 Design goals, in order: **coherent and correct**, **resilient**, **small footprint** (one thread, a few
 MB of RSS idle — 80 of them on a laptop), **fast** (streams, never blocks on disk in the hot path),
 **resumable** (host crash → `bija --resume <id>` carries on), **inspectable** (`bija show`, a control
-socket). Non-goals: a TUI (Mantra is the UI), MCP servers, web search, a plugin system.
+socket). It also runs the user's MCP servers (§10) and, for a model that takes images, can see the
+screen (§6.1). Non-goals: a TUI (Mantra is the UI), web search, a plugin system.
 
 This document is bija's design: the contract between its modules and between bija and Mantra. The
 code follows it, and where the two disagree one of them has a bug; what it leaves open is kept simple.
@@ -34,6 +35,7 @@ mantra_src/
       session.rs      # on-disk session: session.json + transcript.jsonl, replay/repair on resume
       agent.rs        # the turn loop: prompt → API → tools → … → turn_done; steer, interrupt, compaction, external tools
       control.rs      # optional Unix control socket (`bija send`)
+      mcp.rs          # MCP servers: the stdio JSON-RPC client, their tools (§10)
       api/mod.rs      # `Client`: one completion with retries, wire dispatch
       api/http.rs     # minimal HTTP/1.1 client: http/https, proxy CONNECT, SSL_CERT_FILE, chunked, SSE
       api/openai.rs   # Chat Completions request/stream parsing
@@ -42,8 +44,10 @@ mantra_src/
       tools/fs.rs     # read_file, write_file, edit_file, delete, list_dir, glob, grep
       tools/shell.rs  # bash (+timeout, +background jobs), job
       tools/sandbox.rs# path policy + optional bwrap wrapper
+      tools/vision.rs # screenshot, view_image (with --vision)
     tests/
       e2e.rs          # spawns the real binary against an in-test mock Chat Completions server
+                      # (and runs itself as a stdio MCP server for the MCP tests)
 ```
 
 Dependencies: only crates already in Mantra's lockfile — `tokio` (rt, macros, process, io-util, io-std,
@@ -82,6 +86,8 @@ Options (serve and run):
 | `--max-output-tokens N` | `max_tokens` per reply | the provider's; 16384 on `anthropic`, which requires one |
 | `--system TEXT` / `--system-file PATH` | system prompt appended after bija's own preamble | none |
 | `--tools-file PATH` | JSON array of external tool definitions (§4.4) | none |
+| `--mcp-file PATH` | MCP servers to start with the session, `{"mcpServers": {…}}` (§10) | none |
+| `--vision` | offer `screenshot` and `view_image` (§6.1), for a model that takes images | off |
 | `--sandbox MODE` | `read-only\|workspace-write\|full` (§6.3) | `workspace-write` |
 | `--writable DIR` | extra writable root (repeatable) | — |
 | `--network` | allow network inside sandboxed commands (only matters with bwrap) | off |
@@ -94,9 +100,14 @@ Options (serve and run):
 | `--fsync MODE` | `turn\|always\|never` — when transcript appends are fsynced | `turn` |
 | `-v`, `--verbose` | `run` only: print the events to stderr | off |
 
-`--resume` reuses the stored meta (model, wire, url, system prompt, sandbox…); flags given alongside
-override and are saved. `BIJA_PROVIDER_URL`, `BIJA_MODEL`, `BIJA_HOME` are the only env inputs
-besides the key variable.
+`--resume` reuses the stored meta (model, wire, url, system prompt, sandbox, MCP file…); flags given
+alongside override and are saved. `--network` can only turn on: given, it is on and saved; left
+out, the stored choice stands. `--vision` follows the launch: given, the vision tools are offered;
+left out, they are not, whatever the session had — it belongs to the model, which a resume may
+change, and Mantra says it on every launch (a live model switch carries it in `set`, §4.1).
+`BIJA_PROVIDER_URL`,
+`BIJA_MODEL`, `BIJA_HOME` are the only env inputs besides the key variable (and
+`MANTRA_SCREENSHOT_CMD`, §6.1, read by `screenshot`).
 
 Exit codes: 0 clean; 1 runtime failure (printed to stderr, one line); 2 usage error; 128 + N after
 signal N's crash-safe stop (143 SIGTERM, 129 SIGHUP — §3).
@@ -128,9 +139,10 @@ run_turn(text):
        if a steer is waiting: continue (it gets an answer); else finish_turn(Completed); return
     rounds += 1; if rounds > 200: finish_turn(Failed{Internal, "tool round cap"}); return
     for call in tool_calls (in order, one at a time):
-       if runtime.is_builtin(call.name):
+       if runtime.handles(call.name):            (a built-in, a vision tool, an MCP server's tool)
             emit ToolStarted; outcome = runtime.call(name, args, progress→ToolOutput)
-            session.append(Tool{call_id, name, text: outcome.text, is_error: !outcome.ok}); emit ToolDone
+            save outcome.images (§5); session.append(Tool{call_id, name, text: outcome.text, is_error: !outcome.ok, images})
+            emit ToolDone
        else (external, i.e. in --tools-file):
             emit ToolCall{id, name, args}; wait for Op::ToolResult{id} (keep serving other ops meanwhile;
             Interrupt aborts the wait with an "interrupted" result and ends the turn)
@@ -196,8 +208,18 @@ Rules:
 - Every op is answered within one event loop iteration — reading stdin never waits on the API or a tool.
   Implementation: `tokio::select!` over `ops.recv()`, the pinned completion future, and the running tool.
 - Token estimate when the API gave no usage: `chars / 4` over what was sent (system prompt, tool
-  definitions, the messages without their reasoning) and what came back, flagged `estimated: true`. The
-  api layer makes it, so the agent never sees an unexplained zero.
+  definitions, the messages without their reasoning) and what came back, flagged `estimated: true`,
+  each image counted as 1,000 tokens. The api layer makes it, so the agent never sees an unexplained
+  zero.
+- **Images.** A result's images — a vision tool's, an MCP server's, those of an external
+  `tool_result` — are written to `<session dir>/images/<call id>-<n>.<ext>` (PNG, JPEG, GIF or WebP
+  by their bytes, at most 8 MB each; anything else is named in the text instead; a name already
+  taken — a provider that reuses `call_0` every turn — gets `-2`, `-3`… on it, never overwritten;
+  owner-only files in an owner-only directory), the `Tool` record
+  keeps `{mime, path}` (never the bytes), a line `[image: <path>]` per image is appended to the
+  result text (so the model can name the file, and still knows of it where a wire drops the image),
+  and `tool_done.images` lists the paths. The wires read the files when they build a request (§7.3,
+  §7.4); a file gone since is left out with a `warning` (once per file), its text still sent.
 - The final text of a turn = the text of the last assistant message of that turn (may be empty). It is
   the agent's report to whoever prompted it (Mantra's Conductor reads a worker's `STATUS:` line from it);
   a failed turn reports the error instead, through `turn_done`.
@@ -224,9 +246,9 @@ envelope beyond `ev`. SIGTERM and SIGHUP are a crash-safe stop that leaves a run
 {"op":"steer","text":"…"}
 {"op":"interrupt"}
 {"op":"compact"}
-{"op":"set","model":"…"}            // any subset of: model, effort, name
+{"op":"set","model":"…"}            // any subset of: model, effort, name, vision (true|false)
 {"op":"shell","command":"…"}
-{"op":"tool_result","id":"<call id>","ok":true,"text":"…"}
+{"op":"tool_result","id":"<call id>","ok":true,"text":"…","images":[{"mime":"image/png","b64":"…"}]}   // images optional
 {"op":"status"}
 {"op":"shutdown"}
 ```
@@ -242,6 +264,7 @@ envelope beyond `ev`. SIGTERM and SIGHUP are a crash-safe stop that leaves a run
 {"ev":"tool_started","turn":"t3","id":"<call id>","name":"bash","args":{…}}
 {"ev":"tool_output","turn":"t3","id":"<call id>","text":"<chunk>"}        // streamed command output
 {"ev":"tool_done","turn":"t3","id":"<call id>","name":"bash","ok":true,"result":"<text the model got>","exit_code":0,"duration_ms":812,"changes":[{"path":"src/a.rs","kind":"modified","diff":"--- …"}]}
+{"ev":"tool_done","turn":"t3","id":"<call id>","name":"mcp__blender__get_viewport_screenshot","ok":true,"result":"…\n[image: <session dir>/images/<call id>-1.png]","duration_ms":930,"images":["<session dir>/images/<call id>-1.png"]}
 {"ev":"tool_call","turn":"t3","id":"<call id>","name":"mantra_spawn","args":{…}}   // external: answer with tool_result
 {"ev":"usage","turn":"t3","last_in":12345,"last_out":210,"total":98765,"cached":40000,"window":200000,"estimated":false}
 {"ev":"retry","turn":"t3","attempt":2,"max":8,"error":"HTTP 503 …","wait_ms":2000}
@@ -254,7 +277,9 @@ envelope beyond `ev`. SIGTERM and SIGHUP are a crash-safe stop that leaves a run
 {"ev":"exit","code":0}                                                     // last line before exiting (143/129 after a signal)
 ```
 
-`turn_done.status` ∈ `completed | failed | interrupted`. `error.kind` ∈ `transient | rate_limit | auth |
+`tool_started`/`tool_done` carry the name the model called, `mcp__<server>__<tool>` for an MCP
+server's tool; `tool_done.images` (left out when empty) lists the files of the images the result
+carried. `turn_done.status` ∈ `completed | failed | interrupted`. `error.kind` ∈ `transient | rate_limit | auth |
 context | bad_request | usage | interrupted | internal` (`types::ErrorKind`). `tool_done.changes[].kind`
 ∈ `add | modified | delete`. Ids: turns `t<N>` (N counts from 1 across resumes), messages `t<N>-m<K>`,
 reasoning `t<N>-r<K>`; tool ids are the provider's call ids (fallback `t<N>-c<K>`). K counts the turn's
@@ -276,7 +301,8 @@ or tool results without a final assistant text) and bija is continuing that turn
 `{"type":"function","name":"…","description":"…","inputSchema":{…}}` (`parameters` accepted as an alias
 of `inputSchema`). They are offered to the model beside the built-ins; a call to one is emitted as
 `tool_call` and the turn waits for `tool_result` with the same id. A result arriving for an unknown id
-is ignored with a `warning`.
+is ignored with a `warning`. A `tool_result` may carry `images` (`{mime, b64}`; a `data:` URL is
+accepted as `b64` too): they are kept and sent like any tool's (§3 Images).
 
 ### 4.5 Control socket
 
@@ -298,6 +324,7 @@ dropped once it is full, rather than growing bija's memory.
   transcript.jsonl   append-only records (below)
   control.sock       only while --control is running
   jobs/<n>.log       background job output
+  images/<call id>-<n>.<ext>   images tool results carried (§3 Images); the transcript points here
 ```
 
 ### 5.1 session.json
@@ -306,16 +333,20 @@ dropped once it is full, rather than growing bija's memory.
 {"id":"…","name":"…","created_unix":…,"updated_unix":…,"cwd":"/abs","provider_url":"…","wire":"openai_chat",
  "api_key_env":"BIJA_API_KEY","model":"…","effort":"high","context_window":200000,"compact_at":85,
  "max_output_tokens":16384,"system":"<full system prompt incl. preamble>","tools_file":"<abs path or null>",
+ "mcp_file":"<abs path or null>","vision":false,
  "sandbox":"workspace-write","writable":["…"],"network":false,"turns":3,"usage_total":{"input":…,"output":…,"cached":…},
  "last_in":12345,"archived":false,"version":1}
 ```
+
+A field a session.json lacks takes its default (`mcp_file` null, `vision` false), so a session from
+before a field existed opens as it always did.
 
 ### 5.2 transcript.jsonl records
 
 ```json
 {"t":"msg","role":"user","text":"…","at":<unix>}
 {"t":"msg","role":"assistant","text":"…","reasoning":"…","tool_calls":[{"id":"…","name":"…","args":{…}}],"at":…}
-{"t":"msg","role":"tool","call_id":"…","name":"…","text":"…","is_error":false,"at":…}
+{"t":"msg","role":"tool","call_id":"…","name":"…","text":"…","is_error":false,"images":[{"mime":"image/png","path":"<session dir>/images/<call id>-1.png"}],"at":…}   // images only when there are some
 {"t":"compact","summary":"…","from":171000,"to":4100,"at":…}   // everything before this line is history
 {"t":"note","text":"turn interrupted","at":…}                   // becomes a User message "[note] …" for the model
 {"t":"turn","n":3,"status":"completed","at":…}                  // written by finish_turn
@@ -360,6 +391,13 @@ consistent as memory).
 | `grep` | `pattern`, `path?`, `glob?`, `max?` (default 200, max 2000) | shells out to `rg` (preferred, honours `.gitignore`) or `grep -rnHEI`; skips `.git`, `target`, `node_modules` (unless `path` names one) and binary files; results `path:line: text` |
 | `bash` | `command`, `timeout_secs?` (default 120, max 1800), `background?` | `bash -c` in cwd (`sh -c` when there is no `bash`); stdin closed; merged stdout+stderr; tail-truncated at 48 KiB with a `[… N lines truncated]` head note; `background: true` returns `{"job": n, "log": "<path>"}` at once |
 | `job` | `action` ∈ `wait\|output\|kill\|list`, `id?`, `timeout_secs?` | `wait` blocks up to timeout (default 300) and returns exit code + output tail; `output` returns the tail so far. The tail reads at most the last 96 KiB of the log (its note then counts bytes, not lines) |
+| `screenshot` | `region?` (`"x,y,w,h"` in pixels), `display?` | only with `--vision`. Captures the screen of the machine bija runs on with the first that works of: `$MANTRA_SCREENSHOT_CMD` (a `sh` template: `{out}` the PNG to write, `{region}` the region or nothing), `grim` (`-g` for a region, `-o` for display), `gnome-screenshot -f` (whole screen only; the result says so), `scrot` (`-a`), `import -window root` (`-crop`), `screencapture -x` (`-R`, `-D`). Each gets 30 s; they run outside the sandbox (a capture needs the display) without the key variables. Returns the image and its size (pixels for a PNG); when nothing works the error names every attempt and what to install |
+| `view_image` | `path` | only with `--vision`. Reads a PNG, JPEG, GIF or WebP (by its bytes) of at most 8 MB from a regular file, relative to cwd or absolute — reading is never sandboxed — and returns it as an image with its size; anything else is refused (a device, a pipe, a /proc file that reads on past the cap) |
+
+The two vision tools are named and described for what they see — bija's own host — so beside Mantra's
+`mantra_screenshot`/`mantra_view_image` (which see Mantra's) the model can tell them apart; under
+Mantra both are the same machine. An MCP server's tools (§10) are offered after these, under
+`mcp__<server>__<tool>`.
 
 Argument validation errors are returned as `ok:false` text results for the model ("edit_file: `old`
 is required"), never as a crashed turn. Paths are resolved against cwd; `~` is not expanded.
@@ -411,8 +449,12 @@ installed; for `add` the diff is the file's content, for `delete` empty).
   still have members afterwards (a command cut short, or one that exited leaving `server &` behind) is
   remembered and ended with the background jobs at shutdown — all at once, with a 1 s grace (§3).
 - The variable named by `--api-key-env` (and `BIJA_API_KEY`) is removed from every command's
-  environment — the model's, a job's, the user's `shell` op — so no command can print the key into the
+  environment — the model's, a job's, the user's `shell` op, a screen capture, an MCP server (whose
+  own configured `env` is applied after, and wins) — so no command can print the key into the
   transcript.
+- Outside the sandbox, by design: screen captures (they need the display) and MCP servers (§10: the
+  user's own programs, often talking to an app over a socket). Both run in process groups of their
+  own and end with the jobs.
 
 Mantra's worktree isolation is the real boundary between workers; the sandbox is belt and braces,
 as it is for Codex.
@@ -464,7 +506,17 @@ description,parameters}}]` when non-empty, `stream:true` + `stream_options:{incl
 explicitly (providers' defaults otherwise). Headers: `Authorization: Bearer <key>` when a key exists,
 `Content-Type: application/json`, `Accept: text/event-stream`, `User-Agent: bija/<ver>`. Adaptations
 (§7.2): `stream_options` dropped (streaming then goes without usage), `reasoning_effort` dropped,
-`max_tokens` renamed `max_completion_tokens`, `content: null` on tool-call turns sent as `""`.
+`max_tokens` renamed `max_completion_tokens`, `content: null` on tool-call turns sent as `""`, images
+dropped (below).
+
+Images: a `tool` message is text only here, so a result's images ride in a `user` message after the
+run of tool results it belongs to — after *every* result of that assistant turn, which must all follow
+it directly — and before whatever came next (a steer): `{"role":"user","content":[{"type":"text",
+"text":"image from <tool>: <path>"},{"type":"image_url","image_url":{"url":"data:<mime>;base64,…"}},
+…]}`, one text and one image part per image. A 400 that mentions an image after a request that
+carried one (a model that takes none, a size it refuses) turns images off for the session: results go
+as text only, their `[image: <path>]` lines saying what was left out. The compaction call (no tools)
+never carries images.
 
 Stream: `data: <json>` lines, `[DONE]` ends; `choices[0].delta.content` → `Delta::Text`,
 `delta.reasoning_content` or `delta.reasoning` → `Delta::Reasoning`, `delta.tool_calls[]` by `index`
@@ -494,6 +546,11 @@ once, all of them, if the provider refuses a signature). Stream events: `message
 `content_block_start` (`text` / `tool_use{id,name}` / `thinking`), `content_block_delta` (`text_delta`,
 `input_json_delta`, `thinking_delta`), `message_delta` (`stop_reason`, `usage.output_tokens`), `error`
 events, `message_stop`.
+
+Images go inside their result: the `tool_result` block's `content` becomes `[{"type":"text","text":…},
+{"type":"image","source":{"type":"base64","media_type":"<mime>","data":"…"}}, …]`. One whose base64
+is over the API's 5 MB is left out up front (a `warning`, once), and a 400 about an image turns images
+off for the session, as on openai-chat. The compaction call never carries images.
 
 ### 7.5 http.rs
 
@@ -577,8 +634,11 @@ server didn't say `Connection: close`; any error discards it. No gzip (`Accept-E
   `dynamic_tools`) and `system.md` there before launching
   `bija --home <home> --session <sid> --cwd <cwd> --provider-url … --wire … --api-key-env … --model …
   --effort … --context-window … --compact-at … --system-file …/system.md --tools-file …/tools.json
-  --sandbox … [--writable …]… [--network] --name <thread_name>`; a resume launches with `--resume <sid>`
-  and the same flags (so a changed model/effort is picked up).
+  [--mcp-file …/mcp.json] [--vision] --sandbox … [--writable …]… [--network] --name <thread_name>`
+  (`mcp.json` is written beside `tools.json` when the agent has MCP servers, and emptied when a
+  session that had some has none now, so the stored path stops starting them; `--vision` when its
+  model takes images); a resume launches with `--resume <sid>` and the same flags (so a changed
+  model/effort is picked up).
 - Translation (`Translator::on_event`, pure, unit-tested on a recorded fixture
   `testdata/bija-events.jsonl`): `ready` → `HubEvent::Ready{thread_id: session, model, resumed}`;
   `turn_started` → `turn/started {turn:{id}}`; `text_delta` → `item/agentMessage/delta {itemId, delta}`
@@ -610,7 +670,9 @@ server didn't say `Connection: close`; any error discards it. No gzip (`Accept-E
   `usageLimitExceeded`, interrupted/internal→ none; `warning` → `warning {message}`; `exit` → the
   process is ending (the crash/exit path handles the rest).
 - Cmds: `Turn`→`prompt`, `Steer`→`steer`, `Interrupt`→`interrupt`, `Compact`→`compact`,
-  `SetEffort`/`SetModel`→`set` (no restart — bija switches live), `SetName`→`set{name}`,
+  `SetEffort`/`SetModel`→`set` (no restart — bija switches live), `SetVision`→`set{vision}` (the new
+  model takes images or does not: bija's vision tools come or go at its next model call, and the
+  hub remembers it for the next launch's `--vision`), `SetName`→`set{name}`,
   `Shell`→`shell`, `Archive`→ nothing (session stays on disk), `Restart`→ `shutdown` → `Exit::Restarting`
   (resume), `Shutdown`→`shutdown`. One process stopping on its own (a restart, an agent shut down) is
   given ≤ 5 s after `shutdown`, then killed; quitting Mantra gives every bija agent together
@@ -656,3 +718,53 @@ scripts Codex: planner → `mantra_submit_plan` (the shared plan JSON), orchestr
 then a final text with the `STATUS:` line, gate → `mantra_gate_report` pass, manager → `mantra_wait`,
 solo/probe → "OK"/a short text. It decides what to send from the message list (how many tool results it
 already sees for the current turn), is stateless otherwise, and reports plausible `usage`.
+
+---
+
+## 10. MCP servers (mcp.rs)
+
+`--mcp-file` names a JSON file in the shape MCP clients share (Mantra writes it as `mcp.json` in the
+session dir):
+
+```json
+{"mcpServers": {
+  "blender": {"command": "uvx", "args": ["blender-mcp"], "env": {}},
+  "files":   {"command": "npx", "args": ["@modelcontextprotocol/server-filesystem", "/work"]}
+}}
+```
+
+`args` and `env` are optional (numbers and booleans in them are written out as text). A server that
+cannot run here — no `command`, a `type` other than `stdio` (a URL-only server) — is a `warning` and
+skipped; a file that is not this shape fails the launch (exit 1) when given as a flag, and is a
+`warning` (no servers) when only the stored meta names it.
+
+- **Transport**: each server is a child process speaking JSON-RPC 2.0, one message per line, on its
+  stdin/stdout. It runs in the agent's cwd, outside the sandbox, without bija's key variables (the
+  server's `env` is applied after, and wins), in a process group of its own. Its stderr goes to
+  bija's, each line prefixed `mcp <name>: `. Lines on its stdout that are not JSON (a banner) are
+  skipped; one longer than 48 MB is dropped.
+- **Start** (with the session, again on every `--resume`, before `ready`): all servers at once, each
+  with 20 s for `initialize` (`protocolVersion "2025-06-18"`, no client capabilities, `clientInfo
+  {name: "bija"}`; bija then speaks whatever version the server answers), the
+  `notifications/initialized` notification and every page of `tools/list` (following `nextCursor`, at
+  most 100 pages; a server that does not know `tools/list` simply has no tools). One that cannot be
+  started, exits, errs or does not answer in time is killed, skipped and reported in a `warning` after
+  `ready` — with its exit code and last stderr line when it died — and the session goes on with the
+  rest. The system prompt names the configured servers in one line.
+- **Tools**: offered after the built-ins as `mcp__<server>__<tool>` (characters other than
+  `[A-Za-z0-9_-]` become `_`, cut to 64 — what both wires accept; a name taken twice is skipped with a
+  `warning`), with the server's description and `inputSchema` (made an object schema when it is not
+  one). A call goes through the argument shaping of §6.1 like any tool's, then `tools/call {name,
+  arguments}`. The result: its `text` parts joined with newlines (cut to 64 KiB), `image` parts as
+  images (§3 Images), a `resource` with text as its text and with an image blob as an image, other
+  parts named (`[resource link: …]`, `[audio content left out]`); no content at all → its
+  `structuredContent` as JSON, else `(no output)`. `isError: true` is a failed call (`ok: false`); a
+  JSON-RPC error is a failed call saying `mcp <server>: <message> (error <code>)`.
+- **While it runs**: a call waits at most 600 s (then it is cancelled and the model told). An
+  interrupt drops it: the server gets `notifications/cancelled` for that request and its late answer
+  is discarded. The server's own requests are answered — `ping` with `{}`, anything else with
+  `-32601` (bija offers no sampling or roots) — and its `notifications/message` log lines go to stderr.
+  A server that exits fails its calls in flight at once; its tools then answer that it is not running
+  until bija restarts.
+- **End**: at shutdown, with the jobs (§3): stdin closed and SIGTERM to its group, the shared 1 s
+  grace, then SIGKILL to the group — whatever the server started goes with it.

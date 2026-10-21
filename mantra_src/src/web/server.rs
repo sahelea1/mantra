@@ -352,4 +352,14 @@ mod tests {
         assert_eq!(content_type("sw.js"), "text/javascript; charset=utf-8");
         assert_eq!(content_type("manifest.webmanifest"), "application/manifest+json");
     }
+
+    /// A long path in a file list loses its start, never its file name: `.fpath` runs right to
+    /// left, aligned left (the diff tabs' `.diff-file .fpath` turns it back).
+    #[test]
+    fn file_paths_ellipsize_at_their_start() {
+        let Some(css) = assets().get("app.css") else { return };
+        let css = String::from_utf8_lossy(css.bytes);
+        let rule = css.lines().find(|l| l.starts_with(".fpath {")).expect("an .fpath rule");
+        assert!(rule.contains("direction: rtl") && rule.contains("text-align: left"), "{rule}");
+    }
 }

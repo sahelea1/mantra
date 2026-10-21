@@ -18,7 +18,7 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "max_tokens", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "max_tokens", "mcp", "description", "instructions"];
 const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap"];
 
 /// Entries in the left list: roles…, settings, flow
@@ -145,6 +145,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "sandbox" => r.sandbox.clone(),
                 "permission" => r.permission.clone(),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
+                "mcp" => if r.mcp.is_empty() { "none".into() } else { r.mcp.join(", ") },
                 "description" => r.description.clone(),
                 "instructions" => r.instructions.clone(),
                 _ => String::new(),
@@ -286,6 +287,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     "effort" => r.effort = text.to_string(),
                     "fallback" => r.fallback = parse_fallback(text),
                     "max_tokens" => r.max_tokens = text.replace(['_', ','], "").parse().ok(),
+                    "mcp" => r.mcp = parse_mcp(text),
                     _ => {}
                 }
                 app.studio.dirty = true;
@@ -362,7 +364,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
         EditTarget::ModelCell(row, col) => {
             if let Some(m) = app.registry.models.get_mut(*row) {
                 let t = text.trim().to_string();
-                match col {
+                match *col {
                     0 => m.alias = crate::util::slug(&t),
                     1 => m.provider = t,
                     2 => m.model = t,
@@ -370,7 +372,8 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     4 => m.auto_compact_percent = t.trim_end_matches('%').parse().ok().map(|v: u8| v.clamp(10, 99)),
                     5 => m.default_effort = t,
                     6 => m.efforts = t.split([',', ' ']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    7 => m.note = t,
+                    VISION_COL => m.vision = matches!(t.to_ascii_lowercase().as_str(), "y" | "yes" | "on" | "true" | "1" | "◉"),
+                    NOTE_COL => m.note = t,
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -404,6 +407,21 @@ fn parse_fallback(t: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// A role's `mcp` from the editor: server names (or `*`), comma- or space-separated; "none" (or
+/// nothing) clears it. A name is kept as typed: one not in settings.toml is reported at run start.
+fn parse_mcp(t: &str) -> Vec<String> {
+    if t.trim().eq_ignore_ascii_case("none") {
+        return vec![];
+    }
+    let mut v: Vec<String> = vec![];
+    for n in t.split([',', ' ', '\n']).map(str::trim).filter(|n| !n.is_empty()) {
+        if !v.iter().any(|x| x == n) {
+            v.push(n.to_string());
+        }
+    }
+    v
 }
 
 /// `writable_roots` from the editor: comma- or line-separated paths; "none" (or nothing) clears it.
@@ -498,7 +516,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         let is = i == fsel && app.studio.focus == 1;
         let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
         // free text has nothing to step through: ⏎ opens the editor
-        let text_only = ["description", "instructions", "writable_roots"].contains(&fname.as_str()) || fname.ends_with(".task");
+        let text_only = ["description", "instructions", "writable_roots", "mcp"].contains(&fname.as_str()) || fname.ends_with(".task");
         let arrows = if !is { String::new() } else if text_only { format!(" {}", theme::g("⏎", "<enter>")) } else { format!(" {}", theme::g("◂ ▸", "< >")) };
         // the value gets what the marker after it leaves (` ⏎` is narrower than ` ◂ ▸`)
         let fw = fw_all.saturating_sub(w_of(&arrows));
@@ -661,6 +679,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "permission" => "never = the agent never asks (the default). on-request / untrusted: you approve by hand; requests land in the inbox (ctrl+g).",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
+        "mcp" => "MCP servers this role's agents get, by their name in settings.toml [mcp_servers] (e.g. blender), comma-separated. * = every enabled one, none = no server (`mantra mcp` lists them).",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
         "context_cap" => "Tokens of context every agent is told it has, whatever its model's window (the smaller of the two): a huge window lets an agent cycle tools for hours. 0 = the model's full window; 200k is the built-in default.",
         _ => return None,
@@ -773,7 +792,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
             let mut input = Input::default();
             // "none" is how an empty value reads, not text to edit around
             let v = get_value(app, &entry, &fname);
-            input.set(if v == "none" && ["max_tokens", "writable_roots"].contains(&fname.as_str()) { "" } else { &v });
+            input.set(if v == "none" && ["max_tokens", "writable_roots", "mcp"].contains(&fname.as_str()) { "" } else { &v });
             app.overlays.push(Overlay::Edit { title: format!("{entry} · {fname}"), input, target });
         }
         KeyCode::Char('n') => app.overlays.push(Overlay::Edit { title: "new role name".into(), input: Input::default(), target: EditTarget::NewRole }),
@@ -823,7 +842,11 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
 
 // ───────────────────────────── models ─────────────────────────────
 
-const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
+const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "vision", "note / test"];
+/// Where `vision` sits in `MODEL_COLS`: ⏎ (or +/-) toggles it.
+const VISION_COL: usize = 7;
+/// Where the note (or the last `t` result) sits in `MODEL_COLS`.
+const NOTE_COL: usize = 8;
 const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth", "wire"];
 /// Where `kind`, `auth` and `wire` sit in `PROV_COLS` — the columns +/- cycles.
 const PROV_KIND_COL: usize = 5;
@@ -921,7 +944,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
     }
     header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
-    let widths = [10usize, 9, 18, 14, 14, 8, 30, 30];
+    let widths = [10usize, 9, 18, 14, 14, 8, 30, 6, 30];
     // A table wider than the screen scrolls sideways to the selected column, the first column
     // (alias / id) kept, so every cell can be seen and edited at 80 columns too.
     let (mshow, pshow) = {
@@ -952,6 +975,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             },
             if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
             if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
+            theme::g(if m.vision { "◉" } else { "·" }, if m.vision { "y" } else { "-" }).to_string(),
             status,
         ];
         let mut spans = vec![];
@@ -965,9 +989,11 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
                 theme::dim()
             } else if ci == 5 {
                 theme::fg(effort_color(v))
-            } else if ci == 7 && v.starts_with("ok") {
+            } else if ci == VISION_COL && m.vision {
+                theme::fg(theme::BLUE)
+            } else if ci == NOTE_COL && v.starts_with("ok") {
                 theme::fg(theme::GREEN)
-            } else if ci == 7 && v.starts_with("error") {
+            } else if ci == NOTE_COL && v.starts_with("error") {
                 theme::fg(theme::RED)
             } else if ri == app.models_ui.row && !app.models_ui.providers {
                 theme::text()
@@ -982,6 +1008,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     l.push(Line::default());
     l.push(Line::from(Span::styled(" context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
     l.push(Line::from(Span::styled(" dim \"(assumed)\" / \"(default)\" = not set here, using Mantra's built-in 200k / 85% · +/- steps values", theme::faint())));
+    l.push(Line::from(Span::styled(" vision = the model takes images: its agents get the screenshot and view-image tools · ⏎ toggles", theme::faint())));
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 
@@ -1152,6 +1179,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
                         let e = m.step_effort(&m.default_effort.clone(), d as i32);
                         m.default_effort = e;
                     }
+                    VISION_COL => m.vision = !m.vision,
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -1163,9 +1191,16 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
                 let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default(), kind_str(p.kind).to_string(), p.auth.clone(), p.wire.clone()][ui.col.min(PROV_COLS.len() - 1)].clone();
                 let hint = if ui.col == 4 { " (either name an env var or paste a key)" } else { "" };
                 (format!("provider · {}{hint}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
+            } else if ui.col == VISION_COL {
+                // a yes/no: ⏎ flips it, as space does a check box
+                if let Some(m) = app.registry.models.get_mut(ui.row) {
+                    m.vision = !m.vision;
+                    app.models_ui.dirty = true;
+                }
+                return;
             } else {
                 let Some(m) = app.registry.models.get(ui.row) else { return };
-                let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), m.note.clone()][ui.col].clone();
+                let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), String::new(), m.note.clone()][ui.col].clone();
                 (format!("{} · {}  (context accepts 400k / 1m)", m.alias, MODEL_COLS[ui.col]), v, EditTarget::ModelCell(ui.row, ui.col))
             };
             let mut input = Input::default();
@@ -1462,5 +1497,75 @@ mod tests {
         apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), "openai");
         assert_eq!((app.registry.providers[0].wire.as_str(), wire_str(&app.registry.providers[0]).as_str()), ("", "openai"));
         assert_eq!(wire_str(&ProviderEntry::default()), "—", "a Codex provider has no wire");
+    }
+
+    /// A role's `mcp` is a list field like `writable_roots`: ⏎ opens the editor, names are comma-
+    /// or space-separated and kept once each, "none" or nothing clears it.
+    #[test]
+    fn a_roles_mcp_servers_are_a_list_field() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert!(ROLE_FIELDS.contains(&"mcp") && field_hint("mcp").is_some());
+        assert_eq!(get_value(&app, "worker-big", "mcp"), "none", "the built-ins ask for none");
+        let t = EditTarget::RoleField("worker-big".into(), "mcp".into());
+        apply_edit(&mut app, &t, " blender, filesystem  blender\n");
+        assert_eq!(app.studio.pattern.roles["worker-big"].mcp, vec!["blender", "filesystem"]);
+        assert_eq!(get_value(&app, "worker-big", "mcp"), "blender, filesystem");
+        assert!(app.studio.dirty);
+        apply_edit(&mut app, &t, "*");
+        assert_eq!(app.studio.pattern.roles["worker-big"].mcp, vec!["*"]);
+        apply_edit(&mut app, &t, "None");
+        assert!(app.studio.pattern.roles["worker-big"].mcp.is_empty());
+        apply_edit(&mut app, &t, "blender");
+        apply_edit(&mut app, &t, "  ");
+        assert!(app.studio.pattern.roles["worker-big"].mcp.is_empty(), "an emptied field clears the list");
+        // ⏎ on it opens the editor with nothing to type around ("none" is how empty reads)
+        app.studio.sel = StudioSel::Role("worker-big".into());
+        app.studio.focus = 1;
+        app.studio.field = ROLE_FIELDS.iter().position(|f| *f == "mcp").unwrap_or(0);
+        studio_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.overlays.last() {
+            Some(Overlay::Edit { target: EditTarget::RoleField(r, f), input, .. }) => assert!(r == "worker-big" && f == "mcp" && input.text().is_empty()),
+            _ => panic!("⏎ on mcp opens the editor"),
+        }
+    }
+
+    /// `/models` has a vision column: ◉ (y) for a model that takes images, · (-) for one that does
+    /// not; ⏎ or +/- on it toggles, a typed yes/no sets it, and the note moved one column right.
+    #[test]
+    fn the_models_grid_has_a_vision_column_that_toggles() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry.models.insert(0, crate::config::ModelEntry { alias: "local".into(), model: "qwen".into(), note: "on my box".into(), ..Default::default() });
+        assert_eq!((MODEL_COLS[VISION_COL], MODEL_COLS[NOTE_COL]), ("vision", "note / test"));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30)).unwrap();
+        term.draw(|f| draw_models(f, &mut app)).unwrap();
+        let b = term.backend().buffer();
+        let screen: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect();
+        assert!(screen.iter().any(|l| l.contains("vision") && l.contains("note / test")), "{}", screen.join("\n"));
+        let row = |alias: &str| screen.iter().find(|l| l.contains(&format!(" {alias} "))).cloned().unwrap_or_default();
+        let (on, off) = (theme::g("◉", "y"), theme::g("·", "-"));
+        assert!(row("local").contains(&format!(" {off} ")) && row("local").contains("on my box"), "{}", row("local"));
+        assert!(row("astra").contains(&format!(" {on} ")), "the built-in aliases see: {}", row("astra"));
+
+        app.models_ui.row = 0;
+        app.models_ui.col = VISION_COL;
+        models_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.registry.models[0].vision && app.models_ui.dirty);
+        assert!(app.overlays.is_empty(), "a yes/no opens no editor");
+        models_key(&mut app, KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert!(!app.registry.models[0].vision);
+        apply_edit(&mut app, &EditTarget::ModelCell(0, VISION_COL), " Yes ");
+        assert!(app.registry.models[0].vision);
+        apply_edit(&mut app, &EditTarget::ModelCell(0, VISION_COL), "no");
+        assert!(!app.registry.models[0].vision);
+        apply_edit(&mut app, &EditTarget::ModelCell(0, NOTE_COL), "still mine");
+        assert_eq!(app.registry.models[0].note, "still mine");
+        // the note column opens the editor with the note in it
+        app.models_ui.col = NOTE_COL;
+        models_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.overlays.last() {
+            Some(Overlay::Edit { target: EditTarget::ModelCell(0, NOTE_COL), input, .. }) => assert_eq!(input.text(), "still mine"),
+            _ => panic!("⏎ on the note edits it"),
+        }
     }
 }

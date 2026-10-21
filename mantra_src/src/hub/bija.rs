@@ -60,6 +60,9 @@ pub struct BijaSpawn {
     pub writable_roots: Vec<PathBuf>,
     /// Network inside sandboxed commands.
     pub network: bool,
+    /// The model takes images (`ModelEntry.vision`): `--vision` offers bija's own screenshot and
+    /// view-image tools, as Mantra offers its own.
+    pub vision: bool,
 }
 
 /// Mantra's sandbox names (Codex's) in bija's vocabulary.
@@ -91,8 +94,8 @@ const STARTING: &str = "bija is still starting — try again in a moment";
 /// Runs one `bija` process for the lifetime of a single spawn attempt, with `run_claude_process`'s
 /// contract: `session_id` is the agent's `thread_id` slot (a relaunch passes `--resume` with it),
 /// a process that exits before `ready` is `Exit::LaunchFailed`, one that dies after it
-/// `Exit::Crashed`. A model or effort change never relaunches — `set` applies it at bija's next
-/// API call — but is remembered here so a later relaunch starts with it. Prompt and steer text
+/// `Exit::Crashed`. A model, effort or vision change never relaunches — `set` applies it at bija's
+/// next API call — but is remembered here so a later relaunch starts with it. Prompt and steer text
 /// that arrives before `ready` waits in `replay` (a launch can still fail, and with it the pipe),
 /// and goes out as a steer while bija continues a turn a crash cut short.
 ///
@@ -111,6 +114,7 @@ pub(super) async fn run_bija_process(
     session_id: &mut Option<String>,
     effort: &mut String,
     model: &mut String,
+    vision: &mut bool,
     replay: &mut Vec<String>,
     last_turn: &mut Option<String>,
     turn_cut: &mut bool,
@@ -118,11 +122,13 @@ pub(super) async fn run_bija_process(
     let Some(bs) = spec.bija.as_ref() else {
         return Exit::LaunchFailed("internal error: Bija backend spawned without BijaSpawn config".into());
     };
+    // `--vision` as the model now in use says, not as it was at spawn (`Cmd::SetVision`).
+    let bs = &BijaSpawn { vision: *vision, ..bs.clone() };
     let Some((prog, base_args)) = bija_cmd.split_first() else {
         return Exit::LaunchFailed("empty bija command".into());
     };
     let (sid, resume) = launch_identity(id, session_id.as_deref(), &bs.home);
-    let files = match prepare_session(&bs.home, &sid, &bs.system_prompt, &spec.dynamic_tools) {
+    let files = match prepare_session(&bs.home, &sid, &bs.system_prompt, &spec.dynamic_tools, &spec.mcp) {
         Ok(f) => f,
         Err(e) => return Exit::LaunchFailed(format!("couldn't prepare bija session {sid} under {}: {e}", bs.home.display())),
     };
@@ -185,6 +191,7 @@ pub(super) async fn run_bija_process(
                     Cmd::Turn { text } => *last_turn = Some(text.clone()),
                     Cmd::SetEffort(e) => *effort = e.clone(),
                     Cmd::SetModel(m) => *model = m.clone(),
+                    Cmd::SetVision(v) => *vision = *v,
                     Cmd::Compact if !tr.turn_open => tr.idle_compact = true,
                     _ => {}
                 }
@@ -206,7 +213,7 @@ pub(super) async fn run_bija_process(
                     continue;
                 }
                 if let Some((call, ok, text)) = respond_parts(&c) {
-                    for e in tr.on_respond(&call, ok, &text) {
+                    for e in tr.on_respond(&call, ok, &text, &respond_images(&c)) {
                         let _ = ev.send(e);
                     }
                 }
@@ -309,29 +316,39 @@ fn session_dir(home: &Path, sid: &str) -> PathBuf {
 struct SessionFiles {
     system: PathBuf,
     tools: PathBuf,
+    /// `mcp.json`, when the agent has MCP servers — or had some, and this launch has none.
+    mcp: Option<PathBuf>,
 }
 
 /// Creates the session directory (0700: the system prompt is the role's whole brief) and writes
-/// `system.md` and `tools.json` — again on every launch, so a resume picks up instructions or
-/// tools that changed since.
-fn prepare_session(home: &Path, sid: &str, system_prompt: &str, tools: &[Value]) -> std::io::Result<SessionFiles> {
+/// `system.md`, `tools.json` and, when the agent has MCP servers, `mcp.json` (the shape Claude
+/// Code's `--mcp-config` takes) — again on every launch, so a resume picks up instructions, tools
+/// or servers that changed since. A session that had servers and has none now gets an empty
+/// `mcp.json` (and `--mcp-file`): bija would otherwise go on reading the path it stored.
+fn prepare_session(home: &Path, sid: &str, system_prompt: &str, tools: &[Value], mcp: &[(String, crate::config::McpServer)]) -> std::io::Result<SessionFiles> {
     let dir = session_dir(home, sid);
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir)?;
-    let files = SessionFiles { system: dir.join("system.md"), tools: dir.join("tools.json") };
+    let mcp_path = dir.join("mcp.json");
+    let files = SessionFiles { system: dir.join("system.md"), tools: dir.join("tools.json"), mcp: (!mcp.is_empty() || mcp_path.exists()).then(|| mcp_path.clone()) };
     std::fs::write(&files.system, system_prompt)?;
     std::fs::write(&files.tools, Value::Array(tools.to_vec()).to_string())?;
+    if files.mcp.is_some() {
+        let servers: serde_json::Map<String, Value> = mcp.iter().map(|(name, s)| (name.clone(), json!({"command": s.command, "args": s.args, "env": s.env}))).collect();
+        std::fs::write(&mcp_path, json!({"mcpServers": servers}).to_string())?;
+    }
     Ok(files)
 }
 
 /// `[base…] --home H --session|--resume ID --cwd C --provider-url U --wire W [--api-key-env K]
 /// --model M --effort E|none --context-window N --compact-at P --system-file S --tools-file T
-/// --sandbox MODE [--writable DIR]… [--network] [--name NAME]` (SPEC §9.2). A resume repeats every
-/// flag, so a model or effort changed since the last launch is picked up and saved; only the name
-/// is left to the session (`set` may have renamed it since).
+/// [--mcp-file F] --sandbox MODE [--writable DIR]… [--network] [--vision] [--name NAME]` (SPEC
+/// §9.2). A resume repeats every flag, so a model or effort changed since the last launch is
+/// picked up and saved, and the MCP servers start again; only the name is left to the session
+/// (`set` may have renamed it since).
 #[allow(clippy::too_many_arguments)]
 fn build_args(cwd: &Path, bs: &BijaSpawn, files: &SessionFiles, model: &str, effort: &str, session_id: &str, resume: bool, name: Option<&str>, base_args: &[String]) -> Vec<String> {
     let mut a: Vec<String> = base_args.to_vec();
@@ -357,12 +374,18 @@ fn build_args(cwd: &Path, bs: &BijaSpawn, files: &SessionFiles, model: &str, eff
     flag("--compact-at", bs.compact_pct.min(100).to_string());
     flag("--system-file", files.system.to_string_lossy().into_owned());
     flag("--tools-file", files.tools.to_string_lossy().into_owned());
+    if let Some(mcp) = &files.mcp {
+        flag("--mcp-file", mcp.to_string_lossy().into_owned());
+    }
     flag("--sandbox", bs.sandbox.clone());
     for root in &bs.writable_roots {
         flag("--writable", root.to_string_lossy().into_owned());
     }
     if bs.network {
         a.push("--network".into());
+    }
+    if bs.vision {
+        a.push("--vision".into());
     }
     if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
         a.push("--name".into());
@@ -382,9 +405,19 @@ fn op_for(c: &Cmd) -> Option<Value> {
         Cmd::Compact => Some(json!({"op": "compact"})),
         Cmd::SetEffort(e) => Some(json!({"op": "set", "effort": e})),
         Cmd::SetModel(m) => Some(json!({"op": "set", "model": m})),
+        Cmd::SetVision(v) => Some(json!({"op": "set", "vision": v})),
         Cmd::SetName(n) => Some(json!({"op": "set", "name": n})),
         Cmd::Shell { command } => Some(json!({"op": "shell", "command": command})),
-        Cmd::Respond { .. } | Cmd::RespondErr { .. } => respond_parts(c).map(|(id, ok, text)| json!({"op": "tool_result", "id": id, "ok": ok, "text": text})),
+        Cmd::Respond { .. } | Cmd::RespondErr { .. } => respond_parts(c).map(|(id, ok, text)| {
+            let mut op = json!({"op": "tool_result", "id": id, "ok": ok, "text": text});
+            // A screenshot (or any image the engine answers with) goes as base64 beside the text;
+            // bija saves it under the session and sends it to the model its wire's way.
+            let images = respond_images(c);
+            if !images.is_empty() {
+                op["images"] = images.iter().map(|(mime, b64)| json!({"mime": mime, "b64": b64})).collect();
+            }
+            op
+        }),
         Cmd::Shutdown => Some(json!({"op": "shutdown"})),
         Cmd::Archive | Cmd::SetApproval(_) | Cmd::Restart | Cmd::Bridge(_) => None,
     }
@@ -406,6 +439,14 @@ fn respond_parts(c: &Cmd) -> Option<(String, bool, String)> {
         }
         Cmd::RespondErr { id, message } => id.as_str().map(|id| (id.to_string(), false, message.clone())),
         _ => None,
+    }
+}
+
+/// The images in an answer to an external tool call (`inputImage` items with a data URL).
+fn respond_images(c: &Cmd) -> Vec<(String, String)> {
+    match c {
+        Cmd::Respond { result, .. } => super::answer_images(result),
+        _ => vec![],
     }
 }
 
@@ -431,6 +472,8 @@ enum Tool {
     File(String),
     /// A built-in that is neither (read_file, list_dir, glob, grep), shown as an MCP-style call.
     Builtin { tool: String, args: Value },
+    /// A tool of one of the agent's MCP servers (`mcp__<server>__<tool>`), run by bija itself.
+    Mcp { server: String, tool: String, args: Value },
     /// An external (`--tools-file`) tool waiting for the engine's answer. `answered` once
     /// `Cmd::Respond` completed the item, so bija's own `tool_done` for it doesn't do it again.
     External { tool: String, args: Value, answered: bool },
@@ -623,13 +666,16 @@ impl Translator {
     }
 
     /// The engine answered an external call: the item completes now, not when bija gets round to
-    /// its `tool_done`.
-    fn on_respond(&mut self, id: &str, ok: bool, result: &str) -> Vec<HubEvent> {
+    /// its `tool_done`. An image in the answer stays on the item as the `inputImage` it came as.
+    fn on_respond(&mut self, id: &str, ok: bool, result: &str, images: &[(String, String)]) -> Vec<HubEvent> {
         let Some(Tool::External { tool, args, answered }) = self.tools.get_mut(id) else { return vec![] };
         if std::mem::replace(answered, true) {
             return vec![];
         }
-        let item = dynamic_item(id, tool, args, ok, result);
+        let mut item = dynamic_item(id, tool, args, ok, result);
+        for (mime, b64) in images {
+            push_content_item(&mut item, json!({"type": "inputImage", "imageUrl": format!("data:{mime};base64,{b64}")}));
+        }
         vec![self.notif("item/completed", json!({"item": item}))]
     }
 
@@ -672,8 +718,28 @@ impl Translator {
                 }
                 json!({"id": id, "type": "fileChange", "status": status, "changes": changes})
             }
-            // Only the head is shown (a whole file read is the model's, not the card's).
-            Tool::Builtin { tool, args } => dynamic_item(&id, &tool, &args, ok, &crate::util::trunc(&result, BUILTIN_SHOWN)),
+            // Only the head is shown (a whole file read is the model's, not the card's). Images a
+            // tool returned are files under the session dir by now; the card names them, as Codex
+            // describes an image — `inputImage` for a tool of bija's, MCP content for a server's.
+            Tool::Builtin { tool, args } => {
+                let mut item = dynamic_item(&id, &tool, &args, ok, &crate::util::trunc(&result, BUILTIN_SHOWN));
+                for (_, path) in done_images(v) {
+                    push_content_item(&mut item, json!({"type": "inputImage", "imageUrl": path}));
+                }
+                item
+            }
+            Tool::Mcp { server, tool, args } => {
+                let text = crate::util::trunc(&result, BUILTIN_SHOWN);
+                let images = done_images(v);
+                let result = if images.is_empty() {
+                    json!(text)
+                } else {
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    content.extend(images.iter().map(|(mime, path)| json!({"type": "image", "mimeType": mime, "path": path})));
+                    json!({"content": content})
+                };
+                json!({"id": id, "type": "mcpToolCall", "server": server, "tool": tool, "arguments": args, "status": status, "result": result})
+            }
             Tool::External { answered: true, .. } => return,
             Tool::External { tool, args, .. } => dynamic_item(&id, &tool, &args, ok, &result),
         };
@@ -715,8 +781,13 @@ fn num(v: &Value, k: &str) -> u64 {
 /// What a built-in's `item/started` looks like (SPEC §9.2): `bash`/`job` are commands,
 /// `write_file`/`edit_file`/`delete` file changes, every other built-in a dynamic tool call under
 /// its own name — `read_file`, not an MCP `bija.read_file`: they are bija's own tools, as the
-/// role's `mantra_*` ones are Mantra's.
+/// role's `mantra_*` ones are Mantra's. A tool of an MCP server, `mcp__<server>__<tool>`, is the
+/// `mcpToolCall{server, tool}` Codex reports for one.
 fn started_item(id: &str, name: &str, args: &Value) -> (Tool, Value) {
+    if let Some((server, tool)) = super::mcp_tool_name(name) {
+        let item = json!({"id": id, "type": "mcpToolCall", "server": server, "tool": tool, "arguments": args, "status": "inProgress"});
+        return (Tool::Mcp { server: server.to_string(), tool: tool.to_string(), args: args.clone() }, item);
+    }
     match name {
         "bash" | "job" => {
             let command = if name == "bash" { text(args, "command") } else { job_label(args) };
@@ -742,6 +813,26 @@ fn job_label(args: &Value) -> String {
 
 fn dynamic_item(id: &str, tool: &str, args: &Value, ok: bool, result: &str) -> Value {
     json!({"id": id, "type": "dynamicToolCall", "tool": tool, "arguments": args, "status": if ok { "completed" } else { "failed" }, "contentItems": [{"type": "inputText", "text": result}]})
+}
+
+fn push_content_item(item: &mut Value, content: Value) {
+    if let Some(items) = item.get_mut("contentItems").and_then(|c| c.as_array_mut()) {
+        items.push(content);
+    }
+}
+
+/// The `(mime, path)` of each image a `tool_done` lists (`images: ["<session dir>/images/<call
+/// id>-<n>.<ext>", …]`, the files a screenshot or an MCP image became). bija names each file by
+/// the type it checked from the bytes, so the extension is the type. None from a bija that lists none.
+fn done_images(v: &Value) -> Vec<(String, String)> {
+    let Some(images) = v.get("images").and_then(|i| i.as_array()) else { return vec![] };
+    let mime = |path: &str| match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    images.iter().filter_map(|i| i.as_str()).map(|path| (mime(path).to_string(), path.to_string())).collect()
 }
 
 /// A failed turn's error in Codex's shape. The status goes into the message (`HTTP 503: …`, as bija
@@ -798,6 +889,7 @@ mod tests {
             sandbox: "workspace-write".into(),
             writable_roots: vec![PathBuf::from("/data/cache")],
             network: true,
+            vision: false,
         }
     }
 
@@ -809,7 +901,7 @@ mod tests {
     fn build_args_says_everything_on_a_fresh_launch_and_again_on_a_resume() {
         let home = PathBuf::from("/m/bija");
         let bs = spawn_cfg(&home);
-        let files = SessionFiles { system: home.join("sessions/s1/system.md"), tools: home.join("sessions/s1/tools.json") };
+        let files = SessionFiles { system: home.join("sessions/s1/system.md"), tools: home.join("sessions/s1/tools.json"), mcp: None };
         let a = build_args(Path::new("/work"), &bs, &files, "local-model", "high", "s1", false, Some("Notes · worker"), &["--no-bwrap".into()]);
         assert_eq!(a[0], "--no-bwrap", "the configured command's own arguments come first");
         for (flag, want) in [
@@ -848,6 +940,16 @@ mod tests {
         assert_eq!(value_after(&r, "--model"), Some("local-coder"));
         assert_eq!(value_after(&r, "--effort"), Some("none"));
         assert!(!r.contains(&"--api-key-env".to_string()) && !r.contains(&"--network".to_string()) && !r.contains(&"--writable".to_string()));
+        assert!(!a.contains(&"--mcp-file".to_string()) && !a.contains(&"--vision".to_string()) && !r.contains(&"--vision".to_string()), "no servers, no images: neither flag");
+
+        // MCP servers and a model that takes images: `--mcp-file` and `--vision`, again on a resume
+        let with = SessionFiles { mcp: Some(home.join("sessions/s1/mcp.json")), ..files };
+        let eye = BijaSpawn { vision: true, ..no_key };
+        for resume in [false, true] {
+            let v = build_args(Path::new("/work"), &eye, &with, "m", "", "s1", resume, None, &[]);
+            assert_eq!(value_after(&v, "--mcp-file"), Some("/m/bija/sessions/s1/mcp.json"), "{v:?}");
+            assert!(v.contains(&"--vision".to_string()), "{v:?}");
+        }
     }
 
     #[test]
@@ -863,7 +965,8 @@ mod tests {
         let home = std::env::temp_dir().join(format!("mantra-bija-prepare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let tools = vec![json!({"type": "function", "name": "mantra_status", "description": "status", "inputSchema": {"type": "object"}})];
-        let files = prepare_session(&home, "s-1", "be brief", &tools).unwrap();
+        let files = prepare_session(&home, "s-1", "be brief", &tools, &[]).unwrap();
+        assert!(files.mcp.is_none() && !session_dir(&home, "s-1").join("mcp.json").exists(), "no servers, no mcp.json");
         assert_eq!(std::fs::read_to_string(&files.system).unwrap(), "be brief");
         let back: Value = serde_json::from_str(&std::fs::read_to_string(&files.tools).unwrap()).unwrap();
         assert_eq!(back, Value::Array(tools));
@@ -874,8 +977,20 @@ mod tests {
             assert_eq!(mode, 0o700, "the role's brief is nobody else's business");
         }
         // rewritten on the next launch: a resume picks up changed instructions
-        prepare_session(&home, "s-1", "be thorough", &[]).unwrap();
+        prepare_session(&home, "s-1", "be thorough", &[], &[]).unwrap();
         assert_eq!(std::fs::read_to_string(&files.system).unwrap(), "be thorough");
+
+        // the agent's MCP servers: `mcp.json` beside tools.json, in Claude Code's config shape
+        let blender = crate::config::McpServer { command: "uvx".into(), args: vec!["blender-mcp".into()], env: [("BLENDER_PORT".to_string(), "9876".to_string())].into(), enabled: true };
+        let with = prepare_session(&home, "s-1", "be thorough", &[], &[("blender".into(), blender)]).unwrap();
+        let mcp = with.mcp.expect("a path for --mcp-file");
+        assert_eq!(mcp, session_dir(&home, "s-1").join("mcp.json"));
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(cfg, json!({"mcpServers": {"blender": {"command": "uvx", "args": ["blender-mcp"], "env": {"BLENDER_PORT": "9876"}}}}));
+        // and emptied when a later launch has none, so the resumed bija stops starting them
+        assert_eq!(prepare_session(&home, "s-1", "be thorough", &[], &[]).unwrap().mcp.as_ref(), Some(&mcp));
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(cfg, json!({"mcpServers": {}}));
 
         assert!(!launch_identity(1, Some("s-1"), &home).1, "no session.json yet: started fresh under the same id");
         assert_eq!(launch_identity(1, Some("s-1"), &home).0, "s-1");
@@ -898,6 +1013,7 @@ mod tests {
         assert_eq!(op_for(&Cmd::Compact), Some(json!({"op": "compact"})));
         assert_eq!(op_for(&Cmd::SetEffort("high".into())), Some(json!({"op": "set", "effort": "high"})), "a live switch, no relaunch");
         assert_eq!(op_for(&Cmd::SetModel("m2".into())), Some(json!({"op": "set", "model": "m2"})));
+        assert_eq!(op_for(&Cmd::SetVision(false)), Some(json!({"op": "set", "vision": false})));
         assert_eq!(op_for(&Cmd::SetName("run · qa".into())), Some(json!({"op": "set", "name": "run · qa"})));
         assert_eq!(op_for(&Cmd::Shell { command: "ls".into() }), Some(json!({"op": "shell", "command": "ls"})));
         assert_eq!(op_for(&Cmd::Shutdown), Some(json!({"op": "shutdown"})));
@@ -997,12 +1113,73 @@ mod tests {
         };
         assert_eq!((item["type"].as_str(), item["tool"].as_str(), item["status"].as_str()), (Some("dynamicToolCall"), Some("web_search"), Some("failed")));
         tr.on_event(&json!({"ev": "tool_call", "turn": "t1", "id": "c10", "name": "mantra_wait", "args": {}}));
-        assert_eq!(tr.on_respond("c10", true, "done").len(), 1);
-        assert!(tr.on_respond("c10", true, "done").is_empty(), "answered already");
-        assert!(tr.on_respond("nope", true, "x").is_empty(), "an unknown id completes nothing");
+        assert_eq!(tr.on_respond("c10", true, "done", &[]).len(), 1);
+        assert!(tr.on_respond("c10", true, "done", &[]).is_empty(), "answered already");
+        assert!(tr.on_respond("nope", true, "x", &[]).is_empty(), "an unknown id completes nothing");
         assert!(tr.on_event(&json!({"ev": "tool_done", "turn": "t1", "id": "c10", "name": "mantra_wait", "ok": true, "result": "done", "duration_ms": 5})).is_empty(), "bija's own tool_done for an answered call adds nothing");
         assert_eq!(job_label(&json!({"action": "wait", "id": 3})), "job wait 3");
         assert_eq!(job_label(&json!({})), "job list");
+    }
+
+    fn completed(out: &[HubEvent]) -> Value {
+        match out {
+            [HubEvent::Notif { method, params, .. }] if method == "item/completed" => params["item"].clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A server's tool, `mcp__<server>__<tool>`, is an `mcpToolCall{server, tool}` from start to
+    /// end, its text result plain text; the images a `tool_done` lists ride along as MCP image
+    /// content, those of a tool of bija's own as `inputImage` items.
+    #[test]
+    fn mcp_tools_are_their_servers_and_tool_images_stay_on_the_card() {
+        let mut tr = Translator::new(1, "s", 200_000);
+        let mut agent = Agent::new(1, "t", "worker", PathBuf::from("/tmp/bijamcp"));
+        let started = tr.on_event(&json!({"ev": "tool_started", "turn": "t1", "id": "c1", "name": "mcp__demo__scene_info", "args": {}}));
+        let item = match started.as_slice() {
+            [HubEvent::Notif { method, params, .. }] if method == "item/started" => params["item"].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((item["type"].as_str(), item["server"].as_str(), item["tool"].as_str()), (Some("mcpToolCall"), Some("demo"), Some("scene_info")));
+        let done = completed(&tr.on_event(&json!({"ev": "tool_done", "turn": "t1", "id": "c1", "name": "mcp__demo__scene_info", "ok": true, "result": "3 objects: Cube, Camera, Light", "duration_ms": 9})));
+        assert_eq!((done["server"].as_str(), done["tool"].as_str(), done["status"].as_str(), done["result"].as_str()), (Some("demo"), Some("scene_info"), Some("completed"), Some("3 objects: Cube, Camera, Light")));
+        for (m, p) in [("item/started", json!({"item": item})), ("item/completed", json!({"item": done}))] {
+            agent.apply(m, &p);
+        }
+        let tools: Vec<(String, String)> = agent.items.iter().filter_map(|i| if let Kind::Tool { name, result, .. } = &i.kind { Some((name.clone(), result.clone())) } else { None }).collect();
+        assert_eq!(tools, vec![("demo.scene_info".to_string(), "3 objects: Cube, Camera, Light".to_string())]);
+
+        tr.on_event(&json!({"ev": "tool_started", "turn": "t1", "id": "c2", "name": "mcp__demo__render_preview", "args": {"width": 64}}));
+        // bija lists the files it saved, each named by its checked type
+        let img = json!(["/b/sessions/s/images/c2-1.png", "/b/sessions/s/images/c2-2.jpg"]);
+        let done = completed(&tr.on_event(&json!({"ev": "tool_done", "turn": "t1", "id": "c2", "name": "mcp__demo__render_preview", "ok": true, "result": "rendered", "images": img})));
+        assert_eq!(done["result"], json!({"content": [{"type": "text", "text": "rendered"}, {"type": "image", "mimeType": "image/png", "path": "/b/sessions/s/images/c2-1.png"}, {"type": "image", "mimeType": "image/jpeg", "path": "/b/sessions/s/images/c2-2.jpg"}]}));
+        tr.on_event(&json!({"ev": "tool_started", "turn": "t1", "id": "c3", "name": "screenshot", "args": {}}));
+        let done = completed(&tr.on_event(&json!({"ev": "tool_done", "turn": "t1", "id": "c3", "name": "screenshot", "ok": true, "result": "saved", "images": ["/b/s.png"]})));
+        assert_eq!(done["contentItems"], json!([{"type": "inputText", "text": "saved"}, {"type": "inputImage", "imageUrl": "/b/s.png"}]));
+        // the card's image marker names the file, even when the text never does
+        agent.apply("item/completed", &json!({"item": done}));
+        let marker = agent.items.iter().rev().find_map(|i| if let Kind::Tool { image, .. } = &i.kind { image.clone() } else { None });
+        assert_eq!(marker.as_deref(), Some("/b/s.png"));
+        // a server name the model made up still splits; a call bija refused outright too
+        let refused = completed(&tr.on_event(&json!({"ev": "tool_done", "turn": "t1", "id": "c4", "name": "mcp__nope__x", "ok": false, "result": "unknown tool"})));
+        assert_eq!((refused["type"].as_str(), refused["server"].as_str(), refused["status"].as_str()), (Some("mcpToolCall"), Some("nope"), Some("failed")));
+    }
+
+    /// The engine's answer with an image (a screenshot): the op carries it as base64 beside the
+    /// text, and the card keeps the `inputImage`; an answer without one is the op it always was.
+    #[test]
+    fn an_answer_with_an_image_goes_to_bija_as_tool_result_images() {
+        let shot = Cmd::Respond { id: json!("c5"), result: json!({"contentItems": [{"type": "inputText", "text": "saved /r/screenshots/w-1.png (1920×1080)"}, {"type": "inputImage", "imageUrl": "data:image/png;base64,iVBORw0KGgo="}], "success": true}) };
+        assert_eq!(op_for(&shot), Some(json!({"op": "tool_result", "id": "c5", "ok": true, "text": "saved /r/screenshots/w-1.png (1920×1080)", "images": [{"mime": "image/png", "b64": "iVBORw0KGgo="}]})));
+        let plain = Cmd::Respond { id: json!("c6"), result: json!({"contentItems": [{"type": "inputText", "text": "ok"}], "success": true}) };
+        assert!(op_for(&plain).unwrap().get("images").is_none(), "no image, no images key");
+        let mut tr = Translator::new(1, "s", 200_000);
+        tr.on_event(&json!({"ev": "tool_call", "turn": "t1", "id": "c5", "name": "mantra_screenshot", "args": {}}));
+        let (call, ok, text) = respond_parts(&shot).unwrap();
+        let item = completed(&tr.on_respond(&call, ok, &text, &respond_images(&shot)));
+        assert_eq!(item["contentItems"][1], json!({"type": "inputImage", "imageUrl": "data:image/png;base64,iVBORw0KGgo="}));
+        assert_eq!(item["tool"].as_str(), Some("mantra_screenshot"));
     }
 
     /// Feeds the hand-written session in `src/testdata/bija-events.jsonl` (SPEC §4.2: a full turn
@@ -1022,7 +1199,7 @@ mod tests {
             let mut events = tr.on_event(&v);
             if v["ev"] == "tool_call" {
                 // What `run_bija_process` does with the engine's answer to the request above.
-                events.extend(tr.on_respond("call_4Zx8", true, "phase 1/2: 1 of 2 tasks done"));
+                events.extend(tr.on_respond("call_4Zx8", true, "phase 1/2: 1 of 2 tasks done", &[]));
             }
             for e in events {
                 match e {
@@ -1185,6 +1362,7 @@ done"#;
                 envs,
                 claude: None,
                 bija: Some(BijaSpawn { system_prompt: "You are the worker.".into(), ..spawn_cfg(&self.dir.join("home")) }),
+                mcp: vec![],
             }
         }
         fn read(&self, f: &str) -> String {
@@ -1423,6 +1601,40 @@ done"#;
         assert_eq!(fake.read("ops.log").matches(r#""op":"prompt""#).count(), 2, "sent again once, not on every relaunch");
         drop(ctl);
         assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 12 }));
+    }
+
+    /// A live switch to a model that takes images, or does not: `set{vision}` reaches bija at once
+    /// (its tools follow at the next model call), and every later launch says `--vision` or not
+    /// as the model in use does — a crash or a restart never brings back the spawn's choice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_vision_switch_reaches_bija_and_every_later_launch() {
+        let fake = Fake::new("vision");
+        let (ev, mut rx) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        let mut spec = fake.spec(vec![]);
+        if let Some(b) = spec.bija.as_mut() {
+            b.vision = true;
+        }
+        tokio::spawn(super::super::agent_task(13, spec, sh(FAKE_BIJA), ev, cmds, Duration::ZERO));
+        assert!(matches!(next(&mut rx).await, HubEvent::Ready { .. }));
+        let launch = |n: usize| fake.read("args.log").lines().nth(n).map(|l| l.split(' ').any(|w| w == "--vision"));
+        assert_eq!(launch(0), Some(true), "spawned for a model that sees");
+        ctl.send(Cmd::SetModel("plain".into())).unwrap();
+        ctl.send(Cmd::SetVision(false)).unwrap();
+        let ops = wait_for_file(&fake.dir.join("ops.log"), r#""vision":false"#).await;
+        assert!(ops.contains(r#"{"op":"set","vision":false}"#), "{ops}");
+        ctl.send(Cmd::Restart).unwrap();
+        assert!(matches!(next(&mut rx).await, HubEvent::Crashed { restarting: true, attempt: 0, .. }));
+        assert!(matches!(next(&mut rx).await, HubEvent::Ready { resumed: true, .. }));
+        assert_eq!(launch(1), Some(false), "the relaunch has no --vision: {}", fake.read("args.log"));
+        ctl.send(Cmd::SetVision(true)).unwrap();
+        ctl.send(Cmd::Restart).unwrap();
+        assert!(matches!(next(&mut rx).await, HubEvent::Crashed { restarting: true, attempt: 0, .. }));
+        assert!(matches!(next(&mut rx).await, HubEvent::Ready { resumed: true, .. }));
+        assert_eq!(launch(2), Some(true), "and back: {}", fake.read("args.log"));
+        drop(ctl);
+        assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 13 }));
     }
 
     /// A restart asks bija to shut down (its commands and jobs die with it) before the relaunch.

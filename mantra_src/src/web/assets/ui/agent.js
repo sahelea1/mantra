@@ -103,6 +103,9 @@
                         h('span', { class: 'tool-name' }, (tl.name || it.text || 'tool').replace(/^mantra_/, '')),
                         tl.status && tl.status !== 'completed' ? h('span', { class: 'cmd-exit' }, tl.status) : null,
                         icon(open ? 'up' : 'down', 'chev')),
+                    // the result carried an image (a screenshot, an MCP render): say so and where it is — nothing draws it;
+                    // a long path loses its start, not the file name (rtl, the LRMs keep the leading / in place)
+                    tl.image != null ? h('div', { class: 'tool-image' }, h('span', { class: 'tool-image-mark' }, icon('image'), 'image'), tl.image ? h('span', { class: 'tool-image-path', title: tl.image }, '\u200e' + tl.image + '\u200e') : null) : null,
                     open ? h('div', { class: 'tool-body' },
                         tl.args ? [h('div', { class: 'tool-label' }, 'arguments'), h('pre', { class: 'cmd-out' }, typeof tl.args === 'string' ? tl.args : JSON.stringify(tl.args, null, 2))] : null,
                         tl.result ? [h('div', { class: 'tool-label' }, 'result'), h('pre', { class: 'cmd-out' }, F.trunc(typeof tl.result === 'string' ? tl.result : JSON.stringify(tl.result, null, 2), 8000))] : null) : null);

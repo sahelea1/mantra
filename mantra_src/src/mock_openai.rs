@@ -61,6 +61,10 @@ struct Mock {
     flaky: u64,
     requests: AtomicU64,
     ids: AtomicU64,
+    /// Whether a worker offered `mantra_screenshot` calls it: only with `$MANTRA_SCREENSHOT_CMD`
+    /// set. The demo's models take images, so without this a `--demo` on a desktop with `grim`
+    /// or `scrot` would capture the real screen; with it, the e2e script's stand-in is used.
+    screenshots: bool,
 }
 
 impl Mock {
@@ -68,13 +72,13 @@ impl Mock {
         // Seeded from the clock so a resumed bija session (a restarted Mantra, a fresh server)
         // never sees a call id it already holds in its transcript.
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64 & 0xffff_ffff).unwrap_or(0);
-        Mock { speed: speed.max(0.05), flaky: if flaky < 2 { 0 } else { flaky }, requests: AtomicU64::new(0), ids: AtomicU64::new(seed << 16) }
+        Mock { speed: speed.max(0.05), flaky: if flaky < 2 { 0 } else { flaky }, requests: AtomicU64::new(0), ids: AtomicU64::new(seed << 16), screenshots: false }
     }
 
     fn from_env() -> Mock {
         let speed = std::env::var("MANTRA_MOCK_SPEED").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0);
         let flaky = std::env::var("MANTRA_MOCK_FLAKY").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        Mock::new(speed, flaky)
+        Mock { screenshots: std::env::var_os("MANTRA_SCREENSHOT_CMD").is_some_and(|c| !c.is_empty()), ..Mock::new(speed, flaky) }
     }
 
     fn uid(&self, prefix: &str) -> String {
@@ -94,7 +98,7 @@ async fn completions(State(mock): State<Arc<Mock>>, body: Bytes) -> Response {
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_request_error", &format!("the request body is not valid JSON: {e}")),
     };
     let turn = match Turn::read(&req) {
-        Ok(t) => t,
+        Ok(t) => Turn { screenshots: mock.screenshots, ..t },
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e),
     };
     if mock.fail_this_one() {
@@ -158,11 +162,19 @@ struct Turn {
     offered: Vec<String>,
     /// Whether an earlier assistant message exists — its prefix would be served from a cache.
     has_history: bool,
+    /// Every tool result of this turn so far, with the name of the call it answers: what the
+    /// closing text can say the agent saw.
+    results: Vec<(String, String)>,
+    /// Whether the scripts may call `mantra_screenshot` (`Mock::screenshots`).
+    screenshots: bool,
 }
 
 impl Turn {
     fn read(req: &Value) -> Result<Turn, String> {
-        let messages = req.get("messages").and_then(Value::as_array).ok_or("`messages` must be an array of messages")?;
+        let all = req.get("messages").and_then(Value::as_array).ok_or("`messages` must be an array of messages")?;
+        // A result's images ride in a `user` message of their own after the results; that is
+        // still the same step of the same turn, so it is no prompt and ends nothing.
+        let messages: Vec<&Value> = all.iter().filter(|m| !carries_images(m)).collect();
         let role_of = |m: &Value| m.get("role").and_then(Value::as_str).unwrap_or("").to_string();
         let system: Vec<String> = messages.iter().filter(|m| matches!(role_of(m).as_str(), "system" | "developer")).map(|m| text_of(m.get("content"))).collect();
         let system = system.join("\n");
@@ -174,6 +186,19 @@ impl Turn {
             _ => String::new(),
         };
         let offered = req.get("tools").and_then(Value::as_array).map(|tools| tools.iter().filter_map(|t| t.pointer("/function/name").or_else(|| t.get("name")).and_then(Value::as_str).map(str::to_string)).collect()).unwrap_or_default();
+        let mut names = std::collections::HashMap::new();
+        let mut results = Vec::new();
+        for m in tail {
+            for call in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                if let (Some(id), Some(name)) = (call.get("id").and_then(Value::as_str), call.pointer("/function/name").and_then(Value::as_str)) {
+                    names.insert(id.to_string(), name.to_string());
+                }
+            }
+            if role_of(m) == "tool" {
+                let name = m.get("tool_call_id").and_then(Value::as_str).and_then(|id| names.get(id)).cloned().unwrap_or_default();
+                results.push((name, text_of(m.get("content"))));
+            }
+        }
         Ok(Turn {
             role,
             system,
@@ -182,8 +207,31 @@ impl Turn {
             last_result,
             offered,
             has_history: messages.iter().any(|m| role_of(m) == "assistant"),
+            results,
+            screenshots: false,
         })
     }
+
+    fn offers(&self, tool: &str) -> bool {
+        self.offered.iter().any(|t| t == tool)
+    }
+
+    /// The first line of what the last call to `tool` in this turn answered.
+    fn result_of(&self, tool: &str) -> Option<String> {
+        self.results.iter().rev().find(|(name, _)| name == tool).map(|(_, text)| text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string())
+    }
+}
+
+/// bija's chat wire puts a tool result's images in a `user` message after the results (a `tool`
+/// message is text only): `image from <tool>: <path>` and the picture, nothing else.
+fn carries_images(m: &Value) -> bool {
+    if m.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(parts) = m.get("content").and_then(Value::as_array) else { return false };
+    let image = |p: &Value| p.get("type").and_then(Value::as_str) == Some("image_url");
+    let label = |p: &Value| p.get("type").and_then(Value::as_str) == Some("text") && p.get("text").and_then(Value::as_str).is_some_and(|t| t.starts_with("image from "));
+    parts.iter().any(image) && parts.iter().all(|p| image(p) || label(p))
 }
 
 /// A message's text: a plain string, or the text parts of a content array.
@@ -348,7 +396,7 @@ fn worker(turn: &Turn) -> Reply {
     // Each task takes its own time, so a phase's workers report one by one, as they would.
     let h: u64 = id.bytes().map(u64::from).sum();
     let write = Reply::call("write_file", json!({"path": file, "content": content})).thinking(format!("**{title}**\n\nA small, self-contained type in `{dir}/` matches the task.")).after(400 + (h % 5) * 300);
-    let report = Reply::say(format!("Implemented **{title}** in `{file}`.\n\nSTATUS: done\nSUMMARY: added {camel} with a constructor and `run`; the change stays within {dir}/."));
+    let report = Reply::say(format!("Implemented **{title}** in `{file}`.{}\n\nSTATUS: done\nSUMMARY: added {camel} with a constructor and `run`; the change stays within {dir}/.", what_i_saw(turn)));
     // Akasha (`--demo --pattern mantra-swarm`): the models worker, in a group (the tool is
     // offered only then), shares the one fact the others will need first — unless the notes it
     // was briefed with already hold it. One author, so the group's notes hold it once.
@@ -356,12 +404,41 @@ fn worker(turn: &Turn) -> Reply {
     if dir == "src/models" && turn.offered.iter().any(|t| t == "mantra_akasha_note") && !turn.prompt.contains(crate::mock::AKASHA_NOTE) {
         steps.push(Reply::call("mantra_akasha_note", json!({"text": crate::mock::AKASHA_NOTE})).thinking("**Worth sharing**\n\nThe others will want to know where the models are."));
     }
+    // MCP (`--demo` gives every role the `demo` server, `mantra mock-mcp`): a look at the scene
+    // first, through bija's MCP client — the real one, end to end. Then, with vision on, one look
+    // at the screen through Mantra's own tool; whatever either answers, the work goes on.
+    if turn.offers(DEMO_SCENE) {
+        steps.push(Reply::call(DEMO_SCENE, json!({})).thinking("**Looking first**\n\nThis session has a scene server; what is in the scene before anything is written."));
+    }
+    if turn.screenshots && turn.offers("mantra_screenshot") {
+        steps.push(Reply::call("mantra_screenshot", json!({})).thinking("**A look at the screen**\n\nOne capture of the host's screen, to see the state it is in."));
+    }
     steps.push(write);
     // …and a quick look that the file holds what it should: a real command through bija's `bash`.
     if turn.offered.iter().any(|t| t == "bash") {
         steps.push(Reply::call("bash", json!({"command": format!("grep -c 'pub fn' {file}")})).thinking("**Checking the file**\n\nTwo functions expected: `new` and `run`."));
     }
     sequence(turn, steps, report)
+}
+
+/// The demo MCP server's scene tool, under the name bija offers it.
+const DEMO_SCENE: &str = "mcp__demo__scene_info";
+
+/// A worker's word on what it looked at this turn, for its report (empty when it looked at
+/// nothing): the request is all the server has, so it is read back from the turn's results.
+fn what_i_saw(turn: &Turn) -> String {
+    let mut saw = Vec::new();
+    if let Some(scene) = turn.result_of(DEMO_SCENE) {
+        saw.push(format!("the scene through `demo` ({})", crate::util::trunc(&scene, 120)));
+    }
+    if let Some(shot) = turn.result_of("mantra_screenshot") {
+        saw.push(format!("the screen ({})", crate::mock::shot_seen(&shot)));
+    }
+    if saw.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLooked at {} first.", saw.join(" and "))
+    }
 }
 
 fn gate(turn: &Turn) -> Reply {
@@ -729,6 +806,73 @@ mod tests {
         let config = "mantra-role: worker\n## Your task: p1-config — Config loader\nScope: src/config/**\n";
         let other = parse_sse(&post(port, &request(config, vec![user("Add the config loader.")], &offered, true)).await.body);
         assert_eq!(other.calls.first().map(|c| c.1.as_str()), Some("write_file"), "{other:?}");
+    }
+
+    /// `--demo` with the stand-in MCP server and vision: the worker reads the scene through bija's
+    /// MCP client, takes one screenshot through Mantra's tool, then works as before and says what
+    /// it saw. The screenshot's image arrives as bija sends it — a `user` message after the
+    /// result — and must not read as a new prompt (it would restart the script).
+    #[tokio::test]
+    async fn a_worker_with_a_scene_server_and_vision_looks_then_works() {
+        let port = start_with(Mock { screenshots: true, ..Mock::new(1000.0, 0) }).await.unwrap();
+        let system = "mantra-role: worker\n## Your task: p2-api — HTTP API\nScope: src/api/**\n";
+        let offered: Vec<&str> = BUILTINS.iter().copied().chain([DEMO_SCENE, "mantra_screenshot"]).collect();
+        let prompt = user("Implement the REST handlers.");
+        let scene = parse_sse(&post(port, &request(system, vec![prompt.clone()], &offered, true)).await.body);
+        assert_eq!(scene.calls.iter().map(|c| c.1.as_str()).collect::<Vec<_>>(), vec![DEMO_SCENE], "{scene:?}");
+        assert_eq!(serde_json::from_str::<Value>(&scene.calls[0].2).unwrap(), json!({}));
+        let mut history = vec![prompt];
+        history.extend(answered(&scene.calls[0], "Scene \"demo\": 3 objects\n- Cube (mesh) at (0, 0, 1)"));
+        let shot = parse_sse(&post(port, &request(system, history.clone(), &offered, true)).await.body);
+        assert_eq!(shot.calls.iter().map(|c| c.1.as_str()).collect::<Vec<_>>(), vec!["mantra_screenshot"], "{shot:?}");
+        history.extend(answered(&shot.calls[0], "/runs/1-x/screenshots/p2-api-1.png (1×1)\n[image: /s/images/call-1-0.png]"));
+        history.push(json!({"role": "user", "content": [{"type": "text", "text": "image from mantra_screenshot: /s/images/call-1-0.png"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]}));
+        let write = parse_sse(&post(port, &request(system, history.clone(), &offered, true)).await.body);
+        assert_eq!(write.calls.first().map(|c| c.1.as_str()), Some("write_file"), "the image is not a new prompt: {write:?}");
+        history.extend(answered(&write.calls[0], "wrote src/api/p2_api.rs (9 lines)"));
+        let check = parse_sse(&post(port, &request(system, history.clone(), &offered, true)).await.body);
+        assert_eq!(check.calls.first().map(|c| c.1.as_str()), Some("bash"), "{check:?}");
+        history.extend(answered(&check.calls[0], "2"));
+        let report = parse_sse(&post(port, &request(system, history, &offered, true)).await.body);
+        assert!(report.calls.is_empty(), "{report:?}");
+        assert!(report.text.contains("the scene through `demo` (Scene \"demo\": 3 objects)") && report.text.contains("the screen (p2-api-1.png)"), "{}", report.text);
+        assert!(report.text.contains("\n\nSTATUS: done\nSUMMARY: "), "{}", report.text);
+    }
+
+    /// Without `$MANTRA_SCREENSHOT_CMD` (the server's default) an offered `mantra_screenshot` is
+    /// left alone — a demo never captures a real screen — and the scene alone is looked at.
+    #[tokio::test]
+    async fn a_worker_takes_no_screenshot_unless_the_capture_is_set_up() {
+        let port = server().await;
+        let system = "mantra-role: worker\n## Your task: p1-models — Domain models\nScope: src/models/**\n";
+        let offered: Vec<&str> = BUILTINS.iter().copied().chain([DEMO_SCENE, "mantra_screenshot"]).collect();
+        let prompt = user("Add the models.");
+        let scene = parse_sse(&post(port, &request(system, vec![prompt.clone()], &offered, true)).await.body);
+        assert_eq!(scene.calls.first().map(|c| c.1.as_str()), Some(DEMO_SCENE), "{scene:?}");
+        let mut history = vec![prompt];
+        history.extend(answered(&scene.calls[0], "Scene \"demo\": 3 objects"));
+        let next = parse_sse(&post(port, &request(system, history, &offered, true)).await.body);
+        assert_eq!(next.calls.first().map(|c| c.1.as_str()), Some("write_file"), "{next:?}");
+    }
+
+    #[test]
+    fn an_image_message_is_part_of_the_step_before_it() {
+        let carrier = json!({"role": "user", "content": [{"type": "text", "text": "image from view: /a.png"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]});
+        assert!(carries_images(&carrier));
+        assert!(!carries_images(&json!({"role": "user", "content": [{"type": "text", "text": "look at this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]})), "a person's own image is a prompt");
+        assert!(!carries_images(&json!({"role": "user", "content": [{"type": "text", "text": "image from x: /a.png"}]})), "no image, no carrier");
+        assert!(!carries_images(&json!({"role": "user", "content": "image from x: /a.png"})));
+        let req = json!({"messages": [
+            {"role": "system", "content": "mantra-role: worker"},
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "view", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "a picture\n[image: /a.png]"},
+            carrier
+        ]});
+        let t = Turn::read(&req).unwrap();
+        assert_eq!((t.prompt.as_str(), t.step, t.last_result.as_str()), ("do it", 1, "a picture\n[image: /a.png]"));
+        assert_eq!(t.results, vec![("view".to_string(), "a picture\n[image: /a.png]".to_string())]);
+        assert_eq!(t.result_of("view").as_deref(), Some("a picture"));
     }
 
     #[tokio::test]

@@ -6,9 +6,11 @@ mod config;
 mod discover;
 mod engine;
 mod hub;
+mod mcp;
 mod mcp_bridge;
 mod mock;
 mod mock_claude;
+mod mock_mcp;
 mod mock_openai;
 mod rpc;
 mod ui;
@@ -65,6 +67,13 @@ USAGE
   mantra experimental                    list experimental features, on or off
   mantra experimental enable|disable <name>   switch one in settings.toml (akasha: shared notes
                                          for agent groups)
+  mantra mcp                             list the MCP servers agents can be given (settings.toml)
+  mantra mcp add <name> [--env K=V]… -- <command> [args…]
+                                         add one, e.g. mantra mcp add blender -- uvx blender-mcp
+                                         (Solo gets every enabled one; a role with mcp = [\"name\"])
+  mantra mcp remove|enable|disable <name>
+  mantra mcp test <name> [--timeout S]   start it, list its tools (exit 1 if it does not answer
+                                         within S seconds, 20 by default)
   mantra --version
 
   mantra --web [ADDR:PORT] [--web-password PW] [--web-tls]   web UI (phone + desktop) on this machine/LAN
@@ -182,6 +191,16 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>> {
                 }
                 return Ok(None);
             }
+            "mcp" if command => {
+                match mcp_cmd(&args[i + 1..]) {
+                    Ok(out) => print!("{out}"),
+                    Err((code, e)) => {
+                        eprintln!("mantra: {e}");
+                        std::process::exit(code);
+                    }
+                }
+                return Ok(None);
+            }
             "--resume-last" => cli.resume_last = true,
             "--take-over" => cli.take_over = true,
             "--no-sandbox-check" => cli.no_sandbox_check = true,
@@ -273,6 +292,191 @@ fn experimental_cmd(args: &[String]) -> std::result::Result<String, (i32, String
     Ok(format!("{name} {what} (saved in {})\n", config::home().join("settings.toml").display()))
 }
 
+const MCP_USAGE: &str = "usage: mantra mcp [list | add <name> [--env KEY=VALUE]… -- <command> [args…] | remove <name> | enable <name> | disable <name> | test <name> [--timeout SECONDS]]";
+
+/// How long `mantra mcp test` gives a server to start, shake hands and list its tools, unless
+/// `--timeout` says otherwise (a first `uvx` run downloads the server before it can answer).
+const MCP_TEST_BUDGET: Duration = Duration::from_secs(20);
+
+/// `mantra mcp …`: the `[mcp_servers]` of settings.toml as it is on disk (`Settings::load_on_disk`
+/// — never the session's own). Stdout, or the exit code and the error: 2 for a usage error or an
+/// unknown name, 1 for a server that fails its test or a file that cannot be read or saved.
+fn mcp_cmd(args: &[String]) -> std::result::Result<String, (i32, String)> {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let load = || config::Settings::load_on_disk().map_err(|e| (1, e));
+    let save = |s: &config::Settings| s.save().map_err(|e| (1, format!("could not save {}: {e}", config::home().join("settings.toml").display())));
+    let known = |s: &config::Settings, name: &str| {
+        if s.mcp_servers.contains_key(name) {
+            Ok(())
+        } else {
+            let have: Vec<&str> = s.mcp_servers.keys().map(String::as_str).collect();
+            Err((2, format!("no MCP server named {name}{}", if have.is_empty() { " (none configured)".to_string() } else { format!(" (there is: {})", have.join(", ")) })))
+        }
+    };
+    match words.as_slice() {
+        [] | ["list"] => Ok(mcp_list(&load()?)),
+        ["add", name, rest @ ..] => {
+            if let Some(why) = config::mcp_name_problem(name) {
+                return Err((2, why));
+            }
+            let mut server = config::McpServer::default();
+            let mut rest = rest;
+            loop {
+                match rest {
+                    ["--env", kv, tail @ ..] => {
+                        let (k, v) = kv.split_once('=').filter(|(k, _)| !k.is_empty()).ok_or_else(|| (2, format!("--env takes KEY=VALUE, not {kv}")))?;
+                        server.env.insert(k.to_string(), v.to_string());
+                        rest = tail;
+                    }
+                    ["--", tail @ ..] => {
+                        rest = tail;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // A dangling `--env` (or a flag before `--`) is not the server's command.
+            let [command, cmd_args @ ..] = rest else { return Err((2, MCP_USAGE.into())) };
+            if command.starts_with("--") {
+                return Err((2, format!("{command} is not a command — the server's command line goes after --\n{MCP_USAGE}")));
+            }
+            server.command = command.to_string();
+            server.args = cmd_args.iter().map(|a| a.to_string()).collect();
+            let mut s = load()?;
+            if let Some(old) = s.mcp_servers.get(*name) {
+                return Err((2, format!("{name} is already configured ({}) — mantra mcp remove {name} first", shown_command(old))));
+            }
+            let shown = shown_command(&server);
+            let secret = !server.env.is_empty();
+            s.mcp_servers.insert(name.to_string(), server);
+            save(&s)?;
+            let solo = if mcp_solo_gets(&s, name) { "Solo agents get it" } else { "Solo does not (`/mcp solo` in the app)" };
+            let env = if secret { "\nIts env makes settings.toml readable by you only (0600); the values still reach the command line of Codex and Claude Code agents given the server." } else { "" };
+            Ok(format!("added {name}: {shown}\n{solo}; a pattern role gets it with mcp = [\"{name}\"]. Check it with `mantra mcp test {name}`.{env}\n"))
+        }
+        ["remove" | "rm", name] => {
+            let mut s = load()?;
+            known(&s, name)?;
+            s.mcp_servers.remove(*name);
+            save(&s)?;
+            Ok(format!("removed {name}\n"))
+        }
+        [verb @ ("enable" | "disable"), name] => {
+            let mut s = load()?;
+            known(&s, name)?;
+            let on = *verb == "enable";
+            if let Some(server) = s.mcp_servers.get_mut(*name) {
+                server.enabled = on;
+            }
+            save(&s)?;
+            // An open Mantra reads the change at its next Solo (`/new`) or run, not mid-run.
+            Ok(format!("{name} {}\n", if on { "enabled — Solo agents and runs started from now on get it" } else { "disabled — kept in settings.toml; Solo agents and runs started from now on go without it" }))
+        }
+        ["test", name, rest @ ..] => {
+            let budget = match rest {
+                [] => MCP_TEST_BUDGET,
+                ["--timeout", secs] => match secs.parse::<u64>() {
+                    Ok(n) if (1..=3600).contains(&n) => Duration::from_secs(n),
+                    _ => return Err((2, format!("--timeout takes whole seconds, 1 to 3600, not {secs}"))),
+                },
+                _ => return Err((2, MCP_USAGE.into())),
+            };
+            let s = load()?;
+            known(&s, name)?;
+            let server = s.mcp_servers[*name].clone();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| (1, format!("no runtime: {e}")))?;
+            let report = rt.block_on(mcp_test(name, &server, budget)).map_err(|e| (1, e))?;
+            Ok(if server.enabled { report } else { format!("{report}({name} is disabled: `mantra mcp enable {name}` gives it to agents)\n") })
+        }
+        _ => Err((2, MCP_USAGE.into())),
+    }
+}
+
+/// Whether a Solo agent started now gets `name` (`solo_mcp` names it or says `*`, and it is on).
+fn mcp_solo_gets(s: &config::Settings, name: &str) -> bool {
+    s.mcp_for(&s.solo_mcp).iter().any(|(n, _)| n == name)
+}
+
+/// The command line a server runs, an argument with a space or a quote in it single-quoted.
+fn shown_command(s: &config::McpServer) -> String {
+    let shown = |a: &str| if a.is_empty() || a.contains([' ', '\t', '"', '\'']) { format!("'{}'", a.replace('\'', "'\\''")) } else { a.to_string() };
+    std::iter::once(s.command.as_str()).chain(s.args.iter().map(String::as_str)).map(shown).collect::<Vec<_>>().join(" ")
+}
+
+fn mcp_list(s: &config::Settings) -> String {
+    if s.mcp_servers.is_empty() {
+        return "no MCP servers configured — mantra mcp add <name> -- <command> [args…]\n  e.g. Blender's add-on: mantra mcp add blender -- uvx blender-mcp\n".into();
+    }
+    let width = s.mcp_servers.keys().map(|k| k.chars().count()).max().unwrap_or(0);
+    let mut out = format!("MCP servers ({}):\n", config::home().join("settings.toml").display());
+    for (name, server) in &s.mcp_servers {
+        let state = if server.enabled { "enabled " } else { "disabled" };
+        let solo = if mcp_solo_gets(s, name) { "yes" } else { "no" };
+        out.push_str(&format!("  {name:<width$}  {state}  solo: {solo:<3}  {}\n", shown_command(server)));
+        // written by hand into settings.toml: no agent gets it until it is renamed
+        if let Some(why) = config::mcp_name_problem(name) {
+            out.push_str(&format!("  {:<width$}  ↳ never given to an agent: {why}\n", ""));
+        }
+    }
+    out.push_str("A pattern role gets servers with mcp = [\"<name>\"] (or [\"*\"]); Solo with solo_mcp (`/mcp solo`).\n");
+    out
+}
+
+/// Starts the server, shakes hands and lists its tools, all within `budget`: the report, or why
+/// not — with the last lines the server wrote on stderr, which usually say it.
+async fn mcp_test(name: &str, server: &config::McpServer, budget: Duration) -> std::result::Result<String, String> {
+    let mut c = mcp::Client::launch(server).map_err(|e| format!("{name}: {e}"))?;
+    let outcome = tokio::time::timeout(budget, async {
+        c.initialize().await?;
+        c.list_tools().await
+    })
+    .await;
+    let why = match outcome {
+        Ok(Ok(tools)) => return Ok(mcp_test_report(name, server, &c, &tools)),
+        Ok(Err(e)) => e,
+        Err(_) => format!("no answer within {} s", budget.as_secs()),
+    };
+    let tail = c.last_words().await;
+    Err(if tail.is_empty() { format!("{name}: {why}") } else { format!("{name}: {why}\n  its stderr:\n    {}", tail.replace('\n', "\n    ")) })
+}
+
+/// What `mantra mcp test` prints for a server that answered: who it is, and each tool's first line.
+/// A tool's description as one line for `mantra mcp test`: its first sentence, from a first
+/// paragraph that many servers hard-wrap ("…whether the addon matches this server, and which" was
+/// a line of blender-mcp's, not what it says).
+fn tool_about(description: &str) -> String {
+    let para: Vec<&str> = description.lines().map(str::trim).skip_while(|l| l.is_empty()).take_while(|l| !l.is_empty()).collect();
+    let para = para.join(" ");
+    match para.find(". ") {
+        Some(end) => para[..=end].to_string(),
+        None => para,
+    }
+}
+
+/// Room for a tool's line in `mantra mcp test` after its name column: what the terminal leaves
+/// (a line that wraps under the names is hard to scan), 100 when stdout is not one, never under 30.
+fn about_room(name_width: usize) -> usize {
+    use std::io::IsTerminal;
+    let cols = if std::io::stdout().is_terminal() { terminal::size().map(|(w, _)| w as usize).unwrap_or(0) } else { 0 };
+    if cols == 0 {
+        return 100;
+    }
+    cols.saturating_sub(name_width + 7).clamp(30, 100)
+}
+
+fn mcp_test_report(name: &str, server: &config::McpServer, c: &mcp::Client, tools: &[serde_json::Value]) -> String {
+    let mut out = format!("{name}: {}\n  connected: {}, protocol {}\n", shown_command(server), if c.server.is_empty() { "a server with no name" } else { &c.server }, c.protocol);
+    let tool_name = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
+    let width = tools.iter().map(|t| tool_name(t).chars().count()).max().unwrap_or(0);
+    out.push_str(&format!("  {} tool{}{}\n", tools.len(), if tools.len() == 1 { "" } else { "s" }, if tools.is_empty() { "" } else { ":" }));
+    for t in tools {
+        let about = tool_about(t.get("description").and_then(|d| d.as_str()).unwrap_or(""));
+        out.push_str(format!("    {:<width$}  {}", tool_name(t), util::trunc(&about, about_room(width))).trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 fn main() {
     // The mock servers and the MCP bridge (WP10.4/10.6) are separate modes of the same binary.
     match std::env::args().nth(1).as_deref() {
@@ -291,6 +495,11 @@ fn main() {
             rt.block_on(mcp_bridge::run());
             return;
         }
+        Some("mock-mcp") => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            rt.block_on(mock_mcp::run());
+            return;
+        }
         _ => {}
     }
     let cli = match parse_args() {
@@ -301,10 +510,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let env_pw = take_web_password_env();
     util::init_log(&config::log_path());
     mlog!("mantra {} starting", env!("CARGO_PKG_VERSION"));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
-    let res = rt.block_on(async_main(cli));
+    let res = rt.block_on(async_main(cli, env_pw));
     rt.shutdown_timeout(Duration::from_millis(500));
     if let Err(e) = res {
         eprintln!("mantra: {e:#}");
@@ -389,16 +599,39 @@ fn demo_project() -> Result<PathBuf> {
     Ok(dir)
 }
 
-async fn async_main(mut cli: Cli) -> Result<()> {
-    // Checked before `Registry::load()`/`Settings::load()` write their defaults: a fresh install
-    // (no models.toml *and* no settings.toml yet) is the only time it's right to change what a
-    // run defaults to — models.toml missing alone can also mean an established install that just
-    // lost that one file, and must not clobber a user's already-chosen settings.
-    let fresh_install = !config::Registry::path().exists() && !config::home().join("settings.toml").exists();
+/// Whether this is a fresh install: no models.toml, and no settings.toml either — or one that
+/// still has the built-in model and pattern, as `mantra mcp add` or `mantra experimental enable`
+/// run before the first launch leaves it. Checked before `Registry::load()`/`Settings::load()`
+/// write their defaults: a fresh install is the only time it's right to change what a run defaults
+/// to — models.toml missing alone can also mean an established install that just lost that one
+/// file, and must not clobber a user's already-chosen settings.
+fn is_fresh_install(models: &std::path::Path, settings: &std::path::Path) -> bool {
+    if models.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(settings) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(text) => toml::from_str::<config::Settings>(&text).is_ok_and(|s| {
+            let built_in = config::Settings::default();
+            s.default_model == built_in.default_model && s.default_pattern == built_in.default_pattern
+        }),
+    }
+}
+
+/// `MANTRA_WEB_PASSWORD`, taken out of the process environment so no child inherits it — not the
+/// agents' backends, not their shell commands, not a third-party MCP server. Called from `main`
+/// while it is still the only thread (changing the environment is not thread safe).
+fn take_web_password_env() -> Option<String> {
+    let pw = std::env::var("MANTRA_WEB_PASSWORD").ok();
+    std::env::remove_var("MANTRA_WEB_PASSWORD");
+    pw.filter(|p| !p.is_empty())
+}
+
+async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
+    let fresh_install = is_fresh_install(&config::Registry::path(), &config::home().join("settings.toml"));
     let mut settings = config::Settings::load();
     let mut registry = config::Registry::load();
     // Validate the web flags before anything else starts (a bad address is a usage error).
-    let env_pw = std::env::var("MANTRA_WEB_PASSWORD").ok().filter(|p| !p.is_empty());
     let web_cfg = web::WebConfig::resolve(&cli.web, &settings.web, env_pw)?;
     let headless = cli.web.headless;
     if headless {
@@ -480,6 +713,14 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         if !settings.experimental_on(config::EXPERIMENTAL_AKASHA) {
             settings.experimental.push(config::EXPERIMENTAL_AKASHA.to_string());
         }
+        // MCP and images too: the stand-in server (`mantra mock-mcp`) for Solo and, through
+        // `App::start_run_with`, every pattern role — and every model taking images, so the
+        // screenshot tools are offered. A real server of the user's never starts in the demo.
+        settings.mcp_servers.insert(app::DEMO_MCP.into(), config::McpServer { command: exe.to_string_lossy().into_owned(), args: vec!["mock-mcp".into()], ..Default::default() });
+        settings.solo_mcp = vec![app::DEMO_MCP.into()];
+        for m in &mut registry.models {
+            m.vision = true;
+        }
         // Solo stays on the Codex mock: the snapshot and web e2e scripts drive the demo's Solo.
         if registry.backend_of(&registry.resolve(&settings.default_model)) == config::ProviderKind::Bija {
             settings.default_model = "sol".into();
@@ -552,9 +793,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     if let Some(w) = sandbox_warning {
         app.set_sandbox_warning(w);
     }
-    // Web::start already logged these; the toast is for the person looking at the TUI.
+    // Web::start already logged these; the toast is for the person looking at the TUI. There is one
+    // toast slot, so what startup already put there (a lost MCP bridge) goes first, not under.
     if let Some(w) = web.as_ref().map(|w| w.cfg.warnings()).filter(|w| !w.is_empty()) {
-        app.toast(w.join(" · "), crate::agent::Level::Warn);
+        let said = app.toast.take().map(|(t, _, _)| t);
+        app.toast(said.into_iter().chain(w).collect::<Vec<_>>().join(" · "), crate::agent::Level::Warn);
     }
     if let Some(goal) = &cli.run_goal {
         app.start_run_with(goal, None, cli.parallel);
@@ -1684,6 +1927,159 @@ mod cli_tests {
             for bad in [&["enable"][..], &["toggle", "akasha"], &["enable", "akasha", "now"]] {
                 assert_eq!(experimental_cmd(&s(bad)).unwrap_err().0, 2, "{bad:?}");
             }
+        });
+    }
+
+    /// A settings.toml that `mantra mcp add` wrote before the first launch (servers, nothing
+    /// chosen) still counts as a fresh install; one with a model or pattern of the user's, or a
+    /// models.toml, does not.
+    #[test]
+    fn mcp_add_before_the_first_launch_keeps_it_a_fresh_install() {
+        let dir = std::env::temp_dir().join(format!("mantra-fresh-{}", util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (models, settings) = (dir.join("models.toml"), dir.join("settings.toml"));
+        assert!(is_fresh_install(&models, &settings), "nothing at all");
+        let mut s = config::Settings::default();
+        s.mcp_servers.insert("blender".into(), config::McpServer { command: "uvx".into(), args: vec!["blender-mcp".into()], ..Default::default() });
+        std::fs::write(&settings, toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert!(is_fresh_install(&models, &settings), "only servers in it");
+        s.default_model = "luna".into();
+        std::fs::write(&settings, toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert!(!is_fresh_install(&models, &settings), "a model of the user's");
+        std::fs::write(&settings, "default_model = [").unwrap();
+        assert!(!is_fresh_install(&models, &settings), "a file that does not parse is never taken for fresh");
+        std::fs::remove_file(&settings).unwrap();
+        std::fs::write(&models, "").unwrap();
+        assert!(!is_fresh_install(&models, &settings), "models.toml there: an established install");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The web password leaves the environment as it is read, so no agent, shell command or MCP
+    /// server started later inherits it.
+    #[test]
+    fn the_web_password_is_taken_out_of_the_environment() {
+        std::env::set_var("MANTRA_WEB_PASSWORD", "hunter2");
+        assert_eq!(take_web_password_env().as_deref(), Some("hunter2"));
+        assert!(std::env::var_os("MANTRA_WEB_PASSWORD").is_none());
+        std::env::set_var("MANTRA_WEB_PASSWORD", "");
+        assert_eq!(take_web_password_env(), None, "empty is none");
+        assert!(std::env::var_os("MANTRA_WEB_PASSWORD").is_none());
+    }
+
+    /// `mantra mcp` adds, lists, switches and removes servers in settings.toml, refusing names
+    /// that would not survive as a TOML key or a tool prefix; `test` starts the stand-in server
+    /// (`mantra mock-mcp`, run from this test binary — `mock_mcp::tests::test_server`) with the
+    /// `--env` it was added with, and lists its tools; one that dies is exit 1 with its stderr.
+    /// `mantra mcp test` prints a tool's first sentence, whole, even from a hard-wrapped description.
+    #[test]
+    fn a_tools_line_is_its_first_sentence_not_its_first_line() {
+        let wrapped = "Check the connected Blender: its version, whether the addon matches this server, and which\n  features are on. Call it first.\n\nArgs: none";
+        assert_eq!(tool_about(wrapped), "Check the connected Blender: its version, whether the addon matches this server, and which features are on.");
+        assert_eq!(tool_about("Search a library of existing assets. The sources:\n- Poly Haven"), "Search a library of existing assets.");
+        assert_eq!(tool_about("\n  Run Python in Blender (bpy). Whatever it prints is returned."), "Run Python in Blender (bpy).");
+        assert_eq!(tool_about("Version 1.2 of the scene"), "Version 1.2 of the scene");
+        assert_eq!(tool_about(""), "");
+    }
+
+    #[test]
+    fn mcp_add_list_enable_test_and_remove() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+            let out = mcp_cmd(&s(&[])).unwrap();
+            assert!(out.contains("no MCP servers") && out.contains("uvx blender-mcp"), "{out}");
+            let mock = crate::mock_mcp::tests::test_server();
+            let mut add = vec!["add", "demo"];
+            let env = mock.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>();
+            for kv in &env {
+                add.extend(["--env", kv.as_str()]);
+            }
+            add.push("--");
+            add.push(&mock.command);
+            add.extend(mock.args.iter().map(String::as_str));
+            let added = mcp_cmd(&s(&add)).unwrap();
+            assert!(added.contains("added demo") && added.contains("Solo agents get it"), "{added}");
+            assert!(added.contains("(0600)") == !mock.env.is_empty(), "an env is said to be a secret: {added}");
+            let saved = config::Settings::load_on_disk().unwrap();
+            assert_eq!(saved.mcp_servers["demo"], mock, "command, args and env as given");
+            assert_eq!(mcp_cmd(&s(&add)).unwrap_err().0, 2, "a second add of the same name is refused");
+            // without `--` too, and an argument with a space shows quoted
+            mcp_cmd(&s(&["add", "files", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp/a b"])).unwrap();
+            let list = mcp_cmd(&s(&["list"])).unwrap();
+            assert!(list.lines().any(|l| l.contains("files") && l.contains("enabled") && l.contains("solo: yes") && l.contains("'/tmp/a b'")), "{list}");
+
+            let tested = mcp_cmd(&s(&["test", "demo"])).unwrap();
+            assert!(tested.contains("connected: mantra-mock-mcp") && tested.contains("2 tools:"), "{tested}");
+            assert!(tested.lines().any(|l| l.trim_start().starts_with("scene_info") && l.contains("objects")), "{tested}");
+            assert!(tested.lines().any(|l| l.trim_start().starts_with("render_preview")), "{tested}");
+
+            assert!(mcp_cmd(&s(&["disable", "files"])).unwrap().contains("disabled"));
+            let list = mcp_cmd(&s(&[])).unwrap();
+            assert!(list.lines().any(|l| l.contains("files") && l.contains("disabled") && l.contains("solo: no")), "{list}");
+            assert!(config::Settings::load_on_disk().unwrap().mcp_for(&["*".to_string()]).iter().all(|(n, _)| n != "files"));
+            mcp_cmd(&s(&["enable", "files"])).unwrap();
+            assert!(config::Settings::load_on_disk().unwrap().mcp_servers["files"].enabled);
+            assert!(mcp_cmd(&s(&["remove", "files"])).unwrap().contains("removed files"));
+            assert!(!config::Settings::load_on_disk().unwrap().mcp_servers.contains_key("files"));
+
+            // a server that dies before answering: exit 1, with what it said
+            let broken = config::McpServer { command: "sh".into(), args: s(&["-c", "echo 'blender-mcp: cannot reach Blender on :9876' >&2; exit 3"]), ..Default::default() };
+            let mut cfg = config::Settings::load_on_disk().unwrap();
+            cfg.mcp_servers.insert("broken".into(), broken);
+            cfg.save().unwrap();
+            let (code, e) = mcp_cmd(&s(&["test", "broken"])).unwrap_err();
+            assert!(code == 1 && e.contains("broken:") && e.contains("cannot reach Blender"), "{code} {e}");
+            // a name typed into settings.toml that `add` would refuse is listed as never given
+            cfg.mcp_servers.insert("blender.v2".into(), config::McpServer { command: "uvx".into(), ..Default::default() });
+            cfg.save().unwrap();
+            let list = mcp_cmd(&s(&[])).unwrap();
+            assert!(list.contains("↳ never given to an agent: 'blender.v2'"), "{list}");
+            cfg.mcp_servers.remove("blender.v2");
+            cfg.save().unwrap();
+
+            for (bad, code, words) in [
+                (&["add", "a/b", "--", "x"][..], 2, "letters"),
+                (&["add", "mantra", "--", "x"], 2, "Mantra's own"),
+                (&["add", "x"], 2, "usage"),
+                (&["add", "--", "uvx", "blender-mcp"], 2, "cannot start with -"),
+                (&["add", "x", "--env"], 2, "--env is not a command"),
+                (&["add", "x", "--env", "A=1"], 2, "usage"),
+                (&["add", "x", "--env", "NOEQUALS", "--", "y"], 2, "KEY=VALUE"),
+                (&["remove", "nope"], 2, "no MCP server named nope"),
+                (&["test", "nope"], 2, "there is: broken, demo"),
+                (&["enable"], 2, "usage"),
+                (&["frobnicate", "x"], 2, "usage"),
+            ] {
+                let (c, e) = mcp_cmd(&s(bad)).unwrap_err();
+                assert!(c == code && e.contains(words), "{bad:?}: {c} {e}");
+            }
+        });
+    }
+
+    /// `mantra mcp test` exits 1 with a one-line reason for a server that is gone before it
+    /// answers and for one that never says a word (`--timeout` keeps the wait short); a bad
+    /// `--timeout` is a usage error (2), and the silent server does not outlive the test.
+    #[test]
+    fn mcp_test_exits_1_for_a_server_that_dies_or_never_answers() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+            let marker = format!("{}", 60_000 + std::process::id() % 1000);
+            let mut cfg = config::Settings::load_on_disk().unwrap();
+            cfg.mcp_servers.insert("dead".into(), config::McpServer { command: "false".into(), ..Default::default() });
+            cfg.mcp_servers.insert("mute".into(), config::McpServer { command: "sleep".into(), args: vec![marker.clone()], ..Default::default() });
+            cfg.save().unwrap();
+            let (code, e) = mcp_cmd(&s(&["test", "dead"])).unwrap_err();
+            assert!(code == 1 && e.starts_with("dead: ") && e.lines().count() == 1, "{code} {e}");
+            let started = Instant::now();
+            let (code, e) = mcp_cmd(&s(&["test", "mute", "--timeout", "1"])).unwrap_err();
+            assert_eq!((code, e.as_str()), (1, "mute: no answer within 1 s"));
+            assert!(started.elapsed() < Duration::from_secs(10), "the budget, not the server, ended it: {:?}", started.elapsed());
+            let alive = std::process::Command::new("pgrep").args(["-f", &format!("^sleep {marker}$")]).output().map(|o| o.status.success()).unwrap_or(false);
+            assert!(!alive, "the silent server was killed with the test");
+            for bad in ["0", "soon", "99999"] {
+                let (code, e) = mcp_cmd(&s(&["test", "mute", "--timeout", bad])).unwrap_err();
+                assert!(code == 2 && e.contains("--timeout takes whole seconds"), "{bad}: {code} {e}");
+            }
+            assert_eq!(mcp_cmd(&s(&["test", "mute", "--later"])).unwrap_err().0, 2);
         });
     }
 }

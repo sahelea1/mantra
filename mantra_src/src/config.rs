@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every reasoning effort Codex knows about, ordered from lightest to heaviest.
@@ -109,6 +110,29 @@ pub struct Settings {
     pub web: WebSettings,
     /// Experimental features switched on (`mantra experimental enable <name>`); see `EXPERIMENTAL`.
     pub experimental: Vec<String>,
+    /// `[mcp_servers.<name>]`: MCP servers agents may be given (Solo via `solo_mcp`, roles via
+    /// `Role.mcp`). Nothing reaches an agent unless asked for.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_servers: BTreeMap<String, McpServer>,
+    /// Which configured servers Solo agents get: `["*"]` every enabled one (the default), names, or none.
+    pub solo_mcp: Vec<String>,
+}
+
+/// One stdio MCP server as `settings.toml` configures it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpServer {
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    pub enabled: bool,
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        McpServer { command: String::new(), args: vec![], env: BTreeMap::new(), enabled: true }
+    }
 }
 
 /// Akasha: shared notes for agent groups (`engine::akasha`).
@@ -120,6 +144,76 @@ impl Settings {
     pub fn experimental_on(&self, name: &str) -> bool {
         self.experimental.iter().any(|f| f == name)
     }
+
+    /// The servers `wanted` asks for (a role's `mcp`, `solo_mcp`): `"*"` is every enabled one,
+    /// names pick some. Only enabled servers, each once, in name order — so every backend gets
+    /// the same list in the same order whatever the role wrote.
+    ///
+    /// A name `mcp_name_problem` refuses (one typed into settings.toml by hand: a dot, `__`,
+    /// `mantra`) is never given — it would break Codex's `-c` key, the `mcp__<server>__<tool>`
+    /// split or Mantra's own server; `mcp_refused` names those for the journal and the toast.
+    pub fn mcp_for(&self, wanted: &[String]) -> Vec<(String, McpServer)> {
+        self.mcp_asked(wanted).filter(|(name, _)| mcp_name_problem(name).is_none()).map(|(name, s)| (name.clone(), s.clone())).collect()
+    }
+
+    /// The enabled servers `wanted` asks for whose name cannot work, each with why.
+    pub fn mcp_refused(&self, wanted: &[String]) -> Vec<(String, String)> {
+        self.mcp_asked(wanted).filter_map(|(name, _)| mcp_name_problem(name).map(|why| (name.clone(), why))).collect()
+    }
+
+    /// The enabled servers `wanted` names or `"*"` covers, in name order.
+    fn mcp_asked<'a>(&'a self, wanted: &'a [String]) -> impl Iterator<Item = (&'a String, &'a McpServer)> + 'a {
+        let all = wanted.iter().any(|w| w.trim() == "*");
+        self.mcp_servers.iter().filter(move |(name, s)| s.enabled && (all || wanted.iter().any(|w| w.trim() == name.as_str())))
+    }
+
+    /// The names `wanted` asks for that `[mcp_servers]` does not have, each once (`"*"` never is).
+    /// A disabled server is configured, so it is not missing — it is just not launched.
+    pub fn mcp_missing(&self, wanted: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for w in wanted.iter().map(|w| w.trim()).filter(|w| !w.is_empty() && *w != "*") {
+            if !self.mcp_servers.contains_key(w) && !out.iter().any(|o| o == w) {
+                out.push(w.to_string());
+            }
+        }
+        out
+    }
+
+    /// settings.toml as it is on disk, for a change that must be saved without the session's own
+    /// (`--demo` points at its mocks, a missing Codex moves Solo to bija): the defaults when there
+    /// is no file yet, and an error for one that does not parse — `load` would fall back to the
+    /// defaults, and saving those would wipe every setting in it.
+    pub fn load_on_disk() -> std::result::Result<Settings, String> {
+        let path = home().join("settings.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str::<Settings>(&text).map_err(|e| format!("{} does not parse, fix it first: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+/// Why `name` cannot name an MCP server, or `None`. Stricter than "no `/` or spaces": it becomes a
+/// TOML key in Codex's `-c mcp_servers.<name>…` (bare keys are letters, digits, `-` and `_`), the
+/// `<server>` in `mcp__<server>__<tool>` (so no `__` inside it), and a key beside Mantra's own
+/// `mantra` server in Claude Code's `--mcp-config`.
+pub fn mcp_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a server needs a name".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Some(format!("'{name}': use letters, digits, - and _ only (no /, spaces or dots)"));
+    }
+    if name.contains("__") {
+        return Some(format!("'{name}': no double underscore — tools are named mcp__<server>__<tool>"));
+    }
+    if name.starts_with('-') {
+        return Some(format!("'{name}': a name cannot start with - (is a flag or `--` in the wrong place?)"));
+    }
+    if name == "mantra" {
+        return Some("'mantra' is Mantra's own server — pick another name".into());
+    }
+    None
 }
 
 /// `[web]` in settings.toml: defaults for `--web` / `--remote`. Flags override.
@@ -177,6 +271,8 @@ impl Default for Settings {
             notify: true,
             web: WebSettings::default(),
             experimental: vec![],
+            mcp_servers: BTreeMap::new(),
+            solo_mcp: vec!["*".into()],
         }
     }
 }
@@ -196,12 +292,18 @@ impl Settings {
             }
         }
     }
+    /// Whether settings.toml holds a secret: a web password, or any value in an MCP server's
+    /// `env` (a token, typically) — what makes `save` write it 0600.
+    pub fn holds_secrets(&self) -> bool {
+        !self.web.password.is_empty() || self.mcp_servers.values().any(|s| !s.env.is_empty())
+    }
+
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(home())?;
         let body = toml::to_string_pretty(self)?;
         let body = format!("# Mantra settings\n{body}");
-        // A web password in the file makes it a secret (same rule as a key in models.toml).
-        if self.web.password.is_empty() {
+        // A secret in the file makes it restricted (same rule as a key in models.toml).
+        if !self.holds_secrets() {
             atomic_write(&home().join("settings.toml"), &body)
         } else {
             atomic_write_restricted(&home().join("settings.toml"), &body)
@@ -228,6 +330,12 @@ pub struct ModelEntry {
     /// OpenAI models, and *no effort control* for custom-provider models (none is sent).
     pub efforts: Vec<String>,
     pub note: String,
+    /// The model takes images: the screenshot/view-image tools are offered only then. Always
+    /// written, `false` too: a saved file with no `vision` key at all is one from before the key
+    /// existed, which `Registry::add_missing_vision` switches on for the families that take images —
+    /// a "no" the user chose in `/models` must not look like that.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 impl Default for ModelEntry {
@@ -241,6 +349,7 @@ impl Default for ModelEntry {
             default_effort: "medium".into(),
             efforts: vec![],
             note: String::new(),
+            vision: false,
         }
     }
 }
@@ -589,7 +698,7 @@ pub fn claude_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
     let claude_efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].iter().map(|s| s.to_string()).collect();
     CLAUDE_MODELS
         .iter()
-        .map(|(alias, model, context_window, note)| ModelEntry {
+        .map(|(alias, model, context_window, note)| ModelEntry { vision: true,
             alias: (*alias).into(),
             provider: provider_id.to_string(),
             model: (*model).into(),
@@ -735,8 +844,19 @@ pub fn bija_alias(alias: &str) -> String {
 pub fn bija_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
     codex_default_models()
         .into_iter()
-        .map(|m| ModelEntry { alias: bija_alias(&m.alias), provider: provider_id.to_string(), note: format!("{} — with an API key", m.note), ..m })
+        .map(|m| ModelEntry { vision: true, alias: bija_alias(&m.alias), provider: provider_id.to_string(), note: format!("{} — with an API key", m.note), ..m })
         .collect()
+}
+
+/// Whether a model id is one of a family that takes images: an id of the built-in default tables,
+/// or one shaped like them (`gpt-…`, `claude-…`) that the tables have not caught up with. The
+/// open-weight `gpt-oss-…` ids people run locally read text only, so they are not.
+fn takes_images(model: &str) -> bool {
+    let id = model.trim();
+    if CLAUDE_MODELS.iter().any(|(_, m, _, _)| *m == id) || codex_default_models().iter().any(|m| m.model == id) {
+        return true;
+    }
+    (id.starts_with("gpt-") && !id.starts_with("gpt-oss")) || id.starts_with("claude-")
 }
 
 /// The four models Codex's own account runs (provider `openai`).
@@ -751,6 +871,7 @@ fn codex_default_models() -> Vec<ModelEntry> {
             default_effort: "high".into(),
             efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
             note: "most capable — planning & hard problems".into(),
+            vision: true,
             ..Default::default()
         },
         ModelEntry {
@@ -761,6 +882,7 @@ fn codex_default_models() -> Vec<ModelEntry> {
             default_effort: "medium".into(),
             efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
             note: "frontier agentic coding".into(),
+            vision: true,
             ..Default::default()
         },
         ModelEntry {
@@ -771,6 +893,7 @@ fn codex_default_models() -> Vec<ModelEntry> {
             default_effort: "medium".into(),
             efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
             note: "balanced everyday coding".into(),
+            vision: true,
             ..Default::default()
         },
         ModelEntry {
@@ -781,6 +904,7 @@ fn codex_default_models() -> Vec<ModelEntry> {
             default_effort: "medium".into(),
             efforts: all6(&["low", "medium", "high", "xhigh", "max"]),
             note: "fast & affordable workers".into(),
+            vision: true,
             ..Default::default()
         },
     ]
@@ -830,12 +954,39 @@ impl Registry {
         true
     }
 
+    /// A registry written before models had a `vision` key reads `false` everywhere, so nobody
+    /// would get the screenshot tools until they found the column. When `text` (the file as read)
+    /// has no `vision` key on any model, the entries whose model id belongs to a family that takes
+    /// images (`takes_images`) are switched on; a file with any `vision` key — even one `false`
+    /// written by hand — is the user's say and is left alone. True when anything changed.
+    pub fn add_missing_vision(&mut self, text: &str) -> bool {
+        let Ok(doc) = text.parse::<toml::Value>() else { return false };
+        let has_key = doc.get("model").and_then(|m| m.as_array()).is_some_and(|models| models.iter().any(|m| m.get("vision").is_some()));
+        if has_key {
+            return false;
+        }
+        let mut changed = false;
+        for m in self.models.iter_mut().filter(|m| !m.vision && takes_images(&m.model)) {
+            m.vision = true;
+            changed = true;
+        }
+        changed
+    }
+
     pub fn load() -> Registry {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => match toml::from_str::<Registry>(&s) {
                 Ok(mut r) if !r.models.is_empty() => {
-                    if r.add_missing_bija() {
+                    let bija = r.add_missing_bija();
+                    if bija {
                         crate::mlog!("models.toml: added the bija provider and the default models through it");
+                    }
+                    let vision = r.add_missing_vision(&s);
+                    if vision {
+                        crate::mlog!("models.toml: vision switched on for the models whose family takes images");
+                    }
+                    // One save for both: every entry now carries `vision`, so neither runs again.
+                    if bija || vision {
                         let _ = r.save();
                     }
                     r
@@ -882,6 +1033,12 @@ impl Registry {
             .iter()
             .find(|m| m.alias == alias)
             .or_else(|| self.models.iter().find(|m| m.model == alias))
+    }
+
+    /// Whether the alias's model takes images — what offers the screenshot and view-image tools,
+    /// and `--vision` to bija. An unknown alias does not.
+    pub fn vision(&self, alias: &str) -> bool {
+        self.get(alias).map(|m| m.vision).unwrap_or(false)
     }
 
     /// Resolve an alias; unknown names are treated as raw model ids on the default provider.
@@ -1114,10 +1271,13 @@ mod tests {
     }
     #[test]
     fn runs_live_in_home_not_project() {
-        let d = runs_dir(Path::new("/tmp/some project"));
-        assert!(d.starts_with(home().join("runs")));
-        assert!(d.file_name().unwrap().to_string_lossy().starts_with("some-project-"));
-        assert_ne!(runs_dir(Path::new("/a/app")), runs_dir(Path::new("/b/app")));
+        // under the lock the tests that move `$MANTRA_HOME` take, so `home()` holds still
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let d = runs_dir(Path::new("/tmp/some project"));
+            assert!(d.starts_with(home().join("runs")));
+            assert!(d.file_name().unwrap().to_string_lossy().starts_with("some-project-"));
+            assert_ne!(runs_dir(Path::new("/a/app")), runs_dir(Path::new("/b/app")));
+        });
     }
     #[test]
     fn effective_context_and_compact_percent() {
@@ -1450,6 +1610,43 @@ mod tests {
         assert_eq!(taken.providers.len(), 1, "no second provider under the same id");
     }
 
+    /// A models.toml from before the `vision` key gains it once, on the entries whose family takes
+    /// images (the default tables, or an id shaped like them) and only those, in the one save that
+    /// also adds bija; a file with any `vision` key — `false` by hand, or every one switched off in
+    /// `/models` — is left as it says.
+    #[test]
+    fn an_old_registry_gains_vision_once_and_a_said_no_stays_no() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let model = |alias: &str, provider: &str, id: &str| format!("[[model]]\nalias = \"{alias}\"\nprovider = \"{provider}\"\nmodel = \"{id}\"\n\n");
+            let old = [model("astra", "openai", "gpt-6-astra"), model("opus5", "claude", "claude-opus-5"), model("next", "openai", "gpt-7-nova"), model("local", "ollama", "qwen3-coder"), model("oss", "ollama", "gpt-oss-20b")].concat();
+            let old = format!("{old}[[provider]]\nid = \"claude\"\nkind = \"claude-code\"\n");
+            std::fs::write(Registry::path(), &old).unwrap();
+            let r = Registry::load();
+            let on: Vec<&str> = ["astra", "opus5", "next", "local", "oss"].into_iter().filter(|a| r.vision(a)).collect();
+            assert_eq!(on, vec!["astra", "opus5", "next"]);
+            assert!(r.vision("sol-api"), "the bija twins added in the same load take images too");
+            let saved = std::fs::read_to_string(Registry::path()).unwrap();
+            assert_eq!(saved.matches("vision = true").count(), r.models.iter().filter(|m| m.vision).count(), "{saved}");
+            assert!(saved.contains("vision = false"), "a no is written too, so the next load knows: {saved}");
+            // saved once: a second load finds the keys and writes nothing
+            std::fs::write(Registry::path(), format!("{saved}# mine\n")).unwrap();
+            let again = Registry::load();
+            assert!(std::fs::read_to_string(Registry::path()).unwrap().ends_with("# mine\n"), "not saved a second time");
+            assert_eq!(again.models.iter().filter(|m| m.vision).count(), r.models.iter().filter(|m| m.vision).count());
+            // every one switched off in /models stays off
+            let mut off = again;
+            off.models.iter_mut().for_each(|m| m.vision = false);
+            off.save().unwrap();
+            assert!(Registry::load().models.iter().all(|m| !m.vision), "an all-off registry is not an old one");
+            // a hand-written `vision = false` on one entry: the user has said; nothing is switched on
+            let by_hand = old.replacen("model = \"gpt-6-astra\"\n", "model = \"gpt-6-astra\"\nvision = false\n", 1);
+            std::fs::write(Registry::path(), format!("{by_hand}[[provider]]\nid = \"bija\"\nkind = \"bija\"\n")).unwrap();
+            let hand = Registry::load();
+            assert!(hand.models.iter().all(|m| !m.vision), "{:?}", hand.models.iter().map(|m| (&m.alias, m.vision)).collect::<Vec<_>>());
+            assert!(std::fs::read_to_string(Registry::path()).unwrap().contains("[[provider]]\nid = \"bija\"\nkind = \"bija\"\n"), "left as written, not re-saved");
+        });
+    }
+
     #[test]
     fn bija_kind_and_wire_round_trip_through_models_toml() {
         let r: Registry = toml::from_str("[[provider]]\nid = \"a\"\nkind = \"bija\"\nwire = \"anthropic\"\n[[provider]]\nid = \"b\"\nkind = \"seed\"\n[[provider]]\nid = \"c\"\n").unwrap();
@@ -1478,5 +1675,112 @@ mod tests {
         assert_eq!(resolve_bija_from(&cmd(&["bija"]), nowhere, None, Some("  ")), (cmd(&["bija"]), BijaFound::Missing));
         assert_eq!(resolve_bija_from(&Vec::new(), nowhere, None, None).0, vec![bija_exe_name()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn server(command: &str, args: &[&str], enabled: bool) -> McpServer {
+        McpServer { command: command.into(), args: args.iter().map(|a| a.to_string()).collect(), env: BTreeMap::new(), enabled }
+    }
+
+    /// `[mcp_servers.<name>]` survives a save and a load; an old settings.toml without the table
+    /// comes back with none and Solo asking for every enabled one, and saving it adds nothing.
+    #[test]
+    fn mcp_servers_round_trip_and_old_settings_are_unchanged() {
+        let mut s = Settings::default();
+        let mut blender = server("uvx", &["blender-mcp"], true);
+        blender.env.insert("BLENDER_PORT".into(), "9876".into());
+        s.mcp_servers.insert("blender".into(), blender);
+        s.mcp_servers.insert("files".into(), server("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/tmp/a b"], false));
+        s.solo_mcp = vec!["blender".into()];
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.contains("[mcp_servers.blender]") && text.contains("enabled = false"), "{text}");
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(back.mcp_servers, s.mcp_servers);
+        assert_eq!(back.solo_mcp, vec!["blender".to_string()]);
+        // the documented form, with `enabled` and `env` left out
+        let hand: Settings = toml::from_str("[mcp_servers.blender]\ncommand = \"uvx\"\nargs = [\"blender-mcp\"]\n").unwrap();
+        assert_eq!(hand.mcp_servers["blender"], server("uvx", &["blender-mcp"], true));
+        let old: Settings = toml::from_str("default_model = \"sol\"\n").unwrap();
+        assert!(old.mcp_servers.is_empty());
+        assert_eq!(old.solo_mcp, vec!["*".to_string()]);
+        assert!(!toml::to_string_pretty(&old).unwrap().contains("mcp_servers"), "no empty table written");
+    }
+
+    /// `"*"` is every enabled server, names pick some; disabled ones never come back, the list is
+    /// in name order whatever was asked, and only unconfigured names are missing.
+    #[test]
+    fn mcp_for_resolves_star_and_names_and_mcp_missing_names_the_rest() {
+        let mut s = Settings::default();
+        s.mcp_servers.insert("blender".into(), server("uvx", &["blender-mcp"], true));
+        s.mcp_servers.insert("files".into(), server("npx", &["fs"], true));
+        s.mcp_servers.insert("off".into(), server("x", &[], false));
+        let names = |v: Vec<(String, McpServer)>| v.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(names(s.mcp_for(&w(&["*"]))), vec!["blender", "files"]);
+        assert_eq!(names(s.mcp_for(&w(&["files", "blender", "files"]))), vec!["blender", "files"]);
+        assert_eq!(names(s.mcp_for(&w(&["off", "nope"]))), Vec::<String>::new());
+        assert_eq!(names(s.mcp_for(&[])), Vec::<String>::new(), "empty = none");
+        assert_eq!(names(s.mcp_for(&w(&[" blender "]))), vec!["blender"]);
+        assert_eq!(s.mcp_for(&w(&["blender"]))[0].1.args, vec!["blender-mcp".to_string()]);
+        assert_eq!(s.mcp_missing(&w(&["*", "blender", "nope", "off", "nope", ""])), vec!["nope".to_string()]);
+        assert!(Settings::default().mcp_for(&w(&["*"])).is_empty(), "nothing configured, nothing given");
+    }
+
+    /// An MCP server's env (a token, typically) makes settings.toml a secret like a web password
+    /// does: written 0600, whatever the umask.
+    #[test]
+    #[cfg(unix)]
+    fn settings_with_an_mcp_env_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mode = || std::fs::metadata(home().join("settings.toml")).unwrap().permissions().mode() & 0o777;
+            let mut s = Settings::default();
+            s.mcp_servers.insert("blender".into(), server("uvx", &["blender-mcp"], true));
+            assert!(!s.holds_secrets(), "a server without env is no secret");
+            s.mcp_servers.get_mut("blender").unwrap().env.insert("TOKEN".into(), "s3cret".into());
+            assert!(s.holds_secrets());
+            s.save().unwrap();
+            assert_eq!(mode(), 0o600);
+            assert!(Settings { web: WebSettings { password: "pw".into(), ..Default::default() }, ..Settings::default() }.holds_secrets());
+        });
+    }
+
+    /// A name typed into settings.toml by hand that `mantra mcp add` would refuse (a dot, `__`,
+    /// `mantra`, a leading dash) is never handed to an agent — not by name, not through `*` — and
+    /// `mcp_refused` says why, for the journal and the toast.
+    #[test]
+    fn hand_written_server_names_that_cannot_work_are_skipped_and_named() {
+        let mut s = Settings::default();
+        for name in ["blender", "blender.v2", "my__srv", "mantra", "--"] {
+            s.mcp_servers.insert(name.into(), server("uvx", &["x"], true));
+        }
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |v: Vec<(String, McpServer)>| v.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names(s.mcp_for(&w(&["*"]))), vec!["blender"]);
+        assert_eq!(names(s.mcp_for(&w(&["blender.v2", "my__srv", "mantra", "--"]))), Vec::<String>::new());
+        let refused = s.mcp_refused(&w(&["*"]));
+        assert_eq!(refused.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["--", "blender.v2", "mantra", "my__srv"]);
+        assert!(refused.iter().all(|(n, why)| why.contains(n.as_str())), "{refused:?}");
+        assert_eq!(s.mcp_refused(&w(&["blender", "my__srv"])).len(), 1, "only what was asked for");
+        assert!(s.mcp_refused(&[]).is_empty());
+        assert!(s.mcp_missing(&w(&["blender.v2"])).is_empty(), "configured, so not missing — refused instead");
+    }
+
+    #[test]
+    fn mcp_server_names_must_work_as_toml_keys_and_tool_prefixes() {
+        for ok in ["blender", "my-files", "fs_2"] {
+            assert_eq!(mcp_name_problem(ok), None, "{ok}");
+        }
+        for (bad, why) in [("", "needs a name"), ("a/b", "letters"), ("a b", "letters"), ("a.b", "letters"), ("a__b", "double underscore"), ("mantra", "Mantra's own"), ("--", "start with -"), ("-x", "start with -")] {
+            assert!(mcp_name_problem(bad).is_some_and(|e| e.contains(why)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn vision_is_read_from_the_model_entry() {
+        let mut r = Registry { models: vec![ModelEntry { alias: "eye".into(), model: "m-eye".into(), vision: true, ..Default::default() }, ModelEntry { alias: "plain".into(), ..Default::default() }], providers: vec![] };
+        assert!(r.vision("eye") && r.vision("m-eye"));
+        assert!(!r.vision("plain") && !r.vision("unknown"));
+        r.models[0].vision = false;
+        assert!(!r.vision("eye"));
     }
 }

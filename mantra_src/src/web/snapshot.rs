@@ -283,6 +283,9 @@ pub struct ToolView {
     pub args: String,
     pub result: String,
     pub status: String,
+    /// The result carried an image: its path, or `""` when the result names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// One transcript item. `ord` is stable for the agent's lifetime (`Agent::trimmed + index`).
@@ -643,7 +646,7 @@ pub fn item_view(ord: u64, it: &Item) -> ItemView {
             );
             v.status = Some(status.clone());
         }
-        Kind::Tool { name, args, result, status } => v.tool = Some(ToolView { name: name.clone(), args: args.clone(), result: result.clone(), status: status.clone() }),
+        Kind::Tool { name, args, result, status, image } => v.tool = Some(ToolView { name: name.clone(), args: args.clone(), result: result.clone(), status: status.clone(), image: image.clone() }),
         Kind::Web { query } => v.query = Some(query.clone()),
         Kind::Notice { level } => v.level = Some(level_str(level).into()),
         Kind::Compaction { from, to } => {
@@ -665,7 +668,7 @@ impl Fp {
         let extra = match &it.kind {
             Kind::Command { output, status, exit, .. } => output.len().wrapping_add(status.len() << 20).wrapping_add(exit.map(|e| e as usize).unwrap_or(7) << 40),
             Kind::Files { changes, status } => changes.len().wrapping_add(status.len() << 20),
-            Kind::Tool { result, status, .. } => result.len().wrapping_add(status.len() << 20),
+            Kind::Tool { result, status, image, .. } => result.len().wrapping_add(status.len() << 20).wrapping_add(image.as_ref().map_or(0, |p| p.len() + 1) << 40),
             Kind::Compaction { to, .. } => to.map(|t| t as usize).unwrap_or(0),
             _ => 0,
         };
@@ -1445,6 +1448,29 @@ pub(crate) mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    /// A tool item carries its image to the web client as `tool.image` (the path, or "" when the
+    /// result names none); a plain tool item has no such key at all.
+    #[test]
+    fn a_tool_items_image_reaches_the_snapshot() {
+        let mut a = crate::agent::Agent::new(1, "t", "solo", PathBuf::from("/p"));
+        a.apply("item/completed", &serde_json::json!({"item": {"type": "dynamicToolCall", "id": "s1", "tool": "mantra_screenshot", "status": "completed", "contentItems": [
+            {"type": "inputText", "text": "saved to /r/screenshots/solo-1.png (image/png)"}, {"type": "inputImage", "imageUrl": "data:image/png;base64,AA=="}]}}));
+        a.apply("item/completed", &serde_json::json!({"item": {"type": "dynamicToolCall", "id": "s2", "tool": "mantra_status", "status": "completed", "contentItems": [{"type": "inputText", "text": "all good"}]}}));
+        let views: Vec<serde_json::Value> = a.items.iter().enumerate().map(|(i, it)| serde_json::to_value(item_view(i as u64, it)).unwrap_or_default()).collect();
+        assert_eq!(views[0]["tool"]["image"], serde_json::json!("/r/screenshots/solo-1.png"));
+        assert!(views[1]["tool"].get("image").is_none(), "{}", views[1]);
+        // the change detector sees an image arrive on an item that already had its text
+        let mut b = crate::agent::Agent::new(2, "t", "solo", PathBuf::from("/p"));
+        let text = serde_json::json!({"type": "inputText", "text": "saved to /r/x.png"});
+        b.apply("item/started", &serde_json::json!({"item": {"type": "dynamicToolCall", "id": "s1", "tool": "mantra_screenshot", "status": "completed", "contentItems": [text]}}));
+        let before = Fp::of(&b.items[0]);
+        b.items[0].kind = match b.items[0].kind.clone() {
+            Kind::Tool { name, args, result, status, .. } => Kind::Tool { name, args, result, status, image: Some("/r/x.png".into()) },
+            k => k,
+        };
+        assert_ne!(Fp::of(&b.items[0]), before);
     }
 
     pub(crate) fn test_app() -> App {

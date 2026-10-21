@@ -330,7 +330,7 @@ If `claude` is on your `PATH`, Mantra adds a `claude` provider with `opus46`, `o
 
 Under the hood each agent is one long-lived `claude -p --input-format stream-json …` process. Mantra translates its event stream into the same shapes the UI already renders, so nothing else in the app knows the difference: steering lands at the next tool boundary, `x` sends a real interrupt, `/compact` compacts the session, and a crashed process restarts with `--resume`.
 
-Mantra's own tools (`mantra_spawn`, `mantra_submit_plan`, …) reach Claude through MCP: Mantra opens a socket and passes `--mcp-config` pointing at `mantra mcp-bridge`, which `claude` starts itself. Nothing to configure.
+Mantra's own tools (`mantra_spawn`, `mantra_submit_plan`, …) reach Claude through MCP: Mantra opens a socket and passes `--mcp-config` pointing at `mantra mcp-bridge`, which `claude` starts itself. Nothing to configure. MCP servers you give the agent ride in the same config (see *MCP servers* below).
 
 **Third-party gateways** work through the same backend — set `kind = "claude-code"`, `auth = "api_key"`, a base URL and a key:
 
@@ -395,6 +395,54 @@ A provider added with `n` is a **draft** until its URL and key are real: `/model
 Every agent is launched with an explicit context window and compaction threshold — its own numbers, or a conservative assumed 200k / 85% — passed as `model_context_window` + `model_auto_compact_token_limit` to Codex and `--autocompact` to Claude. A 16k model compacts instead of dying. A worker that still overflows on an assumed window gets it halved for the next attempt, with a log line telling you to set the real one.
 
 `/compact` compacts by hand (deferred to the end of the turn if one is running), each compaction appears once in the log as `⇣ context compacted · 182k → 31k`, and the orchestrator is reset or compacted between phases. A turn that contains only a compaction never counts as "the agent finished".
+
+</details>
+
+<details>
+<summary>MCP servers: give agents your tools (Blender, say)</summary>
+
+Any stdio MCP server can be handed to agents on all three backends. Blender is the worked example: its MCP add-on runs inside Blender, and the server agents talk to is `uvx blender-mcp`. With Blender open and the add-on connected:
+
+```sh
+mantra mcp add blender -- uvx blender-mcp   # adds it to settings.toml, enabled
+mantra mcp test blender                     # starts it, lists its tools, exits 0 or 1
+```
+
+`mantra mcp test` waits 20 s for the server to answer; `--timeout 120` gives a first `uvx` run, which downloads the server, the time it needs.
+
+which is the same as writing this into `~/.mantra/settings.toml` yourself:
+
+```toml
+[mcp_servers.blender]       # any name: letters, digits, - and _
+command = "uvx"
+args = ["blender-mcp"]
+env = { }                   # optional, added to the server's environment
+enabled = true              # false keeps the entry and never starts it
+```
+
+`mantra mcp` lists the servers (command, on or off, whether Solo gets it); `add <name> [--env KEY=VALUE]… -- <command> [args…]`, `remove`, `enable`, `disable` and `test` do the rest. Run `test` once after adding a server: the first `uvx blender-mcp` downloads it, which can take longer than an agent waits for a server to start. A server with an `env` makes settings.toml readable by you only (0600); its values still reach the command line of the Codex and Claude Code agents given it. Changes made while Mantra is open reach the next Solo (`/new`) and the next run.
+
+**Who gets which.** Solo gets what `solo_mcp` names — every enabled server by default (`["*"]`), `[]` for none; `/mcp` shows them and which ones the current Solo agent has, and `/mcp solo <name|*|none>` changes it for the next agent (`/new`). A Mandala role gets nothing unless its pattern says so: `mcp = ["blender"]` on the role (or `["*"]`), edited in the Studio like the role's other lists. A role asking for a server that is not configured starts without it, and the run's journal says so once.
+
+**Per backend.** Codex gets each server as `-c mcp_servers.<name>.…` and runs it itself; Claude Code finds it beside Mantra's own server in `--mcp-config` (under `--strict-mcp-config`, so nothing else of yours comes along — except for a Solo agent given none of these, which keeps the servers you set up with `claude mcp add`, as it always had them); bija gets an `mcp.json` in its session directory and starts every server with the session, again on a resume, and stops them with it — one that fails to start is a warning, and the agent goes on without it. Whichever backend, a call shows on the agent's card as `blender.get_scene_info`. Any stdio MCP server works the same — a filesystem server, a browser, a database. A server runs as you, outside the agent's sandbox (a read-only role given a filesystem server can write through it), so give a role the servers its job needs and no more.
+
+`mantra --demo` brings a stand-in (`mantra mock-mcp`, as `demo`, with a three-object scene) and gives it to every agent, so you can watch the calls without installing anything.
+
+</details>
+
+<details>
+<summary>Seeing the screen: screenshots and images for vision models</summary>
+
+A model that takes images has `vision` on in `/models` (`◉`, `⏎` toggles it): a new `models.toml` has it on for the built-in aliases, and `D` sets it on the models it adds when the provider's catalogue says so. A `models.toml` from before 0.7.0 gets it switched on once, at its first load, for the models of the built-in families (any other is yours to switch on in `/models`). Its agents — and only theirs — get two tools that Mantra runs:
+
+| tool | does |
+|---|---|
+| `mantra_screenshot` | captures the screen of the machine Mantra runs on (`region = "x,y,w,h"` for a part of it, `display` to pick one), saves it to the run's `screenshots/<agent>-<n>.png` (Solo: `~/.mantra/screenshots/`) and hands the agent the image and the path |
+| `mantra_view_image` | shows the agent a PNG, JPEG, GIF or WebP file (8 MB at most) from its working directory |
+
+Nothing is captured unless the model calls the tool, and each capture costs context, so the tool tells it to look when it needs to and at a region when it knows where. Mantra captures with the first that works of `grim`, `gnome-screenshot`, `scrot`, ImageMagick's `import` and, on macOS, `screencapture`; with none of them, the tool says what to install. `MANTRA_SCREENSHOT_CMD` overrides the lot with a command of your own — `{out}` is the file to write, `{region}` the region — and is how the tests capture on a machine without a display. It runs with `sh -c`, as you, with Mantra's environment, and `{out}` and `{region}` go in already quoted: write `scrot {out}`, not `scrot "{out}"`. A capture never holds up the other agents (it runs beside them), and the files are readable by you only.
+
+On bija the model also gets bija's own `screenshot` and `view_image` (`--vision`, which Mantra passes for these models, and takes back when you switch the agent to a model without vision); in Mantra they see the same machine. The image reaches the model the way its API takes one, and the transcript keeps a path, not the picture: bija saves it under the session's `images/`. A tool call that returned an image shows `▣ image` (`[img]` in ASCII) and the path on its card.
 
 </details>
 
@@ -584,7 +632,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary>Slash commands</summary>
 
-`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/swarm` `/pattern` `/experimental` `/runs` `/plan` `/akasha` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/web` `/remote` `/help` `/quit` — and `!cmd` runs a shell command.
+`/model` `/effort` `/approvals` `/new` `/compact` `/diff` `/mandala` `/run` `/swarm` `/pattern` `/experimental` `/runs` `/plan` `/akasha` `/mcp` `/pause` `/respawn` `/land` `/studio` `/models` `/inbox` `/verbose` `/web` `/remote` `/help` `/quit` — and `!cmd` runs a shell command.
 
 </details>
 
@@ -595,7 +643,7 @@ The same process that draws the TUI can also serve a small, installable web app 
 <details>
 <summary>Architecture in one paragraph</summary>
 
-One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` and `bija` speak NDJSON, and all three are translated into the same internal events, so the engine and UI have no backend-specific branches. `bija` is the one Mantra ships itself: a single-threaded harness that calls the provider's API directly, runs the file tools itself and commands as its own children, and keeps every session on disk so a crash resumes mid-turn; quitting Mantra gives the bija agents up to 3 s, together, to end their commands and close their transcripts. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working. Codex agents Mantra spawns never pick up your own MCP servers — only Mantra's own tools reach them, so a personal MCP setup never changes what a team run can do.
+One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC over stdio, `claude -p` and `bija` speak NDJSON, and all three are translated into the same internal events, so the engine and UI have no backend-specific branches. `bija` is the one Mantra ships itself: a single-threaded harness that calls the provider's API directly, runs the file tools itself and commands as its own children, and keeps every session on disk so a crash resumes mid-turn; quitting Mantra gives the bija agents up to 3 s, together, to end their commands and close their transcripts. The Mandala flow is a deterministic Rust state machine — spawning, retrying, merging, running checks, advancing phases — and agents are woken only for judgment calls, which they make through tools Mantra executes. Crashes are isolated: one agent restarts (with its thread resumed) while the rest keep working. Agents Mantra spawns never pick up the MCP servers of your own Codex or Claude Code setup — only Mantra's own tools and the servers you give Solo or a role in Mantra's settings reach them, so a personal MCP setup never changes what a team run can do.
 
 [`DESIGN.md`](DESIGN.md) is the long version: the seam between backends, the MCP bridge, halts, the watchdog, resumable runs, the security model and the testing strategy.
 
@@ -609,9 +657,10 @@ One process per agent, supervised by a hub: `codex app-server` speaks JSON-RPC o
 | `~/.mantra/settings.toml` | CLI commands, defaults, approvals, UI options (`$MANTRA_HOME` moves the lot) |
 | `~/.mantra/models.toml` | models, context windows, efforts, providers (`0600` when it stores a key) |
 | `~/.mantra/patterns/*.toml` | your patterns |
-| `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs |
+| `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs, the agents' `screenshots/` |
+| `~/.mantra/screenshots/` | Solo's screenshots |
 | `~/.mantra/worktrees/<id>/` | per-run worktrees, cleaned up as phases complete |
-| `~/.mantra/bija/sessions/<id>/` | one Bija agent's session: `session.json`, `transcript.jsonl`, the `system.md` and `tools.json` Mantra hands it, background-job logs |
+| `~/.mantra/bija/sessions/<id>/` | one Bija agent's session: `session.json`, `transcript.jsonl`, the `system.md`, `tools.json` and `mcp.json` Mantra hands it, the `images/` its tools returned, background-job logs |
 | `~/.mantra/logs/mantra.log` | debug log |
 | `~/.mantra/web/` | TLS certificate, Web Push keys/subscriptions, web sessions, remote identity (`--web`/`--remote`; `0600`) |
 
@@ -643,6 +692,7 @@ set -g allow-passthrough on             # desktop notifications from inside tmux
 - `cargo build` with zero warnings; 433 unit tests in `mantra` (including the chain of command, escalation to the manager and then the planner with its deadlines and watchdog rungs, revision-resume and the periodic review against a fake `Ctx`, the Claude gauge against per-call usage, and 50 for the web UI and remote relay: PBKDF2/HKDF/AES-GCM known-answer and round-trip vectors, every protocol message round-tripping, snapshot/delta diffing, TLS certificate reissue rules, login rate-limiting, and the relay — IPv4-only dialling, the one-session-per-IPv4 refusal shown and retried, a fake relay carrying a real browser handshake end to end), and `scripts/stress.sh`: every screen and overlay rendered at 13 terminal sizes through a whole simulated run, plus a mixed Codex/Claude run over the real MCP bridge, a worker that asks a question mid-phase, a hand stop that must stay stopped, the halt band, the watchdog, zoom-vs-overview, leave → list → resume → delete, and the sandbox notice — in a debug build where arithmetic overflow panics.
 - `bija`'s own unit tests (the sandbox's path policy, the transcript's repair, both wires against sample streams, the retry policy) and end-to-end tests that drive the real binary against an in-test mock API.
 - `docs/tools/bija-e2e.sh`: a whole Mandala on the real `bija` binary against the demo's mock API (`src/mock_openai.rs`, which streams the provider's own SSE shape) — the run must reach Done with every agent a Bija session on disk and the workers' files on the run branch; `MANTRA_MOCK_FLAKY=<n>` answers every n-th request with a 503 to put bija's retries in the loop.
+- `docs/tools/mcp-e2e.sh`: the same run with the demo's MCP server and a stand-in screen capture (`MANTRA_SCREENSHOT_CMD`), on bija and on the Claude Code mock — a worker's `scene_info` call must reach the server and come back, a screenshot must land in the run's `screenshots/` and in a bija session's `images/`.
 - Real runs against live providers with **Codex 0.154.0** and **Claude Code 2.1.269**: Solo turns, full team runs through gates and finale (LibertAI, and OpenRouter's `openai/gpt-5.6-luna` through Codex's Responses API), compaction on a 16k window, a run left mid-phase and resumed with its worker re-attached, and the bad-key path halting in seconds.
 - Bija against a live OpenAI-compatible gateway (LibertAI through a proxy): a Solo turn, a standalone `bija run` with a file write and a command, a SIGKILL mid-command resumed with `--resume`, a full `mantra-default-bija` Mandala to Done, and a `--swarm 4` run with Akasha on — three workers in parallel, fix workers resolving merge conflicts, 18 shared notes — all producing code whose tests passed. 40 idle `bija` processes measured at 4.7 MB each and no CPU.
 - **Not covered:** Claude Code with a *subscription* login (this build machine has none — API-key mode is verified), macOS in an automated matrix, and Windows, which is not supported.
