@@ -99,7 +99,8 @@
                 return h('div', { key: k, class: 'card item tool' + (bad ? ' bad' : '') },
                     h('button', { type: 'button', class: 'item-head', onclick: () => toggleExpand(expandKey(a.id, it)), 'aria-expanded': String(!!open) },
                         !it.done ? h('span', { class: 'spin' }) : icon('tool'),
-                        h('span', { class: 'tool-name' }, tl.name || it.text || 'tool'),
+                        // Mantra's own tools without their prefix, as the terminal shows them (`akasha_note`)
+                        h('span', { class: 'tool-name' }, (tl.name || it.text || 'tool').replace(/^mantra_/, '')),
                         tl.status && tl.status !== 'completed' ? h('span', { class: 'cmd-exit' }, tl.status) : null,
                         icon(open ? 'up' : 'down', 'chev')),
                     open ? h('div', { class: 'tool-body' },
@@ -132,10 +133,10 @@
     function busyLine(a) {
         const now = Date.now();
         if (a.status === 'retrying') {
-            return h('div', { class: 'busy-line wait', key: 'busy' }, h('span', { class: 'spin' }), h('span', null, 'retrying' + (a.status_detail ? ' — ' + F.trunc(a.status_detail, 80) : '')), a.retry_note ? h('span', { class: 'dim' }, ' · ' + a.retry_note) : null);
+            return h('div', { class: 'busy-line wait', key: 'busy' }, h('span', { class: 'spin' }), h('span', null, P.retryingText(a, 80)), a.retry_note ? h('span', { class: 'dim' }, ' · ' + a.retry_note) : null);
         }
         if (a.status === 'starting' || a.awaiting_start) {
-            return h('div', { class: 'busy-line', key: 'busy' }, h('span', { class: 'spin' }), h('span', { class: 'shimmer' }, 'Starting ' + (a.backend === 'claude-code' ? 'Claude Code' : 'Codex') + '…'));
+            return h('div', { class: 'busy-line', key: 'busy' }, h('span', { class: 'spin' }), h('span', { class: 'shimmer' }, 'Starting ' + F.backend(a.backend) + '…'));
         }
         if (!a.busy) return null;
         const label = a.compacting ? 'Compacting context…' : (a.activity || 'Thinking…');

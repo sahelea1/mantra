@@ -445,6 +445,29 @@ pub struct RunView {
     pub branch: String,
     pub landable: bool,
     pub pulse_seq: u64,
+    /// Akasha's shared notes, one block per group (experimental; empty when the run has none).
+    #[serde(default)]
+    pub akasha: Vec<AkashaView>,
+}
+
+/// One Akasha group's block as the web shows it: read-only, the urgent notes marked.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AkashaView {
+    pub group: String,
+    /// The block's rendered size against `cap`, in characters (what the agents' `1.4k/16k` says).
+    pub chars: usize,
+    pub cap: usize,
+    pub entries: Vec<AkashaNoteView>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AkashaNoteView {
+    pub id: u32,
+    pub author: String,
+    /// Milliseconds, like every other web timestamp (the block keeps unix seconds).
+    pub at: u64,
+    pub text: String,
+    pub urgent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -697,6 +720,7 @@ pub(crate) fn backend_str(k: crate::config::ProviderKind) -> &'static str {
     match k {
         crate::config::ProviderKind::Codex => "codex",
         crate::config::ProviderKind::ClaudeCode => "claude-code",
+        crate::config::ProviderKind::Bija => "bija",
     }
 }
 
@@ -984,6 +1008,18 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         branch: format!("mantra/{}", r.id),
         landable: r.stage == Stage::Done,
         pulse_seq: r.pulse_seq,
+        akasha: r.akasha.values().map(akasha_view).collect(),
+    }
+}
+
+/// One block for the web: its rendered size (`Block::chars`, what the agents' `1.4k/16k` says)
+/// and its notes.
+fn akasha_view(b: &crate::engine::akasha::Block) -> AkashaView {
+    AkashaView {
+        group: b.group.clone(),
+        chars: b.chars(),
+        cap: b.cap,
+        entries: b.entries.iter().map(|e| AkashaNoteView { id: e.id, author: e.author.clone(), at: e.at.saturating_mul(1000), text: e.text.clone(), urgent: e.urgent }).collect(),
     }
 }
 
@@ -1414,7 +1450,7 @@ pub(crate) mod tests {
     pub(crate) fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true)
     }
 
@@ -1689,6 +1725,32 @@ pub(crate) mod tests {
         let d = p.publish(&app, None).unwrap();
         assert_eq!(d.plan, Some(None), "gone is an explicit null");
         assert_eq!(d.run, Some(None));
+    }
+
+    /// A run without groups says so with an empty list (old clients and old JSON load either
+    /// way); a block goes out note by note, its time in ms like the rest, the urgent ones marked.
+    #[test]
+    fn the_run_view_carries_akasha_blocks_and_none_when_there_are_none() {
+        let app = test_app();
+        let run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        let v = run_view(&app, &run);
+        assert!(v.akasha.is_empty());
+        let mut json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["akasha"], serde_json::json!([]));
+        json.as_object_mut().unwrap().remove("akasha");
+        assert!(serde_json::from_value::<RunView>(json).unwrap().akasha.is_empty(), "a view from before Akasha still loads");
+
+        let mut b = crate::engine::akasha::Block::new("builders", 16_384);
+        let note = |id: u32, author: &str, text: &str, urgent: bool| crate::engine::akasha::Entry { id, author: author.into(), at: 1_760_000_000 + id as u64, text: text.into(), urgent };
+        b.entries = vec![note(1, "w2", "models live in src/models — reuse `Config` from p1-config", false), note(2, "w3", "the API now returns 201 on create", true)];
+        b.next_id = 3;
+        let v = akasha_view(&b);
+        assert_eq!((v.group.as_str(), v.chars, v.cap), ("builders", b.chars(), 16_384));
+        assert_eq!(v.entries.iter().map(|e| (e.id, e.author.as_str(), e.urgent)).collect::<Vec<_>>(), vec![(1, "w2", false), (2, "w3", true)]);
+        assert_eq!(v.entries[0].at, 1_760_000_001_000, "seconds become ms");
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["entries"][1]["text"], "the API now returns 201 on create");
+        assert_eq!(json["entries"][1]["urgent"], true);
     }
 
     #[test]

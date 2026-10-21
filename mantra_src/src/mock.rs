@@ -26,6 +26,8 @@ struct Thread {
     /// The part of `tokens` that was the thread's prefix re-read from the cache (see `tokens`).
     cached: u64,
     ctx: u64,
+    /// The tools the thread was started with (`dynamicTools`; a resume keeps them, like Codex).
+    tools: Vec<String>,
 }
 
 struct St {
@@ -133,12 +135,16 @@ fn handle(st: &Arc<St>, method: &str, id: Value, p: Value) {
             let role = dev.lines().find_map(|l| l.trim().strip_prefix("mantra-role:")).map(|r| r.trim().to_string()).unwrap_or_else(|| "solo".into());
             let approval = p.get("approvalPolicy").and_then(|t| t.as_str()).unwrap_or("never").to_string();
             let resumed = method == "thread/resume";
+            let tools: Option<Vec<String>> = p.get("dynamicTools").and_then(|t| t.as_array()).map(|t| t.iter().filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(String::from)).collect());
             {
                 let mut th = st.threads.lock().unwrap();
-                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, cached: 0, ctx: start_ctx() });
+                let e = th.entry(tid.clone()).or_insert(Thread { cwd: PathBuf::from(&cwd), role: role.clone(), dev: dev.clone(), approval: approval.clone(), turn_approval: approval.clone(), model: model.clone(), turns: 0, active: None, tokens: 0, cached: 0, ctx: start_ctx(), tools: vec![] });
                 if !dev.is_empty() {
                     e.role = role;
                     e.dev = dev;
+                }
+                if let Some(t) = tools {
+                    e.tools = t;
                 }
                 if resumed {
                     e.turns = e.turns.max(1);
@@ -297,6 +303,9 @@ impl Em {
     }
     fn dev(&self) -> String {
         self.th(|t| t.dev.clone()).unwrap_or_default()
+    }
+    fn offers(&self, tool: &str) -> bool {
+        self.th(|t| t.tools.iter().any(|x| x == tool)).unwrap_or(false)
     }
     fn turns(&self) -> u32 {
         self.th(|t| t.turns).unwrap_or(1)
@@ -712,6 +721,9 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
+/// What a demo worker in an Akasha group notes for the others (both mock backends).
+pub(crate) const AKASHA_NOTE: &str = "models live in src/models — reuse `Config` from p1-config";
+
 /// Shared with `mock_claude.rs` (WP10.6).
 pub(crate) fn task_info(dev: &str) -> (String, String, Vec<String>) {
     let line = dev.lines().find(|l| l.starts_with("## Your task:")).unwrap_or("## Your task: task — work");
@@ -766,6 +778,12 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     } else if !text.contains("[from") {
         step!(e.think(&format!("**{title}**\n\nReading the surrounding code to match existing conventions.")).await);
         step!(e.command(&format!("rg -n \"struct|fn\" {dir} || true"), "src/lib.rs:3:pub fn greet(name: &str) -> String {", 0).await);
+        // Akasha (`--demo --pattern mantra-swarm`): the models worker, in a group, shares the one
+        // fact the others will need — unless the notes it was briefed with already hold it. One
+        // author, so the group's notes hold it once.
+        if dir == "src/models" && e.offers("mantra_akasha_note") && !text.contains(AKASHA_NOTE) {
+            let _ = e.tool("mantra_akasha_note", json!({"text": AKASHA_NOTE})).await;
+        }
     }
     if text.contains("(answering your question)") {
         step!(e.think("**Answer received**\n\nCursor pagination it is — writing the handlers accordingly.").await);

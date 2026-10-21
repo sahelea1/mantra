@@ -62,6 +62,8 @@ pub enum Overlay {
     Web,
     /// `/remote`: the relay link, code, password and QR (`r` rotates).
     Remote,
+    /// `/akasha [group]`: the run's shared notes, every group's block or the one named.
+    Akasha { scroll: usize, group: Option<String> },
 }
 
 /// One row of the `/pattern` picker.
@@ -172,9 +174,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/diff", "open the changes viewer"),
     ("/mandala", "open the Mandala stage"),
     ("/run", "start a Mandala run: /run <goal>"),
+    ("/swarm", "start a swarm run, N workers at once: /swarm <N> <goal>"),
     ("/pattern", "choose the pattern for new runs"),
+    ("/experimental", "experimental features: /experimental [name on|off]"),
     ("/runs", "this project's runs: resume or delete"),
     ("/plan", "show the run's plan"),
+    ("/akasha", "the run's shared notes: /akasha [group]"),
     ("/pause", "pause / resume the run"),
     ("/respawn", "respawn the focused agent in place (planner/orchestrator/gate/finale/worker)"),
     ("/land", "merge the finished run branch into your branch"),
@@ -276,6 +281,38 @@ pub struct AgentOpts {
     pub thread_name: Option<String>,
 }
 
+/// `mantra experimental` and `/experimental`: every experimental feature, on or off, with its line.
+pub fn experimental_list(settings: &Settings) -> Vec<String> {
+    crate::config::EXPERIMENTAL.iter().map(|(name, about)| format!("{name:<8} {:<3}  {about}", if settings.experimental_on(name) { "on" } else { "off" })).collect()
+}
+
+pub fn is_experimental(name: &str) -> bool {
+    crate::config::EXPERIMENTAL.iter().any(|(n, _)| *n == name)
+}
+
+/// Switches an experimental feature in settings.toml as it is on disk — not in the session's
+/// settings, which `--demo` has pointed at its mocks — and returns the settings now saved. A
+/// settings.toml that does not parse is refused rather than saved over: `Settings::load` would
+/// have fallen back to the defaults, and saving those would wipe every setting in the file.
+pub fn save_experimental(name: &str, on: bool) -> Result<Settings, String> {
+    if !is_experimental(name) {
+        let known: Vec<&str> = crate::config::EXPERIMENTAL.iter().map(|(n, _)| *n).collect();
+        return Err(format!("unknown experimental feature '{name}' (there is: {})", known.join(", ")));
+    }
+    let path = crate::config::home().join("settings.toml");
+    let mut s = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str::<Settings>(&text).map_err(|e| format!("{} does not parse, fix it first: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    s.experimental.retain(|f| f != name);
+    if on {
+        s.experimental.push(name.to_string());
+    }
+    s.save().map_err(|e| format!("could not save {}: {e}", path.display()))?;
+    Ok(s)
+}
+
 fn toml_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -310,6 +347,46 @@ fn sandbox_overrides(sandbox: &str, network: bool, extra: &[PathBuf], pattern: &
     out
 }
 
+/// The extra writable roots a Bija agent is launched with: for `workspace-write`, the spawn's own
+/// roots and the pattern's (existing directories, `~` expanded) — the set Codex gets, minus the
+/// toolchain caches, which bija opens by itself. `full` writes everywhere and `read-only`
+/// nowhere, so no roots apply to them.
+fn bija_writable_roots(sandbox: &str, extra: &[PathBuf], pattern: &[String], home: Option<&Path>) -> Vec<PathBuf> {
+    if sandbox != "workspace-write" {
+        return vec![];
+    }
+    let mut roots: Vec<PathBuf> = vec![];
+    let pattern_roots = pattern.iter().map(|p| crate::util::expand_tilde(p, home)).filter(|p| crate::util::sandbox_can_own(p));
+    for r in extra.iter().cloned().chain(pattern_roots) {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    roots
+}
+
+/// A Bija agent's spawn config and child environment. Like the Claude arm of `spawn_agent`,
+/// everything comes from the model's own provider entry and the role, resolved here so
+/// `hub::bija` never reads the registry; the key travels in the child's environment under the
+/// name `--api-key-env` gives — never on argv, never logged.
+fn bija_spawn(reg: &Registry, m: &crate::config::ModelEntry, o: &AgentOpts, cw: u64, compact_pct: u8) -> (crate::hub::BijaSpawn, Vec<(String, String)>) {
+    let provider = reg.providers.iter().find(|p| p.id == m.provider);
+    let key = provider.and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)));
+    let spawn = crate::hub::BijaSpawn {
+        base_url: provider.map(|p| p.base_url.trim().to_string()).unwrap_or_default(),
+        wire: provider.map(|p| p.bija_wire()).unwrap_or("openai-chat").to_string(),
+        api_key_env: key.as_ref().map(|(name, _)| name.clone()),
+        context_window: cw,
+        compact_pct,
+        system_prompt: o.instructions.clone(),
+        home: crate::config::home().join("bija"),
+        sandbox: crate::hub::bija_sandbox(&o.sandbox).into(),
+        writable_roots: bija_writable_roots(&o.sandbox, &o.extra_writable, &o.writable_roots, dirs::home_dir().as_deref()),
+        network: o.network,
+    };
+    (spawn, key.into_iter().collect())
+}
+
 pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, o: AgentOpts) -> AgentId {
     let id = hub.alloc_id();
     let m = reg.resolve(&o.model_alias);
@@ -318,10 +395,11 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     let backend = reg.backend_of(&m);
     // Always tell the backend a context window and compaction limit — an assumed 200k / 85% when
     // the model doesn't have its own, so auto-compaction never relies on a provider's own defaults
-    // (Codex: `-c model_context_window=…`/`model_auto_compact_token_limit=…`; Claude: `--autocompact`).
+    // (Codex: `-c model_context_window=…`/`model_auto_compact_token_limit=…`; Claude: `--autocompact`;
+    // bija: `--context-window`/`--compact-at`).
     let cw = o.context_override.unwrap_or_else(|| m.effective_context());
     let compact_pct = m.effective_compact_percent();
-    let (extra, envs, claude) = if backend == crate::hub::Backend::ClaudeCode {
+    let (extra, envs, claude, bija) = if backend == crate::hub::Backend::ClaudeCode {
         // WP10: no Codex `-c` args at all; auth/base_url/key come from the model's own provider
         // entry, resolved here (not in `hub::claude`, which stays decoupled from `config::Registry`
         // — see `SpawnSpec::claude`/`SpawnSpec::envs`).
@@ -334,7 +412,10 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
                 envs.push(("ANTHROPIC_API_KEY".to_string(), key));
             }
         }
-        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }))
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock() }), None)
+    } else if backend == crate::hub::Backend::Bija {
+        let (spawn, envs) = bija_spawn(reg, &m, &o, cw, compact_pct);
+        (vec![], envs, None, Some(spawn))
     } else {
         let mut extra = reg.provider_args();
         // Mantra's own tools reach the agent as `dynamic_tools` (`SpawnSpec.dynamic_tools`
@@ -375,7 +456,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
             .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
             .into_iter()
             .collect();
-        (extra, envs, None)
+        (extra, envs, None, None)
     };
     let spec = SpawnSpec {
         cwd: o.cwd.clone(),
@@ -393,6 +474,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         backend,
         envs,
         claude,
+        bija,
     };
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
     a.glyph = o.glyph;
@@ -492,7 +574,8 @@ static SANDBOX_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// namespaces `bwrap` needs (`SANDBOX_FALLBACK`): every sandbox mode goes through the same
 /// machinery, so keeping `workspace-write` or `read-only` would just trade one `bwrap` failure for
 /// another, while `danger-full-access` skips `bwrap` entirely. Claude Code agents never sandbox
-/// through `bwrap`, so they keep the role's own mode.
+/// through `bwrap`, and bija probes it itself and runs commands plainly when it can't, so both
+/// keep the role's own mode.
 fn role_sandbox(sandbox: &str, backend: crate::config::ProviderKind) -> String {
     if SANDBOX_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) && backend == crate::config::ProviderKind::Codex {
         return "danger-full-access".into();
@@ -768,6 +851,16 @@ impl App {
         self.registry.alias_problem(alias)
     }
 
+    /// Saves the session's settings to settings.toml — except in demo mode, whose settings point
+    /// at its mocks and have Akasha switched on in memory: a shift+tab or a model pick in the demo
+    /// must not leave `mock-codex` or `experimental = ["akasha"]` behind for every real session.
+    pub(crate) fn save_settings(&self) {
+        if self.demo {
+            return;
+        }
+        let _ = self.settings.save();
+    }
+
     /// `Registry::preflight` with the same demo-mode exemption as `model_problem`.
     fn preflight(&self, pattern: &Pattern) -> Vec<String> {
         if self.demo {
@@ -922,6 +1015,16 @@ impl App {
             return Err(p);
         }
         let new = self.registry.resolve(alias);
+        let old = self.registry.resolve(&ag.model_alias);
+        // Solo just starts a new session on the new provider — and so on whatever backend that
+        // provider runs: a fresh install's Solo is on bija, and Codex's `sol` is one pick away.
+        if Some(a) == self.solo && old.provider != new.provider {
+            self.settings.default_model = new.alias.clone();
+            self.save_settings();
+            self.start_solo();
+            self.toast(format!("new session on {} (provider changed)", new.alias), Level::Info);
+            return Ok(());
+        }
         let new_backend = self.registry.backend_of(&new);
         if new_backend != ag.backend {
             let name = ag.name.clone();
@@ -930,14 +1033,6 @@ impl App {
                 crate::web::snapshot::backend_str(new_backend),
                 crate::web::snapshot::backend_str(ag.backend)
             ));
-        }
-        let old = self.registry.resolve(&ag.model_alias);
-        if Some(a) == self.solo && old.provider != new.provider {
-            self.settings.default_model = new.alias.clone();
-            let _ = self.settings.save();
-            self.start_solo();
-            self.toast(format!("new session on {} (provider changed)", new.alias), Level::Info);
-            return Ok(());
         }
         let effort = new.resolve_effort(&ag.effort);
         // a run agent keeps the run's context cap (the backend was told it at spawn): the gauge
@@ -954,7 +1049,7 @@ impl App {
         }
         if Some(a) == self.solo {
             self.settings.default_model = new.alias.clone();
-            let _ = self.settings.save();
+            self.save_settings();
         }
         Ok(())
     }
@@ -1042,17 +1137,29 @@ impl App {
     }
 
     pub fn start_run(&mut self, goal: &str) {
+        self.start_run_with(goal, None, None);
+    }
+
+    /// `start_run` on `pattern` instead of the session's (`/swarm`), and with `max_parallel`
+    /// overriding the pattern's for this run only (`--parallel N`, `--swarm N`, `/swarm N`): the
+    /// number goes into the run's own copy of the pattern — its `pattern.toml`, which a resume
+    /// reads back — and never into the saved pattern.
+    pub fn start_run_with(&mut self, goal: &str, pattern: Option<&str>, max_parallel: Option<usize>) {
         if self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
             self.toast("a run is already active — re-prompt it from the stage, or /pause", Level::Warn);
             return;
         }
-        let pattern = match Pattern::load(&self.pattern_name, &self.project) {
+        let mut pattern = match Pattern::load(pattern.unwrap_or(&self.pattern_name), &self.project) {
             Ok(p) => p,
             Err(e) => {
                 self.toast(format!("pattern error: {e}"), Level::Error);
                 return;
             }
         };
+        let (from_pattern, tasks_from_pattern) = (pattern.settings.max_parallel, pattern.settings.max_tasks_per_phase);
+        if let Some(n) = max_parallel {
+            pattern.set_parallel(n);
+        }
         let problems = self.preflight(&pattern);
         if !problems.is_empty() {
             // L3: fail before spending a single turn, naming the role, provider and variable.
@@ -1068,6 +1175,7 @@ impl App {
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows());
+        run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
@@ -1075,6 +1183,13 @@ impl App {
         if let Some(w) = &self.sandbox_warning {
             run.log("⚠", "amber", format!("sandbox: {}", crate::util::trunc(w, 140)));
             run.log("⚠", "amber", "sandbox unavailable here: Codex agents run with danger-full-access; git worktrees still keep workers apart");
+        }
+        if let Some(n) = max_parallel.filter(|n| *n != from_pattern) {
+            let tasks = if n > tasks_from_pattern { format!(", and up to {n} tasks a phase (it says {tasks_from_pattern})") } else { String::new() };
+            run.log("⚙", "blue", format!("up to {n} workers at once for this run (the pattern says {from_pattern}){tasks}"));
+        }
+        if let Some(n) = max_parallel.filter(|n| *n > crate::engine::pattern::PARALLEL_NOTE_ABOVE) {
+            run.log("⚙", "amber", format!("{n} at once: the provider's rate limits are the ceiling now, not Mantra"));
         }
         self.run = Some(run);
         // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
@@ -1136,6 +1251,8 @@ impl App {
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows());
+        // before the boot too: the members it re-attaches get the akasha tools back
+        run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
@@ -1218,13 +1335,13 @@ impl App {
             self.toast(format!("not tested — {why}"), Level::Warn);
             return;
         }
-        // Every provider today speaks Codex's wire protocol (`kind = ClaudeCode` and its own test
-        // path — `--append-system-prompt` — arrive with WP10). Keep the dispatch explicit so that
-        // arm can be added here without touching the caller.
-        self.probe_model_codex(alias);
+        // Every backend is tested the same way: a throwaway agent on the alias, given a role-like
+        // system prompt (Codex's developer instructions, Claude's appended prompt, bija's
+        // `system.md`), asked for one word — `spawn_agent` picks the process for the backend.
+        self.probe_model_with_agent(alias);
     }
 
-    fn probe_model_codex(&mut self, alias: &str) {
+    fn probe_model_with_agent(&mut self, alias: &str) {
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -1270,7 +1387,7 @@ impl App {
         // ClaudeCode providers have no `/models` endpoint for a subscription; the built-in defaults
         // (config::CLAUDE_MODELS) are always known locally and answer instantly, with no loading spinner needed. A
         // `base_url` (a third-party gateway) additionally gets queried live, exactly like a Codex
-        // custom provider (§10.5).
+        // custom provider (§10.5) — and so does every Bija provider, with its key when it has one.
         // Drafts (placeholder/malformed URL, or no credential — `ProviderEntry::draft_reason`)
         // never go on the network: they are listed as skipped instead of queried.
         let (drafts, net_provs): (Vec<_>, Vec<_>) = provs.iter().filter(|p| p.needs_url()).cloned().partition(|p| p.draft_reason().is_some());
@@ -1303,7 +1420,7 @@ impl App {
             tokio::task::spawn_blocking(move || {
                 // The key is strictly this provider's own (`resolve_key` on the entry being
                 // queried) — never another provider's, never a global one.
-                let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref()).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
+                let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref(), crate::discover::key_header(&p)).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
                 let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
             });
         }
@@ -1354,7 +1471,7 @@ impl App {
     /// mode is "never" (e.g. mid-turn, or a run agent) is approved automatically.
     pub fn set_approval_mode(&mut self, mode: &str) {
         self.settings.approval_mode = mode.to_string();
-        let _ = self.settings.save();
+        self.save_settings();
         if let Some(s) = self.solo {
             self.hub.send(s, Cmd::SetApproval(mode.to_string()));
             if let Some(a) = self.agents.get_mut(&s) {
@@ -1510,7 +1627,7 @@ impl App {
                         let p = a.ctx_percent().unwrap_or(0);
                         if p >= 85 && !a.ctx_warned && !a.compacting {
                             a.ctx_warned = true;
-                            warn = Some(format!("context {p}% full — /compact frees space (Codex also auto-compacts)"));
+                            warn = Some(format!("context {p}% full — /compact frees space (the agent also auto-compacts)"));
                         } else if p < 70 {
                             a.ctx_warned = false;
                         }
@@ -1581,16 +1698,24 @@ impl App {
                 // Mantra asked for it, nothing crashed.
                 let relaunch = restarting && attempt == 0;
                 if let Some(a) = self.agents.get_mut(&agent) {
-                    a.status = if relaunch { Status::Retrying("relaunching".into()) } else if restarting { Status::Retrying(format!("restarting ({attempt})")) } else { Status::Crashed(reason.clone()) };
+                    a.status = if relaunch { Status::relaunching() } else if restarting { Status::restarting(attempt) } else { Status::Crashed(reason.clone()) };
                     a.activity = if restarting { "restarting".into() } else { "crashed".into() };
-                    let what = if a.backend == crate::config::ProviderKind::ClaudeCode { "claude process" } else { "codex process" };
+                    let what = match a.backend {
+                        crate::config::ProviderKind::ClaudeCode => "claude process",
+                        crate::config::ProviderKind::Bija => "bija process",
+                        crate::config::ProviderKind::Codex => "codex process",
+                    };
                     if relaunch {
                         // A model/effort change waits for the turn to end and the hub replays any
                         // held turn itself; only a plain mid-turn restart loses work worth a nudge.
                         a.relaunching = reason.starts_with("restarting to apply");
                         a.notice(Level::Info, format!("{what} relaunching: {reason}"));
                     } else {
-                        a.notice(Level::Error, format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }));
+                        // The hub's reason already names the backend ("bija exited (code 0)"):
+                        // say it once, then what happens next.
+                        let next = if restarting { "restarting" } else { "keeps crashing — press r (stage) or /new" };
+                        let named = reason.starts_with(&format!("{} exited", what.trim_end_matches(" process")));
+                        a.notice(Level::Error, if named { format!("{reason} — {next}") } else { format!("{what} {}: {reason}", if restarting { "crashed — restarting" } else { "keeps crashing — press r (stage) or /new" }) });
                     }
                 }
                 if self.in_run(agent) {
@@ -2382,6 +2507,14 @@ impl App {
                     self.start_run(arg);
                 }
             }
+            "/swarm" => {
+                let (n, goal) = arg.split_once(char::is_whitespace).map(|(n, g)| (n, g.trim())).unwrap_or((arg, ""));
+                match crate::engine::pattern::parse_parallel(n) {
+                    Ok(n) if !goal.is_empty() => self.start_run_with(goal, Some(crate::engine::pattern::NAME_SWARM), Some(n)),
+                    Ok(_) => self.toast("usage: /swarm <N> <goal>", Level::Info),
+                    Err(e) => self.toast(format!("/swarm: {e}"), Level::Warn),
+                }
+            }
             "/pattern" => {
                 if arg.is_empty() {
                     let list = PatternChoice::all(&self.project);
@@ -2392,8 +2525,10 @@ impl App {
                     self.toast(format!("pattern for new runs: {arg}"), Level::Info);
                 }
             }
+            "/experimental" => self.experimental_command(arg),
             "/runs" => self.open_runs(),
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
+            "/akasha" => crate::ui::overlays::open_akasha(self, arg),
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
@@ -2418,13 +2553,59 @@ impl App {
         }
     }
 
+    /// `/experimental` lists the features; `/experimental <name> on|off` switches one in
+    /// settings.toml and for runs started from now on. A run already open keeps what it started
+    /// with: its agents were briefed and given their tools at spawn.
+    fn experimental_command(&mut self, arg: &str) {
+        let words: Vec<&str> = arg.split_whitespace().collect();
+        let (name, on) = match words.as_slice() {
+            [] => {
+                // One toast line (70 columns at 80): `akasha: on — shared notes for agent groups ·
+                // /experimental akasha off` — the about up to its parenthesis, and the command
+                // that flips it.
+                let feats = crate::config::EXPERIMENTAL;
+                let list = feats
+                    .iter()
+                    .map(|(name, about)| format!("{name}: {} — {}", if self.settings.experimental_on(name) { "on" } else { "off" }, about.split(" (").next().unwrap_or(about)))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let how = match feats {
+                    [(name, _)] => format!("/experimental {name} {}", if self.settings.experimental_on(name) { "off" } else { "on" }),
+                    _ => "/experimental <name> on|off".to_string(),
+                };
+                self.toast(format!("{list} · {how}"), Level::Info);
+                return;
+            }
+            [name, "on"] => (*name, true),
+            [name, "off"] => (*name, false),
+            _ => {
+                self.toast("usage: /experimental [name on|off]", Level::Info);
+                return;
+            }
+        };
+        match save_experimental(name, on) {
+            Ok(_) => {
+                self.settings.experimental.retain(|f| f != name);
+                if on {
+                    self.settings.experimental.push(name.to_string());
+                }
+                let open = self.run.as_ref().map(|r| r.is_active()).unwrap_or(false);
+                let tail = if open { "; the open run changes only after a restart of Mantra" } else { "" };
+                let what = if on { "on, saved — new runs use it" } else { "off, saved — new runs go without it" };
+                self.toast(format!("{name} {what}{tail}"), Level::Ok);
+            }
+            Err(e) => self.toast(e, Level::Warn),
+        }
+    }
+
     pub fn studio_architect_send(&mut self, text: String) {
         let a = self.start_architect();
         prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Auto);
     }
 
-    pub fn shutdown(&mut self) {
-        self.hub.shutdown_all();
+    /// Stops every agent; the caller awaits the result before the runtime goes (`hub::Stopping`).
+    pub fn shutdown(&mut self) -> crate::hub::Stopping {
+        self.hub.shutdown_all()
     }
 }
 
@@ -2437,12 +2618,130 @@ mod tests {
     #[test]
     fn the_pattern_picker_leads_with_the_default_builtin() {
         let list = PatternChoice::all(Path::new("/nonexistent"));
-        let names: Vec<&str> = list.iter().take(4).map(|p| p.name.as_str()).collect();
+        let n = Pattern::names().len();
+        let names: Vec<&str> = list.iter().take(n).map(|p| p.name.as_str()).collect();
         assert_eq!(names, Pattern::names());
         // "edited" when this machine's ~/.mantra/patterns shadows one with a file
         assert!(["default", "edited"].contains(&list[0].tag), "{}", list[0].tag);
-        assert!(list[1..4].iter().all(|p| ["built-in", "edited"].contains(&p.tag)));
-        assert!(list[..4].iter().all(|p| p.about.as_ref().map(|d| !d.is_empty()).unwrap_or(false)));
+        assert!(list[1..n].iter().all(|p| ["built-in", "edited"].contains(&p.tag)));
+        assert!(list[..n].iter().all(|p| p.about.as_ref().map(|d| !d.is_empty()).unwrap_or(false)));
+    }
+
+    /// `/swarm 24 <goal>` starts a run of mantra-swarm with 24 at once in the run's own copy of
+    /// the pattern; the saved pattern, the session's pattern and `/run` stay as they were.
+    #[tokio::test]
+    async fn swarm_starts_a_run_with_the_override_in_the_runs_pattern_copy() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = std::env::temp_dir().join(format!("mantra-swarm-cmd-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+            std::fs::create_dir_all(&project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project.clone();
+            let session_pattern = app.pattern_name.clone();
+            for bad in ["/swarm", "/swarm 24", "/swarm 0 build it", "/swarm many build it"] {
+                app.command(bad);
+                assert!(app.run.is_none(), "{bad}: nothing starts");
+            }
+            app.command("/swarm 24 build the parser");
+            let run = app.run.as_ref().expect("the run started");
+            assert_eq!((run.pattern.name.as_str(), run.pattern.settings.max_parallel), (crate::engine::pattern::NAME_SWARM, 24));
+            let copy = std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap();
+            let copy = Pattern::from_toml(&copy).unwrap();
+            assert_eq!(copy.settings.max_parallel, 24, "a resume reads the run's copy back");
+            assert!(run.pulse.iter().any(|p| p.text.contains("up to 24 workers at once") && p.text.contains("the pattern says 8")), "journaled");
+            assert_eq!(copy.settings.max_tasks_per_phase, 32, "24 fits the pattern's 32 tasks a phase");
+            assert!(!run.pulse.iter().any(|p| p.text.contains("rate limits")), "24 is within what Mantra handles");
+            assert!(!Pattern::path_for(crate::engine::pattern::NAME_SWARM).exists(), "the saved pattern is never written");
+            assert_eq!(Pattern::load(crate::engine::pattern::NAME_SWARM, &project).unwrap().settings.max_parallel, 8);
+            assert_eq!(app.pattern_name, session_pattern, "the session's pattern for /run is unchanged");
+            // past 32 the run says what the ceiling is now
+            app.run = None;
+            app.command("/swarm 64 build the parser");
+            let run = app.run.as_ref().expect("the run started");
+            assert_eq!(run.pattern.settings.max_parallel, 64);
+            assert!(run.pulse.iter().any(|p| p.text.contains("rate limits")), "the note above 32");
+            // 64 at once needs room for 64 tasks in a phase, or the planner's plan is refused
+            assert_eq!(run.pattern.settings.max_tasks_per_phase, 64);
+            assert!(run.pulse.iter().any(|p| p.text.contains("and up to 64 tasks a phase (it says 32)")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+            let copy = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
+            assert_eq!(copy.settings.max_tasks_per_phase, 64, "and a resume keeps it");
+            // and a plain run keeps the pattern's own number
+            app.run = None;
+            app.start_run("build the parser");
+            let run = app.run.as_ref().expect("the run started");
+            assert_eq!((run.pattern.name.as_str(), run.pattern.settings.max_parallel), (session_pattern.as_str(), Pattern::load(&session_pattern, &project).unwrap().settings.max_parallel));
+            app.run = None;
+            let _ = std::fs::remove_dir_all(&project);
+        });
+    }
+
+    /// The demo's settings point at its mocks and have Akasha on in memory: a shift+tab, a model
+    /// pick or a Solo switch there saves nothing, so none of it leaks into the real sessions after.
+    /// Outside the demo the same changes are saved as always.
+    #[test]
+    fn the_demo_never_writes_its_settings_to_disk() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let path = crate::config::home().join("settings.toml");
+            let mut app = crate::web::snapshot::tests::test_app();
+            assert!(app.demo);
+            app.settings.codex_command = vec!["mock-codex".into()];
+            app.settings.experimental.push(crate::config::EXPERIMENTAL_AKASHA.into());
+            app.set_approval_mode("on-request");
+            assert_eq!(app.settings.approval_mode, "on-request", "the session has it");
+            assert!(!path.exists(), "the demo saved {:?}", std::fs::read_to_string(&path));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut real = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            real.set_approval_mode("on-request");
+            let saved = Settings::load();
+            assert_eq!(saved.approval_mode, "on-request");
+            assert!(!saved.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
+        });
+    }
+
+    /// `/experimental akasha on|off` saves settings.toml as it is on disk — not the session's
+    /// settings, which the demo has pointed at its mocks — and mirrors the switch for new runs.
+    #[test]
+    fn experimental_switches_save_the_file_and_the_session() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.settings.codex_command = vec!["mock-codex".into()];
+            app.command("/experimental");
+            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert_eq!(t, "akasha: off — shared notes for agent groups · /experimental akasha on");
+            assert!(crate::util::width(&t) <= 70, "fits the toast at 80 columns");
+            app.command("/experimental akasha on");
+            assert!(app.settings.experimental_on("akasha"));
+            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert!(t.contains("akasha on, saved"), "{t}");
+            let saved = Settings::load();
+            assert!(saved.experimental_on("akasha"));
+            assert_ne!(saved.codex_command, vec!["mock-codex".to_string()], "only the switch is saved");
+            app.command("/experimental akasha off");
+            assert!(!app.settings.experimental_on("akasha") && !Settings::load().experimental_on("akasha"));
+            app.command("/experimental warp on");
+            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert!(t.contains("unknown experimental feature 'warp'") && t.contains("akasha"), "{t}");
+            // a settings.toml that does not parse is left alone, not replaced by the defaults
+            let path = crate::config::home().join("settings.toml");
+            std::fs::write(&path, "default_model = [broken").unwrap();
+            assert!(save_experimental("akasha", true).unwrap_err().contains("does not parse"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "default_model = [broken");
+        });
+    }
+
+    /// The architect writes `[[groups]]` like any other part of a pattern, through the same
+    /// validation: a good group lands in the Studio, a broken one comes back as INVALID.
+    #[test]
+    fn the_architect_writes_groups_through_the_pattern_validation() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let swarm = Pattern::builtin_swarm();
+        let (msg, ok) = app.architect_tool("mantra_write_pattern", &json!({"toml": swarm.to_toml()}));
+        assert!(ok, "{msg}");
+        assert_eq!(app.studio.pattern.groups, swarm.groups);
+        let broken = swarm.to_toml().replace("push = \"urgent\"", "push = \"loud\"");
+        let (msg, ok) = app.architect_tool("mantra_write_pattern", &json!({"toml": broken}));
+        assert!(!ok && msg.starts_with("INVALID") && msg.contains("push"), "{msg}");
+        assert_eq!(app.studio.pattern.groups, swarm.groups, "the Studio keeps the last good pattern");
     }
 
     fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
@@ -2458,7 +2757,7 @@ mod tests {
 
     fn test_hub_with(id: AgentId) -> (Hub, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec![], vec![], ev_tx, false);
+        let mut hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         let rx = hub.test_register(id);
         (hub, rx)
     }
@@ -2491,7 +2790,7 @@ mod tests {
     #[tokio::test]
     async fn a_spawned_agent_shows_its_resolved_effort_never_auto() {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec!["true".into()], vec![], ev_tx, false);
+        let mut hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
         let mut agents = BTreeMap::new();
         let reg = Registry::defaults();
         let opts = |effort: Option<&str>| AgentOpts {
@@ -2539,7 +2838,7 @@ mod tests {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let dir = std::env::temp_dir().join(format!("mantra-demo-keys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mk = |demo| App::new(settings.clone(), reg.clone(), dir.clone(), Hub::new(vec![], vec![], ev_tx.clone(), false), tx.clone(), demo);
+        let mk = |demo| App::new(settings.clone(), reg.clone(), dir.clone(), Hub::new(vec![], vec![], vec![], ev_tx.clone(), false), tx.clone(), demo);
         let real = mk(false);
         assert!(real.model_problem("testing").is_some(), "sanity: the key really is missing");
         assert!(!real.preflight(&pattern).is_empty());
@@ -2567,7 +2866,7 @@ mod tests {
         reg.models.push(crate::config::ModelEntry { alias: "claude-model".into(), model: "claude-model".into(), provider: "cc".into(), ..Default::default() });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
         let id: AgentId = 1;
         let mut a = Agent::new(id, "worker", "worker", PathBuf::from("."));
@@ -2583,6 +2882,28 @@ mod tests {
         assert_eq!(app.agents[&id].model_alias, "sol", "a refused switch never touches the agent");
     }
 
+    /// Solo is no run agent with a backend fixed at spawn: a model on another backend simply
+    /// starts a new Solo session there — a fresh install's Solo is on bija, `sol` one pick away.
+    #[tokio::test]
+    async fn solo_changes_backend_by_starting_a_new_session() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true);
+            app.start_solo();
+            let first = app.solo.expect("Solo is up");
+            assert_eq!(app.agents[&first].backend, crate::config::ProviderKind::Bija, "Solo defaults to bija");
+            assert_eq!(app.set_model(first, "sol"), Ok(()));
+            let second = app.solo.expect("a new Solo");
+            assert_ne!(first, second);
+            assert_eq!(app.agents[&second].backend, crate::config::ProviderKind::Codex);
+            assert_eq!(app.settings.default_model, "sol");
+            assert_eq!(app.set_model(second, "luna-api"), Ok(()), "and back");
+            assert_eq!(app.agents[&app.solo.expect("Solo")].backend, crate::config::ProviderKind::Bija);
+        });
+    }
+
     /// `SANDBOX_FALLBACK` is a process-wide static (the `Ctx`/`start_solo` spawn sites have no
     /// other way to reach `App`) — a test that trips it must reset it, or every test afterward in
     /// this binary silently spawns Codex agents `danger-full-access`.
@@ -2590,13 +2911,68 @@ mod tests {
     fn sandbox_warning_downgrades_codex_to_danger_full_access_only() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true);
         app.set_sandbox_warning("bwrap: setting up uid map: Permission denied".into());
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "danger-full-access");
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::ClaudeCode), "workspace-write", "Claude never sandboxes through bwrap");
+        assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Bija), "workspace-write", "bija probes bwrap itself and runs commands plainly without it");
         reset_sandbox_fallback_for_test();
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "workspace-write");
+    }
+
+    /// A Bija agent gets its provider's URL, wire and key name and the role's window, prompt and
+    /// sandbox in bija's words — and the key itself only in the child's environment.
+    #[test]
+    fn a_bija_spawn_carries_provider_and_role_and_the_key_only_in_the_environment() {
+        let bija = crate::config::ProviderKind::Bija;
+        let mut reg = Registry { models: vec![], providers: vec![] };
+        reg.providers.push(crate::config::ProviderEntry { id: "gw".into(), kind: bija, base_url: " https://gw.dev/v1 ".into(), wire: "anthropic".into(), api_key: Some("sk-secret".into()), ..Default::default() });
+        reg.providers.push(crate::config::ProviderEntry { id: "local".into(), kind: bija, base_url: "http://127.0.0.1:11434/v1".into(), ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "big".into(), provider: "gw".into(), model: "big-1".into(), ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "small".into(), provider: "local".into(), model: "local-model".into(), ..Default::default() });
+        let o = AgentOpts {
+            name: "w".into(),
+            role: "worker".into(),
+            glyph: "·".into(),
+            color: "gray".into(),
+            model_alias: "big".into(),
+            effort: None,
+            cwd: PathBuf::from("/work"),
+            approval: "never".into(),
+            sandbox: "danger-full-access".into(),
+            instructions: "do the task".into(),
+            tools: vec![],
+            extra_writable: vec![PathBuf::from("/integ")],
+            network: true,
+            writable_roots: vec![],
+            context_override: None,
+            resume_thread: None,
+            thread_name: None,
+        };
+        let (s, envs) = bija_spawn(&reg, &reg.resolve("big"), &o, 128_000, 80);
+        assert_eq!((s.base_url.as_str(), s.wire.as_str(), s.api_key_env.as_deref()), ("https://gw.dev/v1", "anthropic", Some("MANTRA_GW_API_KEY")));
+        assert_eq!(envs, vec![("MANTRA_GW_API_KEY".to_string(), "sk-secret".to_string())]);
+        assert_eq!((s.context_window, s.compact_pct, s.system_prompt.as_str(), s.sandbox.as_str(), s.network), (128_000, 80, "do the task", "full", true));
+        assert!(s.writable_roots.is_empty(), "full access needs no roots");
+        assert_eq!(s.home, crate::config::home().join("bija"));
+        let o = AgentOpts { model_alias: "small".into(), sandbox: "workspace-write".into(), ..o };
+        let (s, envs) = bija_spawn(&reg, &reg.resolve("small"), &o, 200_000, 85);
+        assert_eq!((s.wire.as_str(), s.api_key_env.as_deref(), envs.len()), ("openai-chat", None, 0), "a keyless local server");
+        assert_eq!((s.sandbox.as_str(), s.writable_roots.clone()), ("workspace-write", vec![PathBuf::from("/integ")]));
+    }
+
+    #[test]
+    fn bija_writable_roots_are_one_list_for_workspace_write_only() {
+        let root = std::env::temp_dir().join(format!("mantra-bija-roots-{}", std::process::id()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("data")).unwrap();
+        let extra = vec![root.clone(), root.clone()];
+        let pattern = vec!["~/data".to_string(), "/no/such/dir".to_string()];
+        assert_eq!(bija_writable_roots("workspace-write", &extra, &pattern, Some(&home)), vec![root.clone(), home.join("data")], "deduplicated, ~ expanded, missing dirs dropped");
+        assert!(bija_writable_roots("read-only", &extra, &pattern, Some(&home)).is_empty());
+        assert!(bija_writable_roots("danger-full-access", &extra, &pattern, Some(&home)).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2676,7 +3052,7 @@ mod tests {
     fn screen_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
     }
 

@@ -730,6 +730,16 @@ pre.diff { display: grid; grid-template-columns: minmax(100%, max-content); marg
 .hist:first-child { border-top: 0; }
 .hist-top { display: flex; justify-content: space-between; gap: 10px; }
 .hist-sum { color: var(--muted); font-size: var(--fs-sm); margin-top: 4px; }
+.notes-card:not(:has(.notes-group)) .sec-head { margin-bottom: 0; }
+.notes-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; color: var(--muted); font-size: var(--fs-sm); }
+.notes-toggle .chev { width: 16px; height: 16px; color: var(--faint); }
+.notes-group + .notes-group { margin-top: var(--s4); }
+.notes-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+ol.notes { list-style: none; margin: 0; padding: 0; }
+.note { padding: 8px 0 8px 10px; border-top: 1px solid var(--line); border-left: 2px solid transparent; }
+.note.urgent { border-left-color: var(--amber); background: color-mix(in srgb, var(--amber) 6%, transparent); }
+.note-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--fs-xs); color: var(--muted); }
+.note-x { margin-top: 2px; font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── pulse, inbox, runs ──────────────────────────────────────────────────────────────────────── */
 .filters { display: flex; }

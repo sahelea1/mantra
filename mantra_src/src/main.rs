@@ -9,6 +9,7 @@ mod hub;
 mod mcp_bridge;
 mod mock;
 mod mock_claude;
+mod mock_openai;
 mod rpc;
 mod ui;
 mod util;
@@ -43,16 +44,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const HELP: &str = "mantra — one terminal for Codex agents
+const HELP: &str = "mantra — one terminal for coding agents: Codex, Claude Code and bija, the built-in harness
+
+  Solo starts on `sol-api`: bija on the OpenAI API, with the key in $OPENAI_API_KEY. A fresh install
+  whose Codex is signed in with ChatGPT starts on `sol` instead; without Codex, `sol` and the
+  mantra-default pattern move to their bija twins (`sol-api`, mantra-default-bija). /models points
+  bija at any OpenAI- or Anthropic-compatible API (a local server needs no key), or picks a Codex
+  or Claude Code model.
 
 USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
   mantra run \"<goal>\" [--pattern NAME]  open straight into a Mandala run
+             [--parallel N]             … with up to N workers at once, this run only (1-128)
+  mantra --swarm N \"<goal>\"             a run of the mantra-swarm pattern, N workers at once (1-128)
   mantra runs                            list every run (all projects): id, stage, when, goal
   mantra runs resume <id> [--take-over]  reopen a run where it stopped (id prefix is enough);
                                          refused while another Mantra has it open, unless --take-over
   mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
-  mantra doctor                          check codex, login, terminal, config
+  mantra doctor                          check codex, bija, login, terminal, config
+  mantra experimental                    list experimental features, on or off
+  mantra experimental enable|disable <name>   switch one in settings.toml (akasha: shared notes
+                                         for agent groups)
   mantra --version
 
   mantra --web [ADDR:PORT] [--web-password PW] [--web-tls]   web UI (phone + desktop) on this machine/LAN
@@ -63,6 +75,9 @@ OPTIONS
   --cwd DIR       project directory (default: current directory)
   --demo          simulated agents (no API calls, no cost) in a throwaway demo repo
   --pattern NAME  pattern for new runs (default from settings.toml)
+  --parallel N    with a goal: up to N workers at once for that run, whatever the pattern says
+                  (1-128; above 32 the provider's rate limits are the ceiling)
+  --swarm N       --pattern mantra-swarm --parallel N (`mantra run --swarm N \"<goal>\"` too)
   --resume-last   reopen this project's most recent unfinished run (cwd / --cwd; with --demo:
                   the last demo run) — other projects' runs only by id, with `runs resume`
   --no-sandbox-check  start `mantra run` without asking when Codex's sandbox can't work here
@@ -81,8 +96,9 @@ OPTIONS
                            ctrl+c / SIGTERM stop it
 
 FILES
-  ~/.mantra/settings.toml          ui, codex command, defaults   ($MANTRA_HOME overrides the dir)
+  ~/.mantra/settings.toml          ui, backend commands, defaults   ($MANTRA_HOME overrides the dir)
   ~/.mantra/models.toml            models, context windows, efforts, providers
+  ~/.mantra/bija/sessions/         bija agents' sessions, resumable (bija show <id> --home ~/.mantra/bija)
   ~/.mantra/patterns/              your patterns (the Studio saves here)
   ~/.mantra/runs/<project>/<id>/   per-run plan, journal and outputs
   ~/.mantra/web/                   TLS cert, push keys/subscriptions, sessions, remote identity (0600)
@@ -103,20 +119,37 @@ struct Cli {
     take_over: bool,
     no_sandbox_check: bool,
     web: web::CliWeb,
+    /// `--parallel N` / `--swarm N`: `max_parallel` for the run started from the command line.
+    parallel: Option<usize>,
 }
 
 fn parse_args() -> Result<Option<Cli>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, take_over: false, no_sandbox_check: false, web: web::CliWeb::default() };
+    parse_cli(&std::env::args().skip(1).collect::<Vec<String>>())
+}
+
+fn parse_cli(args: &[String]) -> Result<Option<Cli>> {
+    let mut cli = Cli { cwd: None, demo: false, run_goal: None, pattern: None, snapshot: None, size: (120, 36), resume: None, resume_last: false, take_over: false, no_sandbox_check: false, web: web::CliWeb::default(), parallel: None };
+    // `run` and `--swarm` take the goal from the first bare word, wherever it stands:
+    // `mantra run --swarm 8 "goal"` and `mantra --swarm 8 "goal"` are the same run.
+    let (mut run, mut swarm, mut bare) = (false, false, None::<String>);
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
+        // Once `run` or `--swarm` is in, a word that is not an option is the goal, whatever it
+        // says — `mantra run doctor` is a run about a doctor, `mantra run "--dry-run flag for
+        // deploy"` one about a flag — as `run <goal>` took any goal before options could sit
+        // between the two.
+        let command = !(run || swarm);
         let mut next = || -> Result<String> {
             i += 1;
             args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("{a} needs a value"))
         };
         match a.as_str() {
-            "-h" | "--help" | "help" => {
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(None);
+            }
+            "help" if command => {
                 print!("{HELP}");
                 return Ok(None);
             }
@@ -133,7 +166,22 @@ fn parse_args() -> Result<Option<Cli>> {
                 let (w, h) = s.split_once('x').ok_or_else(|| anyhow::anyhow!("--size WxH"))?;
                 cli.size = (w.parse()?, h.parse()?);
             }
-            "run" => cli.run_goal = Some(next()?),
+            "run" => run = true,
+            "--parallel" => cli.parallel = Some(engine::pattern::parse_parallel(&next()?).map_err(|e| anyhow::anyhow!("--parallel: {e}"))?),
+            "--swarm" => {
+                swarm = true;
+                cli.parallel = Some(engine::pattern::parse_parallel(&next()?).map_err(|e| anyhow::anyhow!("--swarm: {e}"))?);
+            }
+            "experimental" if command => {
+                match experimental_cmd(&args[i + 1..]) {
+                    Ok(out) => print!("{out}"),
+                    Err((code, e)) => {
+                        eprintln!("mantra: {e}");
+                        std::process::exit(code);
+                    }
+                }
+                return Ok(None);
+            }
             "--resume-last" => cli.resume_last = true,
             "--take-over" => cli.take_over = true,
             "--no-sandbox-check" => cli.no_sandbox_check = true,
@@ -162,7 +210,7 @@ fn parse_args() -> Result<Option<Cli>> {
             }
             "--remote-site" => cli.web.remote_site = Some(next()?),
             "--headless" => cli.web.headless = true,
-            "runs" => match next().ok().as_deref() {
+            "runs" if command => match next().ok().as_deref() {
                 None | Some("list") | Some("ls") => {
                     runs_list();
                     return Ok(None);
@@ -176,15 +224,53 @@ fn parse_args() -> Result<Option<Cli>> {
                 }
                 Some(other) => anyhow::bail!("mantra runs: unknown subcommand {other} (list | resume <id> | delete <id>)"),
             },
-            "doctor" => {
+            "doctor" if command => {
                 doctor();
                 return Ok(None);
             }
+            other if bare.is_none() && (!command || !other.starts_with('-')) => bare = Some(other.to_string()),
             other => anyhow::bail!("unknown argument {other} (see mantra --help)"),
         }
         i += 1;
     }
+    match bare {
+        Some(goal) if run || swarm => cli.run_goal = Some(goal),
+        Some(other) => anyhow::bail!("unknown argument {other} (see mantra --help)"),
+        None if run => anyhow::bail!("run needs a goal: mantra run \"<goal>\""),
+        None => {}
+    }
+    if cli.parallel.is_some() && cli.run_goal.is_none() {
+        anyhow::bail!("--parallel and --swarm need a goal: mantra --swarm N \"<goal>\" (in the app: /swarm N <goal>)");
+    }
+    if swarm {
+        if let Some(p) = cli.pattern.as_deref().filter(|p| util::slug(p) != engine::pattern::NAME_SWARM) {
+            anyhow::bail!("--swarm runs the {} pattern, not {p}; for another pattern: --pattern NAME --parallel N", engine::pattern::NAME_SWARM);
+        }
+        cli.pattern = Some(engine::pattern::NAME_SWARM.to_string());
+    }
     Ok(Some(cli))
+}
+
+/// `mantra experimental [list | enable <name> | disable <name>]`: what goes to stdout, or the exit
+/// code and the error — 2 for a usage error or an unknown name, which comes with the list.
+fn experimental_cmd(args: &[String]) -> std::result::Result<String, (i32, String)> {
+    let list = || {
+        let s = config::Settings::load();
+        app::experimental_list(&s).iter().map(|l| format!("  {l}\n")).collect::<String>()
+    };
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (name, on) = match words.as_slice() {
+        [] | ["list"] => return Ok(format!("experimental features (mantra experimental enable|disable <name>):\n{}", list())),
+        ["enable", name] => (*name, true),
+        ["disable", name] => (*name, false),
+        _ => return Err((2, "usage: mantra experimental [list | enable <name> | disable <name>]".into())),
+    };
+    if !app::is_experimental(name) {
+        return Err((2, format!("unknown experimental feature '{name}'; there is:\n{}", list().trim_end())));
+    }
+    app::save_experimental(name, on).map_err(|e| (1, e))?;
+    let what = if on { "on — runs started from now on use it" } else { "off" };
+    Ok(format!("{name} {what} (saved in {})\n", config::home().join("settings.toml").display()))
 }
 
 fn main() {
@@ -226,8 +312,66 @@ fn main() {
     }
 }
 
-fn codex_available(cmd: &[String]) -> bool {
+/// Whether `<cmd> --version` runs and exits 0 — how startup tells an installed CLI from a missing one.
+fn answers_version(cmd: &[String]) -> bool {
     cmd.first().map(|p| std::process::Command::new(p).arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)).unwrap_or(false)
+}
+
+/// Without Codex, whatever has a bija twin moves to it for this session: Solo's model (`sol` →
+/// `sol-api`, when the registry has it) and the built-in default pattern (→ `mantra-default-bija`,
+/// when every alias it names exists on a Bija provider).
+/// Anything else stays as configured — a custom Codex provider has no twin, and its spawn error
+/// says what is missing. Returns the pattern runs should open with, when it changed.
+fn prefer_bija(settings: &mut config::Settings, reg: &config::Registry) -> Option<String> {
+    let on_bija = |alias: &str| reg.get(alias).map(|m| reg.backend_of(m) == config::ProviderKind::Bija).unwrap_or(false);
+    let solo = reg.resolve(&settings.default_model);
+    if reg.backend_of(&solo) == config::ProviderKind::Codex {
+        let twin = config::bija_alias(&solo.alias);
+        if on_bija(&twin) {
+            settings.default_model = twin;
+        }
+    }
+    // Only a pattern whose every role has its twin: one that names aliases this registry lacks
+    // would fail every run, where the default at least says what is missing.
+    let twins_exist = engine::pattern::Pattern::builtin_bija().roles.values().all(|r| on_bija(&r.model) && r.fallback.as_deref().filter(|f| !f.trim().is_empty()).map_or(true, on_bija));
+    (settings.default_pattern == engine::pattern::NAME_DEFAULT && twins_exist).then(|| engine::pattern::NAME_BIJA.to_string())
+}
+
+/// The model and pattern a session started now would open with: `settings` as they are, or —
+/// `without_codex` — after `prefer_bija`'s moves, with the pattern it returns (the twin) in
+/// `default_pattern`. Also returns that twin, so doctor can say it graded it instead of the file.
+fn session_defaults(settings: &config::Settings, reg: &config::Registry, without_codex: bool) -> (config::Settings, Option<String>) {
+    let mut eff = settings.clone();
+    if !without_codex {
+        return (eff, None);
+    }
+    let twin = prefer_bija(&mut eff, reg);
+    if let Some(p) = &twin {
+        eff.default_pattern = p.clone();
+    }
+    (eff, twin)
+}
+
+/// `--demo`: the registry's `bija` provider — added, with the default models through it, when
+/// this models.toml has none — points at the in-process mock OpenAI server, keyless. In memory
+/// only, like the demo's Claude provider: nothing here is saved.
+fn point_bija_at_mock(reg: &mut config::Registry, port: u16) {
+    let url = format!("http://127.0.0.1:{port}/v1");
+    match reg.providers.iter_mut().find(|p| p.id == "bija") {
+        Some(p) => {
+            p.kind = config::ProviderKind::Bija;
+            p.base_url = url;
+            p.wire = String::new();
+            p.env_key = String::new();
+            p.api_key = None;
+        }
+        None => reg.providers.push(config::ProviderEntry { base_url: url, env_key: String::new(), ..config::bija_default_provider() }),
+    }
+    for m in config::bija_default_model_entries("bija") {
+        if reg.get(&m.alias).is_none() {
+            reg.models.push(m);
+        }
+    }
 }
 
 fn demo_project() -> Result<PathBuf> {
@@ -261,11 +405,21 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         // Nobody can answer a question on stdin.
         cli.no_sandbox_check = true;
     }
+    // Resolved once and handed to the hub; never written back, so a later `Settings::save` keeps
+    // the configured command rather than this machine's path.
+    let (mut bija_cmd, bija_found) = config::resolve_bija_command(&settings.bija_command);
     let mut demo = cli.demo;
-    if !demo && !codex_available(&settings.codex_command) {
-        eprintln!("mantra: `{}` not found — starting in DEMO mode (simulated agents).\n        Install Codex with `npm i -g @openai/codex`, then `codex login`.", settings.codex_command.join(" "));
-        std::thread::sleep(Duration::from_millis(1500));
-        demo = true;
+    // Codex is optional: bija ships beside mantra, so without Codex the agents run on bija. Only
+    // with neither is there nothing to run but the demo.
+    let mut without_codex = false;
+    if !demo && !answers_version(&settings.codex_command) {
+        if bija_found != config::BijaFound::Missing && answers_version(&bija_cmd) {
+            without_codex = true;
+        } else {
+            eprintln!("mantra: neither `{}` nor `{}` found — starting in DEMO mode (simulated agents).\n        bija ships beside mantra (reinstall it), or install Codex with `npm i -g @openai/codex`, then `codex login`.", settings.codex_command.join(" "), settings.bija_command.join(" "));
+            std::thread::sleep(Duration::from_millis(1500));
+            demo = true;
+        }
     }
     // A resumed run brings its own project directory (it was saved absolute), so `mantra runs
     // resume <id>` works from anywhere. `--resume-last` is this project's last unfinished run —
@@ -313,6 +467,28 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             registry.providers.push(config::ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
             registry.models.extend(config::claude_default_model_entries("claude"));
         }
+        // bija itself is real in the demo — the one built beside this binary — and only the API
+        // behind it is simulated, so `--demo --pattern mantra-default-bija` drives the harness end
+        // to end with zero API calls.
+        if let Some(beside) = exe.parent().map(|d| d.join(config::bija_exe_name())).filter(|p| p.is_file()) {
+            bija_cmd = vec![beside.to_string_lossy().into_owned()];
+        }
+        let port = mock_openai::start().await?;
+        point_bija_at_mock(&mut registry, port);
+        // The demo shows what there is to see, the experiments included — in memory, like the
+        // mocks: settings.toml is not touched.
+        if !settings.experimental_on(config::EXPERIMENTAL_AKASHA) {
+            settings.experimental.push(config::EXPERIMENTAL_AKASHA.to_string());
+        }
+        // Solo stays on the Codex mock: the snapshot and web e2e scripts drive the demo's Solo.
+        if registry.backend_of(&registry.resolve(&settings.default_model)) == config::ProviderKind::Bija {
+            settings.default_model = "sol".into();
+        }
+    }
+    let bija_pattern = if without_codex { prefer_bija(&mut settings, &registry) } else { None };
+    if without_codex {
+        eprintln!("mantra: `{}` not found — agents run on bija ({}), Solo on `{}`.", settings.codex_command.join(" "), bija_cmd.join(" "), settings.default_model);
+        mlog!("codex missing: agents run on bija ({}), Solo on {}, pattern {}", bija_cmd.join(" "), settings.default_model, bija_pattern.as_deref().unwrap_or(&settings.default_pattern));
     }
     // Fresh install, Codex signed in with a ChatGPT subscription (which has no access to `astra`):
     // default every role to a model that account can actually run, once, so the first run doesn't
@@ -366,10 +542,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     // The MCP-bridge socket (WP10.4) is only worth opening when a Claude Code agent could actually
     // run — real or (in `--demo`) mocked.
     let enable_bridge = registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode);
-    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), hub_tx, enable_bridge);
+    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), bija_cmd, hub_tx, enable_bridge);
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
     app.web = web.as_ref().map(|w| w.link());
-    if let Some(p) = cli.pattern {
+    if let Some(p) = cli.pattern.or(bija_pattern) {
         app.pattern_name = p;
     }
     app.start_solo();
@@ -381,7 +557,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         app.toast(w.join(" · "), crate::agent::Level::Warn);
     }
     if let Some(goal) = &cli.run_goal {
-        app.start_run(goal);
+        app.start_run_with(goal, None, cli.parallel);
     }
     if let Some(r) = resume {
         app.resume_run(r);
@@ -421,8 +597,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         if let Some(w) = web.as_mut() {
             w.shutdown();
         }
-        app.shutdown();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopping = app.shutdown();
+        // bija agents get to finish their commands and transcripts before the runtime goes (it
+        // kills every child still running); the sleep is the other backends' moment, as before.
+        tokio::join!(tokio::time::sleep(Duration::from_millis(300)), stopping.wait());
         if app.demo {
             eprintln!("demo project left at {}", app.project.display());
         }
@@ -490,9 +668,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     if let Some(w) = web.as_mut() {
         w.shutdown();
     }
-    app.shutdown();
+    let stopping = app.shutdown();
     restore_terminal(kbd);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // As in the headless path above, with the terminal already back to the user while bija agents
+    // finish.
+    tokio::join!(tokio::time::sleep(Duration::from_millis(150)), stopping.wait());
     if app.demo {
         eprintln!("demo project left at {}", app.project.display());
     }
@@ -826,8 +1006,8 @@ async fn snapshot(mut app: App, mut rx: mpsc::UnboundedReceiver<AppEvent>, scrip
         }
     }
     pump(&mut app, &mut rx);
-    app.shutdown();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stopping = app.shutdown();
+    tokio::join!(tokio::time::sleep(Duration::from_millis(200)), stopping.wait());
     Ok(())
 }
 
@@ -851,9 +1031,22 @@ fn doctor() {
     println!("mantra {} doctor\n", env!("CARGO_PKG_VERSION"));
     // WP10.5: both CLI probes share one 5s timeout (thread + `recv_timeout`), so a hung binary
     // (observed in this sandbox for `claude` under `subscription` auth, §0.3) can never hang doctor.
-    let (good, text) = probe_cli(&s.codex_command[0], " — npm i -g @openai/codex");
-    println!("{} codex executable: {text}", ok(good));
+    let (codex_good, text) = probe_cli(&s.codex_command[0], " — npm i -g @openai/codex");
+    println!("{} codex executable: {text}", ok(codex_good));
     let r = config::Registry::load();
+    // Graded as a session would run: without Codex (and with bija), startup moves Solo and the
+    // default pattern to their bija twins, so the rows below judge those, not the file on disk.
+    let (bija_cmd, found) = config::resolve_bija_command(&s.bija_command);
+    let bija_probe = probe_cli(bija_cmd.first().map(String::as_str).unwrap_or("bija"), " (needed for Bija agents — Solo's default; it ships beside mantra: reinstall, or set bija_command / $MANTRA_BIJA)");
+    let without_codex = !codex_good && found != config::BijaFound::Missing && bija_probe.0;
+    let (eff, twin) = session_defaults(&s, &r, without_codex);
+    if without_codex {
+        println!("  defaults: Solo on `{}`{}", eff.default_model, if eff.default_model != s.default_model { format!(" (`{}`'s bija twin, Codex not installed)", s.default_model) } else { String::new() });
+        match &twin {
+            Some(p) => println!("  default pattern {p} ({}'s bija twin, Codex not installed)", s.default_pattern),
+            None => println!("  default pattern {} (no bija twin — kept as configured)", s.default_pattern),
+        }
+    }
     // Readiness, not presence: the same spawn + `initialize` handshake an agent does, one no-op
     // command through the configured sandbox, then a clean shutdown — each its own row and
     // verdict, each bounded by PROBE_TIMEOUT, each failure quoting Codex's own error line.
@@ -862,7 +1055,7 @@ fn doctor() {
         Ok(t) => println!("{} codex app-server: {t}", ok(true)),
         Err(e) => println!("{} codex app-server: {e}", ok(false)),
     }
-    let (verdict, text) = provider_row(&s, &r);
+    let (verdict, text) = provider_row(&eff, &r);
     println!("{} provider: {text}", verdict.map(ok).unwrap_or(" "));
     match &sandbox {
         Ok(t) => println!("{} sandbox: {t}", ok(true)),
@@ -880,7 +1073,7 @@ fn doctor() {
     if let Ok(o) = std::process::Command::new(&s.codex_command[0]).args(["login", "status"]).output() {
         let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let line = config::login_status_line(&t);
-        let needed = codex_account_needed(&s, &r);
+        let needed = codex_account_needed(&eff, &r);
         match (o.status.success(), needed.is_empty()) {
             (true, _) => println!("{} login: {line}", ok(true)),
             (false, false) => println!("{} login: {line} — needed by {} (run `codex login`)", ok(false), needed.join(", ")),
@@ -889,6 +1082,8 @@ fn doctor() {
     }
     let (good, text) = probe_cli(&s.claude_command[0], " (optional — only needed for Claude Code agents; npm i -g @anthropic-ai/claude-code)");
     println!("{} claude: {text}", ok(good));
+    let (good, text) = bija_probe;
+    println!("{} bija: {text} · {} ({})", ok(good), bija_cmd.join(" "), found.describe());
     if crate::util::effective_uid_is_root() {
         println!("  IS_SANDBOX note: running as root — Mantra sets IS_SANDBOX=1 for claude agents (--dangerously-skip-permissions is otherwise refused for uid 0)");
     }
@@ -924,7 +1119,28 @@ fn doctor() {
                 format!("${} NOT set", p.env_key)
             }
         };
-        if p.kind == config::ProviderKind::ClaudeCode {
+        if p.kind == config::ProviderKind::Bija {
+            // A bija key is optional (a local server takes none), so a missing one is no failure.
+            match p.draft_reason() {
+                Some(why) => println!("{} provider {} (Bija): {why} (/models to fix)", ok(false), p.id),
+                None => {
+                    // Whether a missing key matters depends on where the requests go: say which.
+                    let host = p.host().unwrap_or_default();
+                    let name = host.rsplit_once(':').filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(&host).trim_matches(['[', ']']).to_string();
+                    let local = name == "localhost" || name == "::1" || name == "0.0.0.0" || name.ends_with(".local") || ["127.", "10.", "192.168."].iter().any(|pre| name.starts_with(pre));
+                    let why = if local { "fine for a local server".to_string() } else { format!("{name} will want one") };
+                    let key = if p.resolve_key().is_some() {
+                        key_src(p)
+                    } else if p.env_key.trim().is_empty() {
+                        format!("no key — {why}")
+                    } else {
+                        format!("${} not set — {why}", p.env_key.trim())
+                    };
+                    // the wire in /models' words (`openai` | `anthropic`), not bija's own flag value
+                    println!("{} provider {} (Bija, wire {}): {} · {key}", if p.resolve_key().is_some() { ok(true) } else { " " }, p.id, p.bija_wire().trim_end_matches("-chat"), p.base_url.trim());
+                }
+            }
+        } else if p.kind == config::ProviderKind::ClaudeCode {
             if p.auth == "api_key" {
                 println!("{} provider {} (Claude Code, api_key): {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
             } else {
@@ -1056,7 +1272,7 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
     };
     let name = r.provider_name(&p.id);
     // A placeholder (or malformed) base_url never gets a request: the key would go to example.com.
-    if let Some(why) = p.url_problem() {
+    if let Some(why) = p.url_problem().or_else(|| p.wire_problem()) {
         return (Some(false), format!("{name} for `{alias}`: {why} (/models to fix)"));
     }
     let key_src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
@@ -1072,21 +1288,27 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
         }
         return (Some(p.resolve_key().is_some()), format!("{name} (Claude Code, api_key) for `{alias}`: {key_src}"));
     }
-    let Some(key) = p.resolve_key() else {
+    let key = p.resolve_key();
+    if key.is_none() && p.needs_key() {
         return (Some(false), format!("{name} for `{alias}`: {key_src}"));
-    };
+    }
+    // Only a Bija provider gets here without a key (it is optional): the endpoint itself says
+    // whether it wants one — a local server answers, a hosted API says 401.
+    let key_src = if key.is_some() { key_src } else { "no key".to_string() };
     // `GET /models` on a thread with a hard cap: curl's own limit is longer than PROBE_TIMEOUT.
-    let (base, model) = (p.base_url.clone(), m.model.clone());
+    let (base, model, header, sent) = (p.base_url.clone(), m.model.clone(), discover::key_header(p), key.is_some());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(discover::list_models(&base, Some(&key)));
+        let _ = tx.send(discover::list_models(&base, key.as_deref(), header));
     });
     let host = p.base_url.trim().trim_end_matches('/').to_string();
     match rx.recv_timeout(PROBE_TIMEOUT) {
         Ok(Ok(found)) => {
             let listed = found.iter().any(|f| f.id == model);
-            (Some(true), format!("{name} for `{alias}`: {key_src} · {host}/models accepts the key ({} models{})", found.len(), if listed { format!(", `{model}` listed") } else { format!("; `{model}` not among them — the tag is sent as-is") }))
+            let verdict = if sent { "accepts the key" } else { "answers without one" };
+            (Some(true), format!("{name} for `{alias}`: {key_src} · {host}/models {verdict} ({} models{})", found.len(), if listed { format!(", `{model}` listed") } else { format!("; `{model}` not among them — the tag is sent as-is") }))
         }
+        Ok(Err(e)) if (e.contains("HTTP 401") || e.contains("HTTP 403")) && !sent => (Some(false), format!("{name} for `{alias}`: no key, and {host} wants one — set ${} or paste one in /models ({e})", p.env_var_name())),
         Ok(Err(e)) if e.contains("HTTP 401") || e.contains("HTTP 403") => (Some(false), format!("{name} for `{alias}`: {key_src} · key rejected — {e}")),
         Ok(Err(e)) if e.starts_with("couldn't reach") || e.starts_with("couldn't run") => (Some(false), format!("{name} for `{alias}`: {key_src} · {e}")),
         // Answered, but not with a model list (no /models endpoint): the key is there, that is all doctor can say.
@@ -1291,6 +1513,74 @@ mod resume_tests {
 mod doctor_tests {
     use super::*;
 
+    /// Without Codex, what has a bija twin moves to it for the session; anything else stays.
+    #[test]
+    fn without_codex_solo_and_the_default_pattern_move_to_their_bija_twins() {
+        let reg = config::Registry::defaults();
+        let mut s = config::Settings { default_model: "sol".into(), ..Default::default() };
+        assert_eq!(prefer_bija(&mut s, &reg).as_deref(), Some(engine::pattern::NAME_BIJA));
+        assert_eq!(s.default_model, "sol-api");
+        let mut s = config::Settings { default_model: "glm".into(), default_pattern: "mine".into(), ..Default::default() };
+        assert_eq!(prefer_bija(&mut s, &reg), None, "a pattern of one's own stays");
+        assert_eq!(s.default_model, "glm", "no twin, nothing to move to");
+        let mut s = config::Settings::default();
+        prefer_bija(&mut s, &reg);
+        assert_eq!(s.default_model, "sol-api", "already on bija");
+        // A registry without the twins (a Bija provider set up by hand) keeps the default pattern.
+        let mut bare = config::Registry::defaults();
+        bare.models.retain(|m| !m.alias.ends_with("-api"));
+        let mut s = config::Settings { default_model: "sol".into(), ..Default::default() };
+        assert_eq!(prefer_bija(&mut s, &bare), None, "no pattern of aliases that do not exist");
+        assert_eq!(s.default_model, "sol");
+    }
+
+    /// Doctor grades what a session would run: without Codex, the bija twins — so the built-in
+    /// default pattern no longer asks for Codex's login; with Codex, the settings as they are.
+    #[test]
+    fn doctor_grades_the_bija_twins_when_codex_is_missing() {
+        let reg = config::Registry::defaults();
+        let s = config::Settings { default_model: "sol".into(), ..Default::default() };
+        let (eff, twin) = session_defaults(&s, &reg, true);
+        assert_eq!((eff.default_model.as_str(), eff.default_pattern.as_str(), twin.as_deref()), ("sol-api", engine::pattern::NAME_BIJA, Some(engine::pattern::NAME_BIJA)));
+        assert!(codex_account_needed(&eff, &reg).is_empty(), "{:?}", codex_account_needed(&eff, &reg));
+        let on_disk = codex_account_needed(&s, &reg);
+        assert!(on_disk.iter().any(|n| n.contains(engine::pattern::NAME_DEFAULT)), "the file's pattern does want it: {on_disk:?}");
+        let (same, none) = session_defaults(&s, &reg, false);
+        assert_eq!((same.default_model.as_str(), same.default_pattern.as_str(), none), ("sol", s.default_pattern.as_str(), None));
+    }
+
+    /// The demo's bija provider points at the mock, keyless — a real key never goes there — and a
+    /// models.toml from before bija gets the provider and the `-api` aliases, in memory.
+    #[test]
+    fn the_demo_points_bija_at_the_mock_and_adds_what_is_missing() {
+        let mut reg = config::Registry::defaults();
+        if let Some(p) = reg.providers.iter_mut().find(|p| p.id == "bija") {
+            p.api_key = Some("sk-real".into());
+        }
+        point_bija_at_mock(&mut reg, 4242);
+        let p = reg.providers.iter().find(|p| p.id == "bija").expect("the bija provider");
+        assert_eq!((p.base_url.as_str(), p.env_key.as_str(), p.api_key.as_deref()), ("http://127.0.0.1:4242/v1", "", None));
+        assert_eq!(reg.models.iter().filter(|m| m.alias == "sol-api").count(), 1, "nothing doubled");
+        let mut old = config::Registry { models: vec![config::ModelEntry { alias: "sol".into(), model: "gpt-5.6-sol".into(), ..Default::default() }], providers: vec![] };
+        point_bija_at_mock(&mut old, 7);
+        assert_eq!(old.backend_of(&old.resolve("luna-api")), config::ProviderKind::Bija);
+        assert_eq!(old.provider_of("sol-api").map(|p| p.base_url.as_str()), Some("http://127.0.0.1:7/v1"));
+        assert_eq!(old.alias_problem("astra-api"), None);
+        assert!(old.preflight(&engine::pattern::Pattern::builtin_bija()).is_empty());
+    }
+
+    /// A Bija provider is checked like any custom one, its wire included, before any request.
+    #[test]
+    fn doctor_refuses_a_bija_provider_with_an_unknown_wire_before_any_request() {
+        let mut r = config::Registry::defaults();
+        if let Some(p) = r.providers.iter_mut().find(|p| p.id == "bija") {
+            p.wire = "grpc".into();
+        }
+        let (ok, row) = provider_row(&config::Settings::default(), &r);
+        assert_eq!(ok, Some(false));
+        assert!(row.contains("wire 'grpc'") && row.contains("/models to fix"), "{row}");
+    }
+
     /// The provider row never sends the key to a placeholder: the `n` row with a key configured
     /// is refused before `GET /models` is built (doctor used to be the one path around the draft rules).
     #[test]
@@ -1309,5 +1599,91 @@ mod doctor_tests {
         assert!(ok == Some(false) && row.contains("not a URL"), "{row}");
         let s = config::Settings { default_model: "gpt".into(), ..Default::default() };
         assert_eq!(provider_row(&s, &r).0, None);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli> {
+        parse_cli(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>()).map(|c| c.expect("a session, not a subcommand"))
+    }
+
+    /// `--parallel N` is any pattern's run with N at once; `--swarm N` is that on mantra-swarm,
+    /// before or after `run` and the goal; outside 1..=128 or without a goal it is a usage error.
+    #[test]
+    fn parallel_and_swarm_parse_and_check_their_range() {
+        let c = parse(&["run", "add a parser", "--parallel", "6"]).unwrap();
+        assert_eq!((c.run_goal.as_deref(), c.parallel, c.pattern.as_deref()), (Some("add a parser"), Some(6), None));
+        for args in [&["--swarm", "24", "add a parser"][..], &["run", "--swarm", "24", "add a parser"], &["run", "add a parser", "--swarm", "24"], &["--swarm", "24", "--pattern", "mantra-swarm", "add a parser"]] {
+            let c = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!((c.run_goal.as_deref(), c.parallel, c.pattern.as_deref()), (Some("add a parser"), Some(24), Some(engine::pattern::NAME_SWARM)), "{args:?}");
+        }
+        assert_eq!(parse(&["--swarm", "128", "g"]).unwrap().parallel, Some(128));
+        assert_eq!(parse(&["--swarm", "1", "g"]).unwrap().parallel, Some(1));
+        for (args, words) in [
+            (&["--swarm", "0", "g"][..], "from 1 to 128"),
+            (&["--parallel", "129", "run", "g"], "from 1 to 128"),
+            (&["--swarm", "lots", "g"], "--swarm"),
+            (&["--swarm", "8"], "need a goal"),
+            (&["--parallel", "8"], "need a goal"),
+            (&["--swarm", "8", "--pattern", "mantra-lean", "g"], "--pattern NAME --parallel N"),
+            (&["run"], "run needs a goal"),
+            (&["just words"], "unknown argument just words"),
+            (&["run", "g", "h"], "unknown argument h"),
+        ] {
+            let e = parse(args).err().unwrap_or_else(|| panic!("{args:?} must be refused")).to_string();
+            assert!(e.contains(words), "{args:?}: {e}");
+        }
+        // after `run` or `--swarm N`, any word is the goal — a subcommand's name or one that
+        // starts with a dash too — as `run <goal>` always took it; only the options keep their meaning
+        for (args, goal) in [
+            (&["run", "doctor"][..], "doctor"),
+            (&["run", "help"], "help"),
+            (&["run", "runs"], "runs"),
+            (&["run", "experimental"], "experimental"),
+            (&["run", "--dry-run flag for deploy"], "--dry-run flag for deploy"),
+            (&["--swarm", "8", "doctor"], "doctor"),
+            (&["run", "--swarm", "8", "-x is broken"], "-x is broken"),
+            (&["run", "--pattern", "mantra-lean", "help"], "help"),
+        ] {
+            let c = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(c.run_goal.as_deref(), Some(goal), "{args:?}");
+        }
+        let e = parse(&["run", "g", "--not-an-option"]).err().expect("one goal, then only options").to_string();
+        assert!(e.contains("unknown argument --not-an-option"), "{e}");
+        assert!(parse_cli(&["run".to_string(), "--help".to_string()]).unwrap().is_none(), "--help is still help");
+        // what was there before is parsed as before
+        let c = parse(&["run", "add a parser", "--pattern", "mantra-lean"]).unwrap();
+        assert_eq!((c.run_goal.as_deref(), c.parallel, c.pattern.as_deref()), (Some("add a parser"), None, Some("mantra-lean")));
+        let c = parse(&["--demo", "--cwd", "/tmp"]).unwrap();
+        assert!(c.run_goal.is_none() && c.parallel.is_none() && c.demo);
+    }
+
+    /// `mantra experimental` lists, enables and disables in settings.toml; an unknown name or a
+    /// bad subcommand is exit 2, with the list.
+    #[test]
+    fn experimental_enable_disable_and_list() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+            let out = experimental_cmd(&s(&[])).unwrap();
+            assert!(out.contains("akasha") && out.contains("off") && out.contains("shared notes"), "{out}");
+            assert_eq!(experimental_cmd(&s(&["list"])).unwrap(), out);
+            let on = experimental_cmd(&s(&["enable", "akasha"])).unwrap();
+            assert!(on.contains("akasha on") && on.contains("settings.toml"), "{on}");
+            assert!(config::Settings::load().experimental_on(config::EXPERIMENTAL_AKASHA));
+            assert!(experimental_cmd(&s(&["list"])).unwrap().lines().any(|l| l.contains("akasha") && l.contains(" on ")));
+            // enabling twice keeps one entry
+            experimental_cmd(&s(&["enable", "akasha"])).unwrap();
+            assert_eq!(config::Settings::load().experimental, vec!["akasha".to_string()]);
+            experimental_cmd(&s(&["disable", "akasha"])).unwrap();
+            assert!(!config::Settings::load().experimental_on(config::EXPERIMENTAL_AKASHA));
+            let (code, e) = experimental_cmd(&s(&["enable", "warp"])).unwrap_err();
+            assert!(code == 2 && e.contains("'warp'") && e.contains("akasha"), "{code} {e}");
+            for bad in [&["enable"][..], &["toggle", "akasha"], &["enable", "akasha", "now"]] {
+                assert_eq!(experimental_cmd(&s(bad)).unwrap_err().0, 2, "{bad:?}");
+            }
+        });
     }
 }

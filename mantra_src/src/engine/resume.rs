@@ -42,6 +42,9 @@ impl Run {
         run.plan = plan;
         run.plan_version = st.plan_version;
         run.handoff = st.handoff.clone();
+        // the notes are what the group shared so far: they come back whole (`enable_akasha`
+        // then adds a block for any group that has none yet)
+        run.akasha = st.akasha.clone();
         run.started_unix = st.started_unix;
         // a finished run written before `finished_unix` existed: its last save is the closest
         run.finished_unix = st.finished_unix.or_else(|| st.finished().then_some(st.updated_unix));
@@ -185,7 +188,7 @@ impl Run {
         let m = self.spawn_manager_with(ctx, thread);
         self.mark_edge(m);
         let brief = self.manager_brief(if attached { "[mantra:resume] Mantra restarted; you are re-attached as this run's manager. What you knew still holds — here is the run as it stands now." } else { "[mantra:resume] Mantra restarted; you are this run's new manager." });
-        ctx.prompt(m, brief);
+        ctx.prompt(m, self.with_akasha(m, brief));
         self.log("◈", "blue", if attached { "manager re-attached" } else { "manager started (fresh — no saved thread)" });
     }
 
@@ -200,7 +203,7 @@ impl Run {
         } else {
             self.planning_prompt()
         };
-        ctx.prompt(p, prompt);
+        ctx.prompt(p, self.with_akasha(p, prompt));
         self.log("✦", "saffron", if attached { "planner re-attached — finishing the plan" } else { "planner is exploring and planning" });
     }
 
@@ -259,13 +262,13 @@ impl Run {
         self.mark_edge(o);
         ctx.prompt(
             o,
-            format!(
+            self.with_akasha(o, format!(
                 "[mantra:resume] Mantra restarted while phase {}/{} ({}) was in progress; you are its new orchestrator.\nGoal: {}\n\n{handoff}Current phase:\n```json\n{phase_json}\n```\nWorkers right now (attempts already made are listed; running ones were re-attached or re-spawned by Mantra — do not spawn them again):\n{status}\nSpawn only tasks that have no attempt yet (mantra_spawn), then call mantra_wait.",
                 idx + 1,
                 n,
                 phase.name,
                 phase.goal
-            ),
+            )),
         );
         self.fill_slots(ctx);
         self.check_phase_done(ctx);
@@ -379,10 +382,12 @@ mod tests {
         models: Vec<(String, String)>,
         prompts: Vec<(AgentId, String)>,
         jobs: Vec<String>,
+        /// Every spawn's tool names, by agent name.
+        tools: Vec<(String, Vec<String>)>,
     }
     impl Fake {
         fn new() -> Fake {
-            Fake { agents: HashMap::new(), next: 1, spawned: vec![], models: vec![], prompts: vec![], jobs: vec![] }
+            Fake { agents: HashMap::new(), next: 1, spawned: vec![], models: vec![], prompts: vec![], jobs: vec![], tools: vec![] }
         }
         fn add(&mut self, r: &SpawnReq, resume: Option<String>) -> AgentId {
             let id = self.next;
@@ -390,7 +395,11 @@ mod tests {
             self.agents.insert(id, Agent::new(id, &r.name, &r.role_name, r.cwd.clone()));
             self.spawned.push((r.name.clone(), resume));
             self.models.push((r.name.clone(), r.role.model.clone()));
+            self.tools.push((r.name.clone(), r.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from)).collect()));
             id
+        }
+        fn tools_of(&self, name: &str) -> Vec<String> {
+            self.tools.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()).unwrap_or_default()
         }
         fn model_of(&self, name: &str) -> Option<&str> {
             self.models.iter().find(|(n, _)| n == name).map(|(_, m)| m.as_str())
@@ -499,6 +508,33 @@ mod tests {
         assert!(ctx.prompts.iter().any(|(_, t)| t.contains("your worktree still holds your changes")), "re-attached worker told to continue");
         assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating });
         assert!(run.dir.join("state.json").is_file(), "state is re-saved after boot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed run gets its notes back whole, and a member re-attached to its thread is offered
+    /// the tools again and told what the block holds; the fresh orchestrator, in no group, is not.
+    #[test]
+    fn akasha_notes_come_back_and_reattached_members_get_the_tools_again() {
+        let dir = tmp("akasha");
+        std::fs::create_dir_all(dir.join("wt-b")).unwrap();
+        let mut pattern = Pattern::builtin();
+        pattern.groups = vec![crate::engine::pattern::Group { name: "builders".into(), roles: vec!["worker-small".into()], ..Default::default() }];
+        let mut st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating }, vec![worker("a", "done", 1, Some(dir.join("wt-a"))), worker("b", "running", 1, Some(dir.join("wt-b")))], vec![AgentState { slot: "worker:b#1".into(), thread_id: Some("thr-b".into()), ..Default::default() }]);
+        let mut block = crate::engine::akasha::Block::new("builders", 16_384);
+        block.note("a", "models live in src/models", false, 60).unwrap();
+        st.akasha.insert("builders".into(), block);
+        let mut run = Run::from_state(&st, pattern, Some(plan()), dir.join("run"));
+        run.enable_akasha(true);
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert_eq!(run.akasha, st.akasha, "the notes are intact");
+        assert!(ctx.spawned.iter().any(|(n, r)| n == "b" && r.as_deref() == Some("thr-b")), "{:?}", ctx.spawned);
+        assert!(ctx.tools_of("b").iter().any(|t| t == "mantra_akasha_note"), "{:?}", ctx.tools_of("b"));
+        assert!(!ctx.tools_of("orchestrator").iter().any(|t| t.starts_with("mantra_akasha_")));
+        let b = run.workers.iter().find(|w| w.task.id == "b").and_then(|w| w.agent).expect("b re-attached");
+        let prompt = ctx.prompts.iter().find(|(x, _)| *x == b).map(|(_, t)| t.clone()).unwrap_or_default();
+        assert!(prompt.starts_with("[mantra:resume]") && prompt.contains("\n\n## Shared notes (akasha · builders)\n") && prompt.ends_with("] models live in src/models"), "{prompt}");
+        assert_eq!(RunState::load(&run.dir).unwrap().akasha, st.akasha, "and saved again after the boot");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

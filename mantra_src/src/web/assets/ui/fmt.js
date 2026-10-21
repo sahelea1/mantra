@@ -13,6 +13,10 @@
     const EFFORT_COLOR = { minimal: 'muted', low: 'muted', medium: 'teal', high: 'blue', xhigh: 'violet', max: 'saffron', ultra: 'rose' };
     function effortColor(e) { const c = EFFORT_COLOR[e]; return c ? 'var(--' + c + ')' : 'var(--text)'; }
 
+    // ── backends (snapshot.rs `backend_str`) ─────────────────────────────────────────────────────
+    const BACKEND = { codex: 'Codex', 'claude-code': 'Claude Code', bija: 'Bija' };
+    function backend(b) { return BACKEND[b] || 'Codex'; }
+
     // ── numbers & time ───────────────────────────────────────────────────────────────────────────
     function tokens(n) {
         n = Number(n) || 0;
@@ -280,5 +284,5 @@
             }));
     }
 
-    M.fmt = { colorVar, effortColor, tokens, cached, dur, durShort, ago, clock, trunc, plural, inline, markdown, diffLines, icon };
+    M.fmt = { colorVar, effortColor, backend, tokens, cached, dur, durShort, ago, clock, trunc, plural, inline, markdown, diffLines, icon };
 })(window.Mantra = window.Mantra || {});

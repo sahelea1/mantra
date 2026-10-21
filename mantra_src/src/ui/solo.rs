@@ -170,7 +170,7 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     let key = |k: &str, d: &str| -> Line<'static> { Line::from(vec![Span::styled(format!("    {k:<18}"), theme::muted()), Span::styled(d.to_string(), theme::dim())]) };
     let mut lines = vec![
         Line::from(vec![Span::styled(format!("  {}  ", theme::g("✦", "*")), star), Span::styled("M A N T R A", theme::bold(theme::accent()))]),
-        Line::from(Span::styled("     one terminal for Codex agents — solo, or as a whole team", theme::dim())),
+        Line::from(Span::styled("     one terminal for coding agents — solo, or as a whole team", theme::dim())),
         Line::default(),
         Line::from(vec![
             Span::styled("     model  ", theme::faint()),
@@ -317,7 +317,7 @@ fn side_panel(f: &mut Frame, area: Rect, app: &App, id: Option<AgentId>) {
             l.push(Line::from(Span::styled(format!(" {} / {} tokens", fmt_tokens(a.ctx_used), fmt_tokens(win)), theme::dim())));
             let note = match m.auto_compact_percent {
                 Some(c) if m.context_window.is_some() => format!(" auto-compact at {c}% {}", theme::g("┊", "|")),
-                _ => " auto-compact: Codex default".to_string(),
+                _ => " auto-compact: the backend's default".to_string(),
             };
             l.push(Line::from(Span::styled(note, theme::faint())));
             if shown >= 50 && !a.compacting {

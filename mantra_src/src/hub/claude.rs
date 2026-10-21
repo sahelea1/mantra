@@ -20,16 +20,15 @@
 //! only `Cmd::Respond`/`RespondErr` whose id starts with `cc-call-` get routed back down to the
 //! bridge instead of being Codex-only no-ops.
 
-use super::{AgentId, Cmd, Exit, HubEvent, SpawnSpec};
+use super::{activity, compaction, hold_text, read_ndjson, read_stderr_tail, stderr_tail_text, stdin_lost, token_usage, wait_or_kill, write_line, AgentId, Cmd, Exit, HubEvent, LineIn, SpawnSpec, StderrTail, Totals};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::io::AsyncWriteExt;
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 /// Claude-only spawn configuration, resolved by `app::spawn_agent` from the model's `ProviderEntry`
@@ -105,22 +104,27 @@ pub(super) async fn run_claude_process(
     // every time: `Exit::LaunchFailed` gets the short budget, a crash after `Ready` the long one.
     let mut ready = false;
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<LineIn>();
-    tokio::spawn(read_lines(stdout, line_tx));
-    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-    tokio::spawn(read_stderr(stderr, stderr_tail.clone()));
+    tokio::spawn(read_ndjson(stdout, line_tx, format!("claude {id}"), is_heartbeat));
+    let stderr_tail = StderrTail::default();
+    tokio::spawn(read_stderr_tail(stderr, stderr_tail.clone(), "claude"));
 
     let mut tr = Translator::new(id, cs.autocompact, cs.auth != "api_key");
     // MCP bridge state (WP10.4): `None` until a `Cmd::Bridge` hands over a live connection (or after
     // it closes / this process is about to be replaced by a restart). `bridge_rx` is polled in the
-    // select loop below only while it's `Some` (`recv_bridge`).
+    // select loop below only while it's `Some` (`recv_bridge`). What comes in on it is either
+    // `{"list":true}` (the bridge's `tools/list`, asking for this role's tool array) or
+    // `{"call":"<n>","tool":"<name>","args":{…}}` (a `tools/call` to forward to the engine).
     let mut bridge_write: Option<OwnedWriteHalf> = None;
-    let mut bridge_rx: Option<mpsc::UnboundedReceiver<BridgeIn>> = None;
+    let mut bridge_rx: Option<mpsc::UnboundedReceiver<LineIn>> = None;
 
     loop {
         tokio::select! {
             c = cmds.recv() => {
+                // While a restart is pending the child is about to die: anything written to its
+                // stdin now would never get a reply, so text is held for the next process.
+                let Some(c) = hold_text(tr.restart_pending, replay, c.unwrap_or(Cmd::Shutdown)) else { continue };
                 match c {
-                    None | Some(Cmd::Shutdown) => {
+                    Cmd::Shutdown => {
                         if tr.turn_open {
                             let _ = write_line(&mut stdin, &control_request("shutdown")).await;
                             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -128,33 +132,27 @@ pub(super) async fn run_claude_process(
                         stop_child(&mut stdin, &mut child).await;
                         return Exit::Shutdown;
                     }
-                    Some(Cmd::Turn { text }) => {
-                        // While a restart is pending the child is about to die: anything written to
-                        // its stdin now would never get a reply, so hold it for the next process.
-                        if let Some(text) = hold_or_write(tr.restart_pending, replay, text) {
-                            *last_turn = Some(text.clone());
-                            if write_line(&mut stdin, &user_line(&text)).await.is_err() {
-                                let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
-                            }
+                    Cmd::Turn { text } => {
+                        *last_turn = Some(text.clone());
+                        if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+                            let _ = ev.send(stdin_lost(id, "claude", text));
                         }
                     }
-                    Some(Cmd::Steer { text }) => {
+                    Cmd::Steer { text } => {
                         // Claude does its own queueing: a line written mid-turn is injected at the
                         // next tool boundary (verified, §10.1) — Turn and Steer are the same wire op.
-                        if let Some(text) = hold_or_write(tr.restart_pending, replay, text) {
-                            // Steer only ever adds to an already-open turn, so fold it into
-                            // `last_turn` too: if this turn's result is a dead-resume phantom, the
-                            // fresh relaunch must requeue the steer along with the turn it joined.
-                            *last_turn = Some(match last_turn.take() {
-                                Some(t) => format!("{t}\n\n{text}"),
-                                None => text.clone(),
-                            });
-                            if write_line(&mut stdin, &user_line(&text)).await.is_err() {
-                                let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
-                            }
+                        // Steer only ever adds to an already-open turn, so fold it into `last_turn`
+                        // too: if this turn's result is a dead-resume phantom, the fresh relaunch
+                        // must requeue the steer along with the turn it joined.
+                        *last_turn = Some(match last_turn.take() {
+                            Some(t) => format!("{t}\n\n{text}"),
+                            None => text.clone(),
+                        });
+                        if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+                            let _ = ev.send(stdin_lost(id, "claude", text));
                         }
                     }
-                    Some(Cmd::Interrupt) => {
+                    Cmd::Interrupt => {
                         // Mirror the Codex path (`hub.rs`'s `current_turn`-gated `turn/interrupt`):
                         // only fire when a turn is actually open, and remember the request id so the
                         // matching `control_response` — not just any later one — is what arms
@@ -169,12 +167,12 @@ pub(super) async fn run_claude_process(
                             let _ = write_line(&mut stdin, &control_request(&reqid)).await;
                         }
                     }
-                    Some(Cmd::Compact) => { let _ = write_line(&mut stdin, &user_line("/compact")).await; }
-                    Some(Cmd::Archive) => {} // the session file stays on disk; nothing to do until Shutdown
-                    Some(Cmd::Shell { command }) => {
+                    Cmd::Compact => { let _ = write_line(&mut stdin, &user_line("/compact")).await; }
+                    Cmd::Archive => {} // the session file stays on disk; nothing to do until Shutdown
+                    Cmd::Shell { command } => {
                         let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "shell", error: "the Claude Code backend doesn't support raw shell commands".into(), text: Some(command) });
                     }
-                    Some(Cmd::SetEffort(e)) => {
+                    Cmd::SetEffort(e) => {
                         *effort = e;
                         if !tr.turn_open {
                             stop_child(&mut stdin, &mut child).await;
@@ -182,7 +180,7 @@ pub(super) async fn run_claude_process(
                         }
                         tr.restart_pending = true; // applied at the next idle moment, never mid-turn
                     }
-                    Some(Cmd::SetModel(m)) => {
+                    Cmd::SetModel(m) => {
                         *model = m;
                         if !tr.turn_open {
                             stop_child(&mut stdin, &mut child).await;
@@ -191,16 +189,16 @@ pub(super) async fn run_claude_process(
                         tr.restart_pending = true;
                     }
                     // Claude Code sessions have no title API: the run's name stays on Mantra's side.
-                    Some(Cmd::SetName(_)) => {}
-                    Some(Cmd::SetApproval(_)) => {
+                    Cmd::SetName(_) => {}
+                    Cmd::SetApproval(_) => {
                         // Only "never" (--dangerously-skip-permissions) is modeled until Role.permission
                         // (WP3) lands in a later batch; every Claude agent runs unattended for now.
                     }
-                    Some(Cmd::Restart) => {
+                    Cmd::Restart => {
                         stop_child(&mut stdin, &mut child).await;
                         return Exit::Restarting { reason: "restart requested".into(), fresh: false };
                     }
-                    Some(Cmd::Respond { id: rid, result }) => {
+                    Cmd::Respond { id: rid, result } => {
                         if let Some(call) = rid.as_str().and_then(|s| s.strip_prefix("cc-call-")) {
                             let success = result.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
                             let text = result.pointer("/contentItems/0/text").and_then(|t| t.as_str()).unwrap_or("");
@@ -209,15 +207,15 @@ pub(super) async fn run_claude_process(
                         // else: not a bridge call id — nothing else on the Claude backend consumes
                         // `Cmd::Respond` yet (there's no other kind of request it ever originates).
                     }
-                    Some(Cmd::RespondErr { id: rid, message }) => {
+                    Cmd::RespondErr { id: rid, message } => {
                         if let Some(call) = rid.as_str().and_then(|s| s.strip_prefix("cc-call-")) {
                             reply_bridge_call(&mut bridge_write, call, false, &message, id).await;
                         }
                     }
-                    Some(Cmd::Bridge(stream)) => {
+                    Cmd::Bridge(stream) => {
                         let (rd, wr) = stream.into_split();
                         let (btx, brx) = mpsc::unbounded_channel();
-                        tokio::spawn(read_bridge_lines(rd, btx));
+                        tokio::spawn(read_ndjson(rd, btx, format!("mcp bridge {id}"), |_| true));
                         bridge_write = Some(wr);
                         bridge_rx = Some(brx);
                         crate::mlog!("agent {id}: mcp bridge connected");
@@ -226,7 +224,7 @@ pub(super) async fn run_claude_process(
             }
             b = recv_bridge(&mut bridge_rx), if bridge_rx.is_some() => {
                 match b {
-                    Some(BridgeIn::Line(v)) => {
+                    Some(LineIn::Line(v)) => {
                         if v.get("list").and_then(|x| x.as_bool()) == Some(true) {
                             if let Some(w) = bridge_write.as_mut() {
                                 let _ = write_line(w, &mcp_tool_list(&spec.dynamic_tools)).await;
@@ -237,7 +235,7 @@ pub(super) async fn run_claude_process(
                             let _ = ev.send(HubEvent::Request { agent: id, id: json!(format!("cc-call-{call}")), method: "item/tool/call".into(), params: json!({"tool": tool, "arguments": args}) });
                         }
                     }
-                    Some(BridgeIn::Closed) | None => {
+                    Some(LineIn::Closed) | None => {
                         crate::mlog!("agent {id}: mcp bridge connection closed");
                         bridge_write = None;
                         bridge_rx = None;
@@ -246,13 +244,9 @@ pub(super) async fn run_claude_process(
             }
             l = line_rx.recv() => {
                 match l {
-                    Some(LineIn::Value(v)) => {
-                        if !is_heartbeat(&v) {
-                            crate::mlog!("claude {id}: {}", crate::util::trunc(&v.to_string(), 200));
-                        }
+                    Some(LineIn::Line(v)) => {
                         for e in tr.on_line(&v, is_restart) {
-                            // Mirrors `run_process` (hub.rs): replay is drained after `Ready` is
-                            // sent, in both backends.
+                            // As in every backend, `replay` is drained right after `Ready` is sent.
                             let is_ready = matches!(e, HubEvent::Ready { .. });
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
@@ -265,7 +259,7 @@ pub(super) async fn run_claude_process(
                                 for text in replay.drain(..) {
                                     *last_turn = Some(text.clone());
                                     if write_line(&mut stdin, &user_line(&text)).await.is_err() {
-                                        let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "turn", error: "failed to write to claude's stdin".into(), text: Some(text) });
+                                        let _ = ev.send(stdin_lost(id, "claude", text));
                                     }
                                 }
                             }
@@ -288,7 +282,7 @@ pub(super) async fn run_claude_process(
                     Some(LineIn::Closed) | None => {
                         let code = super::reap_exit_code(&mut child).await;
                         let code_s = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
-                        let tail = stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join(" / ")).unwrap_or_default();
+                        let tail = stderr_tail_text(&stderr_tail, " / ");
                         let reason = if tail.trim().is_empty() { format!("claude exited (code {code_s})") } else { format!("claude exited (code {code_s}): {tail}") };
                         return if ready { Exit::Crashed(reason) } else { Exit::LaunchFailed(reason) };
                     }
@@ -299,7 +293,8 @@ pub(super) async fn run_claude_process(
 }
 
 /// The CLI's own progress ticks (`system/thinking_tokens` every second or two while the model
-/// thinks, `tool_progress` while a tool runs): folded into activity, never worth a log line each.
+/// thinks, `tool_progress` while a tool runs): folded into activity, never worth a log line each
+/// (`read_ndjson` logs every other line).
 /// Deliberately not here: `autocompact_state` (once per session) and `rate_limit_event` (once per
 /// turn) — both are rare and both say something about the account worth keeping in `mantra.log`.
 fn is_heartbeat(v: &Value) -> bool {
@@ -318,36 +313,13 @@ fn user_line(text: &str) -> Value {
     json!({"type": "user", "message": {"role": "user", "content": text}})
 }
 
-/// Writes one NDJSON line and flushes — used for both `claude`'s stdin and a live bridge write half
-/// (`OwnedWriteHalf`), so the MCP-bridge reply path (WP10.4) doesn't need its own copy.
-async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, v: &Value) -> std::io::Result<()> {
-    w.write_all(v.to_string().as_bytes()).await?;
-    w.write_all(b"\n").await?;
-    w.flush().await
-}
-
 /// Ends the child gracefully instead of a bare `kill()`: shuts its stdin down (the CLI treats that
 /// as "no more input coming"), gives it up to 1.5s to exit on its own, and only kills it if it
 /// hasn't — a SIGKILL landing right after an interrupted turn is the likely cause of a `--resume`d
 /// session coming back unusable forever (the CLI needs a moment to flush its session file to disk).
 async fn stop_child(stdin: &mut ChildStdin, child: &mut Child) {
     let _ = stdin.shutdown().await;
-    if tokio::time::timeout(Duration::from_millis(1500), child.wait()).await.is_err() {
-        let _ = child.kill().await;
-    }
-}
-
-/// Decides what to do with one `Cmd::Turn`/`Cmd::Steer`'s text: while a restart is pending the
-/// child is about to die, so writing to its stdin now would just be lost — hold the text in
-/// `replay` instead (delivered once the next process reaches `Ready`) and return `None`. Otherwise
-/// returns the text unchanged, for the caller to write as it always did.
-fn hold_or_write(restart_pending: bool, replay: &mut Vec<String>, text: String) -> Option<String> {
-    if restart_pending {
-        replay.push(text);
-        None
-    } else {
-        Some(text)
-    }
+    wait_or_kill(child, Duration::from_millis(1500)).await;
 }
 
 /// Answers one pending bridge call: `{"call": <n>, "ok": <bool>, "text": <string>}`, per §10.4's
@@ -364,42 +336,10 @@ async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str
     }
 }
 
-/// One line read from a live bridge connection: either `{"list":true}` (the bridge's `tools/list`
-/// asking for this role's tool array) or `{"call":"<n>","tool":"<name>","args":{…}}` (a `tools/call`
-/// to forward to the engine as `HubEvent::Request`) — see the module doc comment and §10.4.
-enum BridgeIn {
-    Line(Value),
-    Closed,
-}
-
-async fn read_bridge_lines(rd: OwnedReadHalf, tx: mpsc::UnboundedSender<BridgeIn>) {
-    let mut lines = BufReader::new(rd).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(l)) => {
-                let l = l.trim();
-                if l.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(l) {
-                    Ok(v) => {
-                        if tx.send(BridgeIn::Line(v)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => crate::mlog!("bad json from mcp-bridge: {e}: {}", crate::util::trunc(l, 200)),
-                }
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    let _ = tx.send(BridgeIn::Closed);
-}
-
 /// `bridge_rx.recv()` when there's a live connection, else pends forever so the `tokio::select!`
 /// arm polling it (guarded by `if bridge_rx.is_some()`) simply never fires — the same "optional
 /// branch" pattern `hub.rs` doesn't need because Codex has no equivalent side channel.
-async fn recv_bridge(rx: &mut Option<mpsc::UnboundedReceiver<BridgeIn>>) -> Option<BridgeIn> {
+async fn recv_bridge(rx: &mut Option<mpsc::UnboundedReceiver<LineIn>>) -> Option<LineIn> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
@@ -513,54 +453,6 @@ fn apply_env(command: &mut Command, spec: &SpawnSpec, cs: &ClaudeSpawn) {
     // never has to read `config::ProviderEntry` itself — never on argv, never logged.
     for (k, v) in &spec.envs {
         command.env(k, v);
-    }
-}
-
-enum LineIn {
-    Value(Value),
-    Closed,
-}
-
-async fn read_lines(stdout: ChildStdout, tx: mpsc::UnboundedSender<LineIn>) {
-    let mut lines = BufReader::with_capacity(1 << 16, stdout).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(line) {
-                    Ok(v) => {
-                        if tx.send(LineIn::Value(v)).is_err() {
-                            return;
-                        }
-                    }
-                    // Non-JSON lines (e.g. `[claude-code:unrecognized_model] …`) land on stderr in
-                    // practice, but tolerate one on stdout too rather than crash the reader.
-                    Err(e) => crate::mlog!("bad json from claude: {e}: {}", crate::util::trunc(line, 200)),
-                }
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    let _ = tx.send(LineIn::Closed);
-}
-
-async fn read_stderr(stderr: ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {
-    const TAIL_LINES: usize = 5;
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(l)) = lines.next_line().await {
-        crate::mlog!("[claude stderr] {}", crate::util::trunc(&l, 400));
-        let clean = crate::util::strip_ansi(&l);
-        if !clean.trim().is_empty() {
-            if let Ok(mut t) = tail.lock() {
-                t.push_back(clean);
-                while t.len() > TAIL_LINES {
-                    t.pop_front();
-                }
-            }
-        }
     }
 }
 
@@ -680,9 +572,9 @@ impl Translator {
         }
     }
 
-    /// The running totals a gauge update carries: (tokens so far, of which cached, window).
-    fn totals(&self) -> (u64, u64, Option<u64>) {
-        (self.total_tokens, self.cached_tokens, self.window())
+    /// The running totals a gauge update carries.
+    fn totals(&self) -> Totals {
+        Totals { tokens: self.total_tokens, cached: self.cached_tokens, window: self.window() }
     }
 
     /// Fold an API `usage` object (an `assistant` message's, or `result`'s) into the running
@@ -703,7 +595,7 @@ impl Translator {
         }
         self.last_ctx = (input, output);
         self.turn_msgs += 1;
-        out.push(token_usage(self.agent, input, output, Some(self.totals())));
+        out.push(token_usage(self.agent, input, output, self.totals()));
         true
     }
 
@@ -757,19 +649,12 @@ impl Translator {
                 // else: the repeat after /compact — never a second Ready.
             }
             "compact_boundary" => {
-                // Same from→to dance Codex's own `contextCompaction` item uses (agent.rs): a
-                // tokenUsage update sets `ctx_used`, the item captures it as `from`, and the
-                // tokenUsage update after `item/completed` fills in `to` once it's lower.
                 self.ensure_turn_open(out);
                 let meta = v.get("compact_metadata");
                 let pre = meta.and_then(|m| m.get("pre_tokens")).and_then(as_u64).unwrap_or(0);
                 let post = meta.and_then(|m| m.get("post_tokens")).and_then(as_u64).unwrap_or(0);
                 let id = format!("cc-compact-{}", v.get("uuid").and_then(|x| x.as_str()).unwrap_or("0"));
-                let totals = self.totals();
-                out.push(token_usage(self.agent, pre, 0, Some(totals)));
-                out.push(HubEvent::Notif { agent: self.agent, method: "item/started".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
-                out.push(HubEvent::Notif { agent: self.agent, method: "item/completed".into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) });
-                out.push(token_usage(self.agent, post, 0, Some(totals)));
+                out.extend(compaction(self.agent, &id, pre, post, self.totals()));
                 self.last_ctx = (post, 0);
             }
             "thinking_tokens" => {
@@ -828,7 +713,7 @@ impl Translator {
         // changed what it would show *and* real counts are already there to hang it on.
         if after != before && self.last_ctx != (0, 0) {
             let (input, output) = self.last_ctx;
-            out.push(token_usage(agent, input, output, Some((self.total_tokens, self.cached_tokens, after))));
+            out.push(token_usage(agent, input, output, Totals { tokens: self.total_tokens, cached: self.cached_tokens, window: after }));
         }
     }
 
@@ -954,7 +839,7 @@ impl Translator {
                 // The gauge already tracks the last call's context; re-emit it so a window first
                 // learned from this very `result` reaches the agent too.
                 let (input, output) = self.last_ctx;
-                out.push(token_usage(self.agent, input, output, Some(self.totals())));
+                out.push(token_usage(self.agent, input, output, self.totals()));
             } else {
                 // No per-call usage came through (an older CLI, or a turn with no assistant
                 // line): `result.usage` is the best available estimate.
@@ -1001,32 +886,6 @@ impl Translator {
         self.pending_interrupt_request = None; // any request left unacked when the turn closed is stale
         self.open_tools.clear(); // any tool call left dangling when the turn ended is stale
     }
-}
-
-/// A liveness tick for `Agent`: bumps `last_event` (watchdog, stall tripwire) and optionally
-/// relabels the activity — a Mantra-only method, see `Agent::apply`.
-fn activity(agent: AgentId, label: Option<&str>) -> HubEvent {
-    let params = match label {
-        Some(l) => json!({"activity": l}),
-        None => json!({}),
-    };
-    HubEvent::Notif { agent, method: "mantra/activity".into(), params }
-}
-
-/// Builds a `thread/tokenUsage/updated` params value. `last_out` almost always 0 by construction —
-/// callers fold everything Codex's own `ctx_used = last.inputTokens + last.outputTokens` should
-/// count (input + cache_read + cache_creation, per §10.3) into `last_in` up front, so the sum comes
-/// out exactly right without agent.rs needing to know about Claude's separate cache-token fields.
-/// A Codex-shaped `thread/tokenUsage/updated`: the last call's context, and the thread's
-/// running totals (tokens, of which cached, context window) when the translator has them.
-fn token_usage(agent: AgentId, last_in: u64, last_out: u64, totals: Option<(u64, u64, Option<u64>)>) -> HubEvent {
-    let mut tu = json!({"last": {"inputTokens": last_in, "outputTokens": last_out}});
-    let (total, cached) = totals.map(|(t, c, _)| (t, c)).unwrap_or((last_in + last_out, 0));
-    tu["total"] = json!({"totalTokens": total, "cachedInputTokens": cached});
-    if let Some((_, _, Some(w))) = totals {
-        tu["modelContextWindow"] = json!(w);
-    }
-    HubEvent::Notif { agent, method: "thread/tokenUsage/updated".into(), params: json!({"tokenUsage": tu}) }
 }
 
 /// Classifies a `codexErrorInfo`-shaped key so `agent::classify`/`refine` (unchanged) map it to the
@@ -1105,6 +964,7 @@ mod tests {
             backend: crate::config::ProviderKind::ClaudeCode,
             envs: vec![],
             claude: None,
+            bija: None,
         };
         let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None };
         let args = build_args(1, &spec, &cs, "sonnet5", "high", "abc-123", true, &[]);
@@ -1137,6 +997,7 @@ mod tests {
             backend: crate::config::ProviderKind::ClaudeCode,
             envs: vec![],
             claude: None,
+            bija: None,
         };
         let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")) };
         let args = build_args(7, &spec, &cs, "sonnet5", "high", "abc-123", false, &[]);
@@ -1600,18 +1461,5 @@ mod tests {
         let result = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 1200, "result": "[Request interrupted by user]"});
         tr.on_line(&result, true);
         assert!(!tr.fresh_restart_pending, "duration_api_ms > 0 means a real call happened — never a phantom");
-    }
-
-    /// `hold_or_write`'s pure decision, factored out of `run_claude_process`'s `Cmd::Turn`/`Cmd::Steer`
-    /// arms: while a restart is pending, texts are held in `replay` — never written — and come out in
-    /// the order they arrived; once the flag clears, texts pass straight through again.
-    #[test]
-    fn turns_are_held_in_order_while_a_restart_is_pending_and_pass_through_once_it_clears() {
-        let mut replay = vec![];
-        assert_eq!(hold_or_write(true, &mut replay, "a".into()), None);
-        assert_eq!(hold_or_write(true, &mut replay, "b".into()), None);
-        assert_eq!(replay, vec!["a".to_string(), "b".to_string()], "held texts come out in the order they arrived");
-        assert_eq!(hold_or_write(false, &mut replay, "c".into()), Some("c".to_string()), "no restart pending: pass straight through, untouched");
-        assert_eq!(replay, vec!["a".to_string(), "b".to_string()], "a passed-through text is never also held");
     }
 }

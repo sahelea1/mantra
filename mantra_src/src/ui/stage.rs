@@ -556,7 +556,11 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                 (V::Retrying, _) => {
                     let t = match w.map(|w| &w.state) {
                         Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
-                        _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
+                        // a process coming back says which one, not "retrying · restarting"
+                        _ => match a {
+                            Some(a) if a.activity == "restarting" || a.activity == "relaunching" => format!("{} {}", match a.backend { crate::config::ProviderKind::ClaudeCode => "claude", crate::config::ProviderKind::Bija => "bija", crate::config::ProviderKind::Codex => "codex" }, a.activity),
+                            _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
+                        },
                     };
                     vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
                 }
@@ -703,7 +707,7 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         (true, _) => vec![Span::styled(format!("{} plan ready · p to review · tab → a to approve · or type feedback", theme::g("☰", "=")), theme::bold(theme::accent()))],
         (_, _) if run.halted() => vec![Span::styled(format!("{} halted — {}", theme::g("⛔", "X"), run.halt_hint()), theme::fg(theme::AMBER))],
         (_, Some(Status::Failed(m))) | (_, Some(Status::Crashed(m))) => vec![Span::styled(trunc(m, (w as usize).saturating_sub(4)), theme::fg(theme::RED))],
-        (_, Some(Status::Retrying(m))) => vec![Span::styled(format!("retrying: {}", trunc(m, (w as usize).saturating_sub(14))), theme::fg(theme::AMBER))],
+        (_, Some(Status::Retrying(m))) => vec![Span::styled(Status::retrying_text(m, (w as usize).saturating_sub(14)), theme::fg(theme::AMBER))],
         (_, Some(Status::Starting)) | (_, None) => vec![Span::styled("starting codex…", theme::faint())],
         _ => vec![Span::styled("exploring the repo & designing phases…", theme::faint())],
     };
@@ -1136,7 +1140,7 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
     let col = theme::named(&a.color);
     let st = match &a.status {
         Status::Busy => format!("running {}", a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default()),
-        Status::Retrying(m) => format!("retrying: {}", trunc(m, 30)),
+        Status::Retrying(m) => Status::retrying_text(m, 30),
         Status::Failed(m) => format!("failed: {}", trunc(m, 30)),
         Status::Crashed(m) => format!("crashed: {}", trunc(m, 30)),
         s => format!("{s:?}").to_lowercase(),
@@ -1176,7 +1180,7 @@ mod tests {
     fn app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
     }
 

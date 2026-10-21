@@ -73,6 +73,31 @@ pub enum Status {
     Stopped,
 }
 
+/// What `Status::Retrying` holds while the process itself comes back (`HubEvent::Crashed`):
+/// "restarting (n)" after a crash, "relaunching" for a relaunch Mantra asked for.
+const RESTARTING: &str = "restarting (";
+const RELAUNCHING: &str = "relaunching";
+
+impl Status {
+    pub fn restarting(attempt: u32) -> Status {
+        Status::Retrying(format!("{RESTARTING}{attempt})"))
+    }
+
+    pub fn relaunching() -> Status {
+        Status::Retrying(RELAUNCHING.into())
+    }
+
+    /// A `Retrying` reason as one status phrase, `why` cut to `max`: a process coming back reads as
+    /// itself ("restarting (1)", every backend alike), a provider retry as "retrying: <why>".
+    pub fn retrying_text(why: &str, max: usize) -> String {
+        if why == RELAUNCHING || why.starts_with(RESTARTING) {
+            why.to_string()
+        } else {
+            format!("retrying: {}", crate::util::trunc(why, max))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ErrKind {
     Transient,
@@ -127,7 +152,7 @@ pub struct Agent {
     /// Provider id this agent's model runs on (set at spawn) — used to name the provider in
     /// halt messages (e.g. `ProviderRejected`).
     pub provider: String,
-    /// Which runtime this agent's process is (Codex app-server or Claude Code) — for wording only;
+    /// Which runtime this agent's process is (Codex app-server, Claude Code or bija) — for wording only;
     /// every protocol-level difference is handled in `hub`.
     pub backend: crate::config::ProviderKind,
     pub effort: String,
@@ -787,7 +812,8 @@ impl Agent {
                         .map(|a| a.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
                         .unwrap_or_default()
                 } else {
-                    item.get("result").map(|r| compact_json(r, 400)).unwrap_or_default()
+                    // A plain-text result (bija's built-ins) reads as text, not as a JSON string.
+                    item.get("result").map(|r| r.as_str().map(|t| crate::util::trunc(t, 400)).unwrap_or_else(|| compact_json(r, 400))).unwrap_or_default()
                 };
                 let it = self.get_or_insert(&id, Kind::Tool { name: name.clone(), args: String::new(), result: String::new(), status: String::new() });
                 if let Kind::Tool { name: n, args: a, result: r, status: st } = &mut it.kind {
@@ -863,7 +889,7 @@ impl Agent {
                 continue;
             }
             let line = match &it.kind {
-                Kind::User if it.text.starts_with("[mantra") || it.text.starts_with("[from ") => {
+                Kind::User if engine_sent(&it.text) => {
                     let first = it.text.lines().next().unwrap_or("");
                     let tag = first.split(']').next().unwrap_or("").trim_start_matches('[').replace("mantra:", "mantra · ");
                     format!("⇢ {tag}")
@@ -947,11 +973,30 @@ pub fn classify(info: &Value) -> ErrKind {
 /// /feedback …"). Nothing Mantra or the user can act on mid-run, so it never shows as the
 /// agent's line. (The fallback-metadata warning has its own, reworded note.)
 pub fn is_housekeeping_warning(msg: &str) -> bool {
-    msg.to_lowercase().contains("diagnostic log")
+    let m = msg.to_lowercase();
+    // bija's one-time "bwrap unavailable — commands run unsandboxed" is the same kind of note:
+    // the host's state, not the turn's, and Mantra's worktrees keep workers apart either way — on
+    // every card of an eighty-agent swarm it would only bury what matters.
+    m.contains("diagnostic log") || m.contains("bwrap unavailable")
 }
 
 /// The item-id prefix of a footnote (`Agent::footnote`).
 const FOOTNOTE: &str = "footnote-";
+
+/// A user-turn text that Mantra sent rather than a person typed: the engine's `[mantra:…]`
+/// prompts, the `[from the orchestrator]`-style relays (`[from the user]` among them — it is the
+/// stage's `@name …`, which callers that care tell apart themselves), and Akasha's mid-turn
+/// `[akasha · w2] …` pushes. One list, so the transcript, the card's line and the engine's "who
+/// asked" agree on it.
+pub fn engine_sent(text: &str) -> bool {
+    text.starts_with("[mantra") || text.starts_with("[from ") || is_akasha_push(text)
+}
+
+/// An Akasha push (`engine::akasha`): a note another member shared, steered into this turn.
+/// Nobody asked this agent anything with it.
+pub fn is_akasha_push(text: &str) -> bool {
+    text.starts_with("[akasha ")
+}
 
 /// "5.9M cached" for a token total of which `cached` was cached input, when that is worth a
 /// word: Codex's `total.totalTokens` counts every request's whole input, so a worker that
@@ -1220,6 +1265,22 @@ mod tests {
         // and Mantra's own info notices (a model switch) are real notices, not footnotes
         a.notice(Level::Info, "model → luna (luna-1)");
         assert_eq!(a.tail_lines(1), vec!["! model → luna (luna-1)".to_string()]);
+    }
+
+    /// An Akasha push is one of Mantra's messages, like `[mantra:…]` and the relays: the card
+    /// shows it as ⇢ with its tag, never as a line the user typed.
+    #[test]
+    fn akasha_pushes_read_as_mantras_messages() {
+        use super::*;
+        let mut a = Agent::new(1, "t", "worker", std::path::PathBuf::from("."));
+        a.push_user("[akasha · p1-b] the parser moved to src/parse.rs\n\n[akasha · p1-c] so did the lexer");
+        assert_eq!(a.tail_lines(1), vec!["⇢ akasha · p1-b".to_string()]);
+        a.push_user("add a test for it");
+        assert_eq!(a.tail_lines(1), vec!["› add a test for it".to_string()]);
+        for (text, sent) in [("[mantra:retry] go on", true), ("[from the orchestrator] which file?", true), ("[akasha · w2] a note", true), ("[akasha-like] typed by hand", false), ("akasha is neat", false)] {
+            assert_eq!(engine_sent(text), sent, "{text}");
+        }
+        assert!(is_akasha_push("[akasha · w2] a note") && !is_akasha_push("[mantra:retry] go on"));
     }
 
     /// `total.totalTokens` counts every request's whole input, so a worker in a big context

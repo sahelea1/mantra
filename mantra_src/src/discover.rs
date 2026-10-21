@@ -30,9 +30,28 @@ const CTX_KEYS: &[&str] = &[
 const NESTED: &[&str] = &["top_provider", "limits", "limit", "capabilities", "metadata", "meta", "info", "architecture"];
 const NOT_CHAT: &[&str] = &["embed", "whisper", "tts", "dall-e", "moderation", "rerank", "transcri", "speech", "audio", "image-gen", "text-to-image"];
 
+/// How a request presents its key: `Authorization: Bearer` (OpenAI and everything shaped like
+/// it), or the Messages API's own `x-api-key` with its version header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyHeader {
+    Bearer,
+    Anthropic,
+}
+
+/// The header a provider's own API expects: a Bija provider on the Messages wire speaks
+/// Anthropic's, everything else OpenAI's.
+pub fn key_header(p: &crate::config::ProviderEntry) -> KeyHeader {
+    if p.kind == crate::config::ProviderKind::Bija && p.bija_wire() == "anthropic" {
+        KeyHeader::Anthropic
+    } else {
+        KeyHeader::Bearer
+    }
+}
+
 /// `key` is the already-resolved API key (from `ProviderEntry::resolve_key`), if any — this
 /// function no longer looks at the environment itself, so a key pasted into `api_key` works too.
-pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<Found>, String> {
+/// `header` is how the provider wants it presented (`key_header`).
+pub fn list_models(base_url: &str, key: Option<&str>, header: KeyHeader) -> Result<Vec<Found>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("set the provider's base URL first".into());
@@ -43,20 +62,33 @@ pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<Found>, Stri
     }
     let mut last = String::new();
     for url in urls {
-        match curl_get(&url, key) {
+        match curl_get(&url, key, header) {
             Ok((200..=299, body)) => {
-                return parse_models(&body).ok_or_else(|| format!("{url} answered, but not with a model list: {}", crate::util::trunc(body.trim(), 120)));
+                return parse_models(&body).ok_or_else(|| format!("{url} answered, but not with a model list: {}", one_line(&body)));
             }
-            Ok((code, body)) => last = format!("HTTP {code} from {url}: {}", crate::util::trunc(body.trim(), 120)),
+            Ok((code, body)) => last = format!("HTTP {code} from {url}: {}", one_line(&body)),
             Err(e) => last = e,
         }
     }
     Err(last)
 }
 
-fn curl_get(url: &str, key: Option<&str>) -> Result<(u16, String), String> {
+/// What an answer says, on one line: the provider's own error message when the body is a JSON
+/// error (`{"error":{"message":…}}`, `{"message":…}`, `{"error":"…"}`), else the body with its
+/// whitespace folded. A pretty-printed error body would otherwise spill over the doctor row and
+/// the discovery line, and its first 120 characters are mostly braces.
+fn one_line(body: &str) -> String {
+    let said = serde_json::from_str::<Value>(body.trim()).ok().and_then(|v| v.pointer("/error/message").or_else(|| v.get("message")).or_else(|| v.get("error")).and_then(|m| m.as_str()).map(str::to_string));
+    let text = said.unwrap_or_else(|| body.to_string());
+    crate::util::trunc(&text.split_whitespace().collect::<Vec<_>>().join(" "), 120)
+}
+
+fn curl_get(url: &str, key: Option<&str>, header: KeyHeader) -> Result<(u16, String), String> {
     let mut c = Command::new("curl");
     c.args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/json", "-w", "\n%{http_code}"]);
+    if header == KeyHeader::Anthropic {
+        c.args(["-H", "anthropic-version: 2023-06-01"]);
+    }
     if key.is_some() {
         c.args(["-H", "@-"]);
     }
@@ -64,7 +96,10 @@ fn curl_get(url: &str, key: Option<&str>) -> Result<(u16, String), String> {
     let mut child = c.spawn().map_err(|e| format!("couldn't run curl ({e}) — is it installed?"))?;
     if let Some(mut stdin) = child.stdin.take() {
         if let Some(k) = key {
-            let _ = writeln!(stdin, "Authorization: Bearer {k}");
+            let _ = match header {
+                KeyHeader::Bearer => writeln!(stdin, "Authorization: Bearer {k}"),
+                KeyHeader::Anthropic => writeln!(stdin, "x-api-key: {k}"),
+            };
         }
     }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
@@ -300,6 +335,23 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_error_answer_is_quoted_on_one_line() {
+        let pretty = "{\n  \"error\": {\n    \"message\": \"Missing bearer authentication in header\",\n    \"type\": \"invalid_request_error\"\n  }\n}\n";
+        assert_eq!(one_line(pretty), "Missing bearer authentication in header");
+        assert_eq!(one_line(r#"{"message": "Unauthorized"}"#), "Unauthorized");
+        assert_eq!(one_line(r#"{"error": "invalid key"}"#), "invalid key");
+        assert_eq!(one_line("<html>\n  <body>404 Not Found</body>\n</html>"), "<html> <body>404 Not Found</body> </html>");
+        assert!(!one_line(&"x ".repeat(400)).contains('\n') && one_line(&"x ".repeat(400)).chars().count() <= 120);
+    }
+    #[test]
+    fn a_messages_wire_bija_provider_presents_its_key_the_anthropic_way() {
+        use crate::config::{ProviderEntry, ProviderKind};
+        let messages = ProviderEntry { kind: ProviderKind::Bija, wire: "anthropic".into(), ..Default::default() };
+        assert_eq!(key_header(&messages), KeyHeader::Anthropic);
+        assert_eq!(key_header(&ProviderEntry { wire: String::new(), ..messages.clone() }), KeyHeader::Bearer);
+        assert_eq!(key_header(&ProviderEntry { kind: ProviderKind::Codex, ..messages }), KeyHeader::Bearer, "only a Bija provider has a wire");
+    }
     #[test]
     fn claude_defaults_are_new_candidates_with_known_context_and_efforts() {
         let cands = claude_defaults("claude2");

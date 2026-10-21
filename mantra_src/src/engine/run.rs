@@ -366,6 +366,14 @@ pub struct PhaseRecord {
 }
 
 pub struct Run {
+    /// Akasha blocks by group name (experimental; empty unless the feature is on and the pattern has
+    /// `[[groups]]`). See `engine::akasha`.
+    pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
+    /// `experimental = ["akasha"]` was on when the app made this run (`enable_akasha`). Off, a
+    /// pattern's groups are inert: no tools, no notes in prompts, no pushes, no entries.
+    pub akasha_enabled: bool,
+    /// Pushes waiting for their member and the Conductor's own bookkeeping. Runtime-only.
+    pub(super) akasha_live: super::akasha::Live,
     pub id: String,
     /// What the run is called for people: the plan's title once the plan is submitted, the goal's
     /// first words before that. The id stays the stable key.
@@ -503,7 +511,7 @@ pub struct Run {
     manager_watchdog: Option<ManagerCase>,
     /// Agents whose turn ended with `mantra_wait` (or a `mantra_status` with nothing new): a tool
     /// call they make in that same turn is refused. Runtime-only; cleared when the turn ends.
-    yielded: HashSet<AgentId>,
+    pub(super) yielded: HashSet<AgentId>,
     /// Yielded agents already interrupted for a refused tool call this turn, so the interrupt goes
     /// out once. Runtime-only.
     yield_interrupted: HashSet<AgentId>,
@@ -534,6 +542,9 @@ impl Run {
         let dir = crate::config::runs_dir(&project).join(&id);
         let title = title_from_goal(&brief);
         Run {
+            akasha: std::collections::BTreeMap::new(),
+            akasha_enabled: false,
+            akasha_live: Default::default(),
             id,
             title,
             dir,
@@ -746,6 +757,7 @@ impl Run {
             workers,
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
+            akasha: self.akasha.clone(),
         }
         .save(&self.dir);
     }
@@ -798,6 +810,9 @@ impl Run {
         if let Some(m) = self.slot_models.get(slot) {
             role.model = m.clone();
         }
+        // `{max_parallel}` (the swarm's planner and orchestrator) is this run's number, not the
+        // pattern file's: `--swarm 24` lives only in the run's own copy of the pattern.
+        role.instructions = super::pattern::with_max_parallel(&role.instructions, self.pattern.settings.max_parallel);
         role
     }
 
@@ -997,7 +1012,7 @@ impl Run {
             if Some(a) == except || !live.contains(&a) || self.edges.get(&a).map(|t| *t >= t0).unwrap_or(false) {
                 continue;
             }
-            ctx.prompt(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into());
+            ctx.prompt(a, self.with_akasha(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into()));
         }
         self.wake_orch(ctx);
     }
@@ -1248,7 +1263,7 @@ Then summarize in 2-4 lines.",
             HaltReason::ProviderRejected => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
                 if h.message.to_lowercase().contains("message role") {
-                    format!("this provider rejects Codex's developer messages — use it through Claude Code (kind = claude-code) or m switch model for {who}")
+                    format!("this provider rejects Codex's developer messages — use it through bija (kind = bija) or Claude Code (kind = claude-code), or m switch model for {who}")
                 } else {
                     format!("m switch model for {who}, then space resumes")
                 }
@@ -1418,7 +1433,7 @@ Then summarize in 2-4 lines.",
         format!("agent-{a}")
     }
 
-    fn worker_idx(&self, a: AgentId) -> Option<usize> {
+    pub(super) fn worker_idx(&self, a: AgentId) -> Option<usize> {
         self.workers.iter().position(|w| w.agent == Some(a))
     }
 
@@ -1632,6 +1647,7 @@ Then summarize in 2-4 lines.",
         // the run is ours from here: another Mantra must not resume it while this one lives
         self.owner.write(&self.dir);
         self.log("◈", "saffron", format!("run {} started with pattern {}", self.id, self.pattern.name));
+        self.akasha_start_note();
         let project = self.project.clone();
         let id = self.id.clone();
         let iso = self.pattern.settings.isolation.clone();
@@ -1661,6 +1677,7 @@ Then summarize in 2-4 lines.",
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
         };
+        let req = self.akasha_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -1751,14 +1768,14 @@ Then summarize in 2-4 lines.",
         self.mark_edge(orch);
         ctx.prompt(
             orch,
-            format!(
+            self.with_akasha(orch, format!(
                 "[mantra:phase] Phase {}/{}: {}\nGoal: {}\nOverall plan: {}\n\n{handoff}Current phase:\n```json\n{phase_json}\n```\nSpawn the tasks with mantra_spawn (sharpen prompts if useful), then call mantra_wait.",
                 idx + 1,
                 plan.phases.len(),
                 phase.name,
                 phase.goal,
                 plan.summary
-            ),
+            )),
         );
         self.save_state();
     }
@@ -1887,6 +1904,7 @@ Then summarize in 2-4 lines.",
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
         let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone() };
+        let req = self.akasha_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -1899,7 +1917,7 @@ Then summarize in 2-4 lines.",
         w.spawned = Instant::now();
         let tid = w.task.id.clone();
         self.mark_edge(id);
-        ctx.prompt(id, prompt);
+        ctx.prompt(id, self.with_akasha(id, prompt));
         self.log(&glyph, "violet", format!("{} {tid} ({rname})", if resumed { "re-attached" } else { "spawned" }));
         self.save_state();
     }
@@ -2072,7 +2090,7 @@ Then summarize in 2-4 lines.",
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
         };
-        let id = ctx.spawn(SpawnReq {
+        let id = ctx.spawn(self.akasha_req(SpawnReq {
             name: name.clone(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2085,10 +2103,10 @@ Then summarize in 2-4 lines.",
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role: role.clone(),
-        });
+        }));
         self.gate_agent = Some(id);
         self.mark_edge(id);
-        ctx.prompt(id, prompt);
+        ctx.prompt(id, self.with_akasha(id, prompt));
         self.log(&role.glyph, "green", format!("{name} gate started (round {round}, fresh agent)"));
         self.save_state();
     }
@@ -2326,7 +2344,7 @@ Then summarize in 2-4 lines.",
             }
             p
         } else {
-            ctx.spawn(SpawnReq {
+            ctx.spawn(self.akasha_req(SpawnReq {
                 name: step.role.clone(),
                 effort,
                 thread_name: self.thread_name(&step.role),
@@ -2339,7 +2357,7 @@ Then summarize in 2-4 lines.",
                 network: self.pattern.settings.network,
                 writable_roots: self.pattern.settings.writable_roots.clone(),
                 role: role.clone(),
-            })
+            }))
         };
         if let Some(prev) = self.finale_agent {
             if Some(prev) != self.planner && prev != agent {
@@ -2349,7 +2367,7 @@ Then summarize in 2-4 lines.",
         }
         self.finale_agent = Some(agent);
         self.mark_edge(agent);
-        ctx.prompt(agent, prompt);
+        ctx.prompt(agent, self.with_akasha(agent, prompt));
         self.log(&role.glyph, "saffron", format!("finale {}/{} — {}", k + 1, steps.len(), step.role));
         self.save_state();
     }
@@ -2408,7 +2426,7 @@ Then summarize in 2-4 lines.",
                     self.stage = Stage::Planning;
                     let p = self.spawn_planner(ctx);
                     self.mark_edge(p);
-                    let prompt = self.planning_prompt();
+                    let prompt = self.with_akasha(p, self.planning_prompt());
                     ctx.prompt(p, prompt);
                     self.log("✦", "saffron", "planner is exploring and planning");
                 }
@@ -2780,7 +2798,7 @@ Then summarize in 2-4 lines.",
                     self.fail_run(ctx, "planner did not submit a valid plan".into());
                 } else {
                     self.mark_edge(a);
-                    ctx.prompt(a, "[mantra] You haven't submitted a valid plan yet. Call mantra_submit_plan with the full plan now.".into());
+                    ctx.prompt(a, self.with_akasha(a, "[mantra] You haven't submitted a valid plan yet. Call mantra_submit_plan with the full plan now.".into()));
                 }
             }
             return;
@@ -2832,7 +2850,7 @@ Then summarize in 2-4 lines.",
                             self.gate_nudges += 1;
                             self.log("◎", "amber", format!("gate round {round}: no report — asking the QA agent for its verdict"));
                             self.mark_edge(a);
-                            ctx.prompt(a, "[mantra:gate] You ended your turn without calling mantra_gate_report. Call it now with your verdict (pass, or fail with every finding: file, what is wrong, what to change).".into());
+                            ctx.prompt(a, self.with_akasha(a, "[mantra:gate] You ended your turn without calling mantra_gate_report. Call it now with your verdict (pass, or fail with every finding: file, what is wrong, what to change).".into()));
                         } else {
                             self.halt_and_escalate(ctx, HaltReason::GateExhausted, Some(a), format!("phase {} gate round {round}: the QA agent ended its turn without a report, twice", idx + 1));
                         }
@@ -2975,7 +2993,7 @@ Then summarize in 2-4 lines.",
                     self.workers[wi].state = WState::Running;
                     self.workers[wi].finished = None;
                     self.mark_edge(a);
-                    ctx.prompt(a, format!("[mantra:resume] The model gateway was down and your last turn failed; the run is resuming now. Your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}", self.workers[wi].prompt));
+                    ctx.prompt(a, self.with_akasha(a, format!("[mantra:resume] The model gateway was down and your last turn failed; the run is resuming now. Your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}", self.workers[wi].prompt)));
                 }
                 None => {
                     let (task, prompt, effort) = (self.workers[wi].task.clone(), self.workers[wi].prompt.clone(), self.workers[wi].effort.clone());
@@ -3028,6 +3046,7 @@ Then summarize in 2-4 lines.",
         if w.paused || w.state == WState::Cancelled {
             return;
         }
+        let before = w.state.clone();
         let tid = w.task.id.clone();
         let agent = w.agent;
         let mut fix_done: Option<(usize, u32)> = None;
@@ -3063,8 +3082,10 @@ Then summarize in 2-4 lines.",
                     let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
                     // Who asked for the follow-up: the user (typed in the zoomed view, or `@name …`,
                     // which arrives as "[from the user] …"), or the orchestrator / manager / Mantra.
-                    let last_ask = agent.and_then(|a| ctx.agent(a)).and_then(|a| a.items.iter().rev().find(|i| matches!(i.kind, crate::agent::Kind::User))).map(|i| i.text.clone()).unwrap_or_default();
-                    let by_you = again && (last_ask.starts_with("[from the user]") || !(last_ask.starts_with("[mantra") || last_ask.starts_with("[from ")));
+                    // An Akasha push that landed in the answering turn asked nothing: the ask is
+                    // the last message before it.
+                    let last_ask = agent.and_then(|a| ctx.agent(a)).and_then(|a| a.items.iter().rev().find(|i| matches!(i.kind, crate::agent::Kind::User) && !crate::agent::is_akasha_push(&i.text))).map(|i| i.text.clone()).unwrap_or_default();
+                    let by_you = again && (last_ask.starts_with("[from the user]") || !crate::agent::engine_sent(&last_ask));
                     let what = match (again, by_you) {
                         (false, _) => "done",
                         (true, true) => "done again (after your message)",
@@ -3120,6 +3141,7 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
+        self.akasha_task_ended(ctx, wi, &before);
         if let Some((idx, round)) = fix_done {
             self.on_fix_done(ctx, idx, round);
         }
@@ -3179,7 +3201,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         if restarting {
-            self.log("↻", "amber", format!("{n}: process crashed ({}) — restarting & resuming", trunc(reason, 50)));
+            self.log("↻", "amber", format!("{n}: {} — restarting & resuming", trunc(reason, 50)));
         } else {
             // Keep the backend's own error line (`codex exited (code 1): …/proc/self/exe…`): it is
             // what tells installation apart from protocol, provider or sandbox trouble.
@@ -3201,7 +3223,7 @@ Then summarize in 2-4 lines.",
         let stopped = ctx.agent(a).map(|x| x.stopped_by_user).unwrap_or(false);
         if resumed && was_busy && self.is_active() && !stopped {
             self.mark_edge(a);
-            ctx.prompt(a, "[mantra:resume] Your process restarted mid-task. Continue exactly where you left off.".into());
+            ctx.prompt(a, self.with_akasha(a, "[mantra:resume] Your process restarted mid-task. Continue exactly where you left off.".into()));
         }
         self.wake_orch(ctx);
     }
@@ -3234,7 +3256,7 @@ Then summarize in 2-4 lines.",
                 self.workers[wi].state = WState::Running;
             }
             self.mark_edge(a);
-            ctx.prompt(a, m);
+            ctx.prompt(a, self.with_akasha(a, m));
         }
         // stall + budget tripwires
         let stall = Duration::from_secs(self.pattern.settings.stall_minutes * 60);
@@ -3260,6 +3282,7 @@ Then summarize in 2-4 lines.",
             self.log("⚠", "amber", e.clone());
             self.orch_event(ctx, e);
         }
+        self.akasha_tick(ctx);
         self.review_tick(ctx);
         self.watchdog_tick(ctx);
         self.wake_orch(ctx);
@@ -3532,7 +3555,7 @@ Then summarize in 2-4 lines.",
                 };
                 self.log("⏰", "amber", format!("{name} idle {secs}s — nudging (watchdog)"));
                 self.mark_edge(a);
-                ctx.prompt(a, format!("[mantra:watchdog] You are expected to be {what} but have been idle for {secs}s. Continue, or call mantra_wait/mantra_log to say why you are waiting."));
+                ctx.prompt(a, self.with_akasha(a, format!("[mantra:watchdog] You are expected to be {what} but have been idle for {secs}s. Continue, or call mantra_wait/mantra_log to say why you are waiting.")));
             }
             2 => {
                 if Some(a) == self.orchestrator {
@@ -3721,6 +3744,7 @@ Then summarize in 2-4 lines.",
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
         };
+        let req = self.akasha_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
@@ -3741,7 +3765,7 @@ Then summarize in 2-4 lines.",
         let glyph = self.role(&self.pattern.flow.manager.clone()).glyph;
         self.log(&glyph, "blue", "manager started — it supervises the whole run");
         self.mark_edge(id);
-        let brief = self.manager_brief("You manage this run.");
+        let brief = self.with_akasha(id, self.manager_brief("You manage this run."));
         ctx.prompt(id, brief);
         Some(id)
     }
@@ -3889,7 +3913,8 @@ Then summarize in 2-4 lines.",
                 self.continue_queue.retain(|(a, t, _)| !(*a == m && *t <= now));
                 self.mark_edge(m);
                 for msg in due {
-                    ctx.prompt(m, msg);
+                    // a manager in a group gets its notes on a retry like every member (`tick`)
+                    ctx.prompt(m, self.with_akasha(m, msg));
                 }
             }
         }
@@ -3980,7 +4005,7 @@ Then summarize in 2-4 lines.",
         if let Some(c) = &self.manager_watchdog {
             prompt.push_str(&format!("\n\nOPEN WATCHDOG CASE — {} has been idle and nobody got it moving. Find out why (mantra_log) and get it moving: mantra_prompt, mantra_respawn / mantra_retry, mantra_set_effort, or mantra_brief_orchestrator.", c.about));
         }
-        ctx.prompt(id, prompt);
+        ctx.prompt(id, self.with_akasha(id, prompt));
         self.log("↻", "violet", "manager respawned (watchdog/manual)");
     }
 
@@ -3990,7 +4015,7 @@ Then summarize in 2-4 lines.",
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
         let role = self.role_for_slot("orchestrator", &name);
-        let id = ctx.spawn(SpawnReq {
+        let id = ctx.spawn(self.akasha_req(SpawnReq {
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4003,7 +4028,7 @@ Then summarize in 2-4 lines.",
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             role,
-        });
+        }));
         self.orchestrator = Some(id);
         id
     }
@@ -4077,7 +4102,7 @@ Then summarize in 2-4 lines.",
         } else {
             self.planning_prompt()
         };
-        ctx.prompt(id, join_note(note, resume));
+        ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
         self.log("↻", "violet", "planner respawned (watchdog/manual)");
     }
 
@@ -4096,7 +4121,7 @@ Then summarize in 2-4 lines.",
             idx + 1,
             total
         );
-        ctx.prompt(id, join_note(note, resume));
+        ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
         self.log("↻", "violet", "orchestrator respawned (watchdog/manual)");
     }
 
@@ -4246,7 +4271,7 @@ Then summarize in 2-4 lines.",
                             self.workers[wi].paused = false;
                         }
                         self.mark_edge(t);
-                        ctx.prompt(t, "[mantra:resume] Continue your task.".into());
+                        ctx.prompt(t, self.with_akasha(t, "[mantra:resume] Continue your task.".into()));
                         done.push(n);
                     }
                 }
@@ -4524,6 +4549,7 @@ Then summarize in 2-4 lines.",
                 let r = self.spawn_task(ctx, task, None, None);
                 (format!("{r}. Call mantra_wait; you'll be woken when fixes finish."), true)
             }
+            t if t.starts_with("mantra_akasha_") => self.akasha_tool(ctx, a, t, args),
             other => (format!("tool '{other}' is not available here"), false),
         }
     }
@@ -4840,6 +4866,8 @@ mod halt_tests {
         sandbox: String,
         model: String,
         context_override: Option<u64>,
+        /// The names of the tools it was offered.
+        tools: Vec<String>,
     }
     impl TestCtx {
         fn new() -> TestCtx {
@@ -4913,7 +4941,8 @@ mod halt_tests {
             let id = self.next;
             self.next += 1;
             self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
-            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override });
+            let tools = r.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from)).collect();
+            self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools });
             self.spawned_instructions.push((id, r.instructions));
             self.spawned_models.push((id, r.role.model));
             id
@@ -4950,6 +4979,427 @@ mod halt_tests {
         }
         fn notify(&mut self, text: &str) {
             self.notified.push(text.to_string());
+        }
+    }
+
+    /// Akasha (experimental) in the Conductor: the block table, tool dispatch, what members are
+    /// told, pushes to busy members, the Conductor's own entries, and the feature switched off.
+    mod akasha {
+        use super::*;
+        use crate::engine::pattern::Group;
+        use crate::engine::state::RunState;
+
+        fn grouped(push: &str, auto: bool, cap: usize) -> Pattern {
+            let mut p = Pattern::builtin();
+            p.groups = vec![Group { name: "builders".into(), roles: vec!["worker-big".into(), "worker-small".into()], shared_chars: cap, push: push.into(), auto }];
+            p
+        }
+
+        /// A run of `pattern` in its first phase, Akasha `on`, writing into a scratch dir of its own.
+        fn run_of(pattern: Pattern, on: bool, tag: &str) -> Run {
+            let mut run = Run::new(PathBuf::from("."), pattern, "build it".into());
+            run.dir = scratch_dir(&format!("akasha-{tag}"));
+            run.enable_akasha(on);
+            run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+            run
+        }
+
+        /// A worker of a member role, running, its agent mid-turn.
+        fn member(ctx: &mut TestCtx, run: &mut Run, id: &str) -> AgentId {
+            let a = ctx.add_busy();
+            run.workers.push(mk_worker(id, "worker-small", a, WState::Running));
+            a
+        }
+
+        /// A worker of a member role started the way the Conductor starts one (spawn + brief).
+        fn spawn_member(ctx: &mut TestCtx, run: &mut Run, id: &str) -> AgentId {
+            let mut w = mk_worker(id, "worker-small", 0, WState::Preparing);
+            w.agent = None;
+            run.workers.push(w);
+            let wi = run.workers.len() - 1;
+            run.launch_worker(ctx, wi, PathBuf::from("."), String::new());
+            run.workers[wi].agent.expect("spawned")
+        }
+
+        fn call(ctx: &mut TestCtx, run: &mut Run, a: AgentId, tool: &str, args: Value) -> (String, bool) {
+            run.handle_tool(ctx, a, tool, &args)
+        }
+
+        fn last_prompt(ctx: &TestCtx, a: AgentId) -> String {
+            ctx.prompts.iter().rev().find(|(x, _)| *x == a).map(|(_, t)| t.clone()).unwrap_or_default()
+        }
+
+        fn instructions_of(ctx: &TestCtx, a: AgentId) -> String {
+            ctx.spawned_instructions.iter().find(|(x, _)| *x == a).map(|(_, i)| i.clone()).unwrap_or_default()
+        }
+
+        fn pushes(ctx: &TestCtx, to: AgentId) -> Vec<String> {
+            ctx.prompts.iter().filter(|(x, t)| *x == to && t.starts_with("[akasha · ")).map(|(_, t)| t.clone()).collect()
+        }
+
+        fn texts(run: &Run) -> Vec<String> {
+            run.akasha["builders"].entries.iter().map(|e| e.text.clone()).collect()
+        }
+
+        #[test]
+        fn blocks_come_from_the_groups_and_only_members_are_in_one() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 4096), true, "table");
+            assert_eq!(run.akasha.keys().map(String::as_str).collect::<Vec<_>>(), vec!["builders"]);
+            assert_eq!((run.akasha["builders"].cap, run.akasha["builders"].entries.len()), (4096, 0));
+            run.akasha.get_mut("builders").unwrap().note("p1-a", "kept", false, 0).unwrap();
+            run.enable_akasha(true);
+            assert_eq!(run.akasha["builders"].entries.len(), 1, "turning it on again keeps what is there");
+            let w = member(&mut ctx, &mut run, "p1-a");
+            let o = ctx.add_idle();
+            run.orchestrator = Some(o);
+            assert_eq!(run.group_of(w), Some("builders"));
+            assert_eq!(run.group_of(o), None, "the orchestrator's role is in no group");
+            assert_eq!(run.group_of(999), None, "nor is an agent outside the run");
+            run.enable_akasha(false);
+            assert_eq!(run.group_of(w), None, "off, nobody is in a group");
+            assert_eq!(run.akasha["builders"].entries.len(), 1, "but the notes are kept for when it is back on");
+            assert!(run_of(Pattern::builtin(), true, "table-plain").akasha.is_empty(), "no groups, no blocks");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn with_the_feature_off_a_grouped_pattern_runs_as_if_it_had_none() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 4096), false, "off");
+            run.stage = Stage::Setup;
+            run.start(&mut ctx);
+            let said: Vec<String> = pulse_texts(&run).into_iter().filter(|l| l.starts_with("akasha")).collect();
+            assert_eq!(said, vec!["akasha: 1 group configured but the feature is off — `mantra experimental enable akasha`".to_string()]);
+            assert!(run.akasha.is_empty(), "no blocks");
+            run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+            let a = spawn_member(&mut ctx, &mut run, "p1-a");
+            assert!(!ctx.spawned("p1-a")[0].tools.iter().any(|t| t.starts_with("mantra_akasha_")), "no tools: {:?}", ctx.spawned("p1-a")[0].tools);
+            assert!(!instructions_of(&ctx, a).contains("Shared notes"));
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "x"}));
+            assert!(!ok && r.contains("not in a group"), "{r}");
+            // on, or without groups, the start says nothing about it
+            for (pattern, on, tag) in [(grouped("urgent", true, 4096), true, "off-on"), (Pattern::builtin(), false, "off-plain")] {
+                let mut other = run_of(pattern, on, tag);
+                other.stage = Stage::Setup;
+                other.start(&mut TestCtx::new());
+                assert!(!pulse_texts(&other).iter().any(|l| l.starts_with("akasha")), "{tag}");
+                let _ = std::fs::remove_dir_all(&other.dir);
+            }
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn members_get_the_tools_and_their_prompts_end_with_the_notes() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "inject");
+            let a = spawn_member(&mut ctx, &mut run, "p1-a");
+            let tools = ctx.spawned("p1-a")[0].tools.clone();
+            for t in ["mantra_akasha_read", "mantra_akasha_note", "mantra_akasha_amend", "mantra_akasha_forget", "mantra_ask"] {
+                assert!(tools.iter().any(|x| x == t), "{t} in {tools:?}");
+            }
+            assert!(instructions_of(&ctx, a).contains("## Shared notes (akasha)"), "the spawn brief introduces the tools");
+            assert!(!last_prompt(&ctx, a).contains("## Shared notes (akasha ·"), "an empty block is not shown");
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "models live in src/models"}));
+            // the next member's spawn brief ends with the block
+            let b = spawn_member(&mut ctx, &mut run, "p1-b");
+            let brief = last_prompt(&ctx, b);
+            let tail = brief.split("\n\n## Shared notes (akasha · builders)\n").nth(1).unwrap_or_else(|| panic!("no notes in: {brief}"));
+            assert!(tail.starts_with("## akasha · builders · 1 note · ") && tail.ends_with("] models live in src/models"), "{tail}");
+            // and so does a retry prompt
+            run.continue_queue.push((a, Instant::now(), "[mantra:retry] Your previous turn failed (x). Continue exactly where you left off.".into()));
+            run.last_tick = Instant::now() - Duration::from_secs(2);
+            run.tick(&mut ctx);
+            let retry = last_prompt(&ctx, a);
+            assert!(retry.starts_with("[mantra:retry]") && retry.contains("\n\n## Shared notes (akasha · builders)\n## akasha · builders · 1 note"), "{retry}");
+            // the orchestrator is in no group: its tools and its prompts stay as they were
+            let o = run.spawn_orchestrator(&mut ctx);
+            assert!(!ctx.spawned("orchestrator")[0].tools.iter().any(|t| t.starts_with("mantra_akasha_")));
+            assert_eq!(run.with_akasha(o, "[mantra:watchdog] nudge".into()), "[mantra:watchdog] nudge");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn the_tools_act_on_the_members_block_and_refuse_everyone_else() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("none", true, 16_384), true, "tools");
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "  the config loader lives in src/config.rs ", "urgent": true}));
+            assert!(ok && r.starts_with("noted #1 (") && r.ends_with("/16k)"), "{r}");
+            assert!(call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "temporary"})).0.starts_with("noted #2"));
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_amend", json!({"id": "#1", "text": "the config loader lives in src/cfg.rs"}));
+            assert!(ok && r.starts_with("amended #1"), "{r}");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_forget", json!({"id": 2}));
+            assert!(ok && r.starts_with("forgot #2"), "{r}");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_forget", json!({"id": 2}));
+            assert!(!ok && r.contains("no note #2"), "{r}");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_amend", json!({"text": "no id"}));
+            assert!(!ok && r.contains("id"), "{r}");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_read", json!({}));
+            assert!(ok && r.starts_with("## akasha · builders · 1 note · ") && r.contains("\n![1 · p1-a · ") && r.ends_with("the config loader lives in src/cfg.rs"), "{r}");
+            // one journal line for each change, and not one toast
+            let said: Vec<String> = pulse_texts(&run).into_iter().filter(|l| l.starts_with("akasha ·")).collect();
+            assert_eq!(said, vec!["akasha · p1-a noted #1 (urgent): the config loader lives in src/config.rs", "akasha · p1-a noted #2: temporary", "akasha · p1-a amended #1: the config loader lives in src/cfg.rs", "akasha · p1-a forgot #2"]);
+            assert!(ctx.notified.is_empty());
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "a long one\n".repeat(30)}));
+            let last = pulse_texts(&run).pop().unwrap_or_default();
+            assert!(last.chars().count() <= 100 && !last.contains('\n'), "{last}");
+            // outside the group: the orchestrator, and an agent the run does not know
+            let o = ctx.add_idle();
+            run.orchestrator = Some(o);
+            for who in [o, 999] {
+                let (r, ok) = call(&mut ctx, &mut run, who, "mantra_akasha_read", json!({}));
+                assert!(!ok && r.contains("not in a group"), "{r}");
+            }
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn urgent_notes_reach_busy_members_only_one_delivery_per_window() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "push");
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let b = member(&mut ctx, &mut run, "p1-b");
+            let c = member(&mut ctx, &mut run, "p1-c");
+            ctx.set_idle_secs(c, 0);
+            let o = ctx.add_busy();
+            run.orchestrator = Some(o);
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "a plain fact"}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "Config::load now returns Result", "urgent": true}));
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b), vec!["[akasha · p1-a] Config::load now returns Result"], "the urgent one only");
+            assert!(pushes(&ctx, a).is_empty() && pushes(&ctx, c).is_empty() && pushes(&ctx, o).is_empty(), "not the author, not an idle member, not an outsider");
+            // two more inside the window wait, then go as one
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "second", "urgent": true}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "third", "urgent": true}));
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b).len(), 1, "at most one delivery per 20 s");
+            *run.akasha_live.pushed.get_mut(&b).unwrap() -= Duration::from_secs(21);
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b)[1], "[akasha · p1-a] second\n\n[akasha · p1-a] third");
+            // a member that went idle before its window opened gets nothing (its next prompt has it)
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "fourth", "urgent": true}));
+            ctx.set_idle_secs(b, 0);
+            *run.akasha_live.pushed.get_mut(&b).unwrap() -= Duration::from_secs(21);
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b).len(), 2);
+            assert!(run.akasha_live.outbox.is_empty());
+            // nor does one whose turn already yielded with mantra_wait
+            ctx.agents.get_mut(&b).unwrap().turn_active = true;
+            run.yielded.insert(b);
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "fifth", "urgent": true}));
+            *run.akasha_live.pushed.get_mut(&b).unwrap() -= Duration::from_secs(21);
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b).len(), 2);
+            assert!(pushes(&ctx, c).is_empty(), "the idle member was never prompted");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        /// A member being stopped — by hand (the interrupt is on its way, the turn not over yet) or
+        /// paused by the orchestrator — is not busy for a push: the steer would land in the turn
+        /// being stopped, and a message clears the hand stop, putting the agent back to work.
+        #[test]
+        fn a_member_being_stopped_or_paused_gets_no_push() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "stopping");
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let b = member(&mut ctx, &mut run, "p1-b");
+            let c = member(&mut ctx, &mut run, "p1-c");
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "queued before the stop", "urgent": true}));
+            assert!(run.akasha_live.outbox.contains_key(&b) && run.akasha_live.outbox.contains_key(&c));
+            ctx.agents.get_mut(&b).unwrap().stopped_by_user = true;
+            let wc = run.worker_idx(c).unwrap();
+            run.workers[wc].paused = true;
+            assert!(ctx.agents[&b].busy() && ctx.agents[&c].busy(), "both turns are still open");
+            run.akasha_tick(&mut ctx);
+            assert!(pushes(&ctx, b).is_empty() && pushes(&ctx, c).is_empty(), "what waited is not delivered after the stop");
+            assert!(run.akasha_live.outbox.is_empty());
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "noted during the stop", "urgent": true}));
+            assert!(run.akasha_live.outbox.is_empty(), "nor queued for them");
+            assert!(ctx.agents[&b].stopped_by_user, "the hand stop stands");
+            // talked to again (the stop is over) and resumed: pushes reach them as before
+            ctx.agents.get_mut(&b).unwrap().stopped_by_user = false;
+            run.workers[wc].paused = false;
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "after", "urgent": true}));
+            run.akasha_tick(&mut ctx);
+            assert_eq!((pushes(&ctx, b), pushes(&ctx, c)), (vec!["[akasha · p1-a] after".to_string()], vec!["[akasha · p1-a] after".to_string()]));
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        /// A push goes as the note reads when it is delivered: amended in the window, with its new
+        /// text; forgotten (retracted as wrong), not at all — and with nothing left, no push.
+        #[test]
+        fn a_push_goes_as_the_note_reads_at_delivery() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "push-now");
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let b = member(&mut ctx, &mut run, "p1-b");
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "first", "urgent": true}));
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b).len(), 1, "the window is open now");
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "Config::load returns Option", "urgent": true}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "the tests live in tests/ (wrong)", "urgent": true}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_amend", json!({"id": 2, "text": "Config::load returns Result"}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_forget", json!({"id": 3}));
+            *run.akasha_live.pushed.get_mut(&b).unwrap() -= Duration::from_secs(21);
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b)[1], "[akasha · p1-a] Config::load returns Result");
+            call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "oops", "urgent": true}));
+            call(&mut ctx, &mut run, a, "mantra_akasha_forget", json!({"id": 4}));
+            *run.akasha_live.pushed.get_mut(&b).unwrap() -= Duration::from_secs(21);
+            let window = run.akasha_live.pushed[&b];
+            run.akasha_tick(&mut ctx);
+            assert_eq!(pushes(&ctx, b).len(), 2, "everything that waited was forgotten");
+            assert!(run.akasha_live.outbox.is_empty());
+            assert_eq!(run.akasha_live.pushed[&b], window, "and no window was spent on nothing");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        /// A push that lands while a done worker answers the orchestrator's follow-up asked nothing:
+        /// the orchestrator still gets its answer, and the push reads as Mantra's, not the user's.
+        #[test]
+        fn a_push_into_a_follow_up_does_not_pass_for_the_users_message() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "follow-up");
+            let o = ctx.add_idle();
+            run.orchestrator = Some(o);
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let b = member(&mut ctx, &mut run, "p1-b");
+            run.on_turn_done(&mut ctx, a, "completed", None, None);
+            assert_eq!(run.workers[0].state, WState::Done);
+            // the orchestrator asks the done worker something; it is answering when p1-b's urgent note comes
+            ctx.agents.get_mut(&a).unwrap().push_user("[from the orchestrator] which file holds the parser?");
+            assert!(ctx.agents[&a].busy());
+            call(&mut ctx, &mut run, b, "mantra_akasha_note", json!({"text": "the parser moved to src/parse.rs", "urgent": true}));
+            run.akasha_tick(&mut ctx);
+            let push = pushes(&ctx, a).pop().expect("pushed into the answering turn");
+            // what `app::prompt_agent` echoes into the transcript
+            ctx.agents.get_mut(&a).unwrap().push_user(&push);
+            assert_eq!(ctx.agents[&a].tail_lines(1), vec!["⇢ akasha · p1-b".to_string()], "Mantra's line, not one the user typed");
+            run.on_turn_done(&mut ctx, a, "completed", None, None);
+            let last = pulse_texts(&run).into_iter().rev().find(|l| l.contains("p1-a done")).unwrap_or_default();
+            assert!(last.contains("p1-a done again in"), "{last}");
+            let heard = ctx.prompts.iter().filter(|(to, t)| *to == o && t.contains("p1-a answered the follow-up")).count() + run.orch_inbox.iter().filter(|t| t.contains("p1-a answered the follow-up")).count();
+            assert_eq!(heard, 1, "{:?} {:?}", ctx.prompts, run.orch_inbox);
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        /// The manager's own retries, which `manager_tick` sends ahead of `tick`, end with the
+        /// notes too when its role is in a group — like every member's retry prompt.
+        #[test]
+        fn a_grouped_managers_retries_carry_the_notes() {
+            let mut ctx = TestCtx::new();
+            let mut pattern = grouped("urgent", true, 16_384);
+            pattern.groups[0].roles.push("manager".into());
+            let mut run = run_of(pattern, true, "manager");
+            let m = ctx.add_idle();
+            run.manager = Some(m);
+            assert_eq!(run.group_of(m), Some("builders"));
+            run.akasha.get_mut("builders").unwrap().note("p1-a", "models live in src/models", false, 0).unwrap();
+            run.continue_queue.push((m, Instant::now(), "[mantra:retry] Your previous turn failed (x). Continue exactly where you left off.".into()));
+            run.manager_tick(&mut ctx);
+            let retry = ctx.prompts.iter().find(|(x, t)| *x == m && t.starts_with("[mantra:retry]")).map(|(_, t)| t.clone()).expect("the retry went out");
+            assert!(retry.contains("\n\n## Shared notes (akasha · builders)\n## akasha · builders · 1 note"), "{retry}");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn push_all_sends_every_note_and_push_none_sends_none() {
+            for (push, urgent, expect) in [("all", false, 1), ("none", true, 0), ("urgent", false, 0)] {
+                let mut ctx = TestCtx::new();
+                let mut run = run_of(grouped(push, true, 16_384), true, &format!("push-{push}"));
+                let a = member(&mut ctx, &mut run, "p1-a");
+                let b = member(&mut ctx, &mut run, "p1-b");
+                call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "a fact", "urgent": urgent}));
+                run.akasha_tick(&mut ctx);
+                assert_eq!(pushes(&ctx, b).len(), expect, "push = {push}, urgent = {urgent}");
+                let _ = std::fs::remove_dir_all(&run.dir);
+            }
+        }
+
+        #[test]
+        fn the_conductor_notes_what_members_finished_failed_and_changed() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("all", true, 16_384), true, "auto");
+            let o = ctx.add_idle();
+            run.orchestrator = Some(o);
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let b = member(&mut ctx, &mut run, "p1-b");
+            if let Some(ag) = ctx.agents.get_mut(&a) {
+                ag.final_message = Some("Implemented it.\n\nSTATUS: done\nSUMMARY: added Config with a loader; tests pass".into());
+                for f in ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs"] {
+                    ag.files.insert(f.into(), Default::default());
+                }
+            }
+            run.on_turn_done(&mut ctx, a, "completed", None, None);
+            assert_eq!(texts(&run), vec!["[p1-a · done] added Config with a loader; tests pass", "[p1-a · changed] src/a.rs, src/b.rs, src/c.rs, +2 more"]);
+            assert!(run.akasha["builders"].entries.iter().all(|e| e.author == "mantra" && !e.urgent));
+            run.akasha_tick(&mut ctx);
+            assert!(pushes(&ctx, b).is_empty(), "the Conductor's entries are never pushed, even with push = all");
+            // a follow-up the done worker answers is not a second completion
+            if let Some(ag) = ctx.agents.get_mut(&a) {
+                ag.push_user("[from the orchestrator] which file?");
+                ag.final_message = Some("STATUS: done\nSUMMARY: src/config.rs".into());
+            }
+            run.on_turn_done(&mut ctx, a, "completed", None, None);
+            assert_eq!(texts(&run).len(), 2);
+            // failed: the error's first line and the attempt; blocked: the report's head
+            run.on_turn_done(&mut ctx, b, "failed", Some("the build script exited 101\nstack backtrace".into()), None);
+            assert_eq!(texts(&run)[2], "[p1-b · failed, attempt 1] the build script exited 101");
+            let c = member(&mut ctx, &mut run, "p1-c");
+            if let Some(ag) = ctx.agents.get_mut(&c) {
+                ag.final_message = Some("STATUS: blocked\nSUMMARY: the spec names no database".into());
+            }
+            run.on_turn_done(&mut ctx, c, "completed", None, None);
+            assert_eq!(texts(&run)[3], "[p1-c · failed, attempt 1] blocked: the spec names no database");
+            assert_eq!(texts(&run).len(), 4);
+            assert!(!pulse_texts(&run).iter().any(|l| l.starts_with("akasha ·")), "they mirror lines the journal already has");
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn a_full_block_drops_the_conductors_entries_and_says_so_once() {
+            let mut ctx = TestCtx::new();
+            let mut run = run_of(grouped("urgent", true, 1024), true, "full");
+            let o = ctx.add_idle();
+            run.orchestrator = Some(o);
+            let a = member(&mut ctx, &mut run, "p1-a");
+            let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "x".repeat(950)}));
+            assert!(ok, "{r}");
+            for (who, id) in [(a, "p1-a"), (member(&mut ctx, &mut run, "p1-b"), "p1-b")] {
+                if let Some(ag) = ctx.agents.get_mut(&who) {
+                    ag.final_message = Some(format!("STATUS: done\nSUMMARY: {id} finished a task whose summary does not fit in what is left"));
+                }
+                run.on_turn_done(&mut ctx, who, "completed", None, None);
+            }
+            assert_eq!(run.akasha["builders"].entries.len(), 1, "the agent's note stays, the Conductor's entries are dropped");
+            let full: Vec<String> = pulse_texts(&run).into_iter().filter(|l| l.contains("is full")).collect();
+            assert_eq!(full, vec!["akasha · builders is full — Mantra's own entries are dropped until notes are forgotten".to_string()], "once, not per drop");
+            // room again: they come back
+            call(&mut ctx, &mut run, a, "mantra_akasha_forget", json!({"id": 1}));
+            let c = member(&mut ctx, &mut run, "p1-c");
+            if let Some(ag) = ctx.agents.get_mut(&c) {
+                ag.final_message = Some("STATUS: done\nSUMMARY: fits now".into());
+            }
+            run.on_turn_done(&mut ctx, c, "completed", None, None);
+            assert_eq!(texts(&run), vec!["[p1-c · done] fits now"]);
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+
+        #[test]
+        fn the_blocks_survive_a_save_and_a_resume() {
+            let mut run = run_of(grouped("urgent", true, 16_384), true, "state");
+            run.akasha.get_mut("builders").unwrap().note("p1-a", "kept across a restart", true, 7).unwrap();
+            run.save_state();
+            let st = RunState::load(&run.dir).unwrap();
+            assert_eq!(st.akasha, run.akasha);
+            let mut back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+            assert_eq!(back.akasha, run.akasha);
+            assert_eq!(back.group_of_role("worker-small"), None, "off until the app says otherwise");
+            back.enable_akasha(true);
+            assert_eq!(back.akasha, run.akasha, "the restored block is kept, not rebuilt empty");
+            assert_eq!(back.group_of_role("worker-small"), Some("builders"));
+            let _ = std::fs::remove_dir_all(&run.dir);
         }
     }
 
@@ -5331,6 +5781,27 @@ mod halt_tests {
         assert!(prompt.contains("\"p1\""), "the current phase must be included: {prompt}");
         assert!(!prompt.contains("\"p2\""), "a later phase must not be attached — that is what mantra_read_phase / mantra_revise_plan are for: {prompt}");
         assert!(prompt.contains("mantra_read_phase"), "{prompt}");
+    }
+
+    /// The swarm's planner and orchestrator are told the run's own number: the pattern's 8, or
+    /// the 24 a `--swarm 24` run carries in its copy of the pattern — never the placeholder.
+    #[test]
+    fn the_swarm_planner_and_orchestrator_are_briefed_with_the_runs_max_parallel() {
+        for (n, want) in [(None, "up to 8"), (Some(24), "up to 24")] {
+            let mut pattern = Pattern::builtin_swarm();
+            if let Some(n) = n {
+                pattern.settings.max_parallel = n;
+            }
+            let mut ctx = TestCtx::new();
+            let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
+            run.plan = Some(one_task_phase());
+            let planner = run.spawn_planner(&mut ctx);
+            let orchestrator = run.spawn_orchestrator(&mut ctx);
+            for a in [planner, orchestrator] {
+                let i = ctx.spawned_instructions.iter().find(|(id, _)| *id == a).map(|(_, i)| i.clone()).expect("instructions captured");
+                assert!(i.contains(want) && !i.contains("{max_parallel}"), "{want}: {i}");
+            }
+        }
     }
 
     /// Review fix: the built-in default pattern's last finale step reuses `self.planner` as the

@@ -87,6 +87,22 @@ fn asciify(buf: &mut ratatui::buffer::Buffer) {
             '⇥' => ">",
             '“' | '”' => "\"",
             '‘' | '’' => "'",
+            // the backends' tags in the model pickers (`◌ codex`, `✧ claude`, `• bija`) and the
+            // Akasha pulse lines stay three different marks
+            '◌' | '⬡' | '⎔' => "o",
+            '✧' => "+",
+            '⛔' => "!",
+            '♦' => "#",
+            '≤' => "<",
+            '≥' => ">",
+            '⇄' => "~",
+            '↳' => "-",
+            // the rest of the pulse feed's marks
+            '⏰' | '⏳' => "t",
+            '⚒' => "%",
+            'ℹ' => "i",
+            '⌫' => "x",
+            '⇲' => "v",
             '\u{2800}'..='\u{28FF}' => "*",
             _ => "?",
         };

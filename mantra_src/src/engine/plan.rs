@@ -46,16 +46,35 @@ pub struct Gate {
 }
 
 impl Plan {
-    /// Parse leniently: accepts the plan object directly or wrapped as {"plan": {...}} or as a JSON string.
+    /// Parse leniently: accepts the plan object directly or wrapped as {"plan": {...}} or as a JSON
+    /// string, and a nested list or object sent as its JSON text (`"phases": "[{…}]"`) — a model
+    /// quirk that would otherwise be refused the same way every round. Bija already shapes its
+    /// calls to the schema; this covers the other backends.
     pub fn from_value(v: &Value) -> Result<Plan, String> {
         let v = match v.get("plan") {
             Some(p) => p.clone(),
             None => v.clone(),
         };
-        let v = match &v {
+        let mut v = match &v {
             Value::String(s) => serde_json::from_str::<Value>(s).map_err(|e| format!("plan is not valid JSON: {e}"))?,
             _ => v,
         };
+        unstring(&mut v, "phases", Value::is_array);
+        unstring(&mut v, "final_checks", Value::is_array);
+        if let Some(Value::Array(phases)) = v.get_mut("phases") {
+            for ph in phases.iter_mut() {
+                unstring(ph, "tasks", Value::is_array);
+                unstring(ph, "gate", Value::is_object);
+                if let Some(gate) = ph.get_mut("gate") {
+                    unstring(gate, "checks", Value::is_array);
+                }
+                if let Some(Value::Array(tasks)) = ph.get_mut("tasks") {
+                    for t in tasks.iter_mut() {
+                        unstring(t, "scope", Value::is_array);
+                    }
+                }
+            }
+        }
         serde_json::from_value::<Plan>(v).map_err(|e| format!("plan does not match the schema: {e}"))
     }
 
@@ -187,6 +206,16 @@ fn scopes_overlap(a: &str, b: &str) -> bool {
     !ra.is_empty() && ra == rb && (a.ends_with("**") || b.ends_with("**"))
 }
 
+/// `obj[key]` sent as JSON text is replaced by what it parses to, when that is the wanted kind;
+/// anything else is left for serde's own error.
+fn unstring(obj: &mut Value, key: &str, wanted: fn(&Value) -> bool) {
+    let Some(slot) = obj.get_mut(key) else { return };
+    let Value::String(text) = &*slot else { return };
+    if let Some(parsed) = serde_json::from_str::<Value>(text).ok().filter(|p| wanted(p)) {
+        *slot = parsed;
+    }
+}
+
 /// JSON schema given to the planner's tools.
 pub fn plan_schema(worker_roles: &[String]) -> Value {
     json!({
@@ -269,9 +298,45 @@ mod tests {
         bad2.phases[0].tasks[1].role = "qa".into();
         assert!(bad2.validate(&p).is_err());
     }
+    /// `--swarm N` / `--parallel N` must be reachable: phases run one after another, so the per
+    /// phase task cap is the ceiling on what runs at once, and the run's copy raises it to N. A
+    /// `--swarm 64` planner that cuts 64 tasks into a phase is accepted; a smaller N leaves the cap.
+    #[test]
+    fn a_runs_parallel_override_lets_a_phase_hold_that_many_tasks() {
+        let phase_of = |n: usize| -> Plan {
+            let tasks: Vec<Value> = (0..n).map(|i| json!({"id": format!("t{i}"), "role": "worker-small", "prompt": "do one small thing well", "scope": [format!("src/m{i}/**")]})).collect();
+            serde_json::from_value(json!({"title": "T", "phases": [{"name": "A", "tasks": tasks, "gate": {"checks": ["true"]}}]})).unwrap()
+        };
+        let mut swarm = Pattern::builtin_swarm();
+        assert!(phase_of(64).validate(&swarm).is_err(), "the pattern's own cap is 32");
+        swarm.set_parallel(64);
+        assert_eq!((swarm.settings.max_parallel, swarm.settings.max_tasks_per_phase), (64, 64));
+        assert!(phase_of(64).validate(&swarm).is_ok(), "{:?}", phase_of(64).validate(&swarm));
+        assert!(phase_of(65).validate(&swarm).unwrap_err()[0].contains("exceeds max_tasks_per_phase = 64"));
+        let mut few = Pattern::builtin_swarm();
+        few.set_parallel(4);
+        assert_eq!((few.settings.max_parallel, few.settings.max_tasks_per_phase), (4, 32), "fewer at once, same plan");
+        let mut default = Pattern::builtin();
+        default.set_parallel(16);
+        assert_eq!((default.settings.max_parallel, default.settings.max_tasks_per_phase), (16, 16));
+    }
     #[test]
     fn lenient_parse() {
         let v = json!({"plan": serde_json::to_string(&sample()).unwrap()});
         assert!(Plan::from_value(&v).is_ok());
+    }
+    #[test]
+    fn nested_lists_sent_as_json_text_are_read() {
+        let mut plan = serde_json::to_value(sample()).unwrap();
+        let phase = &mut plan["phases"][0];
+        phase["gate"]["checks"] = json!(phase["gate"]["checks"].to_string());
+        phase["tasks"] = json!(phase["tasks"].to_string());
+        plan["phases"] = json!(plan["phases"].to_string());
+        plan["final_checks"] = json!("[\"cargo test\"]");
+        let parsed = Plan::from_value(&json!({"plan": plan})).expect("stringified lists parse");
+        assert_eq!(parsed.phases, sample().phases);
+        assert_eq!(parsed.final_checks, vec!["cargo test".to_string()]);
+        let err = Plan::from_value(&json!({"plan": {"title": "T", "phases": "not json"}})).expect_err("prose is still refused");
+        assert!(err.contains("does not match the schema"), "{err}");
     }
 }

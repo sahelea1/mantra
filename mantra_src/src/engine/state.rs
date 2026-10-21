@@ -47,6 +47,10 @@ pub struct RunState {
     pub agents: Vec<AgentState>,
     /// Phases already completed (for the summary screen after a resume).
     pub history: Vec<PhaseHistory>,
+    /// Akasha blocks by group name (`Run::akasha`). Left out of the file while there are none, so a
+    /// run without groups writes the same `state.json` as before, and an older file loads with none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -450,6 +454,7 @@ pub(crate) mod tests {
             workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into(), transient: false, model: Some("sol".into()) }],
             agents: vec![AgentState { slot: "orchestrator".into(), name: "orchestrator".into(), role: "orchestrator".into(), provider: "openai".into(), model_alias: "astra".into(), effort: "high".into(), thread_id: Some("t-1".into()), cwd: "/tmp/wt/integration".into() }],
             history: vec![PhaseHistory { name: "Foundations".into(), workers: vec![("p1-a".into(), "A".into(), "◇".into(), true)], secs: 42 }],
+            akasha: Default::default(),
         }
     }
 
@@ -463,6 +468,29 @@ pub(crate) mod tests {
         assert_eq!(back, st);
         assert_eq!(back.stage_label(), "phase 2 · gate r2");
         assert!(!dir.join("state.json.tmp").exists(), "atomic rename leaves no temp file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Akasha blocks ride along in `state.json` — and only when there are some: a state without
+    /// them is written exactly as before, and a file from before them loads with none.
+    #[test]
+    fn akasha_blocks_round_trip_and_older_files_load_without_them() {
+        let dir = std::env::temp_dir().join(format!("mantra-state-akasha-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = sample();
+        st.save(&dir);
+        let plain = std::fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(!plain.contains("akasha"), "no groups, no key: {plain}");
+        assert!(RunState::load(&dir).unwrap().akasha.is_empty(), "an older file loads with none");
+        let mut b = crate::engine::akasha::Block::new("builders", 16_384);
+        b.note("p1-config", "models live in src/models", true, 50).unwrap();
+        b.note("mantra", "[p1-config · done] added Config", false, 60).unwrap();
+        st.akasha.insert("builders".into(), b);
+        st.save(&dir);
+        let back = RunState::load(&dir).unwrap();
+        assert_eq!(back, st);
+        assert_eq!(back.akasha["builders"].entries.len(), 2);
+        assert_eq!(back.akasha["builders"].next_id, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -70,6 +70,13 @@
     }
 
     // ── agent status vocabulary ──────────────────────────────────────────────────────────────────
+    // A process coming back ("restarting (1)", "relaunching": `Status::retrying_text`) reads as
+    // itself; a provider retry as "retrying — <why>".
+    function retryingText(a, max) {
+        const d = a.status_detail || '';
+        if (d === 'relaunching' || d.startsWith('restarting (')) return d;
+        return 'retrying' + (d ? ' — ' + F.trunc(d, max) : '');
+    }
     // → {text, tone} where tone ∈ busy | wait | bad | idle | dim | done | review
     function status(a, now) {
         now = now || Date.now();
@@ -79,7 +86,7 @@
         if (a.waiting_answer) return { text: 'waiting for an answer', tone: 'wait' };
         switch (a.status) {
             case 'starting': return { text: 'starting…', tone: 'dim' };
-            case 'retrying': return { text: 'retrying' + (a.status_detail ? ' — ' + F.trunc(a.status_detail, 60) : ''), tone: 'wait' };
+            case 'retrying': return { text: retryingText(a, 60), tone: 'wait' };
             case 'failed': return { text: 'failed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
             case 'crashed': return { text: 'crashed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
             case 'stopped': return { text: a.stopped_by_user ? 'stopped by you' : 'stopped', tone: 'wait' };
@@ -463,7 +470,7 @@
     }
 
     M.parts = {
-        glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, statusPill, wstate, groups, roleLabel,
+        glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, retryingText, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
         haltBand, haltPrimary, haltResumeLabel, stageWhere, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };

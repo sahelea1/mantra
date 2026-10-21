@@ -92,8 +92,9 @@ pub fn role_glyph(s: &str) -> String {
         "◆" | "■" => "#",
         "◎" => "O",
         "▲" => "^",
-        _ if s.is_ascii() => s,
-        _ => "?",
+        // anything else is left to the frame's ASCII pass (`ui::asciify`), which knows the pulse
+        // and journal marks (✓ ✗ ↻ ⎇ ☰ …) — a "?" here would hide which line is which
+        _ => s,
     }
     .to_string()
 }

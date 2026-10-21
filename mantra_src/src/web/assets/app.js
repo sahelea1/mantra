@@ -391,7 +391,7 @@
         const rows = [
             ['Model', a.model_alias + (a.model && a.model !== a.model_alias ? ' (' + a.model + ')' : '')],
             ['Provider', a.provider_name || a.provider],
-            ['Backend', a.backend === 'claude-code' ? 'Claude Code' : 'Codex'],
+            ['Backend', F.backend(a.backend)],
             ['Effort', a.effort],
             ['Context', a.ctx_percent !== undefined ? a.ctx_percent + '% of ' + F.tokens(a.ctx_window) + (a.ctx_assumed ? ' (assumed)' : '') : '—'],
             ['Compacts at', a.compact_percent ? a.compact_percent + '%' : null],
@@ -480,7 +480,8 @@
             disabled: m.problem ? true : null,
             onclick: () => onPick(m.alias),
         }, h('span', { class: 'pick-main' }, h('b', null, m.alias), h('span', { class: 'dim mono sm' }, ' ' + m.model)),
-            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend === 'claude-code' ? 'Claude Code' : null, m.context_window ? F.tokens(m.context_window) + ' ctx' : null, m.note].filter(Boolean).join(' · ')),
+            // the backend only when the provider's name does not already say it ("Bija · Bija")
+            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend && m.backend !== 'codex' && F.backend(m.backend) !== m.provider_name ? F.backend(m.backend) : null, m.context_window ? F.tokens(m.context_window) + ' ctx' : null, m.note].filter(Boolean).join(' · ')),
             m.problem ? h('span', { class: 'pick-problem' }, m.problem) : null,
             m.alias === currentAlias ? icon('check', 'pick-check') : null)));
     }

@@ -379,14 +379,15 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
         EditTarget::ProviderCell(row, col) => {
             if let Some(p) = app.registry.providers.get_mut(*row) {
                 let t = text.trim().to_string();
-                match col {
+                match *col {
                     0 => p.id = crate::util::slug(&t).replace('-', "_"),
                     1 => p.name = t,
                     2 => p.base_url = t,
                     3 => p.env_key = t,
                     4 => p.api_key = if t.is_empty() { None } else { Some(t) },
-                    5 => p.kind = parse_kind(&t),
-                    6 => p.auth = parse_auth(&t),
+                    PROV_KIND_COL => p.kind = parse_kind(&t),
+                    PROV_AUTH_COL => p.auth = parse_auth(&t),
+                    PROV_WIRE_COL => p.wire = parse_wire(&t),
                     _ => {}
                 }
                 app.models_ui.dirty = true;
@@ -527,6 +528,11 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     }
     fl.push(Line::default());
     let pad = || vec![Span::raw(" ")];
+    if !wide && entry == "⚙ settings" {
+        for g in groups_lines(&app.studio.pattern) {
+            fl.extend(md::wrap(vec![Span::styled(g, theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), vec![Span::raw("   ")]));
+        }
+    }
     fl.extend(md::wrap(vec![Span::styled("←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
     let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
     // A list longer than the box (settings on a short terminal) scrolls to keep the selection in view.
@@ -586,6 +592,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         }
         pl.push(Line::default());
         pl.push(Line::from(vec![Span::styled(" re-prompt → ", theme::faint()), Span::styled(p.flow.on_reprompt.clone(), theme::text())]));
+        for g in groups_lines(p) {
+            pl.push(Line::from(Span::styled(format!(" {g}"), theme::faint())));
+        }
         pl.push(Line::default());
         for e in errs.iter().take(6) {
             pl.push(Line::from(Span::styled(format!(" {} {}", theme::g("✗", "x"), trunc(e, 42)), theme::fg(theme::RED))));
@@ -628,6 +637,20 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         f.set_cursor_position((ir.x + 2 + cc as u16, ir.y));
     }
     footer(f, rows[3], &[("tab", "focus"), ("↑↓", "select"), ("←→", "change"), ("⏎", "edit"), ("ctrl+s", "save"), ("esc", "back")]);
+}
+
+/// The pattern's Akasha groups, one line each — "groups: builders (worker-big, worker-small) · 16k
+/// · push urgent", the size in k of 1024 as the block's own header reads it. Read-only: groups are edited in the pattern's file (or by the architect) for
+/// now; the line is here so a pattern that has them never looks as if it had none.
+fn groups_lines(p: &crate::engine::pattern::Pattern) -> Vec<String> {
+    p.groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let auto = if g.auto { "" } else { " · no auto entries" };
+            format!("{}{} ({}) · {} · push {}{auto}", if i == 0 { "groups: " } else { "        " }, g.name, g.roles.join(", "), crate::engine::akasha::fmt_k(g.shared_chars), g.push)
+        })
+        .collect()
 }
 
 /// One line on what the focused field means, for the fields that need more than their name.
@@ -778,6 +801,17 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 } else {
                     let i = sel_index(app);
                     app.studio.pattern.roles.remove(&entry);
+                    // Groups are read-only here, so a group left naming the deleted role would be
+                    // an error the Studio could never clear (ctrl+s refuses it): the role leaves
+                    // its group with it.
+                    let mut left = vec![];
+                    for g in app.studio.pattern.groups.iter_mut().filter(|g| g.roles.contains(&entry)) {
+                        g.roles.retain(|r| *r != entry);
+                        left.push(g.name.clone());
+                    }
+                    if !left.is_empty() {
+                        app.toast(format!("deleted {entry}, and took it out of group {}", left.join(", ")), crate::agent::Level::Info);
+                    }
                     app.studio.dirty = true;
                     select_by_index(app, i.saturating_sub(1));
                 }
@@ -790,28 +824,82 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
 // ───────────────────────────── models ─────────────────────────────
 
 const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "note / test"];
-const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth"];
+const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth", "wire"];
+/// Where `kind`, `auth` and `wire` sit in `PROV_COLS` — the columns +/- cycles.
+const PROV_KIND_COL: usize = 5;
+/// The providers grid's column widths, `PROV_COLS` order.
+const PROV_WIDTHS: [usize; 8] = [10, 12, 26, 14, 8, 10, 12, 9];
+
+/// The columns of a grid to draw in `full` cells with column `sel` among them: the first column
+/// always, then from the leftmost one that lets `sel` fit within `avail` (`full` less what the
+/// row needs after its cells), up to the last that fits whole — a column is shown entire or not
+/// at all. Each column takes its width + 1.
+fn shown_cols(ws: &[usize], sel: usize, avail: usize, full: usize) -> Vec<usize> {
+    let sel = sel.min(ws.len().saturating_sub(1));
+    let w = |i: usize| ws[i] + 1;
+    let mut start = 1;
+    while start < sel && w(0) + (start..=sel).map(w).sum::<usize>() > avail {
+        start += 1;
+    }
+    let mut used = w(0);
+    let mut out = vec![0];
+    for i in start.max(1)..ws.len() {
+        if used + w(i) > full && i != sel {
+            break;
+        }
+        used += w(i);
+        out.push(i);
+    }
+    out
+}
+const PROV_AUTH_COL: usize = 6;
+const PROV_WIRE_COL: usize = 7;
 /// Display strings for `ProviderEntry.kind` (WP10.2) — cycled with +/- on the providers grid the
 /// same way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above). Kept here rather
 /// than a `Display` impl on `ProviderKind` since it's presentation-only.
-const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode"];
+const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode", "Bija"];
 /// Display strings for `ProviderEntry.auth` (WP10.2; irrelevant for `Codex`-kind providers, but
 /// still editable so a provider can be flipped to `ClaudeCode` and given `auth` in one place).
 const PROV_AUTHS: &[&str] = &["subscription", "api_key"];
+/// Display strings for `ProviderEntry.wire` (Bija only, editable on any row for the same reason).
+const PROV_WIRES: &[&str] = &["openai", "anthropic"];
 
 fn kind_str(k: crate::config::ProviderKind) -> &'static str {
     match k {
         crate::config::ProviderKind::Codex => "Codex",
         crate::config::ProviderKind::ClaudeCode => "ClaudeCode",
+        crate::config::ProviderKind::Bija => "Bija",
     }
 }
 
 fn parse_kind(t: &str) -> crate::config::ProviderKind {
     let t = t.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
-    if t == "claudecode" || t == "claude" {
-        crate::config::ProviderKind::ClaudeCode
-    } else {
-        crate::config::ProviderKind::Codex
+    match t.as_str() {
+        "claudecode" | "claude" => crate::config::ProviderKind::ClaudeCode,
+        "bija" | "seed" => crate::config::ProviderKind::Bija,
+        _ => crate::config::ProviderKind::Codex,
+    }
+}
+
+/// What a Bija provider's `wire` cell shows: an empty wire is Chat Completions. Other kinds have
+/// no wire to choose.
+fn wire_str(p: &ProviderEntry) -> String {
+    match p.kind {
+        crate::config::ProviderKind::Bija if p.wire.trim().is_empty() => "openai".into(),
+        crate::config::ProviderKind::Bija => p.wire.clone(),
+        _ => "—".into(),
+    }
+}
+
+/// A typed `wire`: Chat Completions is the default and is stored as nothing at all; anything
+/// unrecognised is kept as typed, so the row reads as a draft that names the typo
+/// (`ProviderEntry::wire_problem`) instead of silently becoming Chat Completions.
+fn parse_wire(t: &str) -> String {
+    let t = t.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "" | "openai" | "openai-chat" | "openai_chat" | "chat" => String::new(),
+        "anthropic" | "messages" => "anthropic".into(),
+        _ => t,
     }
 }
 
@@ -834,8 +922,18 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     }
     header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
     let widths = [10usize, 9, 18, 14, 14, 8, 30, 30];
-    let mk_head = |cols: &[&str], ws: &[usize]| Line::from(cols.iter().zip(ws).map(|(c, w)| Span::styled(format!(" {:<w$}", c, w = *w), theme::bold(theme::muted()))).collect::<Vec<_>>());
-    let mut l = vec![mk_head(MODEL_COLS, &widths)];
+    // A table wider than the screen scrolls sideways to the selected column, the first column
+    // (alias / id) kept, so every cell can be seen and edited at 80 columns too.
+    let (mshow, pshow) = {
+        let pw = PROV_WIDTHS;
+        let (msel, psel) = if app.models_ui.providers { (0, app.models_ui.col) } else { (app.models_ui.col, 0) };
+        // a provider row ends in its status (" ○ no key" at the least): room for it when scrolled
+        let (mw, pfull) = (rows[1].width.saturating_sub(2) as usize, rows[2].width.saturating_sub(2) as usize);
+        // the models grid keeps a cut last column: the start of a `t` result ("ok 0.4s") still reads
+        (shown_cols(&widths, msel, mw, usize::MAX), shown_cols(&pw, psel, pfull.saturating_sub(10), pfull))
+    };
+    let mk_head = |cols: &[&str], ws: &[usize], show: &[usize]| Line::from(show.iter().map(|&i| Span::styled(format!(" {:<w$}", cols[i], w = ws[i]), theme::bold(theme::muted()))).collect::<Vec<_>>());
+    let mut l = vec![mk_head(MODEL_COLS, &widths, &mshow)];
     // Whole-thousands tokens print as "200k" (no decimal); anything else falls back to fmt_tokens.
     let short_tokens = |n: u64| if n > 0 && n % 1000 == 0 { format!("{}k", n / 1000) } else { fmt_tokens(n) };
     for (ri, m) in app.registry.models.iter().enumerate() {
@@ -857,7 +955,8 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             status,
         ];
         let mut spans = vec![];
-        for (ci, v) in vals.iter().enumerate() {
+        for &ci in &mshow {
+            let v = &vals[ci];
             let is = !app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
             let derived = (ci == 3 && m.context_window.is_none()) || (ci == 4 && m.auto_compact_percent.is_none());
             let st = if is {
@@ -886,11 +985,12 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
     f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
 
-    let pw = [10usize, 12, 26, 14, 10, 11, 12];
-    let mut pl = vec![mk_head(PROV_COLS, &pw)];
-    let openai_vals = ["openai", "OpenAI", "(built into Codex — uses your codex login)", "", "Codex", "—"];
+    let pw = PROV_WIDTHS;
+    let mut pl = vec![mk_head(PROV_COLS, &pw, &pshow)];
+    let openai_vals = ["openai", "OpenAI", "(built into Codex — uses your codex login)", "", "", "Codex", "—", "—"];
     let mut ospans = vec![];
-    for (ci, v) in openai_vals.iter().enumerate() {
+    for &ci in &pshow {
+        let v = openai_vals[ci];
         ospans.push(Span::raw(" "));
         ospans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), theme::faint()));
     }
@@ -903,9 +1003,13 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             }
             _ => String::new(),
         };
-        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), masked, kind_str(p.kind).to_string(), p.auth.clone()];
+        // auth means something for ClaudeCode only (the hint below says so): any other kind shows
+        // "—" there, as the built-in openai row does, not a `subscription` it does not have.
+        let auth = if p.kind == crate::config::ProviderKind::ClaudeCode { p.auth.clone() } else { "—".to_string() };
+        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), masked, kind_str(p.kind).to_string(), auth, wire_str(p)];
         let mut spans = vec![];
-        for (ci, v) in vals.iter().enumerate() {
+        for &ci in &pshow {
+            let v = &vals[ci];
             let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
             let st = if is { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { theme::text() };
             spans.push(Span::raw(" "));
@@ -913,29 +1017,42 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         }
         // A draft (placeholder/malformed URL, or no credential — `ProviderEntry::draft_reason`)
         // says why `t`/`D` are off for it; a ready row shows where its key is sent and how it is
-        // held. `ClaudeCode` + `subscription` needs no key at all (OAuth login) — a red "no key"
-        // for it would be misleading, so only a key that is actually expected is reported.
-        if let Some(why) = p.draft_reason() {
-            spans.push(Span::styled(format!(" {} draft — {why}", theme::g("✗", "x")), theme::fg(theme::AMBER)));
+        // held. `ClaudeCode` + `subscription` needs no key at all (OAuth login), and a Bija key is
+        // optional (a local server takes none) — a red "no key" for either would be misleading,
+        // so only a key that is actually expected is reported missing.
+        // Room is short at 80-120 columns: the status always shows (whole, or its short form),
+        // then the model count and the host as far as they fit — never a word cut by the border.
+        let room = |spans: &Vec<Span>| (rows[2].width.saturating_sub(2) as usize).saturating_sub(Line::from(spans.clone()).width());
+        let (status, short, st) = if let Some(why) = p.draft_reason() {
+            (format!(" {} draft — {why}", theme::g("✗", "x")), format!(" {} draft", theme::g("✗", "x")), theme::fg(theme::AMBER))
+        } else if p.kind == crate::config::ProviderKind::Bija && p.resolve_key().is_none() {
+            (format!(" {} no key (optional)", theme::g("○", "-")), format!(" {} no key", theme::g("○", "-")), theme::dim())
+        } else if !p.needs_key() {
+            (format!(" {} subscription (OAuth login)", theme::g("○", "-")), format!(" {} OAuth", theme::g("○", "-")), theme::dim())
         } else {
-            if !p.needs_key() {
-                spans.push(Span::styled(format!(" {} subscription (OAuth login)", theme::g("○", "-")), theme::dim()));
-            } else {
-                let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
-                spans.push(Span::styled(format!(" {} {key_msg}", theme::g("✓", "ok")), theme::fg(theme::GREEN)));
-            }
-            if let Some(h) = p.host() {
-                spans.push(Span::styled(format!(" {} {h}", theme::g("→", "->")), theme::dim()));
-            }
-        }
+            let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
+            (format!(" {} {key_msg}", theme::g("✓", "ok")), format!(" {} key", theme::g("✓", "ok")), theme::fg(theme::GREEN))
+        };
+        let left = room(&spans);
+        spans.push(Span::styled(if w_of(&status) <= left { status } else { trunc(&short, left) }, st));
         let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
-        spans.push(Span::styled(format!("  {n} model{}", if n == 1 { "" } else { "s" }), if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
+        let count = format!("  {n} model{}", if n == 1 { "" } else { "s" });
+        // the host, unless the base_url column already shows the whole URL (a draft says why
+        // nothing is sent instead)
+        let host = p.host().filter(|_| p.draft_reason().is_none() && (!pshow.contains(&2) || w_of(&p.base_url) > pw[2])).map(|h| format!(" {} {h}", theme::g("→", "->")));
+        let left = room(&spans);
+        let with_host = host.as_ref().filter(|h| w_of(h) + w_of(&count) <= left);
+        if let Some(h) = with_host {
+            spans.push(Span::styled(h.clone(), theme::dim()));
+        }
+        if w_of(&count) <= room(&spans) {
+            spans.push(Span::styled(count, if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
+        }
         pl.push(Line::from(spans));
     }
-    pl.push(Line::from(Span::styled(" base_url = the provider's API root: Codex reads …/v1/responses + …/v1/models; ClaudeCode uses it as ANTHROPIC_BASE_URL (bare host, no /v1) + …/v1/models for D", theme::faint())));
-    pl.push(Line::from(Span::styled(" env_key = name of an env var holding the key · api_key = paste one directly (stored 0600) · either works · D here = discover this provider", theme::faint())));
-    pl.push(Line::from(Span::styled(" a new row (n) is a draft: saved, but t/D send nothing until base_url is real (not the example.com placeholder) and its own key is available", theme::faint())));
-    pl.push(Line::from(Span::styled(" kind = Codex | ClaudeCode · auth (ClaudeCode only) = subscription | api_key · +/- on either cycles it", theme::faint())));
+    for h in provider_hints(rows[2].width.saturating_sub(2) as usize, app.models_ui.providers && app.models_ui.col >= PROV_KIND_COL) {
+        pl.push(Line::from(Span::styled(h, theme::faint())));
+    }
     let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
     f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);
     // `t`/`D` name the host the selected row's request goes to, or say they are off for a draft
@@ -945,12 +1062,35 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         Some(p) => p.host().map(|h| format!("{verb} {} {h}", theme::g("→", "->"))).unwrap_or_else(|| plain.to_string()),
         None => plain.to_string(),
     };
+    let wide = rows[3].width >= 110;
+    let (t_plain, d_plain) = if wide { ("test model", "discover models") } else { ("test", "discover") };
     let (t_hint, d_hint) = if app.models_ui.providers {
-        ("test model".to_string(), action("discover models", "discover", app.registry.providers.get(app.models_ui.row)))
+        (t_plain.to_string(), action(d_plain, "discover", app.registry.providers.get(app.models_ui.row)))
     } else {
-        (action("test model", "test", app.registry.models.get(app.models_ui.row).and_then(|m| app.registry.provider_of(&m.alias))), "discover models".to_string())
+        (action(t_plain, "test", app.registry.models.get(app.models_ui.row).and_then(|m| app.registry.provider_of(&m.alias))), d_plain.to_string())
     };
-    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("t", &t_hint), ("D", &d_hint), ("n", "new"), ("x", "delete"), ("tab", "models/providers"), ("ctrl+s", "save"), ("esc", "back")]);
+    // `footer` drops whole hints from the end when they do not fit: saving and the other table
+    // come before n/x, so an 80-column screen still says how to keep what was changed.
+    let tab = if wide { "models/providers" } else if app.models_ui.providers { "models" } else { "providers" };
+    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("ctrl+s", "save"), ("tab", tab), ("t", &t_hint), ("D", &d_hint), ("n", "new"), ("x", "delete"), ("esc", "back")]);
+}
+
+/// The four lines under the providers grid. Wide, they explain every column; narrower, the
+/// ones about the column group being edited (kind/auth/wire, or the rest), each within `w`.
+fn provider_hints(w: usize, enums: bool) -> [&'static str; 4] {
+    if w >= 118 {
+        return [
+            " base_url = the API root: Codex adds /responses, Bija /chat/completions or /messages, ClaudeCode wants it without /v1",
+            " env_key = an env var holding the key · api_key = paste one (stored 0600) · either works · D here discovers …/models",
+            " a new row (n) is a draft: saved, but t/D send nothing until base_url is real and its own key is there",
+            " kind = Codex | ClaudeCode | Bija · auth (ClaudeCode) = subscription | api_key · wire (Bija) = openai | anthropic",
+        ];
+    }
+    if enums {
+        [" kind = Codex | ClaudeCode | Bija · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " a new row (n) is a draft until base_url is real and its key is there"]
+    } else {
+        [" base_url = the API root (Codex …/v1/responses · ClaudeCode: no /v1)", " env_key = an env var holding the key · api_key = paste one (0600)", " D here discovers …/models · → reaches kind, auth and wire", " a new row (n) is a draft until base_url is real and its key is there"]
+    }
 }
 
 pub fn models_key(app: &mut App, k: KeyEvent) {
@@ -979,15 +1119,19 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Left => ui.col = ui.col.saturating_sub(1),
         KeyCode::Right => ui.col = (ui.col + 1).min(ncols - 1),
         KeyCode::Char('+') | KeyCode::Char('-') if ui.providers => {
-            // Cycle `kind`/`auth` the same way +/- cycles enumerations on the models grid below,
-            // and the way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above) — the
-            // only in-app way to configure a third-party ClaudeCode provider (§10.2).
+            // Cycle `kind`/`auth`/`wire` the same way +/- cycles enumerations on the models grid
+            // below, and the way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above)
+            // — the only in-app way to configure a third-party ClaudeCode or Bija provider (§10.2).
             let d: i32 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
             if let Some(p) = app.registry.providers.get_mut(ui.row) {
                 match ui.col {
-                    4 => p.kind = parse_kind(&cycle(PROV_KINDS, kind_str(p.kind), d)),
-                    5 => p.auth = cycle(PROV_AUTHS, &p.auth, d),
-                    _ => {}
+                    PROV_KIND_COL => p.kind = parse_kind(&cycle(PROV_KINDS, kind_str(p.kind), d)),
+                    PROV_AUTH_COL => p.auth = cycle(PROV_AUTHS, &p.auth, d),
+                    PROV_WIRE_COL => {
+                        let cur = if p.wire.trim().is_empty() { "openai".to_string() } else { p.wire.clone() };
+                        p.wire = parse_wire(&cycle(PROV_WIRES, &cur, d));
+                    }
+                    _ => return,
                 }
                 app.models_ui.dirty = true;
             }
@@ -1016,7 +1160,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
         KeyCode::Enter => {
             let (title, val, target) = if ui.providers {
                 let Some(p) = app.registry.providers.get(ui.row) else { return };
-                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default(), kind_str(p.kind).to_string(), p.auth.clone()][ui.col.min(6)].clone();
+                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default(), kind_str(p.kind).to_string(), p.auth.clone(), p.wire.clone()][ui.col.min(PROV_COLS.len() - 1)].clone();
                 let hint = if ui.col == 4 { " (either name an env var or paste a key)" } else { "" };
                 (format!("provider · {}{hint}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
             } else {
@@ -1074,6 +1218,41 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Groups show as one read-only line each; a pattern without them shows none.
+    #[test]
+    fn the_overview_lists_akasha_groups_read_only() {
+        let mut p = crate::engine::pattern::Pattern::builtin();
+        assert!(groups_lines(&p).is_empty(), "every pattern from before groups");
+        let group = |name: &str, roles: &[&str], shared_chars: usize, push: &str, auto: bool| crate::engine::pattern::Group { name: name.into(), roles: roles.iter().map(|r| r.to_string()).collect(), shared_chars, push: push.into(), auto };
+        p.groups = vec![group("builders", &["worker-big", "worker-small"], 16_384, "urgent", true), group("reviewers", &["qa"], 2_000, "none", false)];
+        assert_eq!(groups_lines(&p), vec!["groups: builders (worker-big, worker-small) · 16k · push urgent".to_string(), "        reviewers (qa) · 2k · push none · no auto entries".to_string()]);
+    }
+
+    /// Deleting a role a group lists takes it out of the group too: groups are read-only here, so
+    /// a group left naming it would block ctrl+s with an error the Studio cannot clear.
+    #[test]
+    fn deleting_a_grouped_role_takes_it_out_of_its_group() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin_swarm();
+        assert!(app.studio.pattern.groups[0].roles.contains(&"worker-small".to_string()));
+        app.studio.focus = 0;
+        app.studio.sel = StudioSel::Role("worker-small".into());
+        studio_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!app.studio.pattern.roles.contains_key("worker-small"), "deleted");
+        assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string()]);
+        assert!(app.studio.pattern.validate().is_ok(), "{:?}", app.studio.pattern.validate());
+        let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(t.contains("worker-small") && t.contains("group builders"), "{t}");
+        // a role no group lists is deleted as before, groups untouched
+        app.studio.pattern.roles.insert("helper".into(), app.studio.pattern.roles["worker-big"].clone());
+        app.studio.sel = StudioSel::Role("helper".into());
+        app.toast = None;
+        studio_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(!app.studio.pattern.roles.contains_key("helper"));
+        assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string()]);
+        assert!(app.toast.is_none(), "nothing to say");
+    }
 
     /// Every field the editor lists shows something: a name added to `ROLE_FIELDS` /
     /// `SETTING_FIELDS` without its `get_value` arm would otherwise read as an empty, dead row.
@@ -1213,5 +1392,75 @@ mod tests {
         let mut s = PatternSettings { watchdog_seconds: 90, watchdog_escalate_seconds: 30, ..Default::default() };
         clamp_watchdog(&mut s);
         assert!(s.watchdog_escalate_seconds > s.watchdog_seconds, "escalate must never end up <= seconds");
+    }
+
+    /// The grid scrolls sideways to the selected column, keeping the first, and shows columns
+    /// whole or not at all.
+    #[test]
+    fn a_wide_grid_shows_the_selected_column() {
+        let ws = PROV_WIDTHS;
+        assert_eq!(shown_cols(&ws, 0, 200, 200), (0..8).collect::<Vec<_>>(), "everything fits");
+        assert_eq!(shown_cols(&ws, 0, 68, 78), vec![0, 1, 2, 3, 4], "kind would be cut: left out");
+        assert_eq!(shown_cols(&ws, 7, 68, 78), vec![0, 4, 5, 6, 7], "wire selected: from api_key on");
+        assert_eq!(shown_cols(&ws, 2, 68, 78), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// At 80 columns a Bija provider's kind and wire can be seen once the cursor is on them, and
+    /// its status reads whole; the hint under the grid is about the columns being edited.
+    #[test]
+    fn the_providers_grid_at_80_columns_shows_kind_and_wire() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry.providers = vec![ProviderEntry { id: "local".into(), name: "Local vLLM".into(), base_url: "http://127.0.0.1:8000/v1".into(), kind: crate::config::ProviderKind::Bija, wire: "anthropic".into(), ..Default::default() }];
+        app.models_ui.providers = true;
+        app.models_ui.row = 0;
+        app.models_ui.col = PROV_WIRE_COL;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_models(f, &mut app)).unwrap();
+        let b = term.backend().buffer();
+        let screen: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect();
+        let row = screen.iter().find(|l| l.contains("local")).cloned().unwrap_or_default();
+        assert!(row.contains("Bija") && row.contains("anthropic") && row.contains("no key (optional)"), "{row}");
+        assert!(screen.iter().any(|l| l.contains("wire (Bija only) = openai")), "{}", screen.join("\n"));
+        assert!(screen.iter().any(|l| l.contains("ctrl+s save")), "save stays in the footer");
+    }
+
+    /// +/- on the provider grid cycles the column under the cursor — kind, auth or wire — and
+    /// nothing else; a typed wire is stored the way models.toml keeps it.
+    #[test]
+    fn provider_kind_auth_and_wire_cycle_in_their_own_columns() {
+        use crate::config::ProviderKind;
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry.providers = vec![ProviderEntry { id: "gw".into(), base_url: "https://gw.dev/v1".into(), ..Default::default() }];
+        app.models_ui.providers = true;
+        app.models_ui.row = 0;
+        let plus = || KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE);
+        app.models_ui.col = PROV_KIND_COL;
+        for want in [ProviderKind::ClaudeCode, ProviderKind::Bija, ProviderKind::Codex] {
+            models_key(&mut app, plus());
+            assert_eq!(app.registry.providers[0].kind, want);
+        }
+        app.models_ui.col = PROV_AUTH_COL;
+        models_key(&mut app, plus());
+        assert_eq!(app.registry.providers[0].auth, "api_key");
+        app.models_ui.col = PROV_WIRE_COL;
+        models_key(&mut app, plus());
+        assert_eq!(app.registry.providers[0].wire, "anthropic");
+        models_key(&mut app, plus());
+        assert_eq!(app.registry.providers[0].wire, "", "Chat Completions is stored as no wire at all");
+        app.models_ui.dirty = false;
+        app.models_ui.col = 4;
+        models_key(&mut app, plus());
+        assert!(!app.models_ui.dirty, "api_key has nothing to cycle");
+
+        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_KIND_COL), "seed");
+        assert_eq!(app.registry.providers[0].kind, ProviderKind::Bija);
+        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), " Messages ");
+        assert_eq!(app.registry.providers[0].wire, "anthropic");
+        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), "grpc");
+        assert_eq!(wire_str(&app.registry.providers[0]), "grpc");
+        assert!(app.registry.providers[0].draft_reason().is_some_and(|w| w.contains("grpc")), "a typo stays visible, as a draft");
+        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), "openai");
+        assert_eq!((app.registry.providers[0].wire.as_str(), wire_str(&app.registry.providers[0]).as_str()), ("", "openai"));
+        assert_eq!(wire_str(&ProviderEntry::default()), "—", "a Codex provider has no wire");
     }
 }

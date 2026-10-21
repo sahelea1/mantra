@@ -184,6 +184,22 @@ pub fn gate_tools(may_spawn: bool, worker_roles: &[String]) -> Vec<Value> {
     v
 }
 
+/// Akasha (experimental): the tools of an agent whose role is in one of the pattern's `[[groups]]`,
+/// added to its role's own when the feature is on (`Run::akasha_req`). They act on the group's block.
+pub fn akasha_tools() -> Vec<Value> {
+    vec![
+        tool("mantra_akasha_read", "Read your group's shared notes: what the agents working beside you chose to share, and what Mantra noted for them (tasks done or failed, files changed).", json!({}), &[]),
+        tool(
+            "mantra_akasha_note",
+            "Add a note to your group's shared notes: a fact about the codebase another agent would need, a decision, an interface you created, a pitfall — short, one thing per note. Forget what went stale. `urgent` reaches the others mid-turn: use it only for a change that affects their work right now.",
+            json!({"text": {"type": "string", "description": "the note, at most 1000 characters"}, "urgent": {"type": "boolean", "description": "push it to the busy members now (default false)"}}),
+            &["text"],
+        ),
+        tool("mantra_akasha_amend", "Replace a shared note's text (by its #id) when what it says changed.", json!({"id": {"type": "integer"}, "text": {"type": "string"}}), &["id", "text"]),
+        tool("mantra_akasha_forget", "Remove a shared note that went stale (by its #id). The block is small: forget what no longer holds.", json!({"id": {"type": "integer"}}), &["id"]),
+    ]
+}
+
 pub fn architect_tools() -> Vec<Value> {
     vec![
         tool("mantra_read_pattern", "Read the pattern currently open in the Studio (TOML).", json!({}), &[]),
@@ -290,6 +306,18 @@ mantra-role: gate
   can amend the checks) and wait.
 "#;
 
+/// Appended to a member's instructions together with `akasha_tools`.
+pub const AKASHA_PROTOCOL: &str = r#"
+## Shared notes (akasha)
+- You share one small block of notes with the other agents of your group. Mantra shows it at the end of
+  its prompts to you; `mantra_akasha_read` shows it any time.
+- Note (`mantra_akasha_note`) what an agent working beside you would need: a fact about the codebase, a
+  decision, an interface you created, a pitfall. Short, one thing per note; `mantra_akasha_amend` it when
+  it changes, `mantra_akasha_forget` it when it goes stale. Not a log of your work: Mantra notes what you
+  finished and which files you changed.
+- `urgent` reaches the others mid-turn: only for a change that affects their work right now.
+"#;
+
 pub const ARCHITECT_PROMPT: &str = r#"
 mantra-role: architect
 You are the Pattern Architect inside Mantra's Studio. You design agent workflows ("patterns") with the user.
@@ -302,6 +330,8 @@ planner is bothered), orchestrator, phase_gate, on_reprompt, and [[flow.finale]]
 context_cap (the most tokens of context any agent is told it has, 200000 in the built-ins; 0 = the model's full window).
 A role may also set fallback = alias: the model that takes over when an agent of that role sits through
 settings.first_token_minutes (default 4; 0 = off) twice with no output at all.
+Optional [[groups]] (Akasha, experimental: roles that share one block of notes) have name, roles (each role in
+one group at most), shared_chars (1024-262144, default 16384), push = none|urgent|all (default urgent), auto (default true).
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.
 If validation fails, fix and retry. Finally explain the change in 1-3 sentences.
 "#;

@@ -165,6 +165,7 @@
                     open && c.output_tail ? h('pre', { class: 'cmd-out' }, c.output_tail) : null);
             })), { key: 'checks', icon: 'check' }));
         }
+        kids.push(notesCard(run));
         if ((run.conflicts || []).length) kids.push(card('Merge conflicts', h('ul', { class: 'plain' }, run.conflicts.map((c) => h('li', { key: c }, h('code', null, c)))), { key: 'conf', icon: 'alert', cls: 'warn' }));
         if ((run.alerts || []).length) kids.push(card('Alerts', h('ul', { class: 'plain' }, run.alerts.map((c, i) => h('li', { key: i }, c))), { key: 'alerts', icon: 'alert', cls: 'warn' }));
         if ((run.history || []).length) {
@@ -173,6 +174,32 @@
                 r.summary ? h('div', { class: 'hist-sum' }, F.trunc(r.summary, 400)) : null))), { key: 'hist', icon: 'runs' }));
         }
         return page('run', kids);
+    }
+    // Akasha (experimental): what each agent group shares, read-only. Folded by default — it is
+    // the agents' notebook, not the run's state — with the count and the urgent ones on its head.
+    function kChars(n) {
+        if (n < 1000) return String(n);
+        const k = n / 1024;
+        return (k < 10 ? k.toFixed(1) : k.toFixed(0)).replace(/\.0$/, '') + 'k';
+    }
+    function notesCard(run) {
+        const blocks = run.akasha || [];
+        if (!blocks.length) return null;
+        const s = S();
+        const open = !!s.ui.expanded.akasha;
+        const all = blocks.flatMap((b) => b.entries || []);
+        const urgent = all.filter((e) => e.urgent).length;
+        const toggle = h('button', { type: 'button', class: 'notes-toggle', 'aria-expanded': String(open), onclick: () => { s.ui.expanded.akasha = !open; M.act.changed(); } },
+            h('span', null, F.plural(all.length, 'note')), urgent ? h('span', { class: 'mini-chip warn' }, urgent + ' urgent') : null, icon(open ? 'up' : 'down', 'chev'));
+        const group = (b) => h('div', { class: 'notes-group', key: b.group },
+            h('div', { class: 'notes-head' }, h('b', null, b.group), h('span', { class: 'mono dim' }, kChars(b.chars) + '/' + kChars(b.cap))),
+            (b.entries || []).length
+                ? h('ol', { class: 'notes' }, b.entries.map((e) => h('li', { key: e.id, class: 'note' + (e.urgent ? ' urgent' : '') },
+                    h('div', { class: 'note-meta' }, e.urgent ? h('span', { class: 'mini-chip warn' }, 'urgent') : null,
+                        h('span', { class: 'mono dim' }, '#' + e.id), h('span', null, e.author), h('time', { class: 'dim', title: new Date(e.at).toLocaleString() }, F.clock(e.at))),
+                    h('div', { class: 'note-x' }, F.inline(e.text)))))
+                : h('p', { class: 'sec-sub' }, 'No notes yet.'));
+        return card('Shared notes', open ? blocks.map(group) : null, { key: 'akasha', icon: 'edit', right: toggle, cls: 'notes-card' });
     }
     // `sub` is a muted reading of the value under it ("5.9M cached" under a token total).
     function stat(label, value, sub) { return value ? h('div', { class: 'stat', key: label }, h('span', { class: 'stat-v' }, value), sub ? h('span', { class: 'stat-sub' }, sub) : null, h('span', { class: 'stat-l' }, label)) : null; }

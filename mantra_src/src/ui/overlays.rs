@@ -12,11 +12,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // The scrolling ones say how far they can scroll: the stored offset is clamped to it, so
         // ↑ after over-scrolling (or a shrunk terminal) moves the view on the first press.
         if let Some(max) = draw_one(f, app, i) {
-            if let Overlay::Help { scroll } | Overlay::Diff { scroll, .. } | Overlay::Plan { scroll } | Overlay::Halt { scroll } = &mut app.overlays[i] {
+            if let Overlay::Help { scroll } | Overlay::Diff { scroll, .. } | Overlay::Plan { scroll } | Overlay::Halt { scroll } | Overlay::Akasha { scroll, .. } = &mut app.overlays[i] {
                 *scroll = (*scroll).min(max);
             }
         }
     }
+}
+
+/// Clears an overlay's box and a gutter of up to three columns on either side of it, so what
+/// the screen under it had in those columns (a box's border, the last letters of a row cut by
+/// the overlay) does not read as stray marks beside the overlay's own border.
+fn clear(f: &mut Frame, area: Rect, r: Rect) {
+    let x0 = r.x.saturating_sub(3).max(area.x);
+    let x1 = (r.x + r.width + 3).min(area.x + area.width);
+    f.render_widget(Clear, Rect { x: x0, width: x1.saturating_sub(x0), ..r });
 }
 
 /// Draws overlay `i`; a scrolling one returns its largest useful scroll offset.
@@ -35,6 +44,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) -> Option<usize> {
         Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
         Overlay::Web => web(f, area, app),
         Overlay::Remote => remote(f, area, app),
+        Overlay::Akasha { scroll, group } => return Some(akasha(f, area, app, group.as_deref(), *scroll)),
     }
     None
 }
@@ -94,7 +104,7 @@ fn web(f: &mut Frame, area: Rect, app: &App) {
     l.push(Line::default());
     l.push(Line::from(Span::styled("  /remote for the relay link · esc", theme::faint())));
     let r = centered(area, w, l.len() as u16 + 2);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     f.render_widget(Paragraph::new(l).block(block("web", theme::TEAL)), r);
 }
 
@@ -110,7 +120,7 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled("  esc", theme::faint())),
         ];
         let r = centered(area, 90, l.len() as u16 + 2);
-        f.render_widget(Clear, r);
+        clear(f, area, r);
         f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
         return;
     };
@@ -164,7 +174,7 @@ fn remote(f: &mut Frame, area: Rect, app: &App) {
     l.push(Line::from(Span::styled("  the link — or the code + password — opens this session: share it like a key", theme::faint())));
     l.push(Line::from(Span::styled("  r new link (the old one stops working) · esc", theme::faint())));
     let r = centered(area, w, l.len() as u16 + 2);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
 }
 
@@ -211,13 +221,14 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
         k("m", "switch model for the selected agent (fixes a halt where the provider rejected it)"),
         k("p · a", "plan · approve plan (during review)"),
+        k("/akasha [group]", "the shared notes of the run's agent groups (experimental)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
         k("s", "open the pattern studio"),
         k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
     ]
     .concat();
     let r = centered(area, w, l.len() as u16 + 3);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let blk = block("keys", theme::SAFFRON);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
@@ -232,10 +243,12 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
     max
 }
 
-/// Which runtime a provider's models run through (WP10): `codex app-server` or `claude -p`.
+/// Which runtime a provider's models run through (WP10): `codex app-server`, `claude -p` or
+/// `bija`.
 fn backend_glyph(reg: &crate::config::Registry, provider: &str) -> &'static str {
     match reg.providers.iter().find(|p| p.id == provider).map(|p| p.kind) {
         Some(crate::config::ProviderKind::ClaudeCode) => "✧ claude",
+        Some(crate::config::ProviderKind::Bija) => "• bija",
         _ => "◌ codex",
     }
 }
@@ -246,13 +259,19 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
     // narrower terminals. There the notes go first, then (below ~100 columns) the effort bar, and
     // the model id and provider columns narrow, so effort, context and "current" still show.
     let r = centered(area, 132, rows + 7);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let iw = r.width.saturating_sub(2) as usize;
     let notes = iw >= 107;
     let narrow = iw < 98;
     let cur = target.and_then(|a| app.agents.get(&a));
-    let mut l = vec![Line::from(Span::styled(format!("  for: {}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
-    for (i, m) in app.registry.models.iter().enumerate() {
+    // More models than rows (a discovery added some, or a short terminal): a window that keeps
+    // the selection in view, so the keys line below never falls off the box.
+    let n = app.registry.models.len();
+    let vis = (r.height.saturating_sub(2) as usize).saturating_sub(4).max(1);
+    let start = if n <= vis { 0 } else { sel.saturating_sub(vis / 2).min(n - vis) };
+    let window = if n > vis { format!(" · {}-{} of {n}", start + 1, start + vis) } else { String::new() };
+    let mut l = vec![Line::from(Span::styled(format!("  for: {}{window}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
+    for (i, m) in app.registry.models.iter().enumerate().skip(start).take(vis) {
         let is_cur = cur.map(|a| a.model_alias == m.alias).unwrap_or(false);
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
         let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
@@ -275,13 +294,21 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
             row.push(Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))));
         }
         row.push(Span::styled(format!(" {:<12}", ctx), theme::dim()));
+        // What is left of the row goes, in this order, to "current", the other route to the same
+        // model (whole or not at all: "(also vi" says nothing), then the note in what remains.
+        let mut left = iw.saturating_sub(Line::from(row.clone()).width());
         if is_cur {
-            row.push(Span::styled(format!(" {} current", theme::g("●", "*")), theme::fg(theme::GREEN)));
-        } else if notes {
-            row.push(Span::styled(format!(" {}", trunc(&m.note, 18)), theme::faint()));
+            let s = format!(" {} current", theme::g("●", "*"));
+            left = left.saturating_sub(w_of(&s));
+            row.push(Span::styled(s, theme::fg(theme::GREEN)));
         }
-        if notes {
-            row.push(Span::styled(trunc(&dup, 26), theme::faint()));
+        let dup = if notes && w_of(&dup) <= left { dup } else { String::new() };
+        left = left.saturating_sub(w_of(&dup));
+        if notes && !is_cur && !m.note.is_empty() && left >= 9 {
+            row.push(Span::styled(format!(" {}", trunc(&m.note, left - 1)), theme::faint()));
+        }
+        if !dup.is_empty() {
+            row.push(Span::styled(dup, theme::faint()));
         }
         l.push(Line::from(row));
     }
@@ -293,7 +320,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
 
 fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: usize, scroll: usize) -> Option<usize> {
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let Some(a) = app.agents.get(&agent) else { return None };
     let blk = block(&format!("changes · {}", a.name), theme::AMBER);
     let inner = blk.inner(r);
@@ -365,7 +392,7 @@ fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: 
 fn inbox(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     let alerts: Vec<String> = app.run.as_ref().map(|r| r.alerts.clone()).unwrap_or_default();
     let r = centered(area, 90, (app.approvals.len() as u16 * 3 + alerts.len() as u16 + 8).min(area.height.saturating_sub(2)));
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let mut l = vec![];
     if app.approvals.is_empty() && alerts.is_empty() {
         l.push(Line::from(Span::styled("  all clear — nothing needs you right now", theme::dim())));
@@ -392,7 +419,7 @@ fn inbox(f: &mut Frame, area: Rect, app: &App, sel: usize) {
 
 fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> usize {
     let r = Rect { x: area.x + 3, y: area.y + 1, width: area.width.saturating_sub(6), height: area.height.saturating_sub(2) };
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let review = app.run.as_ref().map(|x| x.stage == Stage::Review).unwrap_or(false);
     let title = if review { "plan review" } else { "plan" };
     let blk = block(title, theme::SAFFRON);
@@ -443,7 +470,7 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
         None => l.push(Line::from(Span::styled(" the run is no longer halted", theme::fg(theme::GREEN)))),
     }
     let r = centered(area, w, l.len() as u16 + 3);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let blk = block("halt", theme::AMBER);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
@@ -457,6 +484,80 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
     Some(max)
 }
 
+/// `/akasha [group]`: opens the notes overlay, or says in a toast why there is nothing to open —
+/// no run, a run without groups (Akasha off, or a pattern with none), or a group it does not have.
+pub fn open_akasha(app: &mut App, group: &str) {
+    let groups: Vec<String> = app.run.as_ref().map(|r| r.akasha.keys().cloned().collect()).unwrap_or_default();
+    if groups.is_empty() {
+        app.toast("no akasha groups in this run", crate::agent::Level::Info);
+    } else if !group.is_empty() && !groups.iter().any(|g| g == group) {
+        app.toast(format!("no akasha group '{group}' in this run (it has: {})", groups.join(", ")), crate::agent::Level::Info);
+    } else {
+        app.overlays.push(Overlay::Akasha { scroll: 0, group: (!group.is_empty()).then(|| group.to_string()) });
+    }
+}
+
+/// The run's shared notes, one section per group, each the block exactly as its agents read it
+/// (`Block::render`): what the overlay shows is what they were told, only styled.
+fn akasha(f: &mut Frame, area: Rect, app: &App, group: Option<&str>, scroll: usize) -> usize {
+    let r = Rect { x: area.x + 3, y: area.y + 1, width: area.width.saturating_sub(6), height: area.height.saturating_sub(2) };
+    clear(f, area, r);
+    let blk = block(&group.map(|g| format!("akasha · {g}")).unwrap_or_else(|| "akasha".into()), theme::VIOLET);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    let width = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = vec![];
+    for b in app.run.iter().flat_map(|r| r.akasha.values()).filter(|b| group.map(|g| g == b.group).unwrap_or(true)) {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(akasha_lines(&b.render(), width));
+    }
+    // the run can be closed while this is open: say so instead of drawing an empty box
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("no akasha groups in this run", theme::muted())));
+    }
+    let h = inner.height.saturating_sub(1) as usize;
+    let max = lines.len().saturating_sub(h);
+    let view: Vec<Line> = lines.into_iter().skip(scroll.min(max)).take(h).collect();
+    f.render_widget(Paragraph::new(view), Rect { x: inner.x + 1, width: inner.width.saturating_sub(1), height: h as u16, ..inner });
+    let hint = if max > 0 { " ↑↓ scroll · esc " } else { " esc " };
+    f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
+    max
+}
+
+/// A rendered block, styled by what each line is: the `## akasha · …` header, a note's
+/// `[7 · w2 · 14:02]` head (amber after a `!` when urgent), and the indented lines a note's text
+/// continues on. A long line wraps under the note's text, not under its head.
+fn akasha_lines(rendered: &str, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    for line in rendered.lines() {
+        if let Some(head) = line.strip_prefix("## ") {
+            out.push(Line::from(Span::styled(head.to_string(), theme::bold(theme::fg(theme::VIOLET)))));
+            continue;
+        }
+        let (urgent, rest) = match line.strip_prefix('!') {
+            Some(r) => (true, r),
+            None => (false, line),
+        };
+        // neither a note's head nor its next line: the empty block's "(no notes yet)"
+        if !rest.starts_with('[') && !rest.starts_with("    ") {
+            out.push(Line::from(vec![Span::raw("  "), Span::styled(rest.to_string(), theme::muted())]));
+            continue;
+        }
+        let mark = if urgent { Span::styled("! ", theme::bold(theme::fg(theme::AMBER))) } else { Span::raw("  ") };
+        let (meta, text) = match rest.split_once("] ").filter(|_| rest.starts_with('[')) {
+            Some((m, t)) => (format!("{m}] "), t),
+            // a note's next line: under its text, keeping its own indentation past the render's
+            None => ("  ".to_string(), rest.strip_prefix("    ").unwrap_or(rest)),
+        };
+        let meta_st = if urgent { theme::fg(theme::AMBER) } else { theme::faint() };
+        let first = vec![mark, Span::styled(meta, meta_st)];
+        out.extend(md::wrap(vec![Span::styled(text.to_string(), theme::text())], width, first, vec![Span::raw("    ")]));
+    }
+    out
+}
+
 fn is_multiline(t: &EditTarget) -> bool {
     matches!(t, EditTarget::RoleField(_, f) if f == "instructions" || f == "description") || matches!(t, EditTarget::FlowStep(_, f) if f == "task")
 }
@@ -465,7 +566,7 @@ fn edit(f: &mut Frame, area: Rect, title: &str, input: &crate::ui::input::Input,
     let ml = is_multiline(target);
     let h = if ml { area.height.saturating_sub(6).min(24) } else { 5 };
     let r = centered(area, 90, h);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let blk = block(title, theme::VIOLET);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
@@ -482,7 +583,7 @@ fn edit(f: &mut Frame, area: Rect, title: &str, input: &crate::ui::input::Input,
 fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     use crate::discover::CState;
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let blk = block("discover models", theme::SAFFRON);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
@@ -507,8 +608,10 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     let left = format!(" filter: {}{}", ftxt, theme::g("▏", "_"));
     let right = format!("{} shown · {} selected ", vis.len(), nsel);
     l.push(Line::from(vec![Span::styled(left.clone(), if ftxt.is_empty() { theme::faint() } else { theme::bold(theme::text()) }), Span::raw(" ".repeat(w.saturating_sub(w_of(&left) + w_of(&right)))), Span::styled(right, theme::muted())]));
-    let mw = w.saturating_sub(62).max(16);
-    l.push(Line::from(Span::styled(format!("      {:<10} {:<mw$} {:<16} {:<14} {}", "provider", "model", "context", "effort", "status"), theme::bold(theme::muted()))));
+    // Columns as wide as what they hold ("200.0k assumed", "minimal…xhigh", "fill missing"), the
+    // model taking the rest, so the status still reads whole at 80 columns.
+    let mw = w.saturating_sub(58).max(12);
+    l.push(Line::from(Span::styled(format!("     {:<10} {:<mw$} {:<14} {:<13} {}", "provider", "model", "context", "effort", "status"), theme::bold(theme::muted()))));
     let head = l.len();
     let room = (inner.height as usize).saturating_sub(head + 2).max(1);
     let sel = st.sel.min(vis.len().saturating_sub(1));
@@ -538,8 +641,8 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
             Span::styled(format!("{}{} ", if is { theme::g("▶", ">") } else { " " }, mark), st_row),
             Span::styled(format!("{:<10} ", trunc(&c.provider, 10)), if is { st_row } else { theme::muted() }),
             Span::styled(format!("{:<mw$} ", trunc(&c.model, mw)), st_row),
-            Span::styled(format!("{:<16} ", ctx), if c.context_known { theme::muted() } else { theme::fg(theme::AMBER) }),
-            Span::styled(format!("{:<14} ", trunc(&eff, 14)), theme::muted()),
+            Span::styled(format!("{:<14} ", trunc(&ctx, 14)), if c.context_known { theme::muted() } else { theme::fg(theme::AMBER) }),
+            Span::styled(format!("{:<13} ", trunc(&eff, 13)), theme::muted()),
             Span::styled(status, theme::fg(scol)),
         ]));
     }
@@ -547,16 +650,18 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
         l.push(Line::from(Span::styled(if st.items.is_empty() { "  no models found" } else { "  nothing matches the filter" }, theme::dim())));
     }
     f.render_widget(Paragraph::new(l), inner);
-    let foot = vec![
-        Line::from(Span::styled(" unknown context → assumed 200k (edit in /models) · effort only where the provider reports reasoning support", theme::faint())),
-        Line::from(Span::styled(" type to filter · ↑↓ move · space select · tab all/none · ⏎ add selected & save · esc close", theme::bold(theme::accent()))),
-    ];
+    let (note, keys) = if w >= 112 {
+        (" unknown context → assumed 200k (edit in /models) · effort only where the provider reports reasoning support", " type to filter · ↑↓ move · space select · tab all/none · ⏎ add selected & save · esc close")
+    } else {
+        (" unknown context → 200k assumed · effort where the provider reports it", " type to filter · ↑↓ · space select · tab all · ⏎ add & save · esc")
+    };
+    let foot = vec![Line::from(Span::styled(note, theme::faint())), Line::from(Span::styled(keys, theme::bold(theme::accent())))];
     f.render_widget(Paragraph::new(foot), Rect { y: inner.y + inner.height.saturating_sub(2), height: 2.min(inner.height), ..inner });
 }
 
 fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoice]) {
     let r = centered(area, 110, list.len() as u16 + 5);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let iw = r.width.saturating_sub(2) as usize;
     let nw = list.iter().map(|p| w_of(&p.name)).max().unwrap_or(0).max(14) + 2;
     let active = format!("  {} active", theme::g("●", "*"));
@@ -594,7 +699,7 @@ fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternCho
 fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine::state::RunSummary], confirm: bool, others: usize) {
     use crate::engine::state::fmt_ago;
     let r = centered(area, 100, (list.len() as u16).max(1) + 5);
-    f.render_widget(Clear, r);
+    clear(f, area, r);
     let inner_w = r.width.saturating_sub(4) as usize;
     let id_w = inner_w.saturating_sub(2 + 32 + 1 + 18 + 1 + 9 + 2).max(8);
     let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<32} {:<18} {:>9}  {}", "run", "stage", "updated", "id"), theme::faint()))];
@@ -698,7 +803,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                         },
                         None => {
                             app.settings.default_model = alias;
-                            let _ = app.settings.save();
+                            app.save_settings();
                         }
                     }
                     None
@@ -785,6 +890,14 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 _ => Some(Overlay::Inbox { sel }),
             }
         }
+        Overlay::Akasha { scroll, group } => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Up | KeyCode::Char('k') => Some(Overlay::Akasha { scroll: scroll.saturating_sub(1), group }),
+            KeyCode::Down | KeyCode::Char('j') => Some(Overlay::Akasha { scroll: scroll + 1, group }),
+            KeyCode::PageUp => Some(Overlay::Akasha { scroll: scroll.saturating_sub(20), group }),
+            KeyCode::PageDown | KeyCode::Char(' ') => Some(Overlay::Akasha { scroll: scroll + 20, group }),
+            _ => Some(Overlay::Akasha { scroll, group }),
+        },
         Overlay::Plan { scroll } => match k.code {
             KeyCode::Esc | KeyCode::Char('q') => None,
             KeyCode::Up | KeyCode::Char('k') => Some(Overlay::Plan { scroll: scroll.saturating_sub(1) }),
@@ -1003,5 +1116,89 @@ pub fn key(app: &mut App, k: KeyEvent) {
     };
     if let Some(o) = keep {
         app.overlays.push(o);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn text_of(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+    }
+
+    fn toast(app: &App) -> String {
+        app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default()
+    }
+
+    /// The overlay is the block as the agents read it: the header, then each note on its own line
+    /// with its head, an urgent one marked, a note over several lines kept together under its text.
+    #[test]
+    fn a_rendered_block_reads_note_by_note_with_the_urgent_ones_marked() {
+        let rendered = "## akasha · builders · 3 notes · 312/16k\n[1 · w2 · 14:02] models live in src/models — reuse `Config` from p1-config\n![2 · w3 · 14:05] the API returns 201 on create now\n[3 · mantra · 14:06] trait Store {\n    fn get(&self) -> u32;\n    }";
+        let lines = akasha_lines(rendered, 100);
+        let text = text_of(&lines);
+        assert_eq!(text[0], "akasha · builders · 3 notes · 312/16k");
+        assert_eq!(text[1], "  [1 · w2 · 14:02] models live in src/models — reuse `Config` from p1-config");
+        assert_eq!(text[2], "! [2 · w3 · 14:05] the API returns 201 on create now");
+        assert_eq!(lines[2].spans[0].style, theme::bold(theme::fg(theme::AMBER)), "urgent is marked");
+        assert_eq!(lines[1].spans[0].content, "  ", "the others are not");
+        assert_eq!(text[4].trim(), "fn get(&self) -> u32;", "a note's later lines stay with it");
+        // a long note wraps under its text, never past the width
+        let long = format!("[4 · w5 · 14:10] {}", "word ".repeat(40));
+        let lines = akasha_lines(&long, 40);
+        assert!(lines.len() > 3 && lines.iter().all(|l| l.width() <= 40), "{:?}", text_of(&lines));
+        assert!(text_of(&lines)[1].starts_with("    word"), "{:?}", text_of(&lines));
+        // an empty block, as the engine renders it: its one line is muted, not a note's next line
+        let empty = akasha_lines(&crate::engine::akasha::Block::new("builders", 16_384).render(), 100);
+        assert_eq!(text_of(&empty), vec!["akasha · builders · 0 notes · 54/16k".to_string(), "  (no notes yet)".to_string()]);
+        assert_eq!(empty[1].spans[1].style, theme::muted());
+    }
+
+    /// `/akasha` with nothing to show is a toast, not an empty box; an unknown group names the
+    /// groups there are; the overlay scrolls and closes on esc.
+    #[test]
+    fn akasha_opens_only_on_a_run_with_groups_and_closes_on_esc() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.command("/akasha");
+        assert!(app.overlays.is_empty());
+        assert_eq!(toast(&app), "no akasha groups in this run", "no run");
+        let pattern = crate::engine::pattern::Pattern::builtin();
+        app.run = Some(crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern, "goal".into()));
+        app.toast = None;
+        app.command("/akasha");
+        assert!(app.overlays.is_empty());
+        assert_eq!(toast(&app), "no akasha groups in this run", "a run without groups");
+        if let Some(r) = app.run.as_mut() {
+            r.akasha.insert("builders".into(), crate::engine::akasha::Block::new("builders", 16_384));
+        }
+        app.command("/akasha testers");
+        assert!(app.overlays.is_empty());
+        assert_eq!(toast(&app), "no akasha group 'testers' in this run (it has: builders)");
+        app.command("/akasha builders");
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, group: Some(name) }) if name == "builders"), "the one named");
+        let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        key(&mut app, press(KeyCode::Down));
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 1, .. })));
+        key(&mut app, press(KeyCode::Esc));
+        assert!(app.overlays.is_empty());
+        app.command("/akasha");
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { group: None, .. })), "every group");
+    }
+
+    /// Left open after the run is gone, the overlay says there is nothing rather than drawing an
+    /// empty box, and its scroll is clamped to what there is.
+    #[test]
+    fn the_overlay_without_blocks_says_so() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.overlays.push(Overlay::Akasha { scroll: 7, group: None });
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
+        assert!(screen.contains("no akasha groups in this run") && screen.contains("akasha"), "{screen}");
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, .. })), "clamped");
     }
 }

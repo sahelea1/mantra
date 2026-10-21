@@ -47,7 +47,7 @@ pub fn item_lines(it: &mut Item, width: u16, verbose: bool) -> Vec<Line<'static>
 fn build(it: &Item, width: usize, verbose: bool) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(2).max(10);
     match &it.kind {
-        Kind::User if it.text.starts_with("[mantra") || it.text.starts_with("[from ") => {
+        Kind::User if crate::agent::engine_sent(&it.text) => {
             let first = it.text.lines().next().unwrap_or("");
             let (tag, rest) = match first.find(']') {
                 Some(i) => (first[1..i].replace("mantra:", "mantra · "), first[i + 1..].trim().to_string()),

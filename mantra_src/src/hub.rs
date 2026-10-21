@@ -1,20 +1,25 @@
-//! The hub owns every agent's Codex process.
+//! The hub owns every agent's backend process.
 //!
-//! One `codex app-server` process per agent gives crash isolation: when one dies, only that
-//! agent restarts (with `thread/resume`), everything else keeps running.
+//! One process per agent — `codex app-server`, `claude -p` (`hub/claude.rs`) or `bija`
+//! (`hub/bija.rs`) — gives crash isolation: when one dies, only that agent restarts (resuming its
+//! thread or session), everything else keeps running.
 
+mod bija;
 mod claude;
 
 use crate::rpc::{self, Conn, Incoming};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Child;
+use tokio::process::{Child, ChildStderr};
 use tokio::sync::mpsc;
 
 pub use crate::config::ProviderKind as Backend;
+pub use bija::{sandbox_mode as bija_sandbox, BijaSpawn};
 pub use claude::ClaudeSpawn;
 
 pub type AgentId = u32;
@@ -35,15 +40,17 @@ pub struct SpawnSpec {
     /// What to call the thread in the backend (`thread/name/set`), where it supports names.
     pub thread_name: Option<String>,
     /// Which process type owns this agent (`hub::run_process` for Codex, `hub::claude` for
-    /// Claude Code — WP10). `agent_task` dispatches on this; everything above is Codex-only and
-    /// ignored for the Claude backend.
+    /// Claude Code — WP10 — and `hub::bija` for Bija). `agent_task` dispatches on this; the
+    /// approval, config and extra args above are Codex-only and ignored by the other backends.
     pub backend: Backend,
-    /// Extra environment variables to set on the child (e.g. a pasted `ANTHROPIC_API_KEY` resolved
-    /// by `app::spawn_agent` from the model's provider). Codex's own process doesn't consume this
-    /// yet (WP5 territory); the Claude backend applies it in full.
+    /// Extra environment variables to set on the child (e.g. a pasted `ANTHROPIC_API_KEY`, or the
+    /// key a Bija provider's `--api-key-env` names), resolved by `app::spawn_agent` from the
+    /// model's provider. Every backend applies them.
     pub envs: Vec<(String, String)>,
-    /// Claude-only spawn config; `None` for Codex agents.
+    /// Claude-only spawn config; `None` for the other backends.
     pub claude: Option<ClaudeSpawn>,
+    /// Bija-only spawn config; `None` for the other backends.
+    pub bija: Option<BijaSpawn>,
 }
 
 #[derive(Debug)]
@@ -59,8 +66,8 @@ pub enum Cmd {
     SetEffort(String),
     SetModel(String),
     SetApproval(String),
-    /// Rename the agent's thread (the run's title changed). Codex only; a Claude Code session has
-    /// no name to set.
+    /// Rename the agent's thread (the run's title changed). Codex and bija; a Claude Code session
+    /// has no name to set.
     SetName(String),
     Restart,
     /// A `mantra mcp-bridge` subprocess (spawned by `claude` per `--mcp-config`, WP10.4) connected
@@ -93,6 +100,24 @@ pub enum HubEvent {
 /// one or two (F2) — they recover via the normal restart path, but staggering avoids the noise.
 const SPAWN_STAGGER: Duration = Duration::from_millis(300);
 
+/// When a Codex spawn requested at `now` may start, given when the previous one starts (`last`):
+/// `SPAWN_STAGGER` after it, or now if that is past. Returns the wait and the start, which is what
+/// the next spawn spaces itself from — measured from the previous *request* instead, a burst of k
+/// spawns would all wait the same 300 ms and start together, the very thing the stagger prevents.
+fn stagger(last: Option<Instant>, now: Instant) -> (Duration, Instant) {
+    let start = last.map(|prev| prev + SPAWN_STAGGER).filter(|t| *t > now).unwrap_or(now);
+    (start - now, start)
+}
+
+/// How long quitting waits for the bija agents to finish, all of them together — they stop in
+/// parallel, so one budget covers a swarm. bija closes its transcript first (`bija/src/agent.rs`
+/// `shutdown`), so even a kill here loses nothing of the session; what follows is one 1 s SIGTERM
+/// grace for its background jobs and leftover command groups together (`bija/src/tools/shell.rs`),
+/// and this is well over it so they end cleanly instead of being orphaned. What is still running
+/// past this is killed when the runtime goes, as Codex and Claude Code processes always are;
+/// `hub/bija.rs`'s longer `SHUTDOWN_GRACE` is the limit for one process stopping before a restart.
+pub const QUIT_GRACE: Duration = Duration::from_secs(3);
+
 pub struct Hub {
     ev: mpsc::UnboundedSender<HubEvent>,
     agents: HashMap<AgentId, mpsc::UnboundedSender<Cmd>>,
@@ -100,20 +125,30 @@ pub struct Hub {
     pub codex_cmd: Vec<String>,
     /// Command used to launch one `claude` process per Claude Code agent (WP10.3).
     pub claude_cmd: Vec<String>,
+    /// Command used to launch one `bija` process per Bija agent, already resolved
+    /// (`config::resolve_bija_command`).
+    pub bija_cmd: Vec<String>,
+    /// When the last Codex process starts — after its stagger delay (`SPAWN_STAGGER`).
     last_spawn: Option<Instant>,
     /// Path of the Unix socket `mantra mcp-bridge` subprocesses connect to (WP10.4); `None` when no
     /// `ClaudeCode` provider exists (`enable_bridge = false` in `Hub::new`), or when the socket
     /// couldn't be created (logged, never fatal — Claude agents just run without dynamic tools).
     bridge_sock: Option<PathBuf>,
+    /// Cloned into every bija agent's task, which drops it once its process is reaped; nothing is
+    /// ever sent. `shutdown_all` lets go of the Hub's own and waits on `bija_gone`, which closes
+    /// when the last clone is gone.
+    bija_alive: Option<mpsc::Sender<()>>,
+    bija_gone: Option<mpsc::Receiver<()>>,
 }
 
 impl Hub {
     /// `enable_bridge`: whether to open the MCP-bridge Unix socket at all — only worth doing when
     /// the registry has at least one `ClaudeCode`-kind provider (WP10.4); computed by the caller
     /// (`main.rs`) so `Hub` itself never has to know about `config::Registry`.
-    pub fn new(codex_cmd: Vec<String>, claude_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>, enable_bridge: bool) -> Hub {
+    pub fn new(codex_cmd: Vec<String>, claude_cmd: Vec<String>, bija_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>, enable_bridge: bool) -> Hub {
         let bridge_sock = if enable_bridge { setup_bridge(ev.clone()) } else { None };
-        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, claude_cmd, last_spawn: None, bridge_sock }
+        let (alive, gone) = mpsc::channel(1);
+        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bija_alive: Some(alive), bija_gone: Some(gone) }
     }
 
     /// The bridge socket path a Claude agent's `--mcp-config` should point `mantra mcp-bridge` at,
@@ -135,14 +170,24 @@ impl Hub {
         let cmd = match spec.backend {
             Backend::ClaudeCode => self.claude_cmd.clone(),
             Backend::Codex => self.codex_cmd.clone(),
+            Backend::Bija => self.bija_cmd.clone(),
         };
-        let now = Instant::now();
-        let delay = match self.last_spawn {
-            Some(prev) => SPAWN_STAGGER.saturating_sub(now.duration_since(prev)),
-            None => Duration::ZERO,
+        // Only Codex shares state between its processes (`CODEX_HOME`); a swarm of eighty bija
+        // agents starts at once instead of over half a minute.
+        let delay = if spec.backend == Backend::Codex {
+            let (delay, start) = stagger(self.last_spawn, Instant::now());
+            self.last_spawn = Some(start);
+            delay
+        } else {
+            Duration::ZERO
         };
-        self.last_spawn = Some(now);
-        tokio::spawn(agent_task(id, spec, cmd, ev, rx, delay));
+        let alive = if spec.backend == Backend::Bija { self.bija_alive.clone() } else { None };
+        let task = agent_task(id, spec, cmd, ev, rx, delay);
+        tokio::spawn(async move {
+            // Held for as long as the task runs: see `Stopping`.
+            let _alive = alive;
+            task.await
+        });
     }
 
     /// Whether an agent process is registered under this id (the web API validates ids with it).
@@ -162,7 +207,10 @@ impl Hub {
         }
     }
 
-    pub fn shutdown_all(&mut self) {
+    /// Tells every agent to shut down. The returned `Stopping` is what the quit path awaits before
+    /// the runtime goes: its teardown kills every child still running, and a bija agent needs a
+    /// moment first to end its running command and background jobs and close its transcript.
+    pub fn shutdown_all(&mut self) -> Stopping {
         for (_, tx) in self.agents.drain() {
             let _ = tx.send(Cmd::Shutdown);
         }
@@ -170,6 +218,28 @@ impl Hub {
         // name, next process's bind removes any stale one anyway) but tidying up is cheap.
         if let Some(p) = self.bridge_sock.take() {
             let _ = std::fs::remove_file(p);
+        }
+        self.bija_alive = None;
+        Stopping(self.bija_gone.take())
+    }
+}
+
+/// The bija agents still finishing after `Hub::shutdown_all`. Codex and Claude Code agents are not
+/// waited for: their processes are killed with the runtime, as they always were.
+pub struct Stopping(Option<mpsc::Receiver<()>>);
+
+impl Stopping {
+    /// Waits until every bija agent's process has exited, or `QUIT_GRACE` has passed. True when
+    /// they all made it.
+    pub async fn wait(self) -> bool {
+        self.wait_at_most(QUIT_GRACE).await
+    }
+
+    async fn wait_at_most(self, limit: Duration) -> bool {
+        match self.0 {
+            // `recv` answers `None` once the last sender is gone, i.e. the last bija task ended.
+            Some(mut gone) => tokio::time::timeout(limit, gone.recv()).await.is_ok(),
+            None => true,
         }
     }
 }
@@ -276,8 +346,8 @@ async fn agent_task(
     if initial_delay > Duration::ZERO {
         tokio::time::sleep(initial_delay).await;
     }
-    // `thread_id` doubles as the Claude backend's session id: both are "the identifier this agent
-    // resumes with after a restart", just under different Codex/Claude names.
+    // `thread_id` doubles as the Claude and bija backends' session id: all three are "the
+    // identifier this agent resumes with after a restart", just under different names.
     let mut thread_id = spec.resume_thread.clone();
     let mut effort = spec.effort.clone();
     let mut model = spec.model.clone();
@@ -285,18 +355,22 @@ async fn agent_task(
     let mut restarts: u32 = 0;
     let mut launch_failures: u32 = 0;
     let mut window = Instant::now();
-    // `Cmd::Turn`/`Cmd::Steer` text held instead of being lost: by the dying process itself (Claude's
-    // `restart_pending`, or a dead-resume detection) or by this loop's own crash-backoff wait below —
-    // either way delivered once the next process reaches `Ready` (see `run_process`/`run_claude_process`).
+    // `Cmd::Turn`/`Cmd::Steer` text held instead of being lost: by the process attempt itself
+    // (`hold_text` while Claude's `restart_pending` or before bija's `ready`; Claude's dead-resume
+    // detection) or by this loop's own crash-backoff wait below — either way delivered once a
+    // process reaches `Ready` (every backend drains it right after sending `HubEvent::Ready`).
     let mut replay: Vec<String> = vec![];
     // The last `Cmd::Turn` text actually sent to a child, kept only so `prepare_relaunch` can requeue
     // it on a *fresh* relaunch (the old session is gone, so that turn never got a reply).
     let mut last_turn: Option<String> = None;
+    // bija only: its last process ended while a turn was open (`bija::run_bija_process`).
+    let mut turn_cut = false;
 
     'outer: loop {
         let started = match spec.backend {
             Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
             Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
+            Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn, &mut turn_cut).await,
         };
         let launch_failure = matches!(started, Exit::LaunchFailed(_));
         match started {
@@ -644,6 +718,150 @@ fn fire(conn: &Conn, ev: &mpsc::UnboundedSender<HubEvent>, id: AgentId, method: 
     });
 }
 
+// ── shared by the NDJSON backends (`hub/claude.rs`, `hub/bija.rs`) ──────────────────────────────
+
+/// One line of an NDJSON stream, or its end.
+enum LineIn {
+    Line(Value),
+    Closed,
+}
+
+/// Reads NDJSON into `tx` — one `Value` per line, then `Closed` — from a child's stdout or the MCP
+/// bridge's socket. By bytes, not `lines()`: `lines()` fails on a line that is not UTF-8, which the
+/// backend would take for the process exiting; here such a line costs only itself. Every line is
+/// logged as `<label>: …` unless `quiet` calls it one of the stream's own ticks (a token delta, a
+/// progress beat); one that is not JSON (a CLI's stray warning) is logged and skipped.
+async fn read_ndjson<R: AsyncRead + Unpin>(r: R, tx: mpsc::UnboundedSender<LineIn>, label: String, quiet: fn(&Value) -> bool) {
+    let mut reader = BufReader::with_capacity(1 << 16, r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => {
+                if !quiet(&v) {
+                    crate::mlog!("{label}: {}", crate::util::trunc(line, 200));
+                }
+                if tx.send(LineIn::Line(v)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => crate::mlog!("{label}: not JSON ({e}): {}", crate::util::trunc(line, 200)),
+        }
+    }
+    let _ = tx.send(LineIn::Closed);
+}
+
+/// The last few non-empty lines a child wrote to stderr, ANSI stripped: what its crash reason quotes.
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
+
+const STDERR_TAIL_LINES: usize = 5;
+
+/// Logs every stderr line of a child as `[<label> stderr] …` and keeps the last
+/// `STDERR_TAIL_LINES` non-empty ones in `tail`, until the pipe closes with the process.
+async fn read_stderr_tail(stderr: ChildStderr, tail: StderrTail, label: &'static str) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(l)) = lines.next_line().await {
+        crate::mlog!("[{label} stderr] {}", crate::util::trunc(&l, 400));
+        let clean = crate::util::strip_ansi(&l);
+        if !clean.trim().is_empty() {
+            if let Ok(mut t) = tail.lock() {
+                t.push_back(clean);
+                while t.len() > STDERR_TAIL_LINES {
+                    t.pop_front();
+                }
+            }
+        }
+    }
+}
+
+/// The tail's lines joined with `sep`.
+fn stderr_tail_text(tail: &StderrTail, sep: &str) -> String {
+    tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join(sep)).unwrap_or_default()
+}
+
+/// Writes one NDJSON line and flushes: a child's stdin, or a live MCP-bridge connection.
+async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, v: &Value) -> std::io::Result<()> {
+    let mut line = v.to_string();
+    line.push('\n');
+    w.write_all(line.as_bytes()).await?;
+    w.flush().await
+}
+
+/// Gives a child that was asked to go `grace` to exit by itself, then kills it.
+async fn wait_or_kill(child: &mut Child, grace: Duration) {
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+}
+
+/// Holds a `Cmd::Turn`/`Cmd::Steer`'s text in `replay` while `hold` — while the process cannot be
+/// trusted with it: Claude's is about to be relaunched, bija's has not reached `ready` and may
+/// still fail to — and passes every other command, or any text when not holding, through.
+/// `agent_task` carries `replay` across attempts, and the next `Ready` delivers it.
+fn hold_text(hold: bool, replay: &mut Vec<String>, c: Cmd) -> Option<Cmd> {
+    match c {
+        Cmd::Turn { text } | Cmd::Steer { text } if hold => {
+            replay.push(text);
+            None
+        }
+        c => Some(c),
+    }
+}
+
+/// A turn's text that never reached the process, handed back to the user with the failure.
+fn stdin_lost(agent: AgentId, backend: &str, text: String) -> HubEvent {
+    HubEvent::CmdFailed { agent, what: "turn", error: format!("failed to write to {backend}'s stdin"), text: Some(text) }
+}
+
+/// A thread's running token counts, as a gauge update carries them: every request's input plus
+/// output so far (Codex's `total.totalTokens`), the part of that served from the cache, and the
+/// context window when the backend knows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Totals {
+    tokens: u64,
+    cached: u64,
+    window: Option<u64>,
+}
+
+/// A Codex-shaped `thread/tokenUsage/updated`: the last call's context and the running totals.
+/// `Agent` reads `last.inputTokens + last.outputTokens` as the context in use, so a backend whose
+/// API counts cache reads and writes apart folds them into `last_in` up front.
+fn token_usage(agent: AgentId, last_in: u64, last_out: u64, totals: Totals) -> HubEvent {
+    let mut tu = json!({"last": {"inputTokens": last_in, "outputTokens": last_out}, "total": {"totalTokens": totals.tokens, "cachedInputTokens": totals.cached}});
+    if let Some(w) = totals.window {
+        tu["modelContextWindow"] = json!(w);
+    }
+    HubEvent::Notif { agent, method: "thread/tokenUsage/updated".into(), params: json!({"tokenUsage": tu}) }
+}
+
+/// A compaction the way Codex reports its own `contextCompaction` item, which `Agent` shows as one
+/// `⇣ context compacted · from → to` line: the gauge at the old size (the item takes it as its
+/// `from`), the item started and completed, then the gauge at the new size (`Agent` fills in `to`
+/// once it drops).
+fn compaction(agent: AgentId, id: &str, from: u64, to: u64, totals: Totals) -> [HubEvent; 4] {
+    let item = |method: &str| HubEvent::Notif { agent, method: method.into(), params: json!({"item": {"id": id, "type": "contextCompaction"}}) };
+    [token_usage(agent, from, 0, totals), item("item/started"), item("item/completed"), token_usage(agent, to, 0, totals)]
+}
+
+/// A liveness tick for `Agent` (a Mantra-only method, see `Agent::apply`): bumps `last_event`, which
+/// the watchdog and the stall tripwire read, and relabels the activity when there is a label.
+fn activity(agent: AgentId, label: Option<&str>) -> HubEvent {
+    let params = match label {
+        Some(l) => json!({"activity": l}),
+        None => json!({}),
+    };
+    HubEvent::Notif { agent, method: "mantra/activity".into(), params }
+}
+
 #[cfg(test)]
 impl Hub {
     /// Registers a fake per-agent channel so tests can observe the `Cmd`s `Hub::send` forwards,
@@ -658,6 +876,28 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A burst of Codex spawns requested in the same instant starts 0, 300, 600 ms apart — not one
+    /// now and all the others together at 300 ms — and a spawn after a quiet spell starts at once.
+    #[test]
+    fn codex_spawns_in_a_burst_start_one_stagger_apart() {
+        let t0 = Instant::now();
+        let mut last = None;
+        let mut waits = vec![];
+        for _ in 0..4 {
+            let (wait, start) = stagger(last, t0);
+            waits.push(wait);
+            last = Some(start);
+        }
+        assert_eq!(waits, (0..4).map(|k| SPAWN_STAGGER * k).collect::<Vec<_>>());
+        // half a stagger after the burst's last start: the rest of the gap
+        let later = last.unwrap() + SPAWN_STAGGER / 2;
+        assert_eq!(stagger(last, later), (SPAWN_STAGGER / 2, last.unwrap() + SPAWN_STAGGER));
+        // long after: no wait, and the next one spaces itself from now
+        let quiet = last.unwrap() + Duration::from_secs(5);
+        assert_eq!(stagger(last, quiet), (Duration::ZERO, quiet));
+        assert_eq!(stagger(None, t0), (Duration::ZERO, t0));
+    }
 
     #[test]
     fn launch_failures_stop_after_a_short_budget_while_crashes_keep_the_long_one() {
@@ -720,6 +960,7 @@ mod tests {
             backend: Backend::Codex,
             envs: vec![],
             claude: None,
+            bija: None,
         };
         let cmd: Vec<String> = ["sh", "-c", "echo 'ERROR codex_app_server: cannot read /proc/self/exe (simulated)' >&2; exit 3"].iter().map(|s| s.to_string()).collect();
         let (ev, mut rx) = mpsc::unbounded_channel();
@@ -786,6 +1027,7 @@ done"#;
             backend: Backend::Codex,
             envs: vec![("NAMES_LOG".into(), log.to_string_lossy().to_string())],
             claude: None,
+            bija: None,
         };
         let cmd: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
         let (ev, mut rx) = mpsc::unbounded_channel();
@@ -825,5 +1067,54 @@ done"#;
         assert_eq!(last_significant_stderr_line("WARNING: a\nWARNING: bubblewrap: b\n"), "WARNING: bubblewrap: b");
         assert_eq!(last_significant_stderr_line(""), "");
         assert_eq!(last_significant_stderr_line("  \n  \n"), "");
+    }
+
+    /// While held, turn and steer texts go into `replay` in the order they arrived and nothing
+    /// else is touched; once the hold lifts, texts pass straight through again.
+    #[test]
+    fn texts_are_held_in_order_and_other_commands_pass_through() {
+        let mut replay = vec![];
+        assert!(hold_text(true, &mut replay, Cmd::Turn { text: "a".into() }).is_none());
+        assert!(hold_text(true, &mut replay, Cmd::Steer { text: "b".into() }).is_none());
+        assert!(matches!(hold_text(true, &mut replay, Cmd::Interrupt), Some(Cmd::Interrupt)), "only text is held");
+        assert_eq!(replay, vec!["a".to_string(), "b".to_string()], "held texts come out in the order they arrived");
+        assert!(matches!(hold_text(false, &mut replay, Cmd::Turn { text: "c".into() }), Some(Cmd::Turn { text }) if text == "c"), "no hold: straight through, untouched");
+        assert_eq!(replay.len(), 2, "a passed-through text is never also held");
+    }
+
+    /// A line that is not UTF-8 (or not JSON) costs that line, never the rest of the stream.
+    #[tokio::test]
+    async fn a_bad_line_costs_only_itself() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        read_ndjson(&b"{\"n\":1}\n\xff\xfe garbage\n\nnot json\n{\"n\":2}\n"[..], tx, "test".into(), |_| true).await;
+        let mut got = vec![];
+        while let Some(l) = rx.recv().await {
+            match l {
+                LineIn::Line(v) => got.push(v["n"].as_u64()),
+                LineIn::Closed => got.push(None),
+            }
+        }
+        assert_eq!(got, vec![Some(1), Some(2), None]);
+    }
+
+    /// The compaction every backend reports: gauge at the old size, the item, gauge at the new
+    /// size — the order `Agent` needs to fill in from → to.
+    #[test]
+    fn a_compaction_is_the_gauge_the_item_and_the_gauge_again() {
+        let totals = Totals { tokens: 900, cached: 100, window: Some(200_000) };
+        let events = compaction(3, "c-1", 90_000, 3_000, totals);
+        let shapes: Vec<(String, Value)> = events.iter().map(|e| match e {
+            HubEvent::Notif { agent: 3, method, params } => (method.clone(), params.clone()),
+            other => panic!("{other:?}"),
+        }).collect();
+        assert_eq!(shapes[0].0, "thread/tokenUsage/updated");
+        assert_eq!(shapes[0].1["tokenUsage"]["last"]["inputTokens"], 90_000);
+        assert_eq!(shapes[0].1["tokenUsage"]["total"], json!({"totalTokens": 900, "cachedInputTokens": 100}));
+        assert_eq!(shapes[0].1["tokenUsage"]["modelContextWindow"], 200_000);
+        assert_eq!((shapes[1].0.as_str(), shapes[2].0.as_str()), ("item/started", "item/completed"));
+        assert_eq!(shapes[1].1, json!({"item": {"id": "c-1", "type": "contextCompaction"}}));
+        assert_eq!(shapes[3].1["tokenUsage"]["last"]["inputTokens"], 3_000);
+        let no_window = token_usage(3, 1, 2, Totals { window: None, ..totals });
+        assert!(matches!(no_window, HubEvent::Notif { params, .. } if params["tokenUsage"].get("modelContextWindow").is_none()), "no window is no window, never 0");
     }
 }

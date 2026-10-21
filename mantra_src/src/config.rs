@@ -82,6 +82,10 @@ pub struct Settings {
     /// Command used to launch one `claude` process per Claude Code agent (WP10.3). A `--demo`
     /// override to a mock is WP10.6 territory, not wired up yet.
     pub claude_command: Vec<String>,
+    /// Command used to launch one `bija` process per Bija agent. The default bare name is resolved
+    /// at startup (`resolve_bija_command`): PATH, then the `bija` installed beside `mantra`, then
+    /// `$MANTRA_BIJA` — the resolved path is used, never written back here.
+    pub bija_command: Vec<String>,
     /// Model alias used by Solo mode.
     pub default_model: String,
     /// Approval mode for Solo: "untrusted" | "on-request" | "never".
@@ -103,6 +107,19 @@ pub struct Settings {
     pub notify: bool,
     /// `[web]`: defaults for `--web` / `--remote` (flags override).
     pub web: WebSettings,
+    /// Experimental features switched on (`mantra experimental enable <name>`); see `EXPERIMENTAL`.
+    pub experimental: Vec<String>,
+}
+
+/// Akasha: shared notes for agent groups (`engine::akasha`).
+pub const EXPERIMENTAL_AKASHA: &str = "akasha";
+/// Every experimental feature there is, with one line each — what `mantra experimental` lists.
+pub const EXPERIMENTAL: &[(&str, &str)] = &[(EXPERIMENTAL_AKASHA, "shared notes for agent groups (`[[groups]]` in a pattern)")];
+
+impl Settings {
+    pub fn experimental_on(&self, name: &str) -> bool {
+        self.experimental.iter().any(|f| f == name)
+    }
 }
 
 /// `[web]` in settings.toml: defaults for `--web` / `--remote`. Flags override.
@@ -144,7 +161,10 @@ impl Default for Settings {
         Self {
             codex_command: vec!["codex".into(), "app-server".into()],
             claude_command: vec!["claude".into()],
-            default_model: "sol".into(),
+            bija_command: vec!["bija".into()],
+            // Solo runs on bija (SPEC §9.1): it ships beside mantra, so it is always there — Codex
+            // need not be. A fresh install signed in to Codex with ChatGPT still picks `sol`.
+            default_model: "sol-api".into(),
             approval_mode: "on-request".into(),
             sandbox: "workspace-write".into(),
             default_pattern: "mantra-default".into(),
@@ -156,6 +176,7 @@ impl Default for Settings {
             fps: 12,
             notify: true,
             web: WebSettings::default(),
+            experimental: vec![],
         }
     }
 }
@@ -298,7 +319,8 @@ impl ModelEntry {
 
 /// Which agent runtime a provider's models are launched through. `Codex` (the default, and the
 /// only kind before WP10) covers `openai` plus any custom OpenAI-Responses-compatible provider;
-/// `ClaudeCode` providers are launched via `hub::claude` (`run_claude_process`) instead.
+/// `ClaudeCode` providers are launched via `hub::claude` (`run_claude_process`), `Bija` providers
+/// via `hub::bija` — Mantra's own harness, for any Chat Completions or Messages API.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
@@ -307,6 +329,9 @@ pub enum ProviderKind {
     /// Written as `kind = "claude-code"`; `claude_code` and `claudecode` are accepted too.
     #[serde(alias = "claude_code", alias = "claudecode")]
     ClaudeCode,
+    /// Written as `kind = "bija"` (`seed`, what the word means, is accepted too).
+    #[serde(alias = "seed")]
+    Bija,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -331,11 +356,15 @@ pub struct ProviderEntry {
     /// ClaudeCode only: "subscription" (OAuth login, no `--bare`) | "api_key" (`--bare` +
     /// `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` for third parties). Irrelevant for `Codex`.
     pub auth: String,
+    /// Bija only: the API `base_url` speaks — `""`/`"openai"` (Chat Completions) or `"anthropic"`
+    /// (Messages). Written only when set, so a models.toml without Bija providers never shows it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wire: String,
 }
 
 impl Default for ProviderEntry {
     fn default() -> Self {
-        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into() }
+        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new() }
     }
 }
 
@@ -365,9 +394,33 @@ impl ProviderEntry {
         self.api_key.clone().filter(|s| !s.trim().is_empty())
     }
     /// Whether a key is expected at all: always for Codex; for ClaudeCode only under `api_key`
-    /// (a subscription login lives in `claude` itself).
+    /// (a subscription login lives in `claude` itself); never for Bija, whose key is optional —
+    /// a local Ollama or vLLM takes none, and a hosted API says so itself (HTTP 401).
     pub fn needs_key(&self) -> bool {
-        self.kind != ProviderKind::ClaudeCode || self.auth == "api_key"
+        match self.kind {
+            ProviderKind::Codex => true,
+            ProviderKind::ClaudeCode => self.auth == "api_key",
+            ProviderKind::Bija => false,
+        }
+    }
+    /// The `--wire` a Bija process is launched with: the Messages API for `anthropic`, else Chat
+    /// Completions (`""` or `openai`; anything else is a `wire_problem` and never launched).
+    pub fn bija_wire(&self) -> &'static str {
+        if self.wire.trim().eq_ignore_ascii_case("anthropic") {
+            "anthropic"
+        } else {
+            "openai-chat"
+        }
+    }
+    /// Why a Bija provider's `wire` cannot be used: a typo would otherwise fall back to Chat
+    /// Completions and fail against a Messages API with a confusing 404. `None` for every other
+    /// kind, which has no wire to choose.
+    pub fn wire_problem(&self) -> Option<String> {
+        if self.kind != ProviderKind::Bija {
+            return None;
+        }
+        let w = self.wire.trim().to_ascii_lowercase();
+        (!matches!(w.as_str(), "" | "openai" | "anthropic")).then(|| format!("wire '{}' is neither openai nor anthropic", crate::util::trunc(self.wire.trim(), 20)))
     }
     /// Whether Test / Discover would put a request on the network for this provider: every Codex
     /// provider does; a ClaudeCode one only when a gateway `base_url` is set (otherwise discovery
@@ -385,7 +438,7 @@ impl ProviderEntry {
     /// the `base_url` is the `n` placeholder, malformed or empty (`url_problem`), or no
     /// credential is configured (`env_key` unset in the environment and no `api_key` stored).
     pub fn draft_reason(&self) -> Option<String> {
-        if let Some(why) = self.url_problem() {
+        if let Some(why) = self.url_problem().or_else(|| self.wire_problem()) {
             return Some(why);
         }
         if self.needs_key() && self.resolve_key().is_none() {
@@ -472,8 +525,18 @@ pub struct Registry {
 
 const REGISTRY_HEADER: &str = r#"# Mantra model registry.
 # Each [[model]] gets a short alias you use in patterns and pickers.
-# context_window / auto_compact_percent are passed to Codex per agent.
-# Custom providers must speak the OpenAI *Responses* API (Codex requirement).
+# context_window / auto_compact_percent are passed to every agent's backend.
+# A provider's `kind` picks the backend: "codex" (the default; the provider must speak the OpenAI
+# *Responses* API), "claude-code", or "bija" — Mantra's built-in harness, for any Chat Completions
+# API (wire = "openai", the default) or Messages API (wire = "anthropic"). A bija key is optional,
+# so a local server works as is:
+#
+# [[provider]]
+# id = "ollama"
+# name = "Ollama"
+# kind = "bija"
+# base_url = "http://127.0.0.1:11434/v1"
+#
 # Example (Z.ai GLM through a Responses-compatible gateway):
 #
 # [[provider]]
@@ -597,52 +660,140 @@ pub fn codex_user_mcp_server_names() -> Vec<String> {
     v.get("mcp_servers").and_then(|t| t.as_table()).map(|t| t.keys().cloned().collect()).unwrap_or_default()
 }
 
+/// The name of the bija binary that ships beside `mantra` (SPEC §9.3).
+pub fn bija_exe_name() -> String {
+    format!("bija{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where `resolve_bija_command` found bija — `doctor` says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BijaFound {
+    /// `bija_command[0]` as configured: a path, or a name on PATH.
+    Configured,
+    /// The `bija` installed beside the running `mantra`.
+    BesideMantra,
+    /// `$MANTRA_BIJA`.
+    Env,
+    /// Nowhere: the configured command is kept, and a spawn of it says what is missing.
+    Missing,
+}
+
+impl BijaFound {
+    pub fn describe(self) -> &'static str {
+        match self {
+            BijaFound::Configured => "as configured",
+            BijaFound::BesideMantra => "beside mantra",
+            BijaFound::Env => "from $MANTRA_BIJA",
+            BijaFound::Missing => "not found",
+        }
+    }
+}
+
+/// The command Bija agents are launched with (SPEC §9.1): `bija_command` as configured when its
+/// first word is a path or a name on PATH; else the `bija` installed beside this `mantra` (a
+/// release install and `cargo build` both put it there); else `$MANTRA_BIJA`. The words after
+/// the first are kept in every case.
+pub fn resolve_bija_command(configured: &[String]) -> (Vec<String>, BijaFound) {
+    let beside = crate::util::self_exe().ok().and_then(|exe| exe.parent().map(|d| d.join(bija_exe_name())));
+    let env = std::env::var("MANTRA_BIJA").ok();
+    resolve_bija_from(configured, |name| crate::util::which(name).map(|p| p.is_file()).unwrap_or(false), beside.as_deref(), env.as_deref())
+}
+
+/// `resolve_bija_command` with its three lookups as parameters, so tests never touch PATH or the
+/// process environment (shared by every test in the binary).
+fn resolve_bija_from(configured: &[String], on_path: impl Fn(&str) -> bool, beside: Option<&Path>, env: Option<&str>) -> (Vec<String>, BijaFound) {
+    let default = [bija_exe_name()];
+    let cmd = if configured.first().map(|c| !c.trim().is_empty()).unwrap_or(false) { configured } else { &default[..] };
+    let (first, rest) = (&cmd[0], &cmd[1..]);
+    let with_rest = |prog: String| std::iter::once(prog).chain(rest.iter().cloned()).collect::<Vec<_>>();
+    if first.contains(['/', std::path::MAIN_SEPARATOR]) || on_path(first) {
+        return (cmd.to_vec(), BijaFound::Configured);
+    }
+    if let Some(p) = beside.filter(|p| p.is_file()) {
+        return (with_rest(p.to_string_lossy().into_owned()), BijaFound::BesideMantra);
+    }
+    if let Some(e) = env.map(str::trim).filter(|e| !e.is_empty()) {
+        return (with_rest(e.to_string()), BijaFound::Env);
+    }
+    (cmd.to_vec(), BijaFound::Missing)
+}
+
+/// The provider every registry ships for bija (SPEC §9.1): OpenAI's Chat Completions API with
+/// `$OPENAI_API_KEY`. Pointing it anywhere else is a `/models` edit (URL, wire, key).
+pub fn bija_default_provider() -> ProviderEntry {
+    ProviderEntry { id: "bija".into(), name: "Bija".into(), base_url: "https://api.openai.com/v1".into(), env_key: "OPENAI_API_KEY".into(), kind: ProviderKind::Bija, ..Default::default() }
+}
+
+/// The alias a default model goes by through bija: `sol` → `sol-api`. `pattern::builtin_bija`
+/// maps every role with it, so the two can never disagree on the naming.
+pub fn bija_alias(alias: &str) -> String {
+    format!("{alias}-api")
+}
+
+/// The default models again, reached through bija on `provider_id` with an API key instead of
+/// Codex's own login: the same model ids, windows, efforts and notes under `-api` aliases.
+pub fn bija_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
+    codex_default_models()
+        .into_iter()
+        .map(|m| ModelEntry { alias: bija_alias(&m.alias), provider: provider_id.to_string(), note: format!("{} — with an API key", m.note), ..m })
+        .collect()
+}
+
+/// The four models Codex's own account runs (provider `openai`).
+fn codex_default_models() -> Vec<ModelEntry> {
+    let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        ModelEntry {
+            alias: "astra".into(),
+            model: "gpt-6-astra".into(),
+            context_window: Some(272_000),
+            auto_compact_percent: Some(85),
+            default_effort: "high".into(),
+            efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
+            note: "most capable — planning & hard problems".into(),
+            ..Default::default()
+        },
+        ModelEntry {
+            alias: "sol".into(),
+            model: "gpt-5.6-sol".into(),
+            context_window: Some(272_000),
+            auto_compact_percent: Some(85),
+            default_effort: "medium".into(),
+            efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
+            note: "frontier agentic coding".into(),
+            ..Default::default()
+        },
+        ModelEntry {
+            alias: "terra".into(),
+            model: "gpt-5.6-terra".into(),
+            context_window: Some(272_000),
+            auto_compact_percent: Some(85),
+            default_effort: "medium".into(),
+            efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
+            note: "balanced everyday coding".into(),
+            ..Default::default()
+        },
+        ModelEntry {
+            alias: "luna".into(),
+            model: "gpt-5.6-luna".into(),
+            context_window: Some(272_000),
+            auto_compact_percent: Some(85),
+            default_effort: "medium".into(),
+            efforts: all6(&["low", "medium", "high", "xhigh", "max"]),
+            note: "fast & affordable workers".into(),
+            ..Default::default()
+        },
+    ]
+}
+
 impl Registry {
     pub fn defaults() -> Registry {
-        let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let mut models = vec![
-                ModelEntry {
-                    alias: "astra".into(),
-                    model: "gpt-6-astra".into(),
-                    context_window: Some(272_000),
-                    auto_compact_percent: Some(85),
-                    default_effort: "high".into(),
-                    efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
-                    note: "most capable — planning & hard problems".into(),
-                    ..Default::default()
-                },
-                ModelEntry {
-                    alias: "sol".into(),
-                    model: "gpt-5.6-sol".into(),
-                    context_window: Some(272_000),
-                    auto_compact_percent: Some(85),
-                    default_effort: "medium".into(),
-                    efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
-                    note: "frontier agentic coding".into(),
-                    ..Default::default()
-                },
-                ModelEntry {
-                    alias: "terra".into(),
-                    model: "gpt-5.6-terra".into(),
-                    context_window: Some(272_000),
-                    auto_compact_percent: Some(85),
-                    default_effort: "medium".into(),
-                    efforts: all6(&["low", "medium", "high", "xhigh", "max", "ultra"]),
-                    note: "balanced everyday coding".into(),
-                    ..Default::default()
-                },
-                ModelEntry {
-                    alias: "luna".into(),
-                    model: "gpt-5.6-luna".into(),
-                    context_window: Some(272_000),
-                    auto_compact_percent: Some(85),
-                    default_effort: "medium".into(),
-                    efforts: all6(&["low", "medium", "high", "xhigh", "max"]),
-                    note: "fast & affordable workers".into(),
-                    ..Default::default()
-                },
-            ];
-        let mut providers = vec![];
+        let mut models = codex_default_models();
+        // bija ships beside mantra, so its provider and the default models through it are always
+        // offered — they are what Solo runs on (`Settings::default_model`).
+        let bija = bija_default_provider();
+        models.extend(bija_default_model_entries(&bija.id));
+        let mut providers = vec![bija];
         // Only offered when `claude` is actually installed (WP10.2); `doctor` reports this check.
         if claude_available() {
             providers.push(ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
@@ -660,10 +811,35 @@ impl Registry {
         home().join("models.toml")
     }
 
+    /// A registry written before bija shipped gets its provider and the `-api` twins of the default
+    /// models — what `mantra-default-bija` and the run-without-Codex fallback are built on. Only a
+    /// registry with no Bija provider at all is touched (one the user set up stays as it is), and
+    /// only the aliases it lacks are added. True when anything was added.
+    pub fn add_missing_bija(&mut self) -> bool {
+        if self.providers.iter().any(|p| p.kind == ProviderKind::Bija) {
+            return false;
+        }
+        // An id of the user's own under the default's name is theirs; the twins then go nowhere.
+        if self.providers.iter().any(|p| p.id == bija_default_provider().id) {
+            return false;
+        }
+        let provider = bija_default_provider();
+        let twins: Vec<ModelEntry> = bija_default_model_entries(&provider.id).into_iter().filter(|m| self.get(&m.alias).is_none()).collect();
+        self.providers.push(provider);
+        self.models.extend(twins);
+        true
+    }
+
     pub fn load() -> Registry {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => match toml::from_str::<Registry>(&s) {
-                Ok(r) if !r.models.is_empty() => r,
+                Ok(mut r) if !r.models.is_empty() => {
+                    if r.add_missing_bija() {
+                        crate::mlog!("models.toml: added the bija provider and the default models through it");
+                        let _ = r.save();
+                    }
+                    r
+                }
                 Ok(_) => Registry::defaults(),
                 Err(e) => {
                     crate::mlog!("models.toml invalid ({e}); using defaults");
@@ -755,11 +931,13 @@ impl Registry {
         let Some(p) = self.providers.iter().find(|p| p.id == m.provider) else {
             return Some(format!("{alias} uses provider '{}' which is not in /models", m.provider));
         };
-        if let Some(why) = p.url_problem() {
+        if let Some(why) = p.url_problem().or_else(|| p.wire_problem()) {
             return Some(format!("{alias} via {} — {why} (/models to fix)", self.provider_name(&p.id)));
         }
-        if p.kind == ProviderKind::ClaudeCode && p.auth != "api_key" {
-            return None; // subscription login: `claude` holds the credentials, nothing to check here
+        if !p.needs_key() {
+            // A subscription login (`claude` holds the credentials) or a Bija provider, whose key
+            // is optional: nothing to check here.
+            return None;
         }
         if p.resolve_key().is_none() {
             let var = p.env_var_name();
@@ -790,7 +968,7 @@ impl Registry {
     pub fn provider_args(&self) -> Vec<String> {
         let mut args = vec![];
         for p in &self.providers {
-            if p.id.is_empty() || p.id == "openai" || p.kind == ProviderKind::ClaudeCode {
+            if p.id.is_empty() || p.id == "openai" || p.kind != ProviderKind::Codex {
                 continue;
             }
             let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
@@ -1202,5 +1380,103 @@ mod tests {
         assert_eq!(m.resolve_effort("AUTO"), "low", "nearest to medium on a model without it");
         let none = ModelEntry { provider: "gw".into(), ..Default::default() };
         assert_eq!(none.resolve_effort("auto"), "", "a model without effort control stays without");
+    }
+    /// A Bija provider needs a real URL and a wire it knows, never a key: a local server takes
+    /// none, and a hosted API answers HTTP 401 itself.
+    #[test]
+    fn a_bija_provider_needs_a_url_and_a_wire_but_no_key() {
+        let p = ProviderEntry { id: "ollama".into(), kind: ProviderKind::Bija, base_url: "http://127.0.0.1:11434/v1".into(), ..Default::default() };
+        assert!(!p.needs_key() && p.needs_url());
+        assert_eq!(p.draft_reason(), None, "a missing key does not make a bija provider a draft");
+        assert_eq!(p.bija_wire(), "openai-chat");
+        let messages = ProviderEntry { wire: "Anthropic".into(), ..p.clone() };
+        assert_eq!((messages.bija_wire(), messages.draft_reason()), ("anthropic", None));
+        let typo = ProviderEntry { wire: "anthropc".into(), ..p.clone() };
+        assert!(typo.draft_reason().is_some_and(|w| w.contains("anthropc")), "{:?}", typo.draft_reason());
+        assert!(ProviderEntry { base_url: "https://example.com/v1".into(), ..p.clone() }.draft_reason().is_some_and(|w| w.contains("placeholder")));
+        assert!(ProviderEntry { base_url: String::new(), ..p.clone() }.draft_reason().is_some_and(|w| w.contains("empty")));
+        let codex = ProviderEntry { kind: ProviderKind::Codex, wire: "x".into(), ..p.clone() };
+        assert_eq!(codex.wire_problem(), None, "Codex has no wire to choose, so none can be wrong");
+        // an alias through it runs without any key check — unless the provider itself is wrong
+        let mut r = Registry { models: vec![ModelEntry { alias: "local".into(), provider: "ollama".into(), model: "local-model".into(), ..Default::default() }], providers: vec![p] };
+        assert_eq!(r.alias_problem("local"), None);
+        assert_eq!(r.probe_problem("local"), None);
+        assert!(r.provider_args().is_empty(), "a Bija provider is never a Codex model_providers entry");
+        r.providers[0].wire = "grpc".into();
+        assert!(r.alias_problem("local").is_some_and(|w| w.contains("wire 'grpc'") && w.contains("/models")), "{:?}", r.alias_problem("local"));
+    }
+    #[test]
+    fn defaults_ship_bija_and_the_default_models_through_it() {
+        let r = Registry::defaults();
+        let p = r.providers.iter().find(|p| p.id == "bija").expect("the bija provider always ships");
+        assert_eq!((p.kind, p.name.as_str(), p.base_url.as_str(), p.env_key.as_str(), p.wire.as_str()), (ProviderKind::Bija, "Bija", "https://api.openai.com/v1", "OPENAI_API_KEY", ""));
+        for alias in ["astra", "sol", "terra", "luna"] {
+            let codex = r.get(alias).expect("the Codex alias stays");
+            let api = r.get(&bija_alias(alias)).expect("its -api twin ships");
+            assert_eq!(api.alias, format!("{alias}-api"));
+            assert_eq!((&api.model, api.context_window, &api.efforts, &api.default_effort), (&codex.model, codex.context_window, &codex.efforts, &codex.default_effort));
+            assert_eq!(api.note, format!("{} — with an API key", codex.note));
+            assert_eq!(r.backend_of(api), ProviderKind::Bija);
+            assert_eq!(r.backend_of(codex), ProviderKind::Codex);
+        }
+        let s = Settings::default();
+        assert_eq!(s.default_model, "sol-api", "Solo runs on bija");
+        assert_eq!(r.backend_of(&r.resolve(&s.default_model)), ProviderKind::Bija);
+        assert_eq!(s.bija_command, vec!["bija".to_string()]);
+        assert!(r.provider_args().is_empty(), "nothing in the defaults is a Codex custom provider");
+    }
+    /// A models.toml from before bija gains the provider and the `-api` twins once; one that has a
+    /// Bija provider (or a provider of its own under the name) is left as it is.
+    #[test]
+    fn an_old_registry_gains_bija_once_and_a_set_up_one_is_left_alone() {
+        let mut old = Registry { models: codex_default_models(), providers: vec![] };
+        old.models.push(ModelEntry { alias: "luna-api".into(), model: "my-own-luna".into(), ..Default::default() });
+        assert!(old.add_missing_bija());
+        assert_eq!(old.providers.iter().filter(|p| p.kind == ProviderKind::Bija).count(), 1);
+        for alias in ["astra-api", "sol-api", "terra-api"] {
+            assert_eq!(old.backend_of(&old.resolve(alias)), ProviderKind::Bija, "{alias}");
+        }
+        assert_eq!(old.get("luna-api").map(|m| m.model.as_str()), Some("my-own-luna"), "an alias of the user's own is kept");
+        let problems = old.preflight(&crate::engine::pattern::Pattern::builtin_bija());
+        assert!(problems.iter().all(|w| !w.contains("not in /models")), "every role's alias exists now: {problems:?}");
+        let n = old.models.len();
+        assert!(!old.add_missing_bija(), "once");
+        assert_eq!(old.models.len(), n, "nothing doubled");
+        let mut set_up = Registry::defaults();
+        set_up.models.retain(|m| !m.alias.ends_with("-api"));
+        assert!(!set_up.add_missing_bija(), "a Bija provider means the user decides its models");
+        let mut taken = Registry { models: codex_default_models(), providers: vec![ProviderEntry { id: "bija".into(), base_url: "http://mine".into(), ..Default::default() }] };
+        assert!(!taken.add_missing_bija());
+        assert_eq!(taken.providers.len(), 1, "no second provider under the same id");
+    }
+
+    #[test]
+    fn bija_kind_and_wire_round_trip_through_models_toml() {
+        let r: Registry = toml::from_str("[[provider]]\nid = \"a\"\nkind = \"bija\"\nwire = \"anthropic\"\n[[provider]]\nid = \"b\"\nkind = \"seed\"\n[[provider]]\nid = \"c\"\n").unwrap();
+        assert_eq!(r.providers.iter().map(|p| p.kind).collect::<Vec<_>>(), vec![ProviderKind::Bija, ProviderKind::Bija, ProviderKind::Codex]);
+        let out = toml::to_string_pretty(&r).unwrap();
+        assert!(out.contains("kind = \"bija\"") && out.contains("wire = \"anthropic\""), "{out}");
+        assert_eq!(out.matches("wire =").count(), 1, "an empty wire is never written: {out}");
+    }
+    #[test]
+    fn the_bija_command_resolves_path_then_beside_mantra_then_the_env() {
+        let dir = std::env::temp_dir().join(format!("mantra-bija-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let beside = dir.join("bija");
+        let cmd = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let nowhere = |_: &str| false;
+        // a configured path, or a name on PATH, is used as it is
+        assert_eq!(resolve_bija_from(&cmd(&["/opt/bija", "--x"]), nowhere, None, None), (cmd(&["/opt/bija", "--x"]), BijaFound::Configured));
+        assert_eq!(resolve_bija_from(&cmd(&["bija"]), |n| n == "bija", Some(&beside), Some("/env/bija")).1, BijaFound::Configured);
+        // not on PATH: the bija beside mantra — only once it is really there — then the env;
+        // the configured arguments come along either way
+        assert_eq!(resolve_bija_from(&cmd(&["bija", "--x"]), nowhere, Some(&beside), Some("/env/bija")), (cmd(&["/env/bija", "--x"]), BijaFound::Env));
+        std::fs::write(&beside, "#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_bija_from(&cmd(&["bija", "--x"]), nowhere, Some(&beside), Some("/env/bija")), (vec![beside.to_string_lossy().into_owned(), "--x".into()], BijaFound::BesideMantra));
+        // nowhere at all: the configured command stays (its spawn error names it); empty = default
+        assert_eq!(resolve_bija_from(&cmd(&["bija"]), nowhere, None, Some("  ")), (cmd(&["bija"]), BijaFound::Missing));
+        assert_eq!(resolve_bija_from(&Vec::new(), nowhere, None, None).0, vec![bija_exe_name()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

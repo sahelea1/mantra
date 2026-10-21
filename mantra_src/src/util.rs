@@ -40,7 +40,7 @@ pub fn clock() -> String {
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
 }
 
-fn tz_offset_secs() -> u64 {
+pub(crate) fn tz_offset_secs() -> u64 {
     // Best effort: honour MANTRA_TZ_OFFSET (hours), else UTC.
     std::env::var("MANTRA_TZ_OFFSET")
         .ok()
