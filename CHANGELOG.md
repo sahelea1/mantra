@@ -72,7 +72,7 @@ it a third backend for any role — and the default for Solo.
   before. `--demo` brings a stand-in (`mantra mock-mcp`), and `docs/tools/mcp-e2e.sh` checks it
   end to end on bija and the Claude Code mock.
 - **Seeing the screen.** A model marked `vision` in `/models` (the built-in aliases are in a new
-  `models.toml`, an older one needs it switched on there, and discovery marks the models it adds)
+  `models.toml`; an older one gets it switched on once, at first load, for the built-in families; discovery marks the models it adds)
   gets `mantra_screenshot` — the host's screen, or a region of
   it, saved under the run's `screenshots/` — and `mantra_view_image` for a picture in its
   working directory; nothing is captured unless the model asks. Images reach Codex, Claude Code
