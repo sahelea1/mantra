@@ -30,7 +30,7 @@ const CTX_KEYS: &[&str] = &[
     "inputTokenLimit", "contextWindow", "context_size", "max_context_tokens", "max_context_window", "n_ctx", "max_seq_len",
 ];
 const NESTED: &[&str] = &["top_provider", "limits", "limit", "capabilities", "metadata", "meta", "info", "architecture"];
-const NOT_CHAT: &[&str] = &["embed", "whisper", "tts", "dall-e", "moderation", "rerank", "transcri", "speech", "audio", "image-gen", "text-to-image"];
+const NOT_CHAT: &[&str] = &["embed", "bge-", "whisper", "tts", "dall-e", "moderation", "rerank", "transcri", "speech", "audio", "image-gen", "text-to-image"];
 
 /// How a request presents its key: `Authorization: Bearer` (OpenAI and everything shaped like
 /// it), or the Messages API's own `x-api-key` with its version header.
@@ -58,9 +58,11 @@ pub fn list_models(base_url: &str, key: Option<&str>, header: KeyHeader) -> Resu
     if base.is_empty() {
         return Err("set the provider's base URL first".into());
     }
-    let mut urls = vec![format!("{base}/models")];
+    // The Messages API pages its listing (20 by default); one page of its maximum holds them all.
+    let query = if header == KeyHeader::Anthropic { "?limit=1000" } else { "" };
+    let mut urls = vec![format!("{base}/models{query}")];
     if !base.ends_with("/v1") {
-        urls.push(format!("{base}/v1/models"));
+        urls.push(format!("{base}/v1/models{query}"));
     }
     let mut last = String::new();
     for url in urls {
@@ -160,7 +162,9 @@ pub fn vision_of(item: &Value) -> bool {
     [Some(item), item.get("architecture"), item.get("capabilities"), item.get("features"), item.get("metadata")].into_iter().flatten().any(|o| flag(o) || lists(o))
 }
 
-/// Accepts `{"data":[…]}`, `{"models":[…]}` or a bare array; items may be objects or strings.
+/// Accepts `{"data":[…]}` (OpenAI-compatible, and the Messages API's `{"data":[{"type":"model",
+/// "id":…,"display_name":…}],"has_more":…}`), `{"models":[…]}` or a bare array; items may be
+/// objects or strings.
 pub fn parse_models(body: &str) -> Option<Vec<Found>> {
     let v: Value = serde_json::from_str(body.trim()).ok()?;
     let arr = v.get("data").or_else(|| v.get("models")).unwrap_or(&v).as_array()?;
@@ -247,9 +251,12 @@ pub fn claude_defaults(provider_id: &str) -> Vec<Candidate> {
         .collect()
 }
 
-/// A model found on a custom provider.
+/// A model found on a custom provider. It takes images when the catalogue says so, or when its id
+/// is of a family that does (`config::takes_images`) — the Messages API's listing, for one, says
+/// nothing about it.
 pub fn from_provider(provider: &str, f: &Found) -> Candidate {
     let reasoning = f.reasoning == Some(true);
+    let vision = f.vision || crate::config::takes_images(&f.id);
     Candidate {
         provider: provider.to_string(),
         model: f.id.clone(),
@@ -257,8 +264,8 @@ pub fn from_provider(provider: &str, f: &Found) -> Candidate {
         context_known: f.context.is_some(),
         efforts: if reasoning { strs(&["low", "medium", "high"]) } else { vec![] },
         default_effort: if reasoning { "medium".into() } else { String::new() },
-        note: format!("{provider} · ctx {}{}", if f.context.is_some() { "from API" } else { "assumed 200k" }, if f.vision { " · vision" } else { "" }),
-        vision: f.vision,
+        note: format!("{provider} · ctx {}{}", if f.context.is_some() { "from API" } else { "assumed 200k" }, if vision { " · vision" } else { "" }),
+        vision,
         state: CState::New,
         selected: false,
     }
@@ -389,7 +396,7 @@ mod tests {
     }
     #[test]
     fn parses_common_provider_shapes() {
-        let openai = r#"{"object":"list","data":[{"id":"glm-4.6","object":"model"},{"id":"text-embedding-3-small"},{"id":"glm-4.5-air"}]}"#;
+        let openai = r#"{"object":"list","data":[{"id":"glm-4.6","object":"model"},{"id":"text-embedding-3-small"},{"id":"gw/bge-m3"},{"id":"glm-4.5-air"}]}"#;
         let m = parse_models(openai).unwrap();
         assert_eq!(m.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["glm-4.5-air", "glm-4.6"]);
         assert!(m.iter().all(|f| f.context.is_none()));
@@ -407,6 +414,20 @@ mod tests {
         let google = r#"{"models":[{"name":"models/gemini-x","inputTokenLimit":1048576}]}"#;
         assert_eq!(parse_models(google).unwrap()[0], Found { id: "gemini-x".into(), context: Some(1048576), reasoning: None, vision: false });
         assert!(parse_models("<html>nope</html>").is_none());
+    }
+    /// The Messages API's listing: `data[]` of `type: "model"` with `id` and `display_name`, plus
+    /// paging fields — every model a row, and the families that take images marked so.
+    #[test]
+    fn parses_the_messages_api_listing() {
+        let body = r#"{"data":[
+            {"type":"model","id":"claude-sonnet-5","display_name":"Sonnet 5","created_at":"2026-05-01T00:00:00Z"},
+            {"type":"model","id":"claude-haiku-4-5-20251001","display_name":"Haiku 4.5","created_at":"2025-10-01T00:00:00Z","max_input_tokens":200000}
+        ],"has_more":false,"first_id":"claude-sonnet-5","last_id":"claude-haiku-4-5-20251001"}"#;
+        let m = parse_models(body).expect("a model list");
+        assert_eq!(m.iter().map(|f| (f.id.as_str(), f.context)).collect::<Vec<_>>(), vec![("claude-haiku-4-5-20251001", Some(200_000)), ("claude-sonnet-5", None)]);
+        let c = from_provider("anthropic", &m[1]);
+        assert!(c.vision && c.note.ends_with(" · vision"), "{}", c.note);
+        assert!(!from_provider("x", &Found { id: "gpt-oss-20b".into(), context: None, reasoning: None, vision: false }).vision, "open-weight ids read text only");
     }
     #[test]
     fn detects_reasoning_and_builds_candidates() {

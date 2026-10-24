@@ -599,27 +599,33 @@ server didn't say `Connection: close`; any error discards it. No gzip (`Accept-E
   (`config::resolve_bija_command`): if `bija_command[0]` has no path separator and is not on PATH, a
   `bija` beside the running `mantra` executable is used (`util::self_exe()`), then `$MANTRA_BIJA`;
   `doctor` prints which.
-- **Bija is the default runner for Solo.** `Registry::defaults()` always ships a provider `bija`
-  (`name = "Bija"`, `kind = bija`, `base_url = "https://api.openai.com/v1"`, `env_key = "OPENAI_API_KEY"`,
-  `wire = ""`) — bija is installed beside mantra, so it is always available — and four aliases that are the
-  default models reached through it: `astra-api`, `sol-api`, `terra-api`, `luna-api` (same model ids,
-  windows, efforts and notes as the Codex ones, note suffixed " — through bija with an API key"). The
-  Codex aliases and the `claude` provider stay exactly as they are. `Settings.default_model` defaults to
-  `"sol-api"`; the existing fresh-install branch for a Codex ChatGPT login keeps setting `"sol"`. The
-  `--help`/README text that says what Solo runs on says bija. Everything else about a Bija provider is
-  configured in `/models` like a custom provider (flip `kind`, set `wire`, URL, key; `D` discovers via
-  `/models`). A `models.toml` with no Bija provider at all (written before bija shipped) gets the `bija`
-  provider and whichever `-api` aliases it lacks once, at load, and is saved; one with a Bija provider is
-  left as the user set it up. Without Codex, `mantra-default-bija` becomes the run default only when every
-  one of its aliases exists on a Bija provider.
-- Built-in pattern `mantra-default-bija` (`NAME_BIJA`) = `mantra-default` with every role's alias
-  suffixed `-api` (planner `astra-api`, workers `sol-api`/`luna-api`, …: whatever the base pattern uses,
-  mapped `x → x-api`). It works on a real install and in the demo alike.
+- **Bija is the default runner, for Solo and every built-in pattern.** `Registry::defaults()` ships a
+  provider `bija` (`name = "OpenAI API"`, `kind = bija`, `base_url = "https://api.openai.com/v1"`,
+  `env_key = "OPENAI_API_KEY"`, `wire = ""`) — bija is installed beside mantra, so it is always
+  available — and four models on it under the plain aliases `astra`, `sol`, `terra`, `luna` (the default
+  models' ids, windows, efforts and notes). That is the whole fresh registry: Codex and Claude Code are
+  add-on backends, imported on request from `/models` (`provider_key::add_backend`).
+  `Settings.default_model` defaults to `"sol"`. The `--help`/README text that says what Solo runs on says
+  bija. Everything else about a Bija provider is configured in `/models`: a provider from just its API
+  key (`provider_key::provider_from_key` reads the URL and wire off the key's prefix), or by hand (flip
+  `kind`, set `wire`, URL, key; `ctrl+d` discovers via `/models`). A `models.toml` with no Bija provider
+  at all (written before bija shipped) gets the `bija` provider and the default models once, at load, and
+  is saved — under the plain aliases where those are free, else under their `-api` twins; one with a
+  Bija provider is left as the user set it up.
+- **0.7's `-api` aliases still resolve.** 0.7 named the bija models `astra-api`, `sol-api`, … beside
+  Codex's plain `astra`, `sol`, …; nothing is named so any more, but `Registry::get` answers to either
+  spelling of an alias when only the other exists (logged once per name), so 0.7 pattern files and
+  settings keep working, and a 0.7 `models.toml` on a host without Codex has its Codex models dropped and
+  each `x-api` renamed `x` on load.
+- The built-in patterns `mantra-default-bija` (0.7's `mantra-default` with every role's alias suffixed
+  `-api`), `mantra-swarm` and `mantra-default-claude` are retired and read as `mantra-default`: the
+  built-ins name the plain aliases, so they run on bija as they are, and the swarm is the `worker-swarm`
+  role of every built-in (`Role.parallel`).
 - `--demo`: an in-process mock OpenAI server (`mock_openai.rs`, §9.5) is started on 127.0.0.1:<random
   port>; the in-memory registry's `bija` provider is re-pointed at it (`base_url =
-  http://127.0.0.1:<port>/v1`, no key, `env_key = ""`), so the same `*-api` aliases drive the real `bija`
+  http://127.0.0.1:<port>/v1`, no key, `env_key = ""`), so the plain aliases drive the real `bija`
   binary against the mock. The demo's Solo default stays `mock-codex` (the existing snapshot and web
-  e2e scripts rely on it); `--demo --pattern mantra-default-bija` runs a full Mandala on bija. In the
+  e2e scripts rely on it); `mantra --demo` runs a full Mandala on bija. In the
   demo `bija_command` is the `bija` beside the running executable (`target/<profile>/bija`).
 
 ### 9.2 Hub (`hub.rs`, `hub/bija.rs`)
@@ -704,7 +710,7 @@ copies `target/release/bija` too.
 ### 9.4 Docs
 
 Where bija is documented for users: the README's "Bija: the built-in harness" section under *Models,
-providers and backends* (what it is, a 6-line `models.toml`, the demo pattern, standalone use, swarms),
+providers and backends* (what it is, a 6-line `models.toml`, the demo, standalone use, the swarm class),
 the backends paragraph under *Under the hood* and the files table (`~/.mantra/bija/sessions/`);
 DESIGN.md §2 (diagram and the "Bija" decision); the CHANGELOG's `## v0.7.0` (both manifests carry
 0.7.0). Code, comments and docs name no AI model beyond what the registry already lists.

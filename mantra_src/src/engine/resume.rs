@@ -13,7 +13,7 @@
 //! | Phase · merging/checks/gate| the (idempotent) merge → checks → gate sequence runs again     |
 //! | Phase · handoff            | straight on to the next phase / the finale                     |
 //! | Finale i                   | finale step i starts over (ad-hoc fixes re-spawned)            |
-//! | Done / Failed              | opened read-only — `/land` still works for a finished run      |
+//! | Done / Failed / stopped    | opened read-only — `/land` still works for a finished run      |
 
 use super::git;
 use super::pattern::Pattern;
@@ -172,6 +172,7 @@ impl Run {
                 }
             }
             Stage::Done => self.log("✦", "saffron", "this run is finished — /land merges its branch; delete it from /runs when you're done with it"),
+            Stage::Failed(why) if why == super::run::STOPPED_BY_USER => self.log("■", "amber", "you stopped this run — opened read-only; /land merges what it built, or delete it from /runs"),
             Stage::Failed(why) => self.log("✗", "red", format!("this run had failed ({why}) — opened read-only; delete it from /runs")),
         }
         self.save_state();
@@ -446,19 +447,19 @@ mod tests {
     }
 
     fn worker(task: &str, state: &str, attempt: u32, wt: Option<PathBuf>) -> WorkerState {
-        WorkerState { task: task.into(), title: task.to_uppercase().into(), role: "worker-small".into(), state: state.into(), attempt, branch: format!("mantra-w/r/{task}-{attempt}"), worktree: wt, prompt: format!("do {task}"), report: if state == "done" { "Summary: fine".into() } else { String::new() }, ..Default::default() }
+        WorkerState { task: task.into(), title: task.to_uppercase(), role: "worker-small".into(), state: state.into(), attempt, branch: format!("mantra-w/r/{task}-{attempt}"), worktree: wt, prompt: format!("do {task}"), report: if state == "done" { "Summary: fine".into() } else { String::new() }, ..Default::default() }
     }
 
-    fn state(tmp: &PathBuf, stage: Stage, workers: Vec<WorkerState>, agents: Vec<AgentState>) -> RunState {
+    fn state(tmp: &std::path::Path, stage: Stage, workers: Vec<WorkerState>, agents: Vec<AgentState>) -> RunState {
         RunState {
             format: FORMAT,
             id: "r".into(),
-            project: tmp.clone(),
+            project: tmp.to_path_buf(),
             brief: "brief".into(),
             pattern: "mantra-default".into(),
             plan_version: 1,
             stage,
-            ws: Some(Workspace { worktree: true, repo: tmp.clone(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false }),
+            ws: Some(Workspace { worktree: true, repo: tmp.to_path_buf(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false }),
             workers,
             agents,
             ..Default::default()

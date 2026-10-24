@@ -118,6 +118,13 @@ pub struct PatternInfoView {
     pub name: String,
     pub description: String,
     pub builtin: bool,
+    /// "default" | "built-in" | "edited" | "yours" (`Pattern::tag`).
+    #[serde(default)]
+    pub tag: String,
+    /// How many workers it runs at once (the shared pool), the placeholder of the picker's
+    /// "workers at once"; 0 for a pattern whose file does not load.
+    #[serde(default)]
+    pub max_parallel: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -355,6 +362,9 @@ pub struct StageView {
     pub finale: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A failed stage that is the user's own stop (`Run::stop`), not a failure: shown as stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -884,7 +894,7 @@ fn agent_view_with(app: &App, a: &Agent, facts: &RunFacts) -> AgentView {
 
 fn stage_view(s: &Stage) -> StageView {
     let label = crate::engine::state::stage_label(s);
-    let mut v = StageView { kind: String::new(), label, phase: None, step: None, round: None, finale: None, error: None };
+    let mut v = StageView { kind: String::new(), label, phase: None, step: None, round: None, finale: None, error: None, stopped: false };
     v.kind = match s {
         Stage::Setup => "setup",
         Stage::Planning => "planning",
@@ -909,6 +919,7 @@ fn stage_view(s: &Stage) -> StageView {
         }
         Stage::Done => "done",
         Stage::Failed(e) => {
+            v.stopped = e == crate::engine::run::STOPPED_BY_USER;
             v.error = Some(e.clone());
             "failed"
         }
@@ -1100,6 +1111,7 @@ fn screen_str(s: Screen) -> String {
         Screen::Zoom(a) => format!("zoom:{a}"),
         Screen::Studio => "studio".into(),
         Screen::Models => "models".into(),
+        Screen::Settings => "settings".into(),
     }
 }
 
@@ -1167,13 +1179,9 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
 /// (it may be mid-edit), just without one.
 pub fn pattern_list(project: &std::path::Path) -> Vec<PatternInfoView> {
     use crate::engine::pattern::Pattern;
-    Pattern::list(project)
+    Pattern::summaries(project)
         .into_iter()
-        .map(|name| PatternInfoView {
-            description: Pattern::load(&name, project).map(|p| p.description).unwrap_or_default(),
-            builtin: Pattern::builtin_named(&name).is_some(),
-            name,
-        })
+        .map(|p| PatternInfoView { builtin: Pattern::builtin_named(&p.name).is_some(), tag: p.tag.into(), max_parallel: p.max_parallel, description: p.description, name: p.name })
         .collect()
 }
 
@@ -1234,6 +1242,11 @@ impl Publisher {
             self.patterns = Some((Instant::now(), pattern_list(&app.project)));
         }
         self.patterns.as_ref().map(|(_, p)| p.clone()).unwrap_or_default()
+    }
+
+    /// A pattern was saved or deleted: the next build reads the list again.
+    pub fn invalidate_patterns(&mut self) {
+        self.patterns = None;
     }
 
     fn plan(&mut self, r: Option<&Run>) -> Option<PlanView> {
@@ -1713,9 +1726,12 @@ pub(crate) mod tests {
         let list = pattern_list(&dir);
         let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, [&Pattern::names()[..], &["my-split"][..]].concat(), "built-ins first, default leading, then the user's own");
-        assert!(list[..4].iter().all(|p| p.builtin && !p.description.is_empty()));
+        assert!(list[..Pattern::names().len()].iter().all(|p| p.builtin && !p.description.is_empty()));
         let mine = list.iter().find(|p| p.name == "my-split").expect("the user's own pattern is listed");
         assert_eq!((mine.description.as_str(), mine.builtin), ("my own", false));
+        // the picker's tag and width placeholder come with it
+        assert_eq!((list[0].tag.as_str(), list[1].tag.as_str(), mine.tag.as_str()), ("default", "built-in", "yours"));
+        assert_eq!(mine.max_parallel, own.settings.max_parallel);
 
         let mut app = test_app();
         app.pattern_name = "my-split".into();

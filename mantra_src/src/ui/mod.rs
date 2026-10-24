@@ -2,9 +2,12 @@
 
 pub mod anim;
 pub mod convo;
+pub mod form;
 pub mod input;
 pub mod md;
+pub mod models;
 pub mod overlays;
+pub mod settings;
 pub mod solo;
 pub mod stage;
 pub mod studio;
@@ -31,7 +34,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Zoom(a) => solo::draw(f, app, Some(a)),
         Screen::Stage => stage::draw(f, app),
         Screen::Studio => studio::draw_studio(f, app),
-        Screen::Models => studio::draw_models(f, app),
+        Screen::Models => models::draw_models(f, app),
+        Screen::Settings => settings::draw_settings(f, app),
     }
     overlays::draw(f, app);
     draw_toast(f, app);
@@ -398,7 +402,8 @@ pub fn draw_suggestions(f: &mut Frame, input_area: Rect, app: &App) {
         return;
     }
     let h = (s.len() as u16).min(10) + 2;
-    let w = 64.min(input_area.width);
+    let lw = s.iter().map(|x| w_of(&x.label)).max().unwrap_or(0).max(10) + 2;
+    let w = (lw as u16 + 50).min(input_area.width);
     let area = Rect { x: input_area.x, y: input_area.y.saturating_sub(h), width: w, height: h };
     f.render_widget(Clear, area);
     let sel = app.suggest.min(s.len() - 1);
@@ -408,12 +413,15 @@ pub fn draw_suggestions(f: &mut Frame, input_area: Rect, app: &App) {
         .enumerate()
         .skip(start)
         .take(10)
-        .map(|(i, (c, d))| {
-            let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
-            Line::from(vec![Span::styled(format!(" {c:<12}"), st), Span::styled(trunc(d, 48), theme::dim())])
+        .map(|(i, x)| {
+            let st = if i == sel { theme::bold(theme::accent()) } else { theme::text() };
+            Line::from(vec![Span::styled(format!(" {:<lw$}", x.label), st), Span::styled(trunc(&x.about, (w as usize).saturating_sub(lw + 3)), theme::dim())])
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).block(block("", theme::FAINT)), area);
+    let blk = block("", theme::FAINT);
+    let inner = blk.inner(area);
+    f.render_widget(Paragraph::new(lines).block(blk), area);
+    form::band_line(f.buffer_mut(), inner, sel - start, 0);
 }
 
 pub fn approval_height(ap: &Approval) -> u16 {

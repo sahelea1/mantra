@@ -85,7 +85,24 @@ pub struct PushKeys {
     pub auth: String,
 }
 
+/// A secret on its way in (a pasted API key, a password, a setting that may be one): on the wire
+/// the plain string, in `Debug` never — a command is data, and data ends up in test failures and
+/// log lines.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"••••\"")
+    }
+}
+
 /// Every command of design §6. Agent ids are the hub's `u32`s.
+///
+/// 0.8 added the configuration commands (`run_stop` to `add_backend` below) — additive, so a UI
+/// bundle built for 0.7 keeps working on protocol 1. They go through the same APIs the TUI's
+/// `/settings`, `/models` and `/studio` do (`web::ops`); no reply carries a key or a password.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
@@ -103,6 +120,10 @@ pub enum Command {
         goal: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
+        /// How many workers at once for this run only, in every worker class (`--parallel N`,
+        /// `pattern::PARALLEL_RANGE`); absent = what the pattern says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parallel: Option<usize>,
     },
     PlanApprove,
     PauseResume,
@@ -197,6 +218,125 @@ pub enum Command {
         endpoint: String,
     },
     RemoteRotate,
+    /// Stop the active run for good (`App::stop_run`): saved as "stopped", openable from the runs
+    /// list to land or delete, and the way clear for `start_run`. → `{}`.
+    RunStop,
+    /// Every pattern as a list shows it (`Pattern::summaries`). → `{patterns, current, default}`.
+    PatternsList,
+    /// One pattern to edit. → `{pattern (JSON), toml, tag, builtin, edited, yours, path?, options}`;
+    /// `options` holds the values its fields take (kinds, sandboxes, permissions, models, …).
+    PatternGet {
+        name: String,
+    },
+    /// Validate and save `pattern` (the JSON `pattern_get` gave, edited) under `name`: its own name
+    /// saves over it (a built-in gets an edited copy in ~/.mantra/patterns), another one saves a
+    /// copy (`Pattern::save_as`). → `{name, path, tag}`; refused with every reason, one per line.
+    PatternSave {
+        name: String,
+        pattern: Value,
+    },
+    /// Delete a pattern's file (`Pattern::delete_file`): yours is gone, an edited built-in is the
+    /// built-in again. → `{path}`.
+    PatternDelete {
+        name: String,
+    },
+    /// The settings as `/settings` shows them (`Settings::fields`), the MCP servers and what the
+    /// web layer is serving. Secrets read "set" / "not set". → `{fields, mcp, web, demo}`.
+    SettingsGet,
+    /// One setting (`App::set_setting`), the value as text. → `{note, settings}` (`note`: when it
+    /// takes effect; `settings`: the `settings_get` reply after the change).
+    SettingsSet {
+        key: String,
+        value: Secret,
+    },
+    /// Add an MCP server, or change one: `command` with `args` absent is a command line, split
+    /// the way a shell would (`settings_ops::parse_command_line`); `env` replaces the server's;
+    /// `enabled` alone switches it. Saved to settings.toml. → `{settings}`.
+    McpSet {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<BTreeMap<String, Secret>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+    },
+    /// → `{settings}`.
+    McpRemove {
+        name: String,
+    },
+    /// Start the server, shake hands, list its tools (`mantra mcp test`); answered once it has.
+    /// → `{report}`.
+    McpTest {
+        name: String,
+    },
+    /// The model registry: models, providers (`api_key` as `••••` + its last four), the Codex
+    /// account as a row of its own, which add-on backends can be added. → `{models, providers,
+    /// backends, options}`.
+    ModelsGet,
+    /// One cell of a model (`alias`, `provider`, `model`, `context`, `compact`, `effort`,
+    /// `efforts`, `vision`, `note`), saved to models.toml. → `{alias, registry}` (the alias after
+    /// the change; `registry` is the `models_get` reply).
+    ModelSet {
+        alias: String,
+        field: String,
+        value: String,
+    },
+    /// A new model on `provider`; without `model` (and `alias`) a placeholder row to fill in.
+    /// → `{alias, registry}`.
+    ModelAdd {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+    },
+    /// → `{registry}`.
+    ModelDelete {
+        alias: String,
+    },
+    /// One cell of a provider (`id`, `name`, `base_url`, `env_key`, `api_key`, `kind`, `auth`,
+    /// `wire`); a new id carries its models along. → `{id, registry}`.
+    ProviderSet {
+        id: String,
+        field: String,
+        value: Secret,
+    },
+    /// A provider and every model on it; `openai` is the Codex account (all its models).
+    /// → `{models, registry}` (`models`: how many went with it).
+    ProviderDelete {
+        id: String,
+    },
+    /// A provider from its API key (`provider_key::provider_from_key`). `probe: false` only says
+    /// what the key looks like → `{draft}`; otherwise the provider is added (or the key put into
+    /// the one at that URL) and its model list asked for off the App task, answered once it is
+    /// back → `{provider, draft, candidates, probe_error?, registry}`. A failed probe keeps the
+    /// provider, for models by hand.
+    ProviderFromKey {
+        key: Secret,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe: Option<bool>,
+    },
+    /// Add the chosen `candidates` (rows of a `provider_from_key` reply) to `provider`.
+    /// → `{added, updated, registry}`.
+    ModelsImport {
+        provider: String,
+        candidates: Vec<super::ops::CandidateView>,
+    },
+    /// The live test of `/models`: a throwaway agent on the alias asked for one word, answered
+    /// once it has. → `{status}` ("ok 0.4s · …"); a failed test is an error with the reason.
+    ModelTest {
+        alias: String,
+    },
+    /// An add-on backend's default models, `kind` "codex" | "claude-code"
+    /// (`provider_key::add_backend`). → `{added, registry}`.
+    AddBackend {
+        kind: String,
+    },
 }
 
 impl Command {
@@ -233,6 +373,26 @@ impl Command {
         "push_prefs",
         "push_test",
         "remote_rotate",
+        "run_stop",
+        "patterns_list",
+        "pattern_get",
+        "pattern_save",
+        "pattern_delete",
+        "settings_get",
+        "settings_set",
+        "mcp_set",
+        "mcp_remove",
+        "mcp_test",
+        "models_get",
+        "model_set",
+        "model_add",
+        "model_delete",
+        "provider_set",
+        "provider_delete",
+        "provider_from_key",
+        "models_import",
+        "model_test",
+        "add_backend",
     ];
 
     /// The wire name of this command (for logs and error texts).
@@ -410,7 +570,8 @@ mod tests {
             Command::Send { agent: 1, text: "hi".into(), force: Some(true) },
             Command::Send { agent: 1, text: "hi".into(), force: None },
             Command::RunInput { text: "yes".into() },
-            Command::StartRun { goal: "g".into(), pattern: Some("p".into()) },
+            Command::StartRun { goal: "g".into(), pattern: Some("p".into()), parallel: Some(8) },
+            Command::StartRun { goal: "g".into(), pattern: None, parallel: None },
             Command::PlanApprove,
             Command::PauseResume,
             Command::Interrupt { agent: 2 },
@@ -440,11 +601,46 @@ mod tests {
             Command::PushPrefs { endpoint: "e".into(), prefs },
             Command::PushTest { endpoint: "e".into() },
             Command::RemoteRotate,
+            Command::RunStop,
+            Command::PatternsList,
+            Command::PatternGet { name: "p".into() },
+            Command::PatternSave { name: "p".into(), pattern: json!({"name": "p", "roles": {}}) },
+            Command::PatternDelete { name: "p".into() },
+            Command::SettingsGet,
+            Command::SettingsSet { key: "fps".into(), value: Secret("30".into()) },
+            Command::McpSet { name: "blender".into(), command: Some("uvx blender-mcp".into()), args: None, env: Some([("TOKEN".to_string(), Secret("t".into()))].into()), enabled: Some(true) },
+            Command::McpSet { name: "blender".into(), command: None, args: None, env: None, enabled: Some(false) },
+            Command::McpRemove { name: "blender".into() },
+            Command::McpTest { name: "blender".into() },
+            Command::ModelsGet,
+            Command::ModelSet { alias: "sol".into(), field: "note".into(), value: "x".into() },
+            Command::ModelAdd { provider: "bija".into(), model: Some("m".into()), alias: None },
+            Command::ModelDelete { alias: "m".into() },
+            Command::ProviderSet { id: "bija".into(), field: "api_key".into(), value: Secret("sk-x".into()) },
+            Command::ProviderDelete { id: "gw".into() },
+            Command::ProviderFromKey { key: Secret("sk-x".into()), base_url: None, probe: Some(false) },
+            Command::ModelsImport { provider: "gw".into(), candidates: vec![crate::web::ops::CandidateView { model: "m".into(), context: Some(8000), ..Default::default() }] },
+            Command::ModelTest { alias: "sol".into() },
+            Command::AddBackend { kind: "codex".into() },
         ];
         assert_eq!(cmds.iter().map(|c| c.name()).collect::<std::collections::BTreeSet<_>>().len(), Command::NAMES.len(), "every command covered");
         for (i, cmd) in cmds.into_iter().enumerate() {
             round_client(ClientMsg::Cmd { req: i as u64, cmd });
         }
+    }
+
+    /// A key or password in a command never shows in its `Debug` (test failures, log lines), and
+    /// still travels as the plain string; a 0.7 UI's `start_run` (no `parallel`) still parses.
+    #[test]
+    fn secrets_are_plain_on_the_wire_and_hidden_in_debug() {
+        let cmd = Command::ProviderFromKey { key: Secret("sk-live-123".into()), base_url: None, probe: None };
+        assert!(!format!("{cmd:?}").contains("sk-live-123"), "{cmd:?}");
+        let wire = serde_json::to_string(&ClientMsg::Cmd { req: 1, cmd }).unwrap();
+        assert!(wire.contains(r#""key":"sk-live-123""#), "{wire}");
+        let set = ClientMsg::parse(r#"{"t":"cmd","req":2,"cmd":"settings_set","key":"web.password","value":"hunter2"}"#).unwrap();
+        assert!(!format!("{set:?}").contains("hunter2"));
+        let old = ClientMsg::parse(r#"{"t":"cmd","req":3,"cmd":"start_run","goal":"g"}"#).unwrap();
+        assert_eq!(old, ClientMsg::Cmd { req: 3, cmd: Command::StartRun { goal: "g".into(), pattern: None, parallel: None } });
     }
 
     #[test]

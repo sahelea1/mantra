@@ -152,8 +152,9 @@ if [ "$use_source" -eq 0 ]; then
         log "No release asset available (or download failed); falling back to building from source."
     fi
 
-    # bija rides along with mantra; without it mantra still works with Codex or Claude Code,
-    # so a missing or bad bija asset is a note, never a reason to build everything from source.
+    # bija rides along with mantra and every default model runs on it; a missing or bad bija
+    # asset is still a note, never a reason to build everything from source (mantra says what to
+    # do when it starts on a bija model without it, and a source build brings both).
     if [ -n "$binary_path" ]; then
         bija_asset="bija-${asset#mantra-}"
         if fetch "$base_url/$bija_asset" "$dl_dir/$bija_asset" 2>/dev/null && fetch "$base_url/$bija_asset.sha256" "$dl_dir/$bija_asset.sha256" 2>/dev/null; then

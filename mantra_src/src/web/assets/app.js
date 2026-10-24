@@ -2,10 +2,11 @@
 // command palette, notifications (Web Push), the relay connect flow, banners and timers.
 //
 // Loaded last (see index.html). The other files define M.h/M.patch (ui/dom.js), M.fmt, M.store,
-// M.parts, M.agentView and M.screens; this file defines M.act (what views call), M.push, M.relay.
+// M.parts, M.agentView, M.screens and M.config (the Settings sections, models, patterns); this
+// file defines M.act (what views call), M.push, M.relay.
 'use strict';
 (function (M) {
-    const h = M.h, F = M.fmt, P = M.parts, AV = M.agentView, SC = M.screens;
+    const h = M.h, F = M.fmt, P = M.parts, AV = M.agentView, SC = M.screens, CF = M.config;
     const { S } = M.store;
     const icon = F.icon;
     const T = window.MantraTransport, C = window.MantraCrypto;
@@ -49,15 +50,17 @@
         return client.request(cmd, args, timeout);
     }
     // Run a command with a spinner key and error flash; resolves with data, rejects on error.
+    // `opts.quiet`: no flash for an error the caller shows next to its field; `opts.timeout`:
+    // for a command that waits on the network.
     async function cmd(name, args, opts) {
         opts = opts || {};
         if (opts.busyKey) { S.ui.busy[opts.busyKey] = true; changed(); }
         try {
-            const d = await request(name, args);
+            const d = await request(name, args, opts.timeout);
             if (opts.ok) flash(opts.ok, 'ok');
             return d;
         } catch (e) {
-            flash(e.message || String(e), 'error');
+            if (!opts.quiet) flash(e.message || String(e), 'error');
             throw e;
         } finally {
             if (opts.busyKey) { delete S.ui.busy[opts.busyKey]; changed(); }
@@ -118,7 +121,7 @@
     }
 
     // ── routing ──────────────────────────────────────────────────────────────────────────────────
-    const TABS = { team: 'team', agent: 'agent', run: 'run', inbox: 'inbox', more: 'more', pulse: 'more', runs: 'more', settings: 'more' };
+    const TABS = { team: 'team', agent: 'agent', run: 'run', inbox: 'inbox', more: 'more', pulse: 'more', runs: 'more', settings: 'more', pattern: 'more' };
     function parse(path) {
         let p = path;
         if (base && p.startsWith(base)) p = p.slice(base.length);
@@ -126,6 +129,8 @@
         let m;
         if (p === '/') return { name: 'team' };
         if ((m = /^\/agent\/(\d+)$/.exec(p))) return { name: 'agent', id: Number(m[1]) };
+        if ((m = /^\/settings\/([a-z]+)$/.exec(p))) return { name: 'settings', section: m[1] };
+        if ((m = /^\/patterns\/([^/]+)$/.exec(p))) { try { return { name: 'pattern', id: decodeURIComponent(m[1]) }; } catch (_) { return { name: 'settings', section: 'patterns' }; } }
         if ((m = /^\/(run|pulse|inbox|runs|settings|more|login)$/.exec(p))) return { name: m[1] };
         return { name: 'team' };
     }
@@ -151,6 +156,7 @@
         S.ui.palette = null;
         if (r.name === 'agent') { M.store.setPref('focus', r.id); delete S.ui.unread[r.id]; }
         if (r.name === 'runs' && S.conn.state === 'open') SC.loadRuns();
+        CF.onRoute(r);
         changed();
     }
     window.addEventListener('popstate', (ev) => {
@@ -243,7 +249,8 @@
             case 'pulse': return SC.pulseScreen();
             case 'inbox': return SC.inboxScreen();
             case 'runs': return SC.runsScreen();
-            case 'settings': return SC.settingsScreen();
+            case 'settings': return CF.settingsScreen(r);
+            case 'pattern': return CF.patternEditor(r);
             case 'more': return SC.moreScreen();
             default: return SC.teamScreen();
         }
@@ -258,11 +265,11 @@
         const app = S.app || {};
         const sub = r.name === 'team' ? (S.run ? runWhere(S.run) + ' · ' + F.durShort(S.run.elapsed_ms) : app.branch ? '⎇ ' + app.branch : '')
             : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
-        const backTo = { pulse: '/more', runs: '/more', settings: '/more' }[r.name];
+        const backTo = r.name === 'settings' && r.section ? '/settings' : r.name === 'pattern' ? '/settings/patterns' : { pulse: '/more', runs: '/more', settings: '/more' }[r.name];
         return h('header', { class: 'topbar', key: 'topbar' },
             backTo ? P.iconBtn('back', () => back(backTo), 'Back', { cls: 'back' }) : h('img', { class: 'topbar-logo', src: '/icons/icon.svg', alt: '', width: 28, height: 28 }),
             h('div', { class: 'topbar-titles' },
-                h('h1', null, r.name === 'team' ? (app.project_name || 'Mantra') : TITLES[r.name] || 'Mantra'),
+                h('h1', null, r.name === 'team' ? (app.project_name || 'Mantra') : CF.title(r) || TITLES[r.name] || 'Mantra'),
                 sub ? h('div', { class: 'topbar-sub' }, sub) : null),
             r.name === 'runs' ? P.iconBtn('refresh', () => SC.loadRuns(), 'Refresh') : null,
             connDot());
@@ -293,7 +300,7 @@
             fixed ? null : topbar(r),
             h('main', { class: 'content' + (fixed ? ' fixed' : ''), key: 'content' },
                 fixed || !BANNER_ROUTES[r.name] ? null : banners(r),
-                h('div', { class: 'screen anim-' + (motion() ? S.ui.anim || 'fade' : 'none') + (fixed ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
+                h('div', { class: 'screen anim-' + (motion() ? S.ui.anim || 'fade' : 'none') + (fixed ? ' fill' : ''), key: screenKey(r) }, screenFor(r))),
             tabbar(r));
     }
 
@@ -301,7 +308,9 @@
     function sidebar(r) {
         const app = S.app || {};
         const run = S.run;
-        const item = (path, ico, label, name, badge) => h('button', { type: 'button', key: name, class: 'side-nav-item' + (r.name === name ? ' on' : ''), onclick: () => nav(path) },
+        // a pattern's editor is a page of Settings
+        const on = (name) => r.name === name || (name === 'settings' && r.name === 'pattern');
+        const item = (path, ico, label, name, badge) => h('button', { type: 'button', key: name, class: 'side-nav-item' + (on(name) ? ' on' : ''), onclick: () => nav(path) },
             icon(ico), h('span', null, label), badge ? h('span', { class: 'unread' }, String(badge)) : null);
         return h('aside', { class: 'side', key: 'side', 'aria-label': 'Team' },
             h('div', { class: 'side-head' },
@@ -327,7 +336,7 @@
     function mainHeader(r) {
         if (r.name === 'agent') return null;
         const app = S.app || {};
-        const title = r.name === 'team' ? 'Overview' : TITLES[r.name];
+        const title = r.name === 'team' ? 'Overview' : CF.title(r) || TITLES[r.name];
         // The run's title is the hero right below; the header carries where the run is.
         const sub = r.name === 'team' ? (app.project || '') : (r.name === 'run' || r.name === 'pulse') && S.run ? runWhere(S.run) : '';
         return h('header', { class: 'main-head', key: 'mh' },
@@ -411,6 +420,9 @@
         ];
     }
 
+    // A screen of its own per route (and per agent, section, pattern): its animation runs once.
+    function screenKey(r) { return 'scr-' + r.name + (r.id !== undefined ? r.id : '') + (r.section ? '-' + r.section : ''); }
+
     function deskShell(r) {
         const showPanel = mqWide.matches && S.ui.panelOpen && (r.name === 'agent' || r.name === 'team');
         return h('div', { class: 'shell desk' + (showPanel ? ' with-panel' : ''), key: 'desk' },
@@ -420,7 +432,7 @@
                 mainHeader(r),
                 BANNER_ROUTES[r.name] ? banners(r) : null,
                 h('div', { class: 'main-body' + (r.name === 'agent' ? ' fill' : ''), key: 'mb' },
-                    h('div', { class: 'screen anim-' + (motion() ? 'fade' : 'none') + (r.name === 'agent' ? ' fill' : ''), key: 'scr-' + r.name + (r.id !== undefined ? r.id : '') }, screenFor(r))),
+                    h('div', { class: 'screen anim-' + (motion() ? 'fade' : 'none') + (r.name === 'agent' ? ' fill' : ''), key: screenKey(r) }, screenFor(r))),
                 r.name === 'agent' && mqWide.matches && !S.ui.panelOpen ? h('button', { type: 'button', class: 'panel-reopen', title: 'Show side panel', onclick: () => M.store.setPref('panelOpen', true) }, icon('panel')) : null),
             showPanel ? rightPanel(r) : null);
     }
@@ -577,6 +589,11 @@
                 cls = 'small';
                 break;
             }
+            default: {
+                // the configuration sheets (add a provider, save a pattern's copy) are ui/config.js's
+                const x = CF.sheet(sh);
+                if (x) { title = x.title; body = x.body; cls = x.cls || ''; }
+            }
         }
         if (!body) { S.ui.sheet = null; return null; }
         return h('div', { class: 'sheet-layer', key: 'sheet-' + sh.kind, onclick: (e) => { if (e.target === e.currentTarget) closeSheet(); } },
@@ -600,12 +617,20 @@
         for (const [p, l, i] of go) items.push({ key: 'go' + p, label: 'Go to ' + l, icon: i, run: () => nav(p) });
         const run = S.run;
         if (run && run.stage.kind === 'review') items.push({ key: 'approve', label: 'Approve plan', icon: 'check', run: () => cmd('plan_approve', {}, { ok: 'Plan approved' }) });
-        if (run && run.stage.kind !== 'done') items.push(run.halted ? haltItem(P.haltPrimary(run.halted)) : { key: 'pause', label: 'Pause run', icon: 'pause', run: () => cmd('pause_resume', {}) });
+        if (run && run.active) items.push(run.halted ? haltItem(P.haltPrimary(run.halted)) : { key: 'pause', label: 'Pause run', icon: 'pause', run: () => cmd('pause_resume', {}) });
+        if (run && run.active) items.push({ key: 'stop', label: 'Stop run', icon: 'stop', run: () => SC.stopRun() });
+        if (!run || !run.active) {
+            items.push({
+                key: 'newrun', label: 'New run', icon: 'play',
+                run: () => { nav(run ? '/run' : '/'); requestAnimationFrame(() => requestAnimationFrame(() => { const g = document.querySelector('textarea.goal'); if (g) g.focus(); })); },
+            });
+        }
         if (run && run.landable) items.push({ key: 'land', label: 'Land run', icon: 'land', run: () => sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => cmd('land', {}, { ok: 'Landing…' }) }) });
         items.push({ key: 'solo', label: 'New Solo session', icon: 'plus', run: () => cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && nav('/agent/' + d.agent)) });
         items.push({ key: 'theme', label: 'Toggle dark / light', icon: 'sun', run: () => { const dark = S.ui.theme === 'dark' || (S.ui.theme === 'system' && mqDark.matches); M.store.setPref('theme', dark ? 'light' : 'dark'); applyPrefs(); } });
         items.push({ key: 'verbose', label: (S.ui.verbose ? 'Hide' : 'Show') + ' full reasoning & output', icon: 'eye', run: () => M.store.setPref('verbose', !S.ui.verbose) });
         if (mqWide.matches) items.push({ key: 'panel', label: (S.ui.panelOpen ? 'Hide' : 'Show') + ' side panel', icon: 'panel', run: () => M.store.setPref('panelOpen', !S.ui.panelOpen) });
+        items.push(...CF.paletteItems());
         const ql = q.trim().toLowerCase();
         if (!ql) return items;
         return items.filter((x) => (x.label + ' ' + (x.sub || '')).toLowerCase().includes(ql));
@@ -843,7 +868,7 @@
                         S.ui.route = { name: 'login' };
                         history.replaceState({ d: 0 }, '', '/login');
                     }
-                    if (m.state === 'open') { if (S.ui.route.name === 'runs') SC.loadRuns(); M.push.sync(); if (M.relay.onOpen) M.relay.onOpen(); }
+                    if (m.state === 'open') { if (S.ui.route.name === 'runs') SC.loadRuns(); CF.onRoute(S.ui.route); M.push.sync(); if (M.relay.onOpen) M.relay.onOpen(); }
                     if (MODE === 'relay' && M.relay.onState) M.relay.onState(m);
                     break;
                 case 'retry': S.conn.retryAt = m.at; break;

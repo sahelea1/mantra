@@ -180,7 +180,7 @@ impl Settings {
     }
 
     /// settings.toml as it is on disk, for a change that must be saved without the session's own
-    /// (`--demo` points at its mocks, a missing Codex moves Solo to bija): the defaults when there
+    /// (`--demo` points at its mocks and switches the experiments on): the defaults when there
     /// is no file yet, and an error for one that does not parse — `load` would fall back to the
     /// defaults, and saving those would wipe every setting in it.
     pub fn load_on_disk() -> std::result::Result<Settings, String> {
@@ -190,6 +190,18 @@ impl Settings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
+    }
+}
+
+/// Why `path` must not be written over: it exists and does not parse as `T` (a hand edit gone
+/// wrong), or it cannot be read at all. Writing then would replace what the user has — keys
+/// pasted into models.toml included — with the defaults the session fell back to; refusing keeps
+/// the file until they fix it. `None` = go (the file parses, or there is none yet).
+fn unparseable<T: serde::de::DeserializeOwned>(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str::<T>(&text).err().map(|e| format!("{} does not parse, so it was not saved over — fix it first: {}", path.display(), e.to_string().lines().next().unwrap_or_default())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("{} cannot be read, so it was not saved over: {e}", path.display())),
     }
 }
 
@@ -256,9 +268,9 @@ impl Default for Settings {
             codex_command: vec!["codex".into(), "app-server".into()],
             claude_command: vec!["claude".into()],
             bija_command: vec!["bija".into()],
-            // Solo runs on bija (SPEC §9.1): it ships beside mantra, so it is always there — Codex
-            // need not be. A fresh install signed in to Codex with ChatGPT still picks `sol`.
-            default_model: "sol-api".into(),
+            // Solo runs on bija (SPEC §9.1): it ships beside mantra, so it is always there. A 0.7
+            // file's `sol-api` still resolves (`Registry::get` answers to both spellings).
+            default_model: "sol".into(),
             approval_mode: "on-request".into(),
             sandbox: "workspace-write".into(),
             default_pattern: "mantra-default".into(),
@@ -299,6 +311,9 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<()> {
+        if let Some(why) = unparseable::<Settings>(&home().join("settings.toml")) {
+            anyhow::bail!(why);
+        }
         std::fs::create_dir_all(home())?;
         let body = toml::to_string_pretty(self)?;
         let body = format!("# Mantra settings\n{body}");
@@ -394,7 +409,7 @@ impl ModelEntry {
         if want == "min" {
             return list.first().cloned().unwrap_or_else(|| "low".into());
         }
-        if list.iter().any(|e| *e == want) {
+        if list.contains(&want) {
             return want;
         }
         // nearest by global order
@@ -635,9 +650,11 @@ pub struct Registry {
 const REGISTRY_HEADER: &str = r#"# Mantra model registry.
 # Each [[model]] gets a short alias you use in patterns and pickers.
 # context_window / auto_compact_percent are passed to every agent's backend.
-# A provider's `kind` picks the backend: "codex" (the default; the provider must speak the OpenAI
-# *Responses* API), "claude-code", or "bija" — Mantra's built-in harness, for any Chat Completions
-# API (wire = "openai", the default) or Messages API (wire = "anthropic"). A bija key is optional,
+# A provider's `kind` picks the backend: "bija", Mantra's built-in harness, for any Chat
+# Completions API (wire = "openai", the default) or Messages API (wire = "anthropic");
+# "claude-code"; or "codex" (what a [[provider]] without `kind` reads as; it must speak the OpenAI
+# *Responses* API). Models on provider "openai" run on Codex's own (ChatGPT) login. /models adds
+# a provider from just its API key, and Codex or Claude Code as backends. A bija key is optional,
 # so a local server works as is:
 #
 # [[provider]]
@@ -646,11 +663,12 @@ const REGISTRY_HEADER: &str = r#"# Mantra model registry.
 # kind = "bija"
 # base_url = "http://127.0.0.1:11434/v1"
 #
-# Example (Z.ai GLM through a Responses-compatible gateway):
+# Example (Z.ai GLM through bija, the key in an environment variable):
 #
 # [[provider]]
 # id = "zai"
 # name = "Z.ai"
+# kind = "bija"
 # base_url = "https://your-gateway.example/v1"
 # env_key = "ZAI_API_KEY"
 #
@@ -663,16 +681,25 @@ const REGISTRY_HEADER: &str = r#"# Mantra model registry.
 
 "#;
 
-/// Cheap, side-effect-free check for a `claude` executable on `PATH` (no subprocess spawn).
-/// Cached after the first call — `Registry::defaults()` may run more than once per process (a
-/// missing/invalid `models.toml` falls back to it, and tests call it directly).
+/// Whether an executable `name` is on `PATH` — no subprocess, nothing run.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())).unwrap_or(false)
+}
+
+/// Cheap, side-effect-free check for a `claude` executable on `PATH` (no subprocess spawn),
+/// cached after the first call: what `doctor` reports and what adding Claude Code in `/models`
+/// requires. Nothing is added to a registry for it on its own — Claude Code is an add-on backend.
 pub fn claude_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::env::var_os("PATH")
-            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("claude").is_file()))
-            .unwrap_or(false)
-    })
+    *AVAILABLE.get_or_init(|| on_path("claude"))
+}
+
+/// The same check for `codex`: what adding Codex requires, and what decides whether a 0.7
+/// models.toml keeps its Codex models on load (`Registry::adopt_bija_twins`). Mantra itself never
+/// needs it — bija runs every default model.
+pub fn codex_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| on_path("codex"))
 }
 
 /// The default Claude Code models: alias -> model id, context window and note. Every Opus,
@@ -689,11 +716,10 @@ const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
     ("haiku45", "claude-haiku-4-5-20251001", 200_000, "fast & cheap"),
 ];
 
-/// The default Claude Code models as full `ModelEntry`s for
-/// `provider_id` (`v02plan.md` WP10.2). Used by `Registry::defaults()` (only when `claude` is on
-/// PATH) and by `discover::claude_defaults` (WP10.5, any `ClaudeCode`-kind provider's `D` key), and
-/// injected in memory by `--demo` (WP10.6) regardless of `claude_available()` so
-/// `mantra --demo --pattern mantra-default-claude` needs no real `claude` install.
+/// The default Claude Code models as full `ModelEntry`s for `provider_id` (`v02plan.md` WP10.2):
+/// what adding Claude Code imports (`provider_key::add_backend`), what `discover::claude_defaults`
+/// offers for any `ClaudeCode`-kind provider, and what `--demo` injects in memory regardless of
+/// `claude_available()`, so the demo's mixed-backend runs need no real `claude` install.
 pub fn claude_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
     let claude_efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].iter().map(|s| s.to_string()).collect();
     CLAUDE_MODELS
@@ -713,38 +739,14 @@ pub fn claude_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
 
 /// The one line of `codex login status` output that says whether we are logged in. Codex prints
 /// warnings first (`WARNING: proceeding, even though we could not create PATH aliases …`), on the
-/// same stream, so "the first line" used to show the warning instead of the verdict. Shared by
-/// `doctor` (`main.rs`) and `codex_chatgpt_signed_in` below — one filter, not two to keep in sync.
+/// same stream, so "the first line" used to show the warning instead of the verdict (`doctor`).
 pub fn login_status_line(out: &str) -> String {
     let meaningful = |l: &str| {
         let t = l.trim();
         let low = t.to_lowercase();
         !t.is_empty() && !low.starts_with("warning") && !low.starts_with("warn:") && !low.starts_with("error") && !low.contains("bubblewrap")
     };
-    out.lines().filter(|l| meaningful(l)).last().or_else(|| out.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim().to_string()
-}
-
-/// True when the status line names a ChatGPT subscription rather than an API key ("Logged in
-/// using ChatGPT" vs "Logged in using an API key").
-fn is_chatgpt_login(line: &str) -> bool {
-    let low = line.to_lowercase();
-    low.contains("chatgpt") && !low.contains("api key")
-}
-
-/// Is Codex signed in through a ChatGPT subscription? Runs `<codex> login status` with a 5s hard
-/// cap (a thread + `recv_timeout`, same shape as `main.rs`'s doctor probes — there is no shared
-/// helper for it in this crate to reuse) and classifies the meaningful line. Never panics; a
-/// missing binary, a non-zero exit or a timeout all read as "false" — a fresh install just keeps
-/// the ordinary Codex-account defaults.
-pub fn codex_chatgpt_signed_in(codex_command: &[String]) -> bool {
-    let Some(cmd0) = codex_command.first().cloned() else { return false };
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(std::process::Command::new(&cmd0).args(["login", "status"]).output());
-    });
-    let Ok(Ok(o)) = rx.recv_timeout(std::time::Duration::from_secs(5)) else { return false };
-    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    is_chatgpt_login(&login_status_line(&text))
+    out.lines().rfind(|l| meaningful(l)).or_else(|| out.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim().to_string()
 }
 
 /// Codex's own config dir: `$CODEX_HOME`, else `~/.codex` — same resolution Codex itself uses.
@@ -828,30 +830,33 @@ fn resolve_bija_from(configured: &[String], on_path: impl Fn(&str) -> bool, besi
 }
 
 /// The provider every registry ships for bija (SPEC §9.1): OpenAI's Chat Completions API with
-/// `$OPENAI_API_KEY`. Pointing it anywhere else is a `/models` edit (URL, wire, key).
+/// `$OPENAI_API_KEY` (or a key pasted in `/models`). Pointing it anywhere else is a `/models` edit
+/// (URL, wire, key).
 pub fn bija_default_provider() -> ProviderEntry {
-    ProviderEntry { id: "bija".into(), name: "Bija".into(), base_url: "https://api.openai.com/v1".into(), env_key: "OPENAI_API_KEY".into(), kind: ProviderKind::Bija, ..Default::default() }
+    ProviderEntry { id: "bija".into(), name: "OpenAI API".into(), base_url: "https://api.openai.com/v1".into(), env_key: "OPENAI_API_KEY".into(), kind: ProviderKind::Bija, ..Default::default() }
 }
 
-/// The alias a default model goes by through bija: `sol` → `sol-api`. `pattern::builtin_bija`
-/// maps every role with it, so the two can never disagree on the naming.
+/// The 0.7 spelling of a default model through bija: `sol` → `sol-api`, from when the plain alias
+/// was Codex's. Nothing new is named so, but `Registry::get` still answers to it (and to the plain
+/// alias when only the twin exists), so 0.7 pattern files and settings keep working.
 pub fn bija_alias(alias: &str) -> String {
-    format!("{alias}-api")
+    format!("{alias}{API_SUFFIX}")
 }
 
-/// The default models again, reached through bija on `provider_id` with an API key instead of
-/// Codex's own login: the same model ids, windows, efforts and notes under `-api` aliases.
+/// What `bija_alias` appends.
+const API_SUFFIX: &str = "-api";
+
+/// The default models through bija on `provider_id`: the four aliases every built-in pattern
+/// names, with the same ids, windows, efforts and notes Codex's own account has them under.
 pub fn bija_default_model_entries(provider_id: &str) -> Vec<ModelEntry> {
-    codex_default_models()
-        .into_iter()
-        .map(|m| ModelEntry { vision: true, alias: bija_alias(&m.alias), provider: provider_id.to_string(), note: format!("{} — with an API key", m.note), ..m })
-        .collect()
+    codex_default_models().into_iter().map(|m| ModelEntry { vision: true, provider: provider_id.to_string(), ..m }).collect()
 }
 
 /// Whether a model id is one of a family that takes images: an id of the built-in default tables,
 /// or one shaped like them (`gpt-…`, `claude-…`) that the tables have not caught up with. The
-/// open-weight `gpt-oss-…` ids people run locally read text only, so they are not.
-fn takes_images(model: &str) -> bool {
+/// open-weight `gpt-oss-…` ids people run locally read text only, so they are not. Discovery asks
+/// too: a provider's catalogue rarely says so for these families.
+pub(crate) fn takes_images(model: &str) -> bool {
     let id = model.trim();
     if CLAUDE_MODELS.iter().any(|(_, m, _, _)| *m == id) || codex_default_models().iter().any(|m| m.model == id) {
         return true;
@@ -859,8 +864,9 @@ fn takes_images(model: &str) -> bool {
     (id.starts_with("gpt-") && !id.starts_with("gpt-oss")) || id.starts_with("claude-")
 }
 
-/// The four models Codex's own account runs (provider `openai`).
-fn codex_default_models() -> Vec<ModelEntry> {
+/// The four default models as Codex's own account runs them (provider `openai`): what adding
+/// Codex imports, and — moved onto bija — what every registry starts with.
+pub(crate) fn codex_default_models() -> Vec<ModelEntry> {
     let all6 = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     vec![
         ModelEntry {
@@ -911,19 +917,12 @@ fn codex_default_models() -> Vec<ModelEntry> {
 }
 
 impl Registry {
+    /// A fresh install: bija's provider and the four default models on it — what Solo and every
+    /// built-in pattern run on. Codex and Claude Code are add-on backends
+    /// (`provider_key::add_backend`), never added here, whatever is installed.
     pub fn defaults() -> Registry {
-        let mut models = codex_default_models();
-        // bija ships beside mantra, so its provider and the default models through it are always
-        // offered — they are what Solo runs on (`Settings::default_model`).
         let bija = bija_default_provider();
-        models.extend(bija_default_model_entries(&bija.id));
-        let mut providers = vec![bija];
-        // Only offered when `claude` is actually installed (WP10.2); `doctor` reports this check.
-        if claude_available() {
-            providers.push(ProviderEntry { id: "claude".into(), name: "Claude Code".into(), kind: ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
-            models.extend(claude_default_model_entries("claude"));
-        }
-        Registry { models, providers }
+        Registry { models: bija_default_model_entries(&bija.id), providers: vec![bija] }
     }
 
     /// Which backend a model's provider launches through (`openai`/no provider = Codex).
@@ -935,23 +934,78 @@ impl Registry {
         home().join("models.toml")
     }
 
-    /// A registry written before bija shipped gets its provider and the `-api` twins of the default
-    /// models — what `mantra-default-bija` and the run-without-Codex fallback are built on. Only a
-    /// registry with no Bija provider at all is touched (one the user set up stays as it is), and
-    /// only the aliases it lacks are added. True when anything was added.
+    /// A registry written before bija shipped gets its provider and the default models through
+    /// it: under the plain alias where that is free, else under its `-api` twin (the plain one is
+    /// Codex's, and `get` answers to either). Only a registry with no Bija provider at all is
+    /// touched (one the user set up stays as it is), and only the models it lacks are added. True
+    /// when anything was added.
     pub fn add_missing_bija(&mut self) -> bool {
         if self.providers.iter().any(|p| p.kind == ProviderKind::Bija) {
             return false;
         }
-        // An id of the user's own under the default's name is theirs; the twins then go nowhere.
+        // An id of the user's own under the default's name is theirs; the models then go nowhere.
         if self.providers.iter().any(|p| p.id == bija_default_provider().id) {
             return false;
         }
         let provider = bija_default_provider();
-        let twins: Vec<ModelEntry> = bija_default_model_entries(&provider.id).into_iter().filter(|m| self.get(&m.alias).is_none()).collect();
+        let mut added: Vec<ModelEntry> = vec![];
+        for m in bija_default_model_entries(&provider.id) {
+            let taken = |a: &str| self.models.iter().chain(added.iter()).any(|x| x.alias == a);
+            let alias = if !taken(&m.alias) {
+                m.alias.clone()
+            } else if !taken(&bija_alias(&m.alias)) {
+                bija_alias(&m.alias)
+            } else {
+                continue; // both spellings are the user's own
+            };
+            added.push(ModelEntry { alias, ..m });
+        }
         self.providers.push(provider);
-        self.models.extend(twins);
+        self.models.extend(added);
         true
+    }
+
+    /// A 0.7 registry on a host without Codex: there the plain aliases (`sol`) were Codex's and the
+    /// bija twins (`sol-api`) the ones that could run, so the fallback in `get` cannot help — `sol`
+    /// exists, it just cannot start. Each model `x` on Codex's account that has a twin `x-api` on a
+    /// Bija provider is dropped and the twin takes its name. A Codex model without a twin stays
+    /// (deleting the Codex row in `/models` removes it), and with Codex installed nothing is
+    /// renamed at all. True when anything changed.
+    pub fn adopt_bija_twins(&mut self, codex_available: bool) -> bool {
+        if codex_available {
+            return false;
+        }
+        let bija: Vec<String> = self.providers.iter().filter(|p| p.kind == ProviderKind::Bija).map(|p| p.id.clone()).collect();
+        let has_twin = |alias: &str| self.models.iter().any(|t| t.alias == bija_alias(alias) && bija.contains(&t.provider));
+        let paired: Vec<String> = self.models.iter().filter(|m| !m.is_custom_provider() && has_twin(&m.alias)).map(|m| m.alias.clone()).collect();
+        if paired.is_empty() {
+            return false;
+        }
+        self.models.retain(|m| m.is_custom_provider() || !paired.contains(&m.alias));
+        for m in self.models.iter_mut().filter(|m| bija.contains(&m.provider)) {
+            let Some(plain) = m.alias.strip_suffix(API_SUFFIX).filter(|p| paired.iter().any(|x| x == p)).map(str::to_string) else { continue };
+            // 0.7 wrote the twins' notes as "<note> — with an API key", only to tell the two apart.
+            if let Some(note) = m.note.strip_suffix(" — with an API key") {
+                m.note = note.to_string();
+            }
+            m.alias = plain;
+        }
+        true
+    }
+
+    /// The aliases on Codex's own account (provider `openai`, or none written at all): what the
+    /// synthetic "Codex (ChatGPT login)" row of `/models` stands for — the account has no
+    /// `[[provider]]` entry to show or delete.
+    pub fn codex_account_models(&self) -> Vec<String> {
+        self.models.iter().filter(|m| !m.is_custom_provider()).map(|m| m.alias.clone()).collect()
+    }
+
+    /// Removes every model on Codex's own account: deleting the Codex row, the counterpart of
+    /// adding Codex. Returns how many went.
+    pub fn remove_codex_account(&mut self) -> usize {
+        let before = self.models.len();
+        self.models.retain(|m| m.is_custom_provider());
+        before - self.models.len()
     }
 
     /// A registry written before models had a `vision` key reads `false` everywhere, so nobody
@@ -977,23 +1031,24 @@ impl Registry {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => match toml::from_str::<Registry>(&s) {
                 Ok(mut r) if !r.models.is_empty() => {
-                    let bija = r.add_missing_bija();
-                    if bija {
-                        crate::mlog!("models.toml: added the bija provider and the default models through it");
-                    }
-                    let vision = r.add_missing_vision(&s);
-                    if vision {
-                        crate::mlog!("models.toml: vision switched on for the models whose family takes images");
-                    }
-                    // One save for both: every entry now carries `vision`, so neither runs again.
-                    if bija || vision {
+                    if r.migrate(&s, codex_available()) {
                         let _ = r.save();
                     }
                     r
                 }
-                Ok(_) => Registry::defaults(),
+                // No models at all: the defaults' models, but the providers the file has (keys
+                // included) stay, so the next save does not drop them.
+                Ok(r) => {
+                    let mut d = Registry::defaults();
+                    for p in r.providers {
+                        d.providers.retain(|x| x.id != p.id);
+                        d.providers.push(p);
+                    }
+                    d
+                }
                 Err(e) => {
-                    crate::mlog!("models.toml invalid ({e}); using defaults");
+                    // `save` refuses to write over the file while it does not parse (`unparseable`).
+                    crate::mlog!("models.toml invalid ({e}); using defaults until it is fixed");
                     Registry::defaults()
                 }
             },
@@ -1005,7 +1060,30 @@ impl Registry {
         }
     }
 
+    /// Every migration an older models.toml (`text`, as read) gets on load, in the order that lets
+    /// a pre-0.7 file on a host without Codex land on plain aliases in one go: bija's provider and
+    /// models, then the twins taking the Codex names, then `vision`. True when the caller should
+    /// save — once for all of them; none of them changes the saved file again.
+    fn migrate(&mut self, text: &str, codex_available: bool) -> bool {
+        let bija = self.add_missing_bija();
+        if bija {
+            crate::mlog!("models.toml: added the bija provider and the default models through it");
+        }
+        let twins = self.adopt_bija_twins(codex_available);
+        if twins {
+            crate::mlog!("models.toml: codex is not installed — the bija models took over its aliases");
+        }
+        let vision = self.add_missing_vision(text);
+        if vision {
+            crate::mlog!("models.toml: vision switched on for the models whose family takes images");
+        }
+        bija || twins || vision
+    }
+
     pub fn save(&self) -> Result<()> {
+        if let Some(why) = unparseable::<Registry>(&Self::path()) {
+            anyhow::bail!(why);
+        }
         std::fs::create_dir_all(home())?;
         let body = toml::to_string_pretty(self).context("serialize models")?;
         let text = format!("{REGISTRY_HEADER}{body}");
@@ -1028,11 +1106,30 @@ impl Registry {
         self.providers.iter().find(|p| p.id == id).map(|p| if p.name.trim().is_empty() { p.id.clone() } else { p.name.clone() }).unwrap_or_else(|| id.to_string())
     }
 
+    /// The model an alias names: the alias itself, else a model id, else its other spelling — `x`
+    /// for `x-api` and `x-api` for `x` (`bija_alias`). The last keeps a 0.7 registry (Codex `sol`
+    /// beside bija `sol-api`) and 0.7 pattern files working whichever of the two the user deletes.
+    /// A fallback is logged once per name.
     pub fn get(&self, alias: &str) -> Option<&ModelEntry> {
-        self.models
-            .iter()
-            .find(|m| m.alias == alias)
-            .or_else(|| self.models.iter().find(|m| m.model == alias))
+        let (m, fell_back) = self.lookup(alias)?;
+        if fell_back {
+            static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if !said.iter().any(|a| a == alias) {
+                said.push(alias.to_string());
+                crate::mlog!("models: no alias '{alias}' — using '{}'", m.alias);
+            }
+        }
+        Some(m)
+    }
+
+    /// `get` without the log, and whether it took the other spelling.
+    fn lookup(&self, alias: &str) -> Option<(&ModelEntry, bool)> {
+        let exact = |a: &str| self.models.iter().find(|m| m.alias == a);
+        if let Some(m) = exact(alias).or_else(|| self.models.iter().find(|m| m.model == alias)) {
+            return Some((m, false));
+        }
+        exact(&bija_alias(alias)).or_else(|| alias.strip_suffix(API_SUFFIX).and_then(exact)).map(|m| (m, true))
     }
 
     /// Whether the alias's model takes images — what offers the screenshot and view-image tools,
@@ -1054,8 +1151,32 @@ impl Registry {
     /// engine, which has no registry of its own, is handed at a run's start, resume and every live
     /// model switch (`Run::set_known_models`): it tells a saved alias that still exists from one
     /// that was deleted, and gives the pattern's `context_cap` a window to be measured against.
+    /// Both spellings of every alias are in it, as `get` answers to both: a 0.7 pattern naming
+    /// `sol-api` must not read as "alias deleted" once only `sol` is left.
     pub fn context_windows(&self) -> std::collections::HashMap<String, u64> {
-        self.models.iter().map(|m| (m.alias.clone(), m.effective_context())).collect()
+        self.names().into_iter().map(|(name, m)| (name, m.effective_context())).collect()
+    }
+
+    /// The names whose model takes images — what `Run::set_vision_models` is handed — in both
+    /// spellings, like `context_windows`: a role naming `sol-api` keeps its screenshot tools.
+    pub fn vision_names(&self) -> std::collections::HashSet<String> {
+        self.names().into_iter().filter(|(_, m)| m.vision).map(|(name, _)| name).collect()
+    }
+
+    /// Every name `get` answers to with the entry it names, for the engine, which looks names up
+    /// in plain maps: each alias, then each alias's other spelling where that is no alias itself.
+    fn names(&self) -> Vec<(String, &ModelEntry)> {
+        let mut out: Vec<(String, &ModelEntry)> = self.models.iter().map(|m| (m.alias.clone(), m)).collect();
+        for m in &self.models {
+            let other = m.alias.strip_suffix(API_SUFFIX).map(str::to_string).unwrap_or_else(|| bija_alias(&m.alias));
+            if out.iter().any(|(n, _)| *n == other) {
+                continue;
+            }
+            if let Some((found, _)) = self.lookup(&other) {
+                out.push((other, found));
+            }
+        }
+        out
     }
 
     /// The custom provider an alias runs on; `None` for Codex's own account or an unknown alias.
@@ -1151,23 +1272,6 @@ impl Registry {
     }
 }
 
-/// A built-in pattern with every `astra` role moved to `sol`: what a fresh install saves when Codex
-/// is signed in through a ChatGPT subscription, which has no access to `astra` (it stays in
-/// `models.toml` as a plain alias — nothing defaults to it any more). An `auto` effort stays `auto`.
-pub fn chatgpt_variant(mut p: crate::engine::pattern::Pattern) -> crate::engine::pattern::Pattern {
-    let sol = Registry::defaults().resolve("sol");
-    for role in p.roles.values_mut() {
-        if role.model == "astra" {
-            role.model = "sol".into();
-            if role.effort != crate::engine::pattern::EFFORT_AUTO {
-                role.effort = sol.resolve_effort(&role.effort);
-            }
-        }
-    }
-    p.description = format!("{} — ChatGPT subscription models", p.description);
-    p
-}
-
 /// Write via temp file + rename so a crash never leaves a half-written config.
 pub fn atomic_write(path: &Path, body: &str) -> Result<()> {
     write_atomic(path, body, false)
@@ -1215,6 +1319,46 @@ fn write_restricted(tmp: &Path, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand edit that broke settings.toml or models.toml is never written over: the session ran
+    /// on defaults, and saving those would throw away what the file held — a pasted key included.
+    #[test]
+    fn a_file_that_does_not_parse_is_never_saved_over() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let broken_settings = "default_model = \"sol\"\nnotify = [unterminated\n";
+            std::fs::write(home().join("settings.toml"), broken_settings).unwrap();
+            let err = Settings::default().save().expect_err("refused");
+            assert!(err.to_string().contains("does not parse, so it was not saved over"), "{err}");
+            assert_eq!(std::fs::read_to_string(home().join("settings.toml")).unwrap(), broken_settings);
+
+            let broken_models = "[[provider]]\nid = \"work\"\napi_key = \"secret-corp-key-1234567890\"\n\n[[model]]\nalias = \"x\"\nnote = \"unterminated\n";
+            std::fs::write(Registry::path(), broken_models).unwrap();
+            let loaded = Registry::load();
+            assert_eq!(loaded.models, Registry::defaults().models, "the session runs on the defaults");
+            assert!(loaded.save().is_err(), "but never writes them over the file");
+            assert_eq!(std::fs::read_to_string(Registry::path()).unwrap(), broken_models, "the key is still there");
+
+            // once fixed, saving works again
+            std::fs::remove_file(Registry::path()).unwrap();
+            std::fs::remove_file(home().join("settings.toml")).unwrap();
+            assert!(Registry::defaults().save().is_ok() && Settings::default().save().is_ok());
+        });
+    }
+
+    /// A models.toml with providers but no models gets the default models — and keeps its
+    /// providers, keys included, instead of losing them on the next save.
+    #[test]
+    fn a_registry_without_models_keeps_its_providers() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let text = "[[provider]]\nid = \"work\"\nname = \"Work\"\nbase_url = \"https://llm.example/v1\"\nkind = \"bija\"\napi_key = \"k-123456789\"\n";
+            std::fs::write(Registry::path(), text).unwrap();
+            let r = Registry::load();
+            assert_eq!(r.models, Registry::defaults().models);
+            let work = r.providers.iter().find(|p| p.id == "work").expect("kept");
+            assert_eq!(work.api_key.as_deref(), Some("k-123456789"));
+            assert!(r.providers.iter().any(|p| p.id == "bija"), "the default provider is there for the default models");
+        });
+    }
     #[cfg(unix)]
     #[test]
     fn restricted_writes_never_exist_world_readable() {
@@ -1256,7 +1400,7 @@ mod tests {
         assert_eq!(m.resolve_effort_lowered("high"), ("high".into(), false));
         assert_eq!(m.resolve_effort_lowered("min"), ("low".into(), false), "aliases aren't a downgrade");
         let luna = Registry::defaults().get("luna").unwrap().clone();
-        assert_eq!(luna.resolve_effort_lowered("max").1, false);
+        assert!(!luna.resolve_effort_lowered("max").1);
         let none = ModelEntry { provider: "zai".into(), ..Default::default() };
         assert_eq!(none.resolve_effort_lowered("max"), (String::new(), false), "no effort setting at all isn't a clamp");
     }
@@ -1339,7 +1483,7 @@ mod tests {
     #[test]
     fn preflight_names_missing_keys_per_role() {
         let mut r = Registry::defaults();
-        assert!(r.preflight(&crate::engine::pattern::Pattern::builtin()).is_empty(), "built-in models run on Codex's account");
+        assert!(r.preflight(&crate::engine::pattern::Pattern::builtin()).is_empty(), "built-in models run on bija, whose key is optional");
         r.providers.push(ProviderEntry { id: "zai".into(), name: "Z.ai".into(), base_url: "https://api.z.ai/v1".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
         r.models.push(ModelEntry { alias: "glm".into(), provider: "zai".into(), model: "glm-5.2".into(), ..Default::default() });
         let mut p = crate::engine::pattern::Pattern::builtin_thorough();
@@ -1471,24 +1615,18 @@ mod tests {
         let claude_model = ModelEntry { provider: "claude".into(), ..Default::default() };
         assert_eq!(r.backend_of(&claude_model), ProviderKind::ClaudeCode);
     }
+    /// Claude Code is an add-on backend: the defaults never carry it, installed or not, and its
+    /// models (what adding it imports) keep the WP10.2 shape — model ids, 1M windows, Haiku 200k.
     #[test]
-    fn claude_defaults_only_appear_when_claude_kind_provider_exists() {
-        // Registry::defaults() only adds the built-in `claude` provider when the `claude` binary is
-        // on PATH (config::claude_available()); assert the two are consistent either way, and that
-        // when present the models/provider shape matches WP10.2 (kind, model ids, 1M windows).
+    fn the_defaults_carry_no_claude_code_and_its_models_keep_their_shape() {
         let r = Registry::defaults();
-        let has_claude_provider = r.providers.iter().any(|p| p.kind == ProviderKind::ClaudeCode);
-        assert_eq!(has_claude_provider, claude_available());
-        if has_claude_provider {
-            let p = r.providers.iter().find(|p| p.id == "claude").expect("built-in provider id must be `claude`");
-            assert_eq!(p.auth, "subscription");
-            let sonnet = r.get("sonnet5").expect("sonnet5 alias");
-            assert_eq!(sonnet.model, "claude-sonnet-5");
-            assert_eq!(r.backend_of(sonnet), ProviderKind::ClaudeCode);
-            assert_eq!(sonnet.effective_context(), 1_000_000, "Opus/Sonnet/Fable default to the 1M window");
-            let haiku = r.get("haiku45").expect("haiku45 alias");
-            assert_eq!(haiku.effective_context(), 200_000, "Haiku keeps 200k");
-        }
+        assert!(r.providers.iter().all(|p| p.kind == ProviderKind::Bija), "{:?}", r.providers);
+        let claude = claude_default_model_entries("claude");
+        let sonnet = claude.iter().find(|m| m.alias == "sonnet5").expect("sonnet5 alias");
+        assert_eq!((sonnet.model.as_str(), sonnet.provider.as_str()), ("claude-sonnet-5", "claude"));
+        assert_eq!(sonnet.effective_context(), 1_000_000, "Opus/Sonnet/Fable default to the 1M window");
+        let haiku = claude.iter().find(|m| m.alias == "haiku45").expect("haiku45 alias");
+        assert_eq!(haiku.effective_context(), 200_000, "Haiku keeps 200k");
     }
     #[test]
     fn provider_args_never_mention_claude_code_providers() {
@@ -1496,40 +1634,10 @@ mod tests {
         assert!(r.provider_args().is_empty(), "ClaudeCode providers must not generate Codex model_providers.* args");
     }
     #[test]
-    fn chatgpt_login_line_classifier() {
-        assert!(is_chatgpt_login("Logged in using ChatGPT"));
-        assert!(!is_chatgpt_login("Logged in using an API key"));
-        assert!(!is_chatgpt_login("Not logged in"));
-    }
-    #[test]
-    fn chatgpt_default_pattern_moves_astra_roles_to_sol() {
-        let p = chatgpt_variant(crate::engine::pattern::Pattern::builtin());
-        assert_eq!(p.name, "mantra-default");
-        assert!(p.description.ends_with(" — ChatGPT subscription models"), "{}", p.description);
-        let reg = Registry::defaults();
-        for (n, r) in &p.roles {
-            assert_ne!(r.model, "astra", "role '{n}' still defaults to astra");
-            assert!(!reg.resolve(&r.model).is_custom_provider(), "role '{n}' must resolve to a Codex-account model");
-        }
-        assert!(p.validate().is_ok(), "{:?}", p.validate());
-    }
-    #[test]
-    fn chatgpt_variants_cover_every_built_in_and_keep_auto_efforts() {
-        use crate::engine::pattern::{Pattern, EFFORT_AUTO};
-        let reg = Registry::defaults();
-        for n in ["mantra-default", "mantra-lean", "mantra-thorough"] {
-            let src = Pattern::builtin_named(n).unwrap();
-            let v = chatgpt_variant(src.clone());
-            assert_eq!(v.name, n);
-            assert!(v.roles.values().all(|r| r.model != "astra"), "{n}");
-            assert!(v.validate().is_ok(), "{n}: {:?}", v.validate());
-            for (rn, r) in &v.roles {
-                if src.roles[rn].effort == EFFORT_AUTO {
-                    assert_eq!(r.effort, EFFORT_AUTO, "{n}/{rn}: an auto effort must not be baked into a level");
-                }
-                assert!(!reg.resolve(&r.model).is_custom_provider());
-            }
-        }
+    fn the_login_line_skips_codex_warnings() {
+        let out = "WARNING: proceeding, even though we could not create PATH aliases\nLogged in using ChatGPT\n";
+        assert_eq!(login_status_line(out), "Logged in using ChatGPT");
+        assert_eq!(login_status_line("Not logged in"), "Not logged in");
     }
     #[test]
     fn auto_effort_resolves_like_medium_when_it_reaches_the_registry() {
@@ -1565,28 +1673,32 @@ mod tests {
         r.providers[0].wire = "grpc".into();
         assert!(r.alias_problem("local").is_some_and(|w| w.contains("wire 'grpc'") && w.contains("/models")), "{:?}", r.alias_problem("local"));
     }
+    /// A fresh install is bija and the four default models on it under their plain aliases — the
+    /// ones every built-in pattern names — and nothing on Codex's account.
     #[test]
-    fn defaults_ship_bija_and_the_default_models_through_it() {
+    fn defaults_ship_bija_and_the_default_models_on_it() {
         let r = Registry::defaults();
-        let p = r.providers.iter().find(|p| p.id == "bija").expect("the bija provider always ships");
-        assert_eq!((p.kind, p.name.as_str(), p.base_url.as_str(), p.env_key.as_str(), p.wire.as_str()), (ProviderKind::Bija, "Bija", "https://api.openai.com/v1", "OPENAI_API_KEY", ""));
-        for alias in ["astra", "sol", "terra", "luna"] {
-            let codex = r.get(alias).expect("the Codex alias stays");
-            let api = r.get(&bija_alias(alias)).expect("its -api twin ships");
-            assert_eq!(api.alias, format!("{alias}-api"));
-            assert_eq!((&api.model, api.context_window, &api.efforts, &api.default_effort), (&codex.model, codex.context_window, &codex.efforts, &codex.default_effort));
-            assert_eq!(api.note, format!("{} — with an API key", codex.note));
-            assert_eq!(r.backend_of(api), ProviderKind::Bija);
-            assert_eq!(r.backend_of(codex), ProviderKind::Codex);
+        assert_eq!(r.providers.len(), 1, "{:?}", r.providers);
+        let p = &r.providers[0];
+        assert_eq!((p.id.as_str(), p.kind, p.name.as_str(), p.base_url.as_str(), p.env_key.as_str(), p.wire.as_str()), ("bija", ProviderKind::Bija, "OpenAI API", "https://api.openai.com/v1", "OPENAI_API_KEY", ""));
+        assert_eq!(r.models.iter().map(|m| m.alias.as_str()).collect::<Vec<_>>(), vec!["astra", "sol", "terra", "luna"]);
+        for (m, codex) in r.models.iter().zip(codex_default_models()) {
+            assert_eq!((&m.alias, &m.model, m.context_window, &m.efforts, &m.default_effort, &m.note), (&codex.alias, &codex.model, codex.context_window, &codex.efforts, &codex.default_effort, &codex.note));
+            assert_eq!((m.provider.as_str(), r.backend_of(m), m.vision), ("bija", ProviderKind::Bija, true));
         }
+        assert!(r.codex_account_models().is_empty(), "Codex is added in /models, never by default");
         let s = Settings::default();
-        assert_eq!(s.default_model, "sol-api", "Solo runs on bija");
+        assert_eq!(s.default_model, "sol", "Solo runs on bija");
         assert_eq!(r.backend_of(&r.resolve(&s.default_model)), ProviderKind::Bija);
         assert_eq!(s.bija_command, vec!["bija".to_string()]);
         assert!(r.provider_args().is_empty(), "nothing in the defaults is a Codex custom provider");
+        for role in crate::engine::pattern::Pattern::builtin().roles.values() {
+            assert_eq!(r.backend_of(&r.resolve(&role.model)), ProviderKind::Bija, "{}", role.model);
+        }
     }
-    /// A models.toml from before bija gains the provider and the `-api` twins once; one that has a
-    /// Bija provider (or a provider of its own under the name) is left as it is.
+    /// A models.toml from before bija gains the provider and the default models once — under the
+    /// plain alias where it is free, else its `-api` twin, never over an alias of the user's own;
+    /// one that has a Bija provider (or a provider of its own under the name) is left as it is.
     #[test]
     fn an_old_registry_gains_bija_once_and_a_set_up_one_is_left_alone() {
         let mut old = Registry { models: codex_default_models(), providers: vec![] };
@@ -1596,18 +1708,136 @@ mod tests {
         for alias in ["astra-api", "sol-api", "terra-api"] {
             assert_eq!(old.backend_of(&old.resolve(alias)), ProviderKind::Bija, "{alias}");
         }
+        assert_eq!(old.backend_of(&old.resolve("sol")), ProviderKind::Codex, "the plain alias stays Codex's");
         assert_eq!(old.get("luna-api").map(|m| m.model.as_str()), Some("my-own-luna"), "an alias of the user's own is kept");
-        let problems = old.preflight(&crate::engine::pattern::Pattern::builtin_bija());
-        assert!(problems.iter().all(|w| !w.contains("not in /models")), "every role's alias exists now: {problems:?}");
+        assert!(!old.models.iter().any(|m| m.provider == "bija" && m.model == "gpt-5.6-luna"), "both spellings taken: luna goes nowhere");
+        let problems = old.preflight(&crate::engine::pattern::Pattern::builtin());
+        assert!(problems.iter().all(|w| !w.contains("not in /models")), "every role's alias exists: {problems:?}");
         let n = old.models.len();
         assert!(!old.add_missing_bija(), "once");
         assert_eq!(old.models.len(), n, "nothing doubled");
+        // a file with none of the default aliases gets the plain ones
+        let mut mine = Registry { models: vec![ModelEntry { alias: "glm".into(), provider: "zai".into(), model: "glm-5.2".into(), ..Default::default() }], providers: vec![] };
+        assert!(mine.add_missing_bija());
+        assert_eq!(mine.backend_of(&mine.resolve("sol")), ProviderKind::Bija);
+        assert!(mine.models.iter().all(|m| !m.alias.ends_with("-api")), "{:?}", mine.models);
         let mut set_up = Registry::defaults();
-        set_up.models.retain(|m| !m.alias.ends_with("-api"));
+        set_up.models.truncate(1);
         assert!(!set_up.add_missing_bija(), "a Bija provider means the user decides its models");
         let mut taken = Registry { models: codex_default_models(), providers: vec![ProviderEntry { id: "bija".into(), base_url: "http://mine".into(), ..Default::default() }] };
         assert!(!taken.add_missing_bija());
         assert_eq!(taken.providers.len(), 1, "no second provider under the same id");
+    }
+
+    /// The 0.7 shape: Codex's `x` beside bija's `x-api` for each default model, plus models of the
+    /// user's own on both.
+    fn registry_07() -> Registry {
+        let mut r = Registry { models: codex_default_models(), providers: vec![bija_default_provider()] };
+        r.models.extend(codex_default_models().into_iter().map(|m| ModelEntry { alias: bija_alias(&m.alias), provider: "bija".into(), note: format!("{} — with an API key", m.note), ..m }));
+        r.models.push(ModelEntry { alias: "gpt5".into(), model: "gpt-5".into(), ..Default::default() });
+        r.models.push(ModelEntry { alias: "mine-api".into(), provider: "bija".into(), model: "my-model".into(), ..Default::default() });
+        r
+    }
+
+    /// A 0.7 models.toml on a host without Codex: each Codex model with a bija twin gives the twin
+    /// its name (and its note back), the user's own models are untouched; with Codex there, nothing
+    /// is renamed and the fallback covers whichever side the user deletes.
+    #[test]
+    fn without_codex_the_bija_twins_take_over_the_plain_aliases() {
+        let mut r = registry_07();
+        assert!(!r.adopt_bija_twins(true), "Codex installed: the file stays as it is");
+        assert_eq!(r.models.len(), registry_07().models.len());
+        assert!(r.adopt_bija_twins(false));
+        let aliases: Vec<&str> = r.models.iter().map(|m| m.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["astra", "sol", "terra", "luna", "gpt5", "mine-api"]);
+        for alias in ["astra", "sol", "terra", "luna"] {
+            let m = r.get(alias).unwrap();
+            assert_eq!((r.backend_of(m), m.note.contains("API key")), (ProviderKind::Bija, false), "{alias}");
+        }
+        assert_eq!(r.codex_account_models(), vec!["gpt5".to_string()], "a Codex model without a twin stays");
+        assert_eq!(r.get("mine-api").map(|m| m.model.as_str()), Some("my-model"), "no Codex `mine`, so nothing to take over");
+        assert!(!r.adopt_bija_twins(false), "once");
+        // 0.7 pattern files and settings name `sol-api`: it still resolves, and runs on bija
+        assert_eq!(r.get("sol-api").map(|m| m.alias.as_str()), Some("sol"));
+        assert!(r.preflight(&crate::engine::pattern::Pattern::builtin()).is_empty());
+    }
+
+    /// A pre-0.7 file (Codex models only) on a host without Codex lands on plain bija aliases in one
+    /// load: bija is added under the twins' names, which then take over.
+    #[test]
+    fn a_pre_bija_file_without_codex_lands_on_plain_aliases_in_one_migration() {
+        let text = "[[model]]\nalias = \"sol\"\nmodel = \"gpt-5.6-sol\"\nvision = true\n";
+        let mut r: Registry = toml::from_str(text).unwrap();
+        assert!(r.migrate(text, false));
+        assert_eq!(r.models.iter().map(|m| (m.alias.as_str(), m.provider.as_str())).collect::<Vec<_>>(), vec![("astra", "bija"), ("sol", "bija"), ("terra", "bija"), ("luna", "bija")]);
+        assert!(!r.migrate(text, false), "nothing left to do");
+        // with Codex installed the same file keeps Codex's `sol` and gains `sol-api` beside it
+        let mut c: Registry = toml::from_str(text).unwrap();
+        assert!(c.migrate(text, true));
+        assert_eq!(c.backend_of(&c.resolve("sol")), ProviderKind::Codex);
+        assert_eq!(c.backend_of(&c.resolve("sol-api")), ProviderKind::Bija);
+    }
+
+    /// `get` answers to both spellings — `x-api` when only `x` is left, `x` when only `x-api` is —
+    /// after the alias itself and a model id; everything that looks an alias up goes through it.
+    #[test]
+    fn an_alias_falls_back_to_its_other_spelling_both_ways() {
+        let mut r = registry_07();
+        assert_eq!(r.get("sol").map(|m| m.provider.as_str()), Some("openai"), "the exact alias wins");
+        assert_eq!(r.get("sol-api").map(|m| m.provider.as_str()), Some("bija"));
+        assert_eq!(r.get("gpt-5").map(|m| m.alias.as_str()), Some("gpt5"), "a model id still resolves");
+        // the Codex row deleted: `sol` → `sol-api`
+        assert_eq!(r.remove_codex_account(), 5);
+        assert_eq!(r.get("sol").map(|m| m.alias.as_str()), Some("sol-api"));
+        assert_eq!(r.resolve("sol").alias, "sol-api", "resolve names the real alias");
+        assert_eq!(r.alias_problem("sol"), None);
+        assert_eq!(r.provider_of("sol").map(|p| p.id.as_str()), Some("bija"));
+        assert!(r.vision("sol"));
+        assert_eq!(r.get("mine").map(|m| m.alias.as_str()), Some("mine-api"));
+        // the other way: only the plain aliases (a fresh install) and a 0.7 pattern's `luna-api`
+        let d = Registry::defaults();
+        assert_eq!(d.get("luna-api").map(|m| m.alias.as_str()), Some("luna"));
+        assert_eq!(d.probe_problem("luna-api"), None);
+        assert_eq!(d.provider_of("luna-api").map(|p| p.id.as_str()), Some("bija"));
+        assert!(d.vision("astra-api"));
+        assert!(d.get("nope").is_none() && d.get("nope-api").is_none() && d.get("-api").is_none() && d.get("").is_none());
+        assert!(d.alias_problem("nope-api").unwrap().contains("not in /models"));
+    }
+
+    /// The engine is handed both spellings of every alias, so a 0.7 pattern naming `sol-api` is no
+    /// deleted alias once only `sol` exists — and the exact alias's window wins over a twin's.
+    #[test]
+    fn context_windows_name_both_spellings() {
+        let mut d = Registry::defaults();
+        d.models[1].context_window = Some(100_000);
+        let w = d.context_windows();
+        assert_eq!((w.get("sol"), w.get("sol-api"), w.get("luna-api")), (Some(&100_000), Some(&100_000), Some(&272_000)));
+        assert_eq!(w.len(), 8);
+        let mut r = registry_07();
+        r.models.iter_mut().find(|m| m.alias == "sol-api").unwrap().context_window = Some(64_000);
+        let w = r.context_windows();
+        assert_eq!((w.get("sol"), w.get("sol-api")), (Some(&272_000), Some(&64_000)), "each its own");
+        assert_eq!((w.get("mine-api"), w.get("mine")), (Some(&crate::discover::ASSUMED_CONTEXT), Some(&crate::discover::ASSUMED_CONTEXT)));
+        assert_eq!(w.get("gpt5-api"), Some(&crate::discover::ASSUMED_CONTEXT), "a plain alias of the user's own answers to the -api spelling too");
+        // the names that take images, the same way
+        let mut sees = Registry::defaults();
+        sees.models[3].vision = false;
+        let v = sees.vision_names();
+        assert!(v.contains("sol") && v.contains("sol-api") && v.contains("astra-api"), "{v:?}");
+        assert!(!v.contains("luna") && !v.contains("luna-api"), "{v:?}");
+    }
+
+    /// Codex's account is every model on provider `openai` or none: the Codex row lists them and
+    /// deleting it removes all of them, nothing else.
+    #[test]
+    fn the_codex_account_is_listed_and_removed_as_one() {
+        let mut r = registry_07();
+        r.models.push(ModelEntry { alias: "bare".into(), provider: String::new(), model: "gpt-bare".into(), ..Default::default() });
+        assert_eq!(r.codex_account_models(), vec!["astra", "sol", "terra", "luna", "gpt5", "bare"]);
+        assert_eq!(r.remove_codex_account(), 6);
+        assert!(r.codex_account_models().is_empty());
+        assert_eq!(r.models.len(), 5, "the bija models stay");
+        assert_eq!(r.remove_codex_account(), 0);
     }
 
     /// A models.toml from before the `vision` key gains it once, on the entries whose family takes

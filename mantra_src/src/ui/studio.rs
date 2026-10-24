@@ -1,10 +1,12 @@
-//! Pattern Studio (roles, flow, settings + an architect agent) and the Models screen.
+//! Pattern Studio: roles, flow and settings of a pattern, edited in place (`ui::form`) — a commit
+//! validates the whole pattern and saves it when it is valid — plus an architect agent that edits
+//! it from a description.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, StudioSel};
-use crate::config::ProviderEntry;
-use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, EFFORT_AUTO, KINDS, PERMISSIONS};
-use crate::ui::input::{Act, Input};
+use crate::app::{App, EditTarget, StudioSel};
+use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, EFFORT_AUTO, KINDS, PARALLEL_RANGE, PERMISSIONS};
+use crate::ui::form::{self, Edit, Outcome, Start};
+use crate::ui::input::Act;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 
@@ -18,8 +20,51 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "max_tokens", "mcp", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "parallel", "max_tokens", "mcp", "description", "instructions"];
+/// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
+const PATTERN_FIELDS: &[&str] = &["name", "description"];
 const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap"];
+const ADD_STEP: &str = "+ add finale step";
+
+/// How a field takes keys (`ui::form`'s rules).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    /// Typed in place: a printable key overwrites, ⏎ edits, Backspace clears.
+    Text,
+    /// Typed in place over several lines (a role's instructions, a finale step's task).
+    Lines,
+    /// Typed (a number, a glyph), or stepped with ←→.
+    Step,
+    /// One of a list: ←→, space and ⏎ step through it, a letter jumps.
+    Choice,
+    /// On or off: ←→, space and ⏎ flip it.
+    Toggle,
+    /// A row that does something on ⏎ (`+ add finale step`).
+    Action,
+}
+
+fn field_kind(entry: &str, field: &str) -> Kind {
+    match entry {
+        "⚙ settings" => match field {
+            "name" | "description" | "writable_roots" => Kind::Text,
+            "isolation" | "orchestrator_context" => Kind::Choice,
+            "network" | "review_plan" => Kind::Toggle,
+            _ => Kind::Step,
+        },
+        "⇢ flow" => match field {
+            ADD_STEP => Kind::Action,
+            f if f.ends_with(".task") => Kind::Lines,
+            f if f.ends_with(".may_spawn") => Kind::Toggle,
+            _ => Kind::Choice,
+        },
+        _ => match field {
+            "instructions" => Kind::Lines,
+            "description" | "mcp" => Kind::Text,
+            "glyph" | "parallel" | "max_tokens" => Kind::Step,
+            _ => Kind::Choice,
+        },
+    }
+}
 
 /// Entries in the left list: roles…, settings, flow
 fn entries(app: &App) -> Vec<String> {
@@ -66,16 +111,25 @@ fn flow_fields(app: &App) -> Vec<String> {
         v.push(format!("finale[{i}].task"));
         v.push(format!("finale[{i}].may_spawn"));
     }
-    v.push("+ add finale step".into());
+    v.push(ADD_STEP.into());
     v
 }
 
 fn fields(app: &App, entry: &str) -> Vec<String> {
     match entry {
-        "⚙ settings" => SETTING_FIELDS.iter().map(|s| s.to_string()).collect(),
+        "⚙ settings" => PATTERN_FIELDS.iter().chain(SETTING_FIELDS).map(|s| s.to_string()).collect(),
         "⇢ flow" => flow_fields(app),
-        _ => ROLE_FIELDS.iter().map(|s| s.to_string()).collect(),
+        role => {
+            // only workers run many at a time: on any other kind `parallel` would be a dead row
+            let worker = app.studio.pattern.roles.get(role).map(|r| r.kind == "worker").unwrap_or(false);
+            ROLE_FIELDS.iter().filter(|f| worker || **f != "parallel").map(|s| s.to_string()).collect()
+        }
     }
+}
+
+/// The finale step a `finale[i].…` field is about.
+fn finale_index(field: &str) -> Option<usize> {
+    field.strip_prefix("finale[")?.split(']').next()?.parse().ok()
 }
 
 fn get_value(app: &App, entry: &str, field: &str) -> String {
@@ -84,12 +138,14 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
         "⚙ settings" => {
             let s = &p.settings;
             match field {
+                "name" => p.name.clone(),
+                "description" => p.description.clone(),
                 "isolation" => s.isolation.clone(),
                 "network" => if s.network { "on".into() } else { "off".into() },
                 "writable_roots" => if s.writable_roots.is_empty() { "none".into() } else { s.writable_roots.join(", ") },
                 "max_parallel" => s.max_parallel.to_string(),
                 "worker_retries" => s.worker_retries.to_string(),
-                "review_plan" => s.review_plan.to_string(),
+                "review_plan" => if s.review_plan { "on".into() } else { "off".into() },
                 "orchestrator_context" => s.orchestrator_context.clone(),
                 "stall_minutes" => s.stall_minutes.to_string(),
                 "gate_max_rounds" => s.gate_max_rounds.to_string(),
@@ -113,14 +169,15 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "phase_gate" => f.phase_gate.clone(),
                 "on_reprompt" => f.on_reprompt.clone(),
                 x if x.starts_with("finale[") => {
-                    let i: usize = x[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-                    let st = f.finale.get(i).cloned().unwrap_or_default();
+                    let st = finale_index(x).and_then(|i| f.finale.get(i)).cloned().unwrap_or_default();
                     if x.ends_with(".role") {
                         st.role
                     } else if x.ends_with(".task") {
                         st.task
+                    } else if st.may_spawn {
+                        "on".into()
                     } else {
-                        st.may_spawn.to_string()
+                        "off".into()
                     }
                 }
                 _ => String::new(),
@@ -144,6 +201,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "fallback" => r.fallback.clone().unwrap_or_else(|| "none".into()),
                 "sandbox" => r.sandbox.clone(),
                 "permission" => r.permission.clone(),
+                "parallel" => r.parallel.map(|n| n.to_string()).unwrap_or_else(|| "none".into()),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
                 "mcp" => if r.mcp.is_empty() { "none".into() } else { r.mcp.join(", ") },
                 "description" => r.description.clone(),
@@ -154,13 +212,109 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
     }
 }
 
-fn cycle<T: AsRef<str>>(list: &[T], cur: &str, d: i32) -> String {
-    let n = list.len() as i32;
-    if n == 0 {
-        return cur.to_string();
+/// What an edit of the field starts from: its value, with the words that stand for "nothing"
+/// (`none`, a cap of `0 (the model's full window)`) left out — they are how empty reads, not text
+/// to edit around.
+fn edit_value(app: &App, entry: &str, field: &str) -> String {
+    let v = get_value(app, entry, field);
+    match field {
+        "max_tokens" | "parallel" | "writable_roots" | "mcp" if v == "none" => String::new(),
+        "context_cap" if app.studio.pattern.settings.context_cap == 0 => "0".into(),
+        "manager_minutes" if app.studio.pattern.settings.manager_minutes == 0 => "off".into(),
+        _ => v,
     }
-    let i = list.iter().position(|x| x.as_ref() == cur).map(|i| i as i32).unwrap_or(-1);
-    list[((i + d).rem_euclid(n)) as usize].as_ref().to_string()
+}
+
+/// The options of a choice field, as its value reads (`none` for no fallback or no manager).
+fn choices(app: &App, entry: &str, field: &str) -> Vec<String> {
+    let p = &app.studio.pattern;
+    let aliases = || app.registry.models.iter().map(|m| m.alias.clone()).collect::<Vec<_>>();
+    let roles = || p.roles.keys().cloned().collect::<Vec<_>>();
+    let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    match entry {
+        "⚙ settings" => match field {
+            "isolation" => list(&["auto", "worktree", "shared"]),
+            "orchestrator_context" => list(&["fresh", "compact"]),
+            _ => vec![],
+        },
+        "⇢ flow" => match field {
+            // the manager is optional: none, or a role of kind manager
+            "manager" => std::iter::once("none".to_string()).chain(p.roles.iter().filter(|(_, r)| r.kind == "manager").map(|(n, _)| n.clone())).collect(),
+            _ => roles(),
+        },
+        role => {
+            let Some(r) = p.roles.get(role) else { return vec![] };
+            match field {
+                "kind" => list(KINDS),
+                "color" => list(COLORS),
+                "model" => aliases(),
+                // "auto" leads: Mantra picks the effort per spawn from the role's job
+                "effort" => std::iter::once(EFFORT_AUTO.to_string()).chain(app.registry.resolve(&r.model).efforts()).collect(),
+                // none leads, then every model alias but the role's own
+                "fallback" => std::iter::once("none".to_string()).chain(aliases().into_iter().filter(|a| *a != r.model)).collect(),
+                "sandbox" => list(SANDBOXES),
+                "permission" => list(PERMISSIONS),
+                _ => vec![],
+            }
+        }
+    }
+}
+
+/// A choice field's value as `choices` lists it.
+fn choice_value(app: &App, entry: &str, field: &str) -> String {
+    match (entry, field) {
+        ("⇢ flow", "manager") => get_value(app, entry, field),
+        (role, "model") => app.studio.pattern.roles.get(role).map(|r| r.model.clone()).unwrap_or_default(),
+        _ => get_value(app, entry, field),
+    }
+}
+
+/// Sets a choice field to `v`, one of its `choices`. A new model re-clamps a named effort to what
+/// it offers (`auto` stays auto).
+fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
+    let reg = app.registry.clone();
+    let p = &mut app.studio.pattern;
+    match entry {
+        "⚙ settings" => match field {
+            "isolation" => p.settings.isolation = v.into(),
+            "orchestrator_context" => p.settings.orchestrator_context = v.into(),
+            _ => return,
+        },
+        "⇢ flow" => {
+            let f = &mut p.flow;
+            match field {
+                "planner" => f.planner = v.into(),
+                "manager" => f.manager = if v == "none" { String::new() } else { v.into() },
+                "orchestrator" => f.orchestrator = v.into(),
+                "phase_gate" => f.phase_gate = v.into(),
+                "on_reprompt" => f.on_reprompt = v.into(),
+                x if x.ends_with(".role") => match finale_index(x).and_then(|i| f.finale.get_mut(i)) {
+                    Some(st) => st.role = v.into(),
+                    None => return,
+                },
+                _ => return,
+            }
+        }
+        role => {
+            let Some(r) = p.roles.get_mut(role) else { return };
+            match field {
+                "kind" => r.kind = v.into(),
+                "color" => r.color = v.into(),
+                "model" => {
+                    r.model = v.into();
+                    if r.effort != EFFORT_AUTO {
+                        r.effort = reg.resolve(&r.model).resolve_effort(&r.effort);
+                    }
+                }
+                "effort" => r.effort = v.into(),
+                "fallback" => r.fallback = if v == "none" { None } else { Some(v.into()) },
+                "sandbox" => r.sandbox = v.into(),
+                "permission" => r.permission = v.into(),
+                _ => return,
+            }
+        }
+    }
+    app.studio.dirty = true;
 }
 
 /// Enforces the floors and the `escalate > seconds` invariant that `Pattern::validate` requires
@@ -174,22 +328,22 @@ fn clamp_watchdog(s: &mut PatternSettings) {
     }
 }
 
-/// ←/→ on a field: cycle enumerations / step numbers / toggle booleans.
+/// ←/→ on a field: the next / previous choice, a number stepped, an on/off flipped.
 fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
-    let aliases: Vec<String> = app.registry.models.iter().map(|m| m.alias.clone()).collect();
-    let roles: Vec<String> = app.studio.pattern.roles.keys().cloned().collect();
+    if field_kind(entry, field) == Kind::Choice {
+        let next = form::cycle(&choices(app, entry, field), &choice_value(app, entry, field), d);
+        return set_choice(app, entry, field, &next);
+    }
     let p = &mut app.studio.pattern;
     let step_u = |v: &mut usize, lo: usize| *v = ((*v as i64 + d as i64).max(lo as i64)) as usize;
     match entry {
         "⚙ settings" => {
             let s = &mut p.settings;
             match field {
-                "isolation" => s.isolation = cycle(&["auto", "worktree", "shared"], &s.isolation, d),
                 "network" => s.network = !s.network,
                 "max_parallel" => step_u(&mut s.max_parallel, 1),
                 "worker_retries" => s.worker_retries = (s.worker_retries as i32 + d).max(0) as u32,
                 "review_plan" => s.review_plan = !s.review_plan,
-                "orchestrator_context" => s.orchestrator_context = cycle(&["fresh", "compact"], &s.orchestrator_context, d),
                 "stall_minutes" => s.stall_minutes = (s.stall_minutes as i64 + d as i64).max(1) as u64,
                 "gate_max_rounds" => s.gate_max_rounds = (s.gate_max_rounds as i32 + d).max(1) as u32,
                 "check_timeout_secs" => s.check_timeout_secs = (s.check_timeout_secs as i64 + 60 * d as i64).max(60) as u64,
@@ -209,60 +363,19 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 _ => return,
             }
         }
-        "⇢ flow" => {
-            // The manager is optional: its options are "" (none) plus every role of kind manager.
-            let mut managers: Vec<String> = vec![String::new()];
-            managers.extend(p.roles.iter().filter(|(_, r)| r.kind == "manager").map(|(n, _)| n.clone()));
-            let f = &mut p.flow;
-            match field {
-                "planner" => f.planner = cycle(&roles, &f.planner, d),
-                "manager" => f.manager = cycle(&managers, &f.manager, d),
-                "orchestrator" => f.orchestrator = cycle(&roles, &f.orchestrator, d),
-                "phase_gate" => f.phase_gate = cycle(&roles, &f.phase_gate, d),
-                "on_reprompt" => f.on_reprompt = cycle(&roles, &f.on_reprompt, d),
-                x if x.starts_with("finale[") => {
-                    let i: usize = x[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-                    if let Some(st) = f.finale.get_mut(i) {
-                        if x.ends_with(".role") {
-                            st.role = cycle(&roles, &st.role, d);
-                        } else if x.ends_with(".may_spawn") {
-                            st.may_spawn = !st.may_spawn;
-                        } else {
-                            return;
-                        }
-                    }
-                }
-                _ => return,
-            }
-        }
+        "⇢ flow" => match finale_index(field).and_then(|i| p.flow.finale.get_mut(i)) {
+            Some(st) if field.ends_with(".may_spawn") => st.may_spawn = !st.may_spawn,
+            _ => return,
+        },
         role => {
-            let reg = app.registry.clone();
             let Some(r) = p.roles.get_mut(role) else { return };
             match field {
-                "kind" => r.kind = cycle(KINDS, &r.kind, d),
-                "glyph" => r.glyph = cycle(GLYPHS, &r.glyph, d),
-                "color" => r.color = cycle(COLORS, &r.color, d),
-                "model" => {
-                    r.model = cycle(&aliases, &r.model, d);
-                    if r.effort != EFFORT_AUTO {
-                        r.effort = reg.resolve(&r.model).resolve_effort(&r.effort);
-                    }
+                "glyph" => r.glyph = form::cycle(GLYPHS, &r.glyph, d),
+                // none (shares max_parallel) sits below 1, and 128 is the top
+                "parallel" => {
+                    let next = r.parallel.unwrap_or(0) as i64 + d as i64;
+                    r.parallel = if next <= 0 { None } else { Some((next as usize).min(*PARALLEL_RANGE.end())) };
                 }
-                "effort" => {
-                    // "auto" leads the list: Mantra picks the effort per spawn from the role's job.
-                    let mut effs = reg.resolve(&r.model).efforts();
-                    effs.insert(0, EFFORT_AUTO.to_string());
-                    r.effort = cycle(&effs, &r.effort, d);
-                }
-                "fallback" => {
-                    // "" (none) leads the list, then every model alias but the role's own.
-                    let mut opts = vec![String::new()];
-                    opts.extend(aliases.iter().filter(|a| **a != r.model).cloned());
-                    let next = cycle(&opts, r.fallback.as_deref().unwrap_or(""), d);
-                    r.fallback = if next.is_empty() { None } else { Some(next) };
-                }
-                "sandbox" => r.sandbox = cycle(SANDBOXES, &r.sandbox, d),
-                "permission" => r.permission = cycle(PERMISSIONS, &r.permission, d),
                 "max_tokens" => {
                     let cur = r.max_tokens.unwrap_or(0) as i64;
                     let next = cur + d as i64 * 250_000;
@@ -275,23 +388,39 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
     app.studio.dirty = true;
 }
 
+/// A typed field into the pattern (the Studio's `EditTarget`s). A value that cannot be one is
+/// said or left as it was; the pattern as a whole is validated when it is saved.
 pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
     match target {
+        // a number out of range is said, not swallowed: the field keeps what it had
+        EditTarget::RoleField(role, field) if field == "parallel" => match parse_role_parallel(text) {
+            Ok(n) => {
+                if let Some(r) = app.studio.pattern.roles.get_mut(role) {
+                    r.parallel = n;
+                    app.studio.dirty = true;
+                }
+            }
+            Err(e) => app.toast(format!("parallel: {e}"), crate::agent::Level::Warn),
+        },
         EditTarget::RoleField(role, field) => {
             if let Some(r) = app.studio.pattern.roles.get_mut(role) {
                 match field.as_str() {
                     "description" => r.description = text.to_string(),
                     "instructions" => r.instructions = text.to_string(),
-                    "glyph" => r.glyph = text.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+                    "glyph" => r.glyph = text.trim().chars().next().map(|c| c.to_string()).unwrap_or_default(),
                     "model" => r.model = text.to_string(),
                     "effort" => r.effort = text.to_string(),
                     "fallback" => r.fallback = parse_fallback(text),
-                    "max_tokens" => r.max_tokens = text.replace(['_', ','], "").parse().ok(),
+                    "max_tokens" => r.max_tokens = text.replace(['_', ','], "").trim().parse().ok(),
                     "mcp" => r.mcp = parse_mcp(text),
                     _ => {}
                 }
                 app.studio.dirty = true;
             }
+        }
+        EditTarget::PatternField(field) if field == "description" => {
+            app.studio.pattern.description = text.trim().to_string();
+            app.studio.dirty = true;
         }
         EditTarget::Setting(field) => {
             let s = &mut app.studio.pattern.settings;
@@ -323,7 +452,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     let t = text.trim();
                     if t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("full") {
                         s.context_cap = 0;
-                    } else if let Some(v) = parse_tokens(text) {
+                    } else if let Some(v) = super::models::parse_tokens(text) {
                         s.context_cap = v;
                     }
                 }
@@ -341,62 +470,18 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 app.studio.dirty = true;
             }
         }
-        EditTarget::NewRole => {
-            let name = crate::util::slug(text);
-            if name.is_empty() || app.studio.pattern.roles.contains_key(&name) {
-                app.toast("role name empty or taken", crate::agent::Level::Warn);
-                return;
-            }
-            app.studio.pattern.roles.insert(name.clone(), Role { description: "new role".into(), ..Default::default() });
-            app.studio.dirty = true;
-            app.studio.sel = StudioSel::Role(name);
-            app.studio.focus = 1;
-        }
-        EditTarget::NewPattern => {
-            let name = crate::util::slug(text);
-            if name.is_empty() {
-                return;
-            }
-            app.studio.pattern.name = name.clone();
-            app.studio.dirty = true;
-            app.toast(format!("renamed to {name} — ctrl+s saves it as a new pattern"), crate::agent::Level::Info);
-        }
-        EditTarget::ModelCell(row, col) => {
-            if let Some(m) = app.registry.models.get_mut(*row) {
-                let t = text.trim().to_string();
-                match *col {
-                    0 => m.alias = crate::util::slug(&t),
-                    1 => m.provider = t,
-                    2 => m.model = t,
-                    3 => m.context_window = parse_tokens(&t),
-                    4 => m.auto_compact_percent = t.trim_end_matches('%').parse().ok().map(|v: u8| v.clamp(10, 99)),
-                    5 => m.default_effort = t,
-                    6 => m.efforts = t.split([',', ' ']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    VISION_COL => m.vision = matches!(t.to_ascii_lowercase().as_str(), "y" | "yes" | "on" | "true" | "1" | "◉"),
-                    NOTE_COL => m.note = t,
-                    _ => {}
-                }
-                app.models_ui.dirty = true;
-            }
-        }
-        EditTarget::ProviderCell(row, col) => {
-            if let Some(p) = app.registry.providers.get_mut(*row) {
-                let t = text.trim().to_string();
-                match *col {
-                    0 => p.id = crate::util::slug(&t).replace('-', "_"),
-                    1 => p.name = t,
-                    2 => p.base_url = t,
-                    3 => p.env_key = t,
-                    4 => p.api_key = if t.is_empty() { None } else { Some(t) },
-                    PROV_KIND_COL => p.kind = parse_kind(&t),
-                    PROV_AUTH_COL => p.auth = parse_auth(&t),
-                    PROV_WIRE_COL => p.wire = parse_wire(&t),
-                    _ => {}
-                }
-                app.models_ui.dirty = true;
-            }
-        }
+        _ => {}
     }
+}
+
+/// A role's `parallel` from the editor: a number of agents at once (`PARALLEL_RANGE`), or none —
+/// "none" or an empty field — to share `max_parallel` with the other roles again.
+fn parse_role_parallel(t: &str) -> Result<Option<usize>, String> {
+    let t = t.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    crate::engine::pattern::parse_parallel(t).map(Some)
 }
 
 /// A role's fallback model from the editor: an alias, or nothing for "none" / an empty field.
@@ -432,18 +517,83 @@ fn parse_roots(t: &str) -> Vec<String> {
     t.split([',', '\n']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
 }
 
-fn parse_tokens(t: &str) -> Option<u64> {
-    let t = t.trim().to_lowercase().replace([',', '_'], "");
-    if t.is_empty() || t == "none" || t == "default" {
-        return None;
+/// The pattern validated and, when valid, saved — what every commit ends in. Invalid, it stays
+/// unsaved ("● not saved" in the header, the first reason above the footer) until a later
+/// commit or ctrl+s finds it valid. Returns whether it was saved.
+fn save_pattern(app: &mut App) -> bool {
+    match app.studio.pattern.validate() {
+        Ok(()) => match app.studio.pattern.save() {
+            Ok(_) => {
+                app.studio.dirty = false;
+                app.studio.saved = Some(std::time::Instant::now());
+                app.pattern_name = app.studio.pattern.name.clone();
+                true
+            }
+            Err(e) => {
+                app.studio.dirty = true;
+                app.toast(format!("could not save the pattern: {e}"), crate::agent::Level::Error);
+                false
+            }
+        },
+        Err(errs) => {
+            app.studio.dirty = true;
+            app.studio.errors = errs;
+            false
+        }
     }
-    if let Some(k) = t.strip_suffix('k') {
-        return k.parse::<f64>().ok().map(|v| (v * 1000.0) as u64);
+}
+
+/// A finished edit into the pattern, then saved. Returns false — the edit stays open — when it
+/// cannot be taken at all: a new role's name that is taken, a copy's name that is refused.
+fn commit(app: &mut App, e: &Edit) -> bool {
+    let text = e.text();
+    match &e.target {
+        EditTarget::NewRole => {
+            let name = crate::util::slug(&text);
+            if name.is_empty() {
+                return true;
+            }
+            if app.studio.pattern.roles.contains_key(&name) {
+                app.toast(format!("there is a role {name} already"), crate::agent::Level::Warn);
+                return false;
+            }
+            let model = app.settings.default_model.clone();
+            app.studio.pattern.roles.insert(name.clone(), Role { description: "new role".into(), model, ..Default::default() });
+            app.studio.sel = StudioSel::Role(name);
+            app.studio.focus = 1;
+            app.studio.field = 0;
+            app.studio.dirty = true;
+            save_pattern(app);
+            true
+        }
+        EditTarget::PatternField(f) if f == "name" => {
+            let name = crate::util::slug(&text);
+            if name.is_empty() || name == app.studio.pattern.name {
+                return true;
+            }
+            match app.studio.pattern.save_as(&name, &app.project) {
+                Ok((copy, path)) => {
+                    app.studio.pattern = copy;
+                    app.studio.dirty = false;
+                    app.studio.saved = Some(std::time::Instant::now());
+                    app.pattern_name = name.clone();
+                    app.toast(format!("saved a copy as {name} ({}) — new runs use it", home_rel(&path)), crate::agent::Level::Ok);
+                    true
+                }
+                Err(errs) => {
+                    app.toast(errs.first().cloned().unwrap_or_default(), crate::agent::Level::Warn);
+                    false
+                }
+            }
+        }
+        target => {
+            if e.changed() {
+                apply_edit(app, target, text.trim_end());
+                save_pattern(app);
+            }
+            true
+        }
     }
-    if let Some(m) = t.strip_suffix('m') {
-        return m.parse::<f64>().ok().map(|v| (v * 1_000_000.0) as u64);
-    }
-    t.parse().ok()
 }
 
 // ───────────────────────────── studio ─────────────────────────────
@@ -457,7 +607,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     app.studio.errors = errs.clone();
     let mut crumbs = vec![Span::styled(format!("  {} studio  ", theme::g("›", ">")), theme::faint()), Span::styled(app.studio.pattern.name.clone(), theme::bold(theme::fg(theme::VIOLET)))];
     if app.studio.dirty {
-        crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
+        crumbs.push(Span::styled(format!("  {} not saved", theme::g("●", "*")), theme::fg(theme::AMBER)));
+    } else if app.studio.saved.is_some_and(|t| t.elapsed() < crate::app::SAVED_SHOWN) {
+        crumbs.push(Span::styled(format!("  {} saved", theme::g("✓", "ok")), theme::fg(theme::GREEN)));
     }
     let right = if errs.is_empty() { vec![Span::styled(format!("{} valid ", theme::g("✓", "ok")), theme::fg(theme::GREEN))] } else { vec![Span::styled(format!("{} {} issue(s) ", theme::g("✗", "x"), errs.len()), theme::fg(theme::RED))] };
     header(f, rows[0], crumbs, right);
@@ -466,79 +618,139 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let cols = if wide {
         Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(34), Constraint::Min(40), Constraint::Length(44)]).split(rows[1])
     } else {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(28), Constraint::Min(40)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(29), Constraint::Min(40)]).split(rows[1])
     };
     let es = entries(app);
     let sel = sel_index(app);
     let flash = anim::fade(app.studio.flash, 900);
-    // list
+    let new_role = app.edit.as_ref().filter(|e| e.target == EditTarget::NewRole);
+    let mut cursor = None;
+    // list: the selected entry is the band while the list has the focus, bold and accent always
+    let lblk = block("roles", if flash > 0.0 { theme::SAFFRON } else if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT });
+    let linner = lblk.inner(cols[0]);
+    f.render_widget(lblk, cols[0]);
     let mut l = vec![];
+    let mut band = None;
     for (i, e) in es.iter().enumerate() {
-        let is = i == sel;
+        let is = i == sel && new_role.is_none();
         let st = if is { theme::bold(theme::accent()) } else { theme::text() };
         match app.studio.pattern.roles.get(e) {
             Some(r) => l.push(Line::from(vec![
-                Span::styled(if is { format!(" {} ", theme::g("▶", ">")) } else { "   ".into() }, st),
+                Span::raw(" "),
                 Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
                 Span::styled(format!("{:<13}", trunc(e, 13)), st),
-                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (cols[0].width as usize).saturating_sub(22)), theme::faint()),
+                // what the space, the glyph and the name leave, a column short of the border
+                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (linner.width as usize).saturating_sub(17)), theme::faint()),
             ])),
             None => {
                 if i > 0 && app.studio.pattern.roles.contains_key(&es[i - 1]) {
+                    // the role being added (ctrl+n) is typed where it will be
+                    if let Some(ed) = new_role {
+                        let w = (linner.width as usize).saturating_sub(4);
+                        let (shown, cur) = ed.view(w);
+                        cursor = Some((linner.x + 3 + cur as u16, linner.y + l.len() as u16));
+                        band = Some(l.len());
+                        l.push(Line::from(vec![Span::styled(" + ", theme::bold(theme::accent())), Span::styled(format!("{shown:<w$}"), theme::bold(theme::text()).add_modifier(Modifier::UNDERLINED))]));
+                    }
                     l.push(Line::default());
                 }
-                l.push(Line::from(vec![Span::styled(if is { format!(" {} ", theme::g("▶", ">")) } else { "   ".into() }, st), Span::styled(e.clone(), st)]));
+                l.push(Line::from(vec![Span::raw(" "), Span::styled(e.clone(), st)]));
             }
         }
+        if is && app.studio.focus == 0 {
+            band = Some(l.len() - 1);
+        }
     }
-    let lcol = if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT };
-    let lcol_blk = if flash > 0.0 { theme::SAFFRON } else { lcol };
-    f.render_widget(Paragraph::new(l).block(block("roles", lcol_blk)), cols[0]);
+    f.render_widget(Paragraph::new(l), linner);
+    if let Some(y) = band {
+        form::band_line(f.buffer_mut(), linner, y, 0);
+    }
 
     // fields
     let entry = es[sel].clone();
     let fs = fields(app, &entry);
     let fsel = app.studio.field.min(fs.len().saturating_sub(1));
+    let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
+    let fblk = block(&entry, fcol);
+    let finner = fblk.inner(cols[1]);
+    f.render_widget(fblk, cols[1]);
     // name column as wide as the longest name (settings has a 25-char one); the value column gets
-    // the box's inner width less the " ▶" + name prefix, and on the selected row the arrows too
+    // the box's inner width less the name, and on the selected row its marker too
     let nw = fs.iter().map(|f| w_of(f)).max().unwrap_or(0).max(19) + 1;
-    let fw_all = (cols[1].width as usize).saturating_sub(2 + 2 + nw);
+    let fw_all = (finner.width as usize).saturating_sub(2 + nw);
+    let editing = app.edit.as_ref().filter(|e| e.target != EditTarget::NewRole);
+    // the cursor of a field being edited, as (column, line of `fl`): the scroll is known only later
+    let mut fcursor: Option<(u16, usize)> = None;
     let mut fl = vec![];
     if let Some(r) = app.studio.pattern.roles.get(&entry) {
-        let dw = (cols[1].width as usize).saturating_sub(7 + w_of(&entry));
+        let dw = (finner.width as usize).saturating_sub(5 + w_of(&entry));
         fl.push(Line::from(vec![Span::styled(format!(" {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(entry.clone(), theme::bold(theme::text())), Span::styled(format!("  {}", trunc(&r.description, dw)), theme::dim())]));
         fl.push(Line::default());
     }
-    // the selected field's line and the last line of its hint, which the scroll keeps in view
+    // the selected field's line and the last line of what goes with it, which the scroll keeps in view
     let (mut sel_line, mut sel_end) = (0, 0);
     for (i, fname) in fs.iter().enumerate() {
         let v = get_value(app, &entry, fname);
+        let kind = field_kind(&entry, fname);
         let is = i == fsel && app.studio.focus == 1;
         let st = if is { theme::bold(theme::accent()) } else { theme::muted() };
-        // free text has nothing to step through: ⏎ opens the editor
-        let text_only = ["description", "instructions", "writable_roots", "mcp"].contains(&fname.as_str()) || fname.ends_with(".task");
-        let arrows = if !is { String::new() } else if text_only { format!(" {}", theme::g("⏎", "<enter>")) } else { format!(" {}", theme::g("◂ ▸", "< >")) };
-        // the value gets what the marker after it leaves (` ⏎` is narrower than ` ◂ ▸`)
-        let fw = fw_all.saturating_sub(w_of(&arrows));
-        let shown = if fname == "instructions" || fname.ends_with(".task") {
-            let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-            format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
-        } else {
-            trunc(&v, fw)
-        };
-        let vstyle = match fname.as_str() {
-            "effort" => theme::fg(effort_color(&v)),
-            "color" => theme::fg(theme::named(&v)),
-            _ => theme::text(),
-        };
         if i == fsel {
             sel_line = fl.len();
         }
-        fl.push(Line::from(vec![Span::styled(format!(" {}{:<nw$}", if is { theme::g("▶", ">") } else { " " }, fname), st), Span::styled(shown, vstyle), Span::styled(arrows, theme::faint())]));
+        let name = Span::styled(format!("  {fname:<nw$}"), st);
+        match editing.filter(|_| is) {
+            // several lines: the field opens under its name, as many lines as there is room for
+            Some(e) if e.multiline => {
+                fl.push(Line::from(vec![name, Span::styled("alt+⏎ new line · ⏎ saves", theme::faint())]));
+                let w = (finner.width as usize).saturating_sub(4);
+                let (lines, cr, cc) = e.input.layout(w);
+                let room = (finner.height as usize).saturating_sub(6).clamp(3, 14);
+                let start = cr.saturating_sub(room - 1);
+                for (k, line) in lines.iter().enumerate().skip(start).take(room) {
+                    if k == cr {
+                        fcursor = Some((finner.x + 3 + cc as u16, fl.len()));
+                    }
+                    fl.push(Line::from(vec![Span::raw("   "), Span::styled(line.clone(), theme::text())]));
+                }
+            }
+            Some(e) => {
+                let (shown, cur) = e.view(fw_all);
+                fcursor = Some((finner.x + 2 + nw as u16 + cur as u16, fl.len()));
+                fl.push(Line::from(vec![name, Span::styled(format!("{shown:<fw_all$}"), theme::bold(theme::text()).add_modifier(Modifier::UNDERLINED))]));
+            }
+            None => {
+                // what ←→ or ⏎ does on the selected field, after its value
+                let mark = match kind {
+                    _ if !is => String::new(),
+                    Kind::Choice | Kind::Toggle | Kind::Step => format!(" {}", theme::g("◂ ▸", "< >")),
+                    Kind::Text | Kind::Lines => format!(" {}", theme::g("⏎", "<enter>")),
+                    Kind::Action => String::new(),
+                };
+                // the value gets what the marker after it leaves (` ⏎` is narrower than ` ◂ ▸`)
+                let fw = fw_all.saturating_sub(w_of(&mark));
+                let shown = if kind == Kind::Lines {
+                    let first = v.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                    format!("{} ({} lines)", trunc(&first, fw.saturating_sub(12)), v.lines().count())
+                } else {
+                    trunc(&v, fw)
+                };
+                let vstyle = match fname.as_str() {
+                    "effort" => theme::fg(effort_color(&v)),
+                    "color" => theme::fg(theme::named(&v)),
+                    ADD_STEP => if is { theme::bold(theme::accent()) } else { theme::muted() },
+                    _ => theme::text(),
+                };
+                if kind == Kind::Action {
+                    fl.push(Line::from(vec![Span::styled(format!("  {fname}"), vstyle)]));
+                } else {
+                    fl.push(Line::from(vec![name, Span::styled(shown, vstyle), Span::styled(mark, theme::faint())]));
+                }
+            }
+        }
         // what the focused field means, right under it
-        if let Some(h) = field_hint(fname).filter(|_| is) {
+        if let Some(h) = field_hint(fname).filter(|_| is && editing.is_none()) {
             let pad = || vec![Span::raw("   ")];
-            fl.extend(md::wrap(vec![Span::styled(h, theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
+            fl.extend(md::wrap(vec![Span::styled(h, theme::faint())], (finner.width as usize).saturating_sub(3), pad(), pad()));
         }
         if i == fsel {
             sel_end = fl.len() - 1;
@@ -548,15 +760,23 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let pad = || vec![Span::raw(" ")];
     if !wide && entry == "⚙ settings" {
         for g in groups_lines(&app.studio.pattern) {
-            fl.extend(md::wrap(vec![Span::styled(g, theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), vec![Span::raw("   ")]));
+            fl.extend(md::wrap(vec![Span::styled(g, theme::faint())], (finner.width as usize).saturating_sub(1), pad(), vec![Span::raw("   ")]));
         }
     }
-    fl.extend(md::wrap(vec![Span::styled("←→ change · ⏎ edit text · n new role · x delete role · r rename pattern", theme::faint())], (cols[1].width as usize).saturating_sub(3), pad(), pad()));
-    let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
+    // invalid: why it is not saved, where the eye is
+    if let Some(e) = errs.first().filter(|_| app.studio.dirty) {
+        fl.extend(md::wrap(vec![Span::styled(format!("{} not saved: {e} — fix it (ctrl+s saves once it is valid)", theme::g("✗", "x")), theme::fg(theme::RED))], (finner.width as usize).saturating_sub(1), pad(), pad()));
+    }
     // A list longer than the box (settings on a short terminal) scrolls to keep the selection in view.
-    let fh = cols[1].height.saturating_sub(2) as usize;
-    let scroll = (sel_end + 1).saturating_sub(fh).min(sel_line) as u16;
-    f.render_widget(Paragraph::new(fl).scroll((scroll, 0)).block(block(&entry, fcol)), cols[1]);
+    let fh = finner.height as usize;
+    let scroll = (sel_end + 1).saturating_sub(fh).min(sel_line);
+    if let Some((x, line)) = fcursor.filter(|(_, line)| *line >= scroll && *line - scroll < fh) {
+        cursor = Some((x, finner.y + (line - scroll) as u16));
+    }
+    f.render_widget(Paragraph::new(fl).scroll((scroll as u16, 0)), finner);
+    if app.studio.focus == 1 {
+        form::band_line(f.buffer_mut(), finner, sel_line, scroll);
+    }
 
     // flow preview + validation
     if wide {
@@ -584,14 +804,16 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
             pl.push(arrow("unsticks agents, resolves halts"));
         }
         pl.push(row(rg(&p.flow.orchestrator)));
-        pl.push(arrow(&format!("spawns ≤{} in parallel / phase", p.settings.max_parallel)));
+        // the shared pool, then each worker class with a cap of its own (the swarm's)
+        let own: Vec<String> = p.worker_roles().into_iter().filter_map(|w| p.roles[&w].parallel.map(|n| format!(" · {w} ≤{n}"))).collect();
+        pl.push(arrow(&if own.is_empty() { format!("spawns ≤{} in parallel / phase", p.settings.max_parallel) } else { format!("spawns ≤{}{} / phase", p.settings.max_parallel, own.concat()) }));
         let mut ws = vec![];
         for w in p.worker_roles() {
             ws.extend(rg(&w));
             ws.push(Span::raw("  "));
         }
         // side by side while they fit, else one worker role per row
-        if Line::from(ws.clone()).width() + 1 <= cols[2].width.saturating_sub(2) as usize {
+        if Line::from(ws.clone()).width() < cols[2].width.saturating_sub(2) as usize {
             pl.push(row(ws));
         } else {
             pl.extend(p.worker_roles().iter().map(|w| row(rg(w))));
@@ -653,8 +875,41 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{} ", theme::g("›", ">")), theme::bold(theme::accent())), shown])), ir);
     if app.studio.focus == 2 {
         f.set_cursor_position((ir.x + 2 + cc as u16, ir.y));
+    } else if let Some(c) = cursor {
+        f.set_cursor_position(c);
     }
-    footer(f, rows[3], &[("tab", "focus"), ("↑↓", "select"), ("←→", "change"), ("⏎", "edit"), ("ctrl+s", "save"), ("esc", "back")]);
+    let hints = studio_footer(app, &entry, fs.get(fsel).map(String::as_str).unwrap_or(""));
+    footer(f, rows[3], &hints.iter().map(|(k, d)| (*k, d.as_str())).collect::<Vec<_>>());
+}
+
+/// The footer for what the Studio is doing: editing, a Delete armed, or the keys of the focused
+/// pane — eight at the most.
+fn studio_footer(app: &App, entry: &str, field: &str) -> Vec<(&'static str, String)> {
+    if let Some(e) = &app.edit {
+        return if e.multiline {
+            vec![("⏎", "save".into()), ("alt+⏎", "new line".into()), ("esc", "revert".into())]
+        } else if e.target == EditTarget::NewRole {
+            vec![("⏎", "add the role".into()), ("esc", "cancel".into())]
+        } else {
+            vec![("⏎", "save".into()), ("esc", "revert".into()), ("↑↓", "save and move".into())]
+        };
+    }
+    if let Some(what) = form::armed(&app.confirm) {
+        return vec![("del", format!("again to delete {what}")), ("esc", "keep it".into())];
+    }
+    match app.studio.focus {
+        2 => vec![("⏎", "send to the architect".into()), ("tab", "focus".into()), ("esc", "back to the list".into())],
+        0 => vec![("↑↓", "select".into()), ("⏎ →", "its fields".into()), ("ctrl+n", "new role".into()), ("del", "delete".into()), ("tab", "focus".into()), ("ctrl+s", "save".into()), ("esc", "back".into())],
+        _ => {
+            let edit = match field_kind(entry, field) {
+                Kind::Choice | Kind::Toggle => ("←→", "change"),
+                Kind::Step => ("type ←→", "change"),
+                Kind::Action => ("⏎", "add"),
+                _ => ("type ⏎", "edit"),
+            };
+            vec![(edit.0, edit.1.into()), ("↑↓", "field".into()), ("ctrl+n", "new role".into()), ("del", "delete".into()), ("tab", "focus".into()), ("ctrl+s", "save".into()), ("esc", "back".into())]
+        }
+    }
 }
 
 /// The pattern's Akasha groups, one line each — "groups: builders (worker-big, worker-small) · 16k
@@ -674,32 +929,127 @@ fn groups_lines(p: &crate::engine::pattern::Pattern) -> Vec<String> {
 /// One line on what the focused field means, for the fields that need more than their name.
 fn field_hint(field: &str) -> Option<&'static str> {
     Some(match field {
-        "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small workers, high for finale steps.",
+        "name" => "A new name saves a copy of this pattern under it, and new runs use the copy.",
+        "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small and swarm workers, high for finale steps.",
+        "parallel" => "How many workers of this role run at once, counted apart from the rest (1-128; worker-swarm has 16). none = it shares the pattern's max_parallel with the other roles without one.",
         "fallback" => "The model that takes over when this role's model twice produces nothing within first_token_minutes. none = the manager is asked instead.",
         "permission" => "never = the agent never asks (the default). on-request / untrusted: you approve by hand; requests land in the inbox (ctrl+g).",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
-        "mcp" => "MCP servers this role's agents get, by their name in settings.toml [mcp_servers] (e.g. blender), comma-separated. * = every enabled one, none = no server (`mantra mcp` lists them).",
+        "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
         "context_cap" => "Tokens of context every agent is told it has, whatever its model's window (the smaller of the two): a huge window lets an agent cycle tools for hours. 0 = the model's full window; 200k is the built-in default.",
         _ => return None,
     })
 }
 
+/// Starts editing the selected field (`start`; a typed `c` for `Overwrite`).
+fn begin(app: &mut App, entry: &str, field: &str, start: Start, c: Option<char>) {
+    let target = match entry {
+        "⚙ settings" if PATTERN_FIELDS.contains(&field) => EditTarget::PatternField(field.to_string()),
+        "⚙ settings" => EditTarget::Setting(field.to_string()),
+        "⇢ flow" => match finale_index(field) {
+            Some(i) if field.ends_with(".task") => EditTarget::FlowStep(i, "task".into()),
+            _ => return,
+        },
+        role => EditTarget::RoleField(role.to_string(), field.to_string()),
+    };
+    let value = edit_value(app, entry, field);
+    let mut e = match (start, c) {
+        (Start::Overwrite, Some(c)) => Edit::overwrite(target, &value, c),
+        (s, _) => Edit::new(target, &value, s),
+    };
+    if field_kind(entry, field) == Kind::Lines {
+        e = e.multiline();
+    }
+    app.edit = Some(e);
+}
+
+/// A key while a field (or a new role's name) is being edited.
+fn edit_key(app: &mut App, k: KeyEvent) {
+    let Some(e) = app.edit.as_mut() else { return };
+    let outcome = e.key(k);
+    match outcome {
+        Outcome::Editing => {}
+        Outcome::Revert => app.edit = None,
+        Outcome::Commit | Outcome::CommitMove(_) => {
+            let Some(e) = app.edit.take() else { return };
+            if !commit(app, &e) {
+                app.edit = Some(e);
+                return;
+            }
+            if let Outcome::CommitMove(d) = outcome {
+                let n = fields(app, &entries(app)[sel_index(app)]).len();
+                app.studio.field = (app.studio.field as i64 + d as i64).clamp(0, n.saturating_sub(1) as i64) as usize;
+            }
+        }
+    }
+}
+
+/// Delete on the list's role (or a finale step in the flow): the first press arms, the second
+/// deletes and saves. A role the flow uses stays; one a group lists leaves the group with it.
+fn delete(app: &mut App, entry: &str, field: Option<&str>) {
+    if entry == "⇢ flow" {
+        let Some(i) = field.and_then(finale_index) else { return };
+        if form::confirm(&mut app.confirm, &format!("finale step {}", i + 1)) {
+            app.studio.pattern.flow.finale.remove(i);
+            app.studio.dirty = true;
+            app.studio.field = 0;
+            save_pattern(app);
+        }
+        return;
+    }
+    if !app.studio.pattern.roles.contains_key(entry) {
+        return;
+    }
+    let fl = &app.studio.pattern.flow;
+    let used = [&fl.planner, &fl.manager, &fl.orchestrator, &fl.phase_gate, &fl.on_reprompt].iter().any(|x| **x == entry) || fl.finale.iter().any(|s| s.role == entry);
+    if used {
+        return app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
+    }
+    if !form::confirm(&mut app.confirm, entry) {
+        return;
+    }
+    let i = sel_index(app);
+    app.studio.pattern.roles.remove(entry);
+    // Groups are read-only here, so a group left naming the deleted role would be an error the
+    // Studio could never clear: the role leaves its group with it.
+    let mut left = vec![];
+    for g in app.studio.pattern.groups.iter_mut().filter(|g| g.roles.iter().any(|r| r == entry)) {
+        g.roles.retain(|r| r != entry);
+        left.push(g.name.clone());
+    }
+    if !left.is_empty() {
+        app.toast(format!("deleted {entry}, and took it out of group {}", left.join(", ")), crate::agent::Level::Info);
+    }
+    app.studio.dirty = true;
+    select_by_index(app, i.saturating_sub(1));
+    save_pattern(app);
+}
+
 pub fn studio_key(app: &mut App, k: KeyEvent) {
+    if app.edit.is_some() {
+        return edit_key(app, k);
+    }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    if k.code != KeyCode::Delete {
+        app.confirm = None;
+    }
     if ctrl && k.code == KeyCode::Char('s') {
         match app.studio.pattern.validate() {
-            Ok(()) => match app.studio.pattern.save() {
-                Ok(p) => {
-                    app.studio.dirty = false;
-                    app.pattern_name = app.studio.pattern.name.clone();
-                    app.toast(format!("saved {}", home_rel(&p)), crate::agent::Level::Ok);
+            Ok(()) => {
+                if save_pattern(app) {
+                    let path = app.studio.pattern.source_dir.clone().unwrap_or_else(crate::config::patterns_dir).join(format!("{}.toml", crate::util::slug(&app.studio.pattern.name)));
+                    app.toast(format!("saved {}", home_rel(&path)), crate::agent::Level::Ok);
                 }
-                Err(e) => app.toast(format!("save failed: {e}"), crate::agent::Level::Error),
-            },
+            }
             Err(errs) => app.toast(format!("fix first: {}", errs[0]), crate::agent::Level::Error),
         }
+        return;
+    }
+    if ctrl && k.code == KeyCode::Char('n') {
+        app.studio.focus = 0;
+        app.edit = Some(Edit::new(EditTarget::NewRole, "", Start::Clear));
         return;
     }
     if k.code == KeyCode::Tab {
@@ -726,12 +1076,21 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
     let es = entries(app);
     let entry = es[sel_index(app)].clone();
     let fs = fields(app, &entry);
-    match k.code {
-        KeyCode::Esc => {
-            app.leave_screen();
+    let field = fs.get(app.studio.field.min(fs.len().saturating_sub(1))).cloned();
+    let list = app.studio.focus == 0;
+    let kind = field.as_deref().map(|f| field_kind(&entry, f)).unwrap_or(Kind::Action);
+    // a change to a field saves the pattern when it is valid
+    let changed = |app: &mut App, d: i32| {
+        if let Some(f) = &field {
+            nudge(app, &entry, f, d);
+            save_pattern(app);
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.studio.focus == 0 {
+    };
+    match k.code {
+        _ if ctrl => {}
+        KeyCode::Esc => app.leave_screen(),
+        KeyCode::Up | KeyCode::Char('k') if list || k.code == KeyCode::Up => {
+            if list {
                 let i = sel_index(app);
                 select_by_index(app, i.saturating_sub(1));
                 app.studio.field = 0;
@@ -739,8 +1098,8 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 app.studio.field = app.studio.field.saturating_sub(1);
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.studio.focus == 0 {
+        KeyCode::Down | KeyCode::Char('j') if list || k.code == KeyCode::Down => {
+            if list {
                 let i = sel_index(app);
                 select_by_index(app, (i + 1).min(es.len() - 1));
                 app.studio.field = 0;
@@ -748,502 +1107,41 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
                 app.studio.field = (app.studio.field + 1).min(fs.len().saturating_sub(1));
             }
         }
-        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-            if app.studio.focus == 0 {
-                app.studio.focus = 1;
-                return;
-            }
-            let d = if matches!(k.code, KeyCode::Left | KeyCode::Char('h')) { -1 } else { 1 };
-            if let Some(fname) = fs.get(app.studio.field) {
-                nudge(app, &entry, fname, d);
-            }
+        KeyCode::Right | KeyCode::Enter if list => app.studio.focus = 1,
+        KeyCode::Delete => delete(app, &entry, field.as_deref()),
+        _ if list => {}
+        KeyCode::Left | KeyCode::Right if matches!(kind, Kind::Choice | Kind::Toggle | Kind::Step) => changed(app, if k.code == KeyCode::Left { -1 } else { 1 }),
+        KeyCode::Char(c @ ('+' | '-')) if matches!(kind, Kind::Choice | Kind::Toggle) || (kind == Kind::Step && field.as_deref() != Some("glyph")) => changed(app, if c == '-' { -1 } else { 1 }),
+        KeyCode::Char(' ') | KeyCode::Enter if matches!(kind, Kind::Choice | Kind::Toggle) => changed(app, 1),
+        KeyCode::Enter if kind == Kind::Action => {
+            let first_gate = app.studio.pattern.roles.iter().find(|(_, r)| r.kind == "gate").map(|(n, _)| n.clone()).unwrap_or_default();
+            app.studio.pattern.flow.finale.push(FinaleStep { role: first_gate, task: "Describe what this step should do.".into(), may_spawn: false });
+            app.studio.dirty = true;
+            save_pattern(app);
         }
         KeyCode::Enter => {
-            if app.studio.focus == 0 {
-                app.studio.focus = 1;
-                return;
+            if let Some(f) = &field {
+                begin(app, &entry, f, Start::Append, None);
             }
-            let Some(fname) = fs.get(app.studio.field).cloned() else { return };
-            if fname == "+ add finale step" {
-                let first_gate = app.studio.pattern.roles.iter().find(|(_, r)| r.kind == "gate").map(|(n, _)| n.clone()).unwrap_or_default();
-                app.studio.pattern.flow.finale.push(FinaleStep { role: first_gate, task: "Describe what this step should do.".into(), may_spawn: false });
-                app.studio.dirty = true;
-                return;
-            }
-            let target = match entry.as_str() {
-                "⚙ settings" if ["isolation", "network", "review_plan", "orchestrator_context"].contains(&fname.as_str()) => return nudge(app, &entry, &fname, 1),
-                "⚙ settings" => EditTarget::Setting(fname.clone()),
-                "⇢ flow" if fname.starts_with("finale[") => {
-                    let i: usize = fname[7..].split(']').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-                    if fname.ends_with(".task") {
-                        EditTarget::FlowStep(i, "task".into())
-                    } else {
-                        return nudge(app, &entry, &fname, 1);
-                    }
-                }
-                "⇢ flow" => return nudge(app, &entry, &fname, 1),
-                role => {
-                    if ["kind", "color", "sandbox", "permission", "effort", "model", "fallback"].contains(&fname.as_str()) {
-                        return nudge(app, &entry, &fname, 1);
-                    }
-                    EditTarget::RoleField(role.to_string(), fname.clone())
-                }
-            };
-            let mut input = Input::default();
-            // "none" is how an empty value reads, not text to edit around
-            let v = get_value(app, &entry, &fname);
-            input.set(if v == "none" && ["max_tokens", "writable_roots", "mcp"].contains(&fname.as_str()) { "" } else { &v });
-            app.overlays.push(Overlay::Edit { title: format!("{entry} · {fname}"), input, target });
         }
-        KeyCode::Char('n') => app.overlays.push(Overlay::Edit { title: "new role name".into(), input: Input::default(), target: EditTarget::NewRole }),
-        KeyCode::Char('r') => {
-            let mut input = Input::default();
-            input.set(&app.studio.pattern.name);
-            app.overlays.push(Overlay::Edit { title: "pattern name (saving under a new name creates a copy)".into(), input, target: EditTarget::NewPattern });
-        }
-        KeyCode::Char('x') | KeyCode::Delete => {
-            if entry == "⇢ flow" {
-                if let Some(fname) = fs.get(app.studio.field) {
-                    if let Some(i) = fname.strip_prefix("finale[").and_then(|x| x.split(']').next()).and_then(|n| n.parse::<usize>().ok()) {
-                        app.studio.pattern.flow.finale.remove(i);
-                        app.studio.dirty = true;
-                        app.studio.field = 0;
-                    }
-                }
-                return;
+        KeyCode::Backspace if matches!(kind, Kind::Text | Kind::Lines | Kind::Step) => {
+            if let Some(f) = &field {
+                begin(app, &entry, f, Start::Clear, None);
             }
-            if app.studio.pattern.roles.contains_key(&entry) {
-                let fl = &app.studio.pattern.flow;
-                let used = [&fl.planner, &fl.manager, &fl.orchestrator, &fl.phase_gate, &fl.on_reprompt].iter().any(|x| **x == entry) || fl.finale.iter().any(|s| s.role == entry);
-                if used {
-                    app.toast(format!("{entry} is used in the flow — change the flow first"), crate::agent::Level::Warn);
-                } else {
-                    let i = sel_index(app);
-                    app.studio.pattern.roles.remove(&entry);
-                    // Groups are read-only here, so a group left naming the deleted role would be
-                    // an error the Studio could never clear (ctrl+s refuses it): the role leaves
-                    // its group with it.
-                    let mut left = vec![];
-                    for g in app.studio.pattern.groups.iter_mut().filter(|g| g.roles.contains(&entry)) {
-                        g.roles.retain(|r| *r != entry);
-                        left.push(g.name.clone());
-                    }
-                    if !left.is_empty() {
-                        app.toast(format!("deleted {entry}, and took it out of group {}", left.join(", ")), crate::agent::Level::Info);
-                    }
-                    app.studio.dirty = true;
-                    select_by_index(app, i.saturating_sub(1));
+        }
+        KeyCode::Char(c) if kind == Kind::Choice && c.is_alphanumeric() => {
+            if let Some(f) = &field {
+                if let Some(v) = form::jump(&choices(app, &entry, f), &choice_value(app, &entry, f), c) {
+                    set_choice(app, &entry, f, &v);
+                    save_pattern(app);
                 }
             }
         }
-        _ => {}
-    }
-}
-
-// ───────────────────────────── models ─────────────────────────────
-
-const MODEL_COLS: &[&str] = &["alias", "provider", "model", "context", "compact", "default", "efforts", "vision", "note / test"];
-/// Where `vision` sits in `MODEL_COLS`: ⏎ (or +/-) toggles it.
-const VISION_COL: usize = 7;
-/// Where the note (or the last `t` result) sits in `MODEL_COLS`.
-const NOTE_COL: usize = 8;
-const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth", "wire"];
-/// Where `kind`, `auth` and `wire` sit in `PROV_COLS` — the columns +/- cycles.
-const PROV_KIND_COL: usize = 5;
-/// The providers grid's column widths, `PROV_COLS` order.
-const PROV_WIDTHS: [usize; 8] = [10, 12, 26, 14, 8, 10, 12, 9];
-
-/// The columns of a grid to draw in `full` cells with column `sel` among them: the first column
-/// always, then from the leftmost one that lets `sel` fit within `avail` (`full` less what the
-/// row needs after its cells), up to the last that fits whole — a column is shown entire or not
-/// at all. Each column takes its width + 1.
-fn shown_cols(ws: &[usize], sel: usize, avail: usize, full: usize) -> Vec<usize> {
-    let sel = sel.min(ws.len().saturating_sub(1));
-    let w = |i: usize| ws[i] + 1;
-    let mut start = 1;
-    while start < sel && w(0) + (start..=sel).map(w).sum::<usize>() > avail {
-        start += 1;
-    }
-    let mut used = w(0);
-    let mut out = vec![0];
-    for i in start.max(1)..ws.len() {
-        if used + w(i) > full && i != sel {
-            break;
-        }
-        used += w(i);
-        out.push(i);
-    }
-    out
-}
-const PROV_AUTH_COL: usize = 6;
-const PROV_WIRE_COL: usize = 7;
-/// Display strings for `ProviderEntry.kind` (WP10.2) — cycled with +/- on the providers grid the
-/// same way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above). Kept here rather
-/// than a `Display` impl on `ProviderKind` since it's presentation-only.
-const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode", "Bija"];
-/// Display strings for `ProviderEntry.auth` (WP10.2; irrelevant for `Codex`-kind providers, but
-/// still editable so a provider can be flipped to `ClaudeCode` and given `auth` in one place).
-const PROV_AUTHS: &[&str] = &["subscription", "api_key"];
-/// Display strings for `ProviderEntry.wire` (Bija only, editable on any row for the same reason).
-const PROV_WIRES: &[&str] = &["openai", "anthropic"];
-
-fn kind_str(k: crate::config::ProviderKind) -> &'static str {
-    match k {
-        crate::config::ProviderKind::Codex => "Codex",
-        crate::config::ProviderKind::ClaudeCode => "ClaudeCode",
-        crate::config::ProviderKind::Bija => "Bija",
-    }
-}
-
-fn parse_kind(t: &str) -> crate::config::ProviderKind {
-    let t = t.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
-    match t.as_str() {
-        "claudecode" | "claude" => crate::config::ProviderKind::ClaudeCode,
-        "bija" | "seed" => crate::config::ProviderKind::Bija,
-        _ => crate::config::ProviderKind::Codex,
-    }
-}
-
-/// What a Bija provider's `wire` cell shows: an empty wire is Chat Completions. Other kinds have
-/// no wire to choose.
-fn wire_str(p: &ProviderEntry) -> String {
-    match p.kind {
-        crate::config::ProviderKind::Bija if p.wire.trim().is_empty() => "openai".into(),
-        crate::config::ProviderKind::Bija => p.wire.clone(),
-        _ => "—".into(),
-    }
-}
-
-/// A typed `wire`: Chat Completions is the default and is stored as nothing at all; anything
-/// unrecognised is kept as typed, so the row reads as a draft that names the typo
-/// (`ProviderEntry::wire_problem`) instead of silently becoming Chat Completions.
-fn parse_wire(t: &str) -> String {
-    let t = t.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "" | "openai" | "openai-chat" | "openai_chat" | "chat" => String::new(),
-        "anthropic" | "messages" => "anthropic".into(),
-        _ => t,
-    }
-}
-
-fn parse_auth(t: &str) -> String {
-    let t = t.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    if t == "api_key" || t == "apikey" || t == "key" {
-        "api_key".into()
-    } else {
-        "subscription".into()
-    }
-}
-
-pub fn draw_models(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let np = app.registry.providers.len() as u16;
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(np + 8), Constraint::Length(1)]).split(area);
-    let mut crumbs = vec![Span::styled(format!("  {} models", theme::g("›", ">")), theme::faint())];
-    if app.models_ui.dirty {
-        crumbs.push(Span::styled(format!("  {} modified", theme::g("●", "*")), theme::fg(theme::AMBER)));
-    }
-    header(f, rows[0], crumbs, vec![Span::styled(home_rel(&crate::config::Registry::path()), theme::faint()), Span::raw(" ")]);
-    let widths = [10usize, 9, 18, 14, 14, 8, 30, 6, 30];
-    // A table wider than the screen scrolls sideways to the selected column, the first column
-    // (alias / id) kept, so every cell can be seen and edited at 80 columns too.
-    let (mshow, pshow) = {
-        let pw = PROV_WIDTHS;
-        let (msel, psel) = if app.models_ui.providers { (0, app.models_ui.col) } else { (app.models_ui.col, 0) };
-        // a provider row ends in its status (" ○ no key" at the least): room for it when scrolled
-        let (mw, pfull) = (rows[1].width.saturating_sub(2) as usize, rows[2].width.saturating_sub(2) as usize);
-        // the models grid keeps a cut last column: the start of a `t` result ("ok 0.4s") still reads
-        (shown_cols(&widths, msel, mw, usize::MAX), shown_cols(&pw, psel, pfull.saturating_sub(10), pfull))
-    };
-    let mk_head = |cols: &[&str], ws: &[usize], show: &[usize]| Line::from(show.iter().map(|&i| Span::styled(format!(" {:<w$}", cols[i], w = ws[i]), theme::bold(theme::muted()))).collect::<Vec<_>>());
-    let mut l = vec![mk_head(MODEL_COLS, &widths, &mshow)];
-    // Whole-thousands tokens print as "200k" (no decimal); anything else falls back to fmt_tokens.
-    let short_tokens = |n: u64| if n > 0 && n % 1000 == 0 { format!("{}k", n / 1000) } else { fmt_tokens(n) };
-    for (ri, m) in app.registry.models.iter().enumerate() {
-        let status = app.models_ui.status.get(&m.alias).cloned().unwrap_or_else(|| m.note.clone());
-        let vals = [
-            m.alias.clone(),
-            m.provider.clone(),
-            m.model.clone(),
-            match m.context_window {
-                Some(cw) => short_tokens(cw),
-                None => format!("{} (assumed)", short_tokens(m.effective_context())),
-            },
-            match m.auto_compact_percent {
-                Some(p) => format!("{p}%"),
-                None => format!("{}% (default)", m.effective_compact_percent()),
-            },
-            if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
-            if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
-            theme::g(if m.vision { "◉" } else { "·" }, if m.vision { "y" } else { "-" }).to_string(),
-            status,
-        ];
-        let mut spans = vec![];
-        for &ci in &mshow {
-            let v = &vals[ci];
-            let is = !app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
-            let derived = (ci == 3 && m.context_window.is_none()) || (ci == 4 && m.auto_compact_percent.is_none());
-            let st = if is {
-                Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else if derived {
-                theme::dim()
-            } else if ci == 5 {
-                theme::fg(effort_color(v))
-            } else if ci == VISION_COL && m.vision {
-                theme::fg(theme::BLUE)
-            } else if ci == NOTE_COL && v.starts_with("ok") {
-                theme::fg(theme::GREEN)
-            } else if ci == NOTE_COL && v.starts_with("error") {
-                theme::fg(theme::RED)
-            } else if ri == app.models_ui.row && !app.models_ui.providers {
-                theme::text()
-            } else {
-                theme::muted()
-            };
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("{:<w$}", trunc(v, widths[ci]), w = widths[ci]), st));
-        }
-        l.push(Line::from(spans));
-    }
-    l.push(Line::default());
-    l.push(Line::from(Span::styled(" context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)", theme::faint())));
-    l.push(Line::from(Span::styled(" dim \"(assumed)\" / \"(default)\" = not set here, using Mantra's built-in 200k / 85% · +/- steps values", theme::faint())));
-    l.push(Line::from(Span::styled(" vision = the model takes images: its agents get the screenshot and view-image tools · ⏎ toggles", theme::faint())));
-    let mcol = if app.models_ui.providers { theme::FAINT } else { theme::SAFFRON };
-    f.render_widget(Paragraph::new(l).block(block("models", mcol)), rows[1]);
-
-    let pw = PROV_WIDTHS;
-    let mut pl = vec![mk_head(PROV_COLS, &pw, &pshow)];
-    let openai_vals = ["openai", "OpenAI", "(built into Codex — uses your codex login)", "", "", "Codex", "—", "—"];
-    let mut ospans = vec![];
-    for &ci in &pshow {
-        let v = openai_vals[ci];
-        ospans.push(Span::raw(" "));
-        ospans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), theme::faint()));
-    }
-    pl.push(Line::from(ospans));
-    for (ri, p) in app.registry.providers.iter().enumerate() {
-        let masked = match &p.api_key {
-            Some(k) if !k.trim().is_empty() => {
-                let k = k.trim();
-                if k.len() > 4 { format!("••••{}", &k[k.len() - 4..]) } else { "••••".to_string() }
-            }
-            _ => String::new(),
-        };
-        // auth means something for ClaudeCode only (the hint below says so): any other kind shows
-        // "—" there, as the built-in openai row does, not a `subscription` it does not have.
-        let auth = if p.kind == crate::config::ProviderKind::ClaudeCode { p.auth.clone() } else { "—".to_string() };
-        let vals = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), masked, kind_str(p.kind).to_string(), auth, wire_str(p)];
-        let mut spans = vec![];
-        for &ci in &pshow {
-            let v = &vals[ci];
-            let is = app.models_ui.providers && ri == app.models_ui.row && ci == app.models_ui.col;
-            let st = if is { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { theme::text() };
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("{:<w$}", trunc(v, pw[ci]), w = pw[ci]), st));
-        }
-        // A draft (placeholder/malformed URL, or no credential — `ProviderEntry::draft_reason`)
-        // says why `t`/`D` are off for it; a ready row shows where its key is sent and how it is
-        // held. `ClaudeCode` + `subscription` needs no key at all (OAuth login), and a Bija key is
-        // optional (a local server takes none) — a red "no key" for either would be misleading,
-        // so only a key that is actually expected is reported missing.
-        // Room is short at 80-120 columns: the status always shows (whole, or its short form),
-        // then the model count and the host as far as they fit — never a word cut by the border.
-        let room = |spans: &Vec<Span>| (rows[2].width.saturating_sub(2) as usize).saturating_sub(Line::from(spans.clone()).width());
-        let (status, short, st) = if let Some(why) = p.draft_reason() {
-            (format!(" {} draft — {why}", theme::g("✗", "x")), format!(" {} draft", theme::g("✗", "x")), theme::fg(theme::AMBER))
-        } else if p.kind == crate::config::ProviderKind::Bija && p.resolve_key().is_none() {
-            (format!(" {} no key (optional)", theme::g("○", "-")), format!(" {} no key", theme::g("○", "-")), theme::dim())
-        } else if !p.needs_key() {
-            (format!(" {} subscription (OAuth login)", theme::g("○", "-")), format!(" {} OAuth", theme::g("○", "-")), theme::dim())
-        } else {
-            let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
-            (format!(" {} {key_msg}", theme::g("✓", "ok")), format!(" {} key", theme::g("✓", "ok")), theme::fg(theme::GREEN))
-        };
-        let left = room(&spans);
-        spans.push(Span::styled(if w_of(&status) <= left { status } else { trunc(&short, left) }, st));
-        let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
-        let count = format!("  {n} model{}", if n == 1 { "" } else { "s" });
-        // the host, unless the base_url column already shows the whole URL (a draft says why
-        // nothing is sent instead)
-        let host = p.host().filter(|_| p.draft_reason().is_none() && (!pshow.contains(&2) || w_of(&p.base_url) > pw[2])).map(|h| format!(" {} {h}", theme::g("→", "->")));
-        let left = room(&spans);
-        let with_host = host.as_ref().filter(|h| w_of(h) + w_of(&count) <= left);
-        if let Some(h) = with_host {
-            spans.push(Span::styled(h.clone(), theme::dim()));
-        }
-        if w_of(&count) <= room(&spans) {
-            spans.push(Span::styled(count, if n == 0 { theme::fg(theme::AMBER) } else { theme::dim() }));
-        }
-        pl.push(Line::from(spans));
-    }
-    for h in provider_hints(rows[2].width.saturating_sub(2) as usize, app.models_ui.providers && app.models_ui.col >= PROV_KIND_COL) {
-        pl.push(Line::from(Span::styled(h, theme::faint())));
-    }
-    let pcol = if app.models_ui.providers { theme::SAFFRON } else { theme::FAINT };
-    f.render_widget(Paragraph::new(pl).block(block("providers", pcol)), rows[2]);
-    // `t`/`D` name the host the selected row's request goes to, or say they are off for a draft
-    // (the row itself carries the reason).
-    let action = |plain: &str, verb: &str, p: Option<&ProviderEntry>| match p {
-        Some(p) if p.draft_reason().is_some() => format!("{verb} · off (draft)"),
-        Some(p) => p.host().map(|h| format!("{verb} {} {h}", theme::g("→", "->"))).unwrap_or_else(|| plain.to_string()),
-        None => plain.to_string(),
-    };
-    let wide = rows[3].width >= 110;
-    let (t_plain, d_plain) = if wide { ("test model", "discover models") } else { ("test", "discover") };
-    let (t_hint, d_hint) = if app.models_ui.providers {
-        (t_plain.to_string(), action(d_plain, "discover", app.registry.providers.get(app.models_ui.row)))
-    } else {
-        (action(t_plain, "test", app.registry.models.get(app.models_ui.row).and_then(|m| app.registry.provider_of(&m.alias))), d_plain.to_string())
-    };
-    // `footer` drops whole hints from the end when they do not fit: saving and the other table
-    // come before n/x, so an 80-column screen still says how to keep what was changed.
-    let tab = if wide { "models/providers" } else if app.models_ui.providers { "models" } else { "providers" };
-    footer(f, rows[3], &[("↑↓←→", "cell"), ("⏎", "edit"), ("ctrl+s", "save"), ("tab", tab), ("t", &t_hint), ("D", &d_hint), ("n", "new"), ("x", "delete"), ("esc", "back")]);
-}
-
-/// The four lines under the providers grid. Wide, they explain every column; narrower, the
-/// ones about the column group being edited (kind/auth/wire, or the rest), each within `w`.
-fn provider_hints(w: usize, enums: bool) -> [&'static str; 4] {
-    if w >= 118 {
-        return [
-            " base_url = the API root: Codex adds /responses, Bija /chat/completions or /messages, ClaudeCode wants it without /v1",
-            " env_key = an env var holding the key · api_key = paste one (stored 0600) · either works · D here discovers …/models",
-            " a new row (n) is a draft: saved, but t/D send nothing until base_url is real and its own key is there",
-            " kind = Codex | ClaudeCode | Bija · auth (ClaudeCode) = subscription | api_key · wire (Bija) = openai | anthropic",
-        ];
-    }
-    if enums {
-        [" kind = Codex | ClaudeCode | Bija · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " a new row (n) is a draft until base_url is real and its key is there"]
-    } else {
-        [" base_url = the API root (Codex …/v1/responses · ClaudeCode: no /v1)", " env_key = an env var holding the key · api_key = paste one (0600)", " D here discovers …/models · → reaches kind, auth and wire", " a new row (n) is a draft until base_url is real and its key is there"]
-    }
-}
-
-pub fn models_key(app: &mut App, k: KeyEvent) {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let ui = &mut app.models_ui;
-    let (nrows, ncols) = if ui.providers { (app.registry.providers.len(), PROV_COLS.len()) } else { (app.registry.models.len(), MODEL_COLS.len()) };
-    if ctrl && k.code == KeyCode::Char('s') {
-        match app.registry.save() {
-            Ok(()) => {
-                app.models_ui.dirty = false;
-                app.toast("models saved — new agents use these settings", crate::agent::Level::Ok);
-            }
-            Err(e) => app.toast(format!("save failed: {e}"), crate::agent::Level::Error),
-        }
-        return;
-    }
-    match k.code {
-        KeyCode::Esc => app.leave_screen(),
-        KeyCode::Tab => {
-            ui.providers = !ui.providers;
-            ui.row = 0;
-            ui.col = 0;
-        }
-        KeyCode::Up => ui.row = ui.row.saturating_sub(1),
-        KeyCode::Down => ui.row = (ui.row + 1).min(nrows.saturating_sub(1)),
-        KeyCode::Left => ui.col = ui.col.saturating_sub(1),
-        KeyCode::Right => ui.col = (ui.col + 1).min(ncols - 1),
-        KeyCode::Char('+') | KeyCode::Char('-') if ui.providers => {
-            // Cycle `kind`/`auth`/`wire` the same way +/- cycles enumerations on the models grid
-            // below, and the way `sandbox`/`permission` cycle elsewhere in Studio (`nudge`, above)
-            // — the only in-app way to configure a third-party ClaudeCode or Bija provider (§10.2).
-            let d: i32 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
-            if let Some(p) = app.registry.providers.get_mut(ui.row) {
-                match ui.col {
-                    PROV_KIND_COL => p.kind = parse_kind(&cycle(PROV_KINDS, kind_str(p.kind), d)),
-                    PROV_AUTH_COL => p.auth = cycle(PROV_AUTHS, &p.auth, d),
-                    PROV_WIRE_COL => {
-                        let cur = if p.wire.trim().is_empty() { "openai".to_string() } else { p.wire.clone() };
-                        p.wire = parse_wire(&cycle(PROV_WIRES, &cur, d));
-                    }
-                    _ => return,
-                }
-                app.models_ui.dirty = true;
-            }
-        }
-        KeyCode::Char('+') | KeyCode::Char('-') if !ui.providers => {
-            let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
-            if let Some(m) = app.registry.models.get_mut(ui.row) {
-                match ui.col {
-                    3 => {
-                        const P: &[u64] = &[128_000, 200_000, 272_000, 400_000, 1_000_000];
-                        let cur = m.context_window.unwrap_or(0);
-                        let i = P.iter().position(|x| *x >= cur).unwrap_or(P.len()) as i64;
-                        let j = (i + d).clamp(0, P.len() as i64 - 1) as usize;
-                        m.context_window = Some(P[j]);
-                    }
-                    4 => m.auto_compact_percent = Some((m.auto_compact_percent.unwrap_or(85) as i64 + 5 * d).clamp(10, 99) as u8),
-                    5 => {
-                        let e = m.step_effort(&m.default_effort.clone(), d as i32);
-                        m.default_effort = e;
-                    }
-                    VISION_COL => m.vision = !m.vision,
-                    _ => {}
-                }
-                app.models_ui.dirty = true;
-            }
-        }
-        KeyCode::Enter => {
-            let (title, val, target) = if ui.providers {
-                let Some(p) = app.registry.providers.get(ui.row) else { return };
-                let v = [p.id.clone(), p.name.clone(), p.base_url.clone(), p.env_key.clone(), p.api_key.clone().unwrap_or_default(), kind_str(p.kind).to_string(), p.auth.clone(), p.wire.clone()][ui.col.min(PROV_COLS.len() - 1)].clone();
-                let hint = if ui.col == 4 { " (either name an env var or paste a key)" } else { "" };
-                (format!("provider · {}{hint}", PROV_COLS[ui.col]), v, EditTarget::ProviderCell(ui.row, ui.col))
-            } else if ui.col == VISION_COL {
-                // a yes/no: ⏎ flips it, as space does a check box
-                if let Some(m) = app.registry.models.get_mut(ui.row) {
-                    m.vision = !m.vision;
-                    app.models_ui.dirty = true;
-                }
-                return;
-            } else {
-                let Some(m) = app.registry.models.get(ui.row) else { return };
-                let v = [m.alias.clone(), m.provider.clone(), m.model.clone(), m.context_window.map(|c| c.to_string()).unwrap_or_default(), m.auto_compact_percent.map(|c| c.to_string()).unwrap_or_default(), m.default_effort.clone(), m.efforts().join(", "), String::new(), m.note.clone()][ui.col].clone();
-                (format!("{} · {}  (context accepts 400k / 1m)", m.alias, MODEL_COLS[ui.col]), v, EditTarget::ModelCell(ui.row, ui.col))
-            };
-            let mut input = Input::default();
-            input.set(&val);
-            app.overlays.push(Overlay::Edit { title, input, target });
-        }
-        KeyCode::Char('n') => {
-            if ui.providers {
-                app.registry.providers.push(ProviderEntry { id: "myprovider".into(), name: "My provider".into(), base_url: "https://example.com/v1".into(), env_key: "MYPROVIDER_API_KEY".into(), wire_api: "responses".into(), ..Default::default() });
-                ui.row = app.registry.providers.len() - 1;
-            } else {
-                app.registry.models.push(crate::config::ModelEntry { alias: format!("model{}", app.registry.models.len() + 1), model: "model-id".into(), ..Default::default() });
-                ui.row = app.registry.models.len() - 1;
-            }
-            app.models_ui.dirty = true;
-        }
-        KeyCode::Char('x') | KeyCode::Delete => {
-            if ui.providers {
-                if ui.row < app.registry.providers.len() {
-                    app.registry.providers.remove(ui.row);
-                }
-            } else if ui.row < app.registry.models.len() && app.registry.models.len() > 1 {
-                app.registry.models.remove(ui.row);
-            }
-            app.models_ui.row = app.models_ui.row.saturating_sub(1);
-            app.models_ui.dirty = true;
-        }
-        KeyCode::Char('t') if !ui.providers => {
-            if let Some(m) = app.registry.models.get(ui.row) {
-                let alias = m.alias.clone();
-                app.probe_model(&alias);
-            }
-        }
-        KeyCode::Char('D') | KeyCode::Char('d') => {
-            if ui.providers {
-                match app.registry.providers.get(ui.row).map(|p| (p.id.clone(), p.draft_reason())) {
-                    // A draft never goes on the network — say why instead (P2, test report).
-                    Some((id, Some(why))) => app.toast(format!("{id} is a draft, not discovered — {why}"), crate::agent::Level::Warn),
-                    Some((id, None)) => app.discover(Some(id)),
-                    None => app.toast("add a provider first (n)", crate::agent::Level::Info),
-                }
-            } else {
-                app.discover(None);
+        // a number takes digits (and `200k`'s letters after them); a glyph any character
+        KeyCode::Char(c) if kind == Kind::Step && !(c.is_ascii_digit() || field.as_deref() == Some("glyph")) => {}
+        KeyCode::Char(c) if matches!(kind, Kind::Text | Kind::Lines | Kind::Step) && !c.is_control() => {
+            if let Some(f) = &field {
+                begin(app, &entry, f, Start::Overwrite, Some(c));
             }
         }
         _ => {}
@@ -1254,39 +1152,158 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
 mod tests {
     use super::*;
 
+    fn press(app: &mut App, code: KeyCode) {
+        studio_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn typed(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn on_field(app: &mut App, role: &str, field: &str) {
+        app.studio.sel = StudioSel::Role(role.into());
+        app.studio.focus = 1;
+        app.studio.field = fields(app, role).iter().position(|f| f == field).expect("the field");
+    }
+
     /// Groups show as one read-only line each; a pattern without them shows none.
     #[test]
     fn the_overview_lists_akasha_groups_read_only() {
-        let mut p = crate::engine::pattern::Pattern::builtin();
+        let mut p = crate::engine::pattern::Pattern { groups: vec![], ..crate::engine::pattern::Pattern::builtin() };
         assert!(groups_lines(&p).is_empty(), "every pattern from before groups");
+        assert_eq!(groups_lines(&crate::engine::pattern::Pattern::builtin()), vec!["groups: builders (worker-big, worker-small, worker-swarm) · 16k · push urgent".to_string()], "the built-ins have one");
         let group = |name: &str, roles: &[&str], shared_chars: usize, push: &str, auto: bool| crate::engine::pattern::Group { name: name.into(), roles: roles.iter().map(|r| r.to_string()).collect(), shared_chars, push: push.into(), auto };
         p.groups = vec![group("builders", &["worker-big", "worker-small"], 16_384, "urgent", true), group("reviewers", &["qa"], 2_000, "none", false)];
         assert_eq!(groups_lines(&p), vec!["groups: builders (worker-big, worker-small) · 16k · push urgent".to_string(), "        reviewers (qa) · 2k · push none · no auto entries".to_string()]);
     }
 
     /// Deleting a role a group lists takes it out of the group too: groups are read-only here, so
-    /// a group left naming it would block ctrl+s with an error the Studio cannot clear.
+    /// a group left naming it would keep the pattern from saving with an error the Studio cannot
+    /// clear. Delete arms on the first press and deletes on the second.
     #[test]
     fn deleting_a_grouped_role_takes_it_out_of_its_group() {
-        let mut app = crate::web::snapshot::tests::test_app();
-        app.studio.pattern = crate::engine::pattern::Pattern::builtin_swarm();
-        assert!(app.studio.pattern.groups[0].roles.contains(&"worker-small".to_string()));
-        app.studio.focus = 0;
-        app.studio.sel = StudioSel::Role("worker-small".into());
-        studio_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(!app.studio.pattern.roles.contains_key("worker-small"), "deleted");
-        assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string()]);
-        assert!(app.studio.pattern.validate().is_ok(), "{:?}", app.studio.pattern.validate());
-        let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-        assert!(t.contains("worker-small") && t.contains("group builders"), "{t}");
-        // a role no group lists is deleted as before, groups untouched
-        app.studio.pattern.roles.insert("helper".into(), app.studio.pattern.roles["worker-big"].clone());
-        app.studio.sel = StudioSel::Role("helper".into());
-        app.toast = None;
-        studio_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
-        assert!(!app.studio.pattern.roles.contains_key("helper"));
-        assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string()]);
-        assert!(app.toast.is_none(), "nothing to say");
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            assert!(app.studio.pattern.groups[0].roles.contains(&"worker-small".to_string()));
+            app.studio.focus = 0;
+            app.studio.sel = StudioSel::Role("worker-small".into());
+            press(&mut app, KeyCode::Delete);
+            assert!(app.studio.pattern.roles.contains_key("worker-small"), "armed only");
+            press(&mut app, KeyCode::Delete);
+            assert!(!app.studio.pattern.roles.contains_key("worker-small"), "deleted");
+            assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string(), "worker-swarm".to_string()]);
+            assert!(app.studio.pattern.validate().is_ok(), "{:?}", app.studio.pattern.validate());
+            assert!(!app.studio.dirty, "and saved");
+            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            assert!(t.contains("worker-small") && t.contains("group builders"), "{t}");
+            // a role no group lists is deleted as before, groups untouched
+            app.studio.pattern.roles.insert("helper".into(), app.studio.pattern.roles["worker-big"].clone());
+            app.studio.sel = StudioSel::Role("helper".into());
+            app.toast = None;
+            press(&mut app, KeyCode::Delete);
+            press(&mut app, KeyCode::Delete);
+            assert!(!app.studio.pattern.roles.contains_key("helper"));
+            assert_eq!(app.studio.pattern.groups[0].roles, vec!["worker-big".to_string(), "worker-swarm".to_string()]);
+            assert!(app.toast.is_none(), "nothing to say");
+        });
+    }
+
+    /// Type to edit in the Studio: a letter replaces the field's text where it is, ⏎ validates
+    /// and saves the pattern; a value that makes it invalid stays in it unsaved, with the reason
+    /// on screen, until it is fixed. ←→ change a choice and save too.
+    #[test]
+    fn a_commit_saves_a_valid_pattern_and_keeps_an_invalid_one_unsaved() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            on_field(&mut app, "worker-big", "description");
+            typed(&mut app, "Big jobs");
+            assert!(matches!(&app.edit, Some(e) if e.text() == "Big jobs" && e.target == EditTarget::RoleField("worker-big".into(), "description".into())));
+            assert!(app.overlays.is_empty(), "no popup");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["worker-big"].description, "Big jobs");
+            assert!(!app.studio.dirty);
+            let saved = crate::engine::pattern::Pattern::load(crate::engine::pattern::NAME_DEFAULT, std::path::Path::new("/nonexistent")).unwrap();
+            assert_eq!(saved.roles["worker-big"].description, "Big jobs", "saved on ⏎");
+            // a planner that is not of kind planner makes the pattern invalid: the change stays in
+            // the Studio, unsaved, and says why; the next change that makes it valid saves again
+            app.studio.sel = StudioSel::Flow;
+            app.studio.focus = 1;
+            app.studio.field = 0;
+            press(&mut app, KeyCode::Right);
+            assert_ne!(app.studio.pattern.flow.planner, "planner");
+            assert!(app.studio.dirty, "invalid, so not saved");
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| draw_studio(f, &mut app)).unwrap();
+            let b = term.backend().buffer();
+            let screen: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+            assert!(screen.contains("not saved: flow.planner") && screen.contains("not saved"), "{screen}");
+            assert_eq!(crate::engine::pattern::Pattern::load(crate::engine::pattern::NAME_DEFAULT, std::path::Path::new("/nonexistent")).unwrap().flow.planner, "planner", "the file keeps the valid one");
+            press(&mut app, KeyCode::Left);
+            assert!(!app.studio.dirty, "valid again: saved");
+            on_field(&mut app, "worker-big", "sandbox");
+            let before = app.studio.pattern.roles["worker-big"].sandbox.clone();
+            press(&mut app, KeyCode::Right);
+            assert_ne!(app.studio.pattern.roles["worker-big"].sandbox, before);
+            assert!(!app.studio.dirty);
+            // a letter on a choice jumps
+            on_field(&mut app, "worker-big", "permission");
+            typed(&mut app, "u");
+            assert_eq!(app.studio.pattern.roles["worker-big"].permission, "untrusted");
+            assert!(app.edit.is_none());
+        });
+    }
+
+    /// The pattern's name is the first field of its settings: a new name saves a copy under it
+    /// and the Studio (and new runs) switch to the copy; a built-in's name is refused.
+    #[test]
+    fn a_new_name_saves_a_copy_and_switches_to_it() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            app.studio.sel = StudioSel::Settings;
+            app.studio.focus = 1;
+            app.studio.field = 0;
+            assert_eq!(fields(&app, "⚙ settings")[0], "name");
+            typed(&mut app, "mine");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!((app.studio.pattern.name.as_str(), app.pattern_name.as_str()), ("mine", "mine"));
+            assert!(crate::engine::pattern::Pattern::path_for("mine").exists());
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("saved a copy as mine")), "{:?}", app.toast);
+            press(&mut app, KeyCode::Backspace);
+            typed(&mut app, "mantra-lean");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("built-in")), "{:?}", app.toast);
+            assert!(app.edit.is_some(), "refused: still editing");
+            assert_eq!(app.studio.pattern.name, "mine");
+        });
+    }
+
+    /// ctrl+n types a new role's name into the list where it will be; ⏎ adds it on Solo's model
+    /// and opens its fields, a name taken is refused, esc adds nothing.
+    #[test]
+    fn ctrl_n_adds_a_role_in_place() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            studio_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            assert!(matches!(&app.edit, Some(e) if e.target == EditTarget::NewRole));
+            typed(&mut app, "planner");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("already")), "taken");
+            press(&mut app, KeyCode::Esc);
+            assert!(app.edit.is_none());
+            studio_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            typed(&mut app, "Docs Writer");
+            press(&mut app, KeyCode::Enter);
+            let r = app.studio.pattern.roles.get("docs-writer").expect("added");
+            assert_eq!(r.model, app.settings.default_model);
+            assert_eq!((app.studio.sel.clone(), app.studio.focus), (StudioSel::Role("docs-writer".into()), 1));
+            assert!(!app.studio.dirty, "valid, so saved");
+        });
     }
 
     /// Every field the editor lists shows something: a name added to `ROLE_FIELDS` /
@@ -1295,12 +1312,43 @@ mod tests {
     fn every_listed_field_has_a_value() {
         let mut app = crate::web::snapshot::tests::test_app();
         app.studio.pattern = crate::engine::pattern::Pattern::builtin();
-        for f in SETTING_FIELDS {
-            assert!(!get_value(&app, "⚙ settings", f).is_empty(), "settings field {f} shows nothing");
+        for f in fields(&app, "⚙ settings") {
+            assert!(!get_value(&app, "⚙ settings", &f).is_empty(), "settings field {f} shows nothing");
         }
         for f in ROLE_FIELDS {
             assert!(!get_value(&app, "planner", f).is_empty(), "role field {f} shows nothing");
         }
+    }
+
+    /// A role's `parallel` shows "none" until it has one; ←→ steps it (below 1 is none again,
+    /// 128 the top), and the editor takes a number in range or none — anything else is said and
+    /// leaves the value as it was.
+    #[test]
+    fn a_roles_parallel_steps_and_edits_within_its_range() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert_eq!((get_value(&app, "worker-big", "parallel").as_str(), get_value(&app, "worker-swarm", "parallel").as_str()), ("none", "16"));
+        assert!(fields(&app, "worker-big").contains(&"parallel".to_string()));
+        assert!(!fields(&app, "planner").contains(&"parallel".to_string()), "only workers run many at a time");
+        nudge(&mut app, "worker-big", "parallel", 1);
+        assert_eq!(app.studio.pattern.roles["worker-big"].parallel, Some(1));
+        assert!(app.studio.dirty);
+        nudge(&mut app, "worker-big", "parallel", -1);
+        assert_eq!(app.studio.pattern.roles["worker-big"].parallel, None, "below 1 shares the pool again");
+        let edit = |app: &mut App, text: &str| apply_edit(app, &EditTarget::RoleField("worker-swarm".into(), "parallel".into()), text);
+        edit(&mut app, " 32 ");
+        assert_eq!(app.studio.pattern.roles["worker-swarm"].parallel, Some(32));
+        nudge(&mut app, "worker-swarm", "parallel", 200);
+        assert_eq!(app.studio.pattern.roles["worker-swarm"].parallel, Some(128), "the top of the range");
+        for bad in ["0", "129", "lots"] {
+            app.toast = None;
+            edit(&mut app, bad);
+            assert_eq!(app.studio.pattern.roles["worker-swarm"].parallel, Some(128), "{bad} changes nothing");
+            assert!(app.toast.as_ref().map(|t| t.0.contains("from 1 to 128")).unwrap_or(false), "{bad}: {:?}", app.toast);
+        }
+        edit(&mut app, "none");
+        assert_eq!(app.studio.pattern.roles["worker-swarm"].parallel, None);
+        assert!(app.studio.pattern.validate().is_ok());
     }
 
     /// The fallback model cycles none → every other alias → none, and the editor's "none" clears it.
@@ -1364,6 +1412,7 @@ mod tests {
         assert_eq!(app.studio.pattern.settings.manager_minutes, 7);
         apply_edit(&mut app, &t, "off (escalations only)");
         assert_eq!(app.studio.pattern.settings.manager_minutes, 0);
+        assert_eq!(edit_value(&app, "⚙ settings", "manager_minutes"), "off", "an edit starts from the word, not the label");
     }
 
     /// The context cap is listed, shown, stepped and typed — as a number, `200k`, or off.
@@ -1429,78 +1478,9 @@ mod tests {
         assert!(s.watchdog_escalate_seconds > s.watchdog_seconds, "escalate must never end up <= seconds");
     }
 
-    /// The grid scrolls sideways to the selected column, keeping the first, and shows columns
-    /// whole or not at all.
-    #[test]
-    fn a_wide_grid_shows_the_selected_column() {
-        let ws = PROV_WIDTHS;
-        assert_eq!(shown_cols(&ws, 0, 200, 200), (0..8).collect::<Vec<_>>(), "everything fits");
-        assert_eq!(shown_cols(&ws, 0, 68, 78), vec![0, 1, 2, 3, 4], "kind would be cut: left out");
-        assert_eq!(shown_cols(&ws, 7, 68, 78), vec![0, 4, 5, 6, 7], "wire selected: from api_key on");
-        assert_eq!(shown_cols(&ws, 2, 68, 78), vec![0, 1, 2, 3, 4]);
-    }
-
-    /// At 80 columns a Bija provider's kind and wire can be seen once the cursor is on them, and
-    /// its status reads whole; the hint under the grid is about the columns being edited.
-    #[test]
-    fn the_providers_grid_at_80_columns_shows_kind_and_wire() {
-        let mut app = crate::web::snapshot::tests::test_app();
-        app.registry.providers = vec![ProviderEntry { id: "local".into(), name: "Local vLLM".into(), base_url: "http://127.0.0.1:8000/v1".into(), kind: crate::config::ProviderKind::Bija, wire: "anthropic".into(), ..Default::default() }];
-        app.models_ui.providers = true;
-        app.models_ui.row = 0;
-        app.models_ui.col = PROV_WIRE_COL;
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw_models(f, &mut app)).unwrap();
-        let b = term.backend().buffer();
-        let screen: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect();
-        let row = screen.iter().find(|l| l.contains("local")).cloned().unwrap_or_default();
-        assert!(row.contains("Bija") && row.contains("anthropic") && row.contains("no key (optional)"), "{row}");
-        assert!(screen.iter().any(|l| l.contains("wire (Bija only) = openai")), "{}", screen.join("\n"));
-        assert!(screen.iter().any(|l| l.contains("ctrl+s save")), "save stays in the footer");
-    }
-
-    /// +/- on the provider grid cycles the column under the cursor — kind, auth or wire — and
-    /// nothing else; a typed wire is stored the way models.toml keeps it.
-    #[test]
-    fn provider_kind_auth_and_wire_cycle_in_their_own_columns() {
-        use crate::config::ProviderKind;
-        let mut app = crate::web::snapshot::tests::test_app();
-        app.registry.providers = vec![ProviderEntry { id: "gw".into(), base_url: "https://gw.dev/v1".into(), ..Default::default() }];
-        app.models_ui.providers = true;
-        app.models_ui.row = 0;
-        let plus = || KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE);
-        app.models_ui.col = PROV_KIND_COL;
-        for want in [ProviderKind::ClaudeCode, ProviderKind::Bija, ProviderKind::Codex] {
-            models_key(&mut app, plus());
-            assert_eq!(app.registry.providers[0].kind, want);
-        }
-        app.models_ui.col = PROV_AUTH_COL;
-        models_key(&mut app, plus());
-        assert_eq!(app.registry.providers[0].auth, "api_key");
-        app.models_ui.col = PROV_WIRE_COL;
-        models_key(&mut app, plus());
-        assert_eq!(app.registry.providers[0].wire, "anthropic");
-        models_key(&mut app, plus());
-        assert_eq!(app.registry.providers[0].wire, "", "Chat Completions is stored as no wire at all");
-        app.models_ui.dirty = false;
-        app.models_ui.col = 4;
-        models_key(&mut app, plus());
-        assert!(!app.models_ui.dirty, "api_key has nothing to cycle");
-
-        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_KIND_COL), "seed");
-        assert_eq!(app.registry.providers[0].kind, ProviderKind::Bija);
-        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), " Messages ");
-        assert_eq!(app.registry.providers[0].wire, "anthropic");
-        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), "grpc");
-        assert_eq!(wire_str(&app.registry.providers[0]), "grpc");
-        assert!(app.registry.providers[0].draft_reason().is_some_and(|w| w.contains("grpc")), "a typo stays visible, as a draft");
-        apply_edit(&mut app, &EditTarget::ProviderCell(0, PROV_WIRE_COL), "openai");
-        assert_eq!((app.registry.providers[0].wire.as_str(), wire_str(&app.registry.providers[0]).as_str()), ("", "openai"));
-        assert_eq!(wire_str(&ProviderEntry::default()), "—", "a Codex provider has no wire");
-    }
-
-    /// A role's `mcp` is a list field like `writable_roots`: ⏎ opens the editor, names are comma-
-    /// or space-separated and kept once each, "none" or nothing clears it.
+    /// A role's `mcp` is a list field like `writable_roots`: names are comma- or space-separated
+    /// and kept once each, "none" or nothing clears it; ⏎ on it edits in place, from nothing
+    /// ("none" is how empty reads, not text to type around).
     #[test]
     fn a_roles_mcp_servers_are_a_list_field() {
         let mut app = crate::web::snapshot::tests::test_app();
@@ -1519,53 +1499,32 @@ mod tests {
         apply_edit(&mut app, &t, "blender");
         apply_edit(&mut app, &t, "  ");
         assert!(app.studio.pattern.roles["worker-big"].mcp.is_empty(), "an emptied field clears the list");
-        // ⏎ on it opens the editor with nothing to type around ("none" is how empty reads)
-        app.studio.sel = StudioSel::Role("worker-big".into());
-        app.studio.focus = 1;
-        app.studio.field = ROLE_FIELDS.iter().position(|f| *f == "mcp").unwrap_or(0);
-        studio_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match app.overlays.last() {
-            Some(Overlay::Edit { target: EditTarget::RoleField(r, f), input, .. }) => assert!(r == "worker-big" && f == "mcp" && input.text().is_empty()),
-            _ => panic!("⏎ on mcp opens the editor"),
-        }
+        on_field(&mut app, "worker-big", "mcp");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.edit, Some(e) if e.target == t && e.text().is_empty()), "⏎ edits it in place");
+        assert!(app.overlays.is_empty());
     }
 
-    /// `/models` has a vision column: ◉ (y) for a model that takes images, · (-) for one that does
-    /// not; ⏎ or +/- on it toggles, a typed yes/no sets it, and the note moved one column right.
+    /// The instructions open in place over several lines: alt+⏎ adds a line, ⏎ keeps them.
     #[test]
-    fn the_models_grid_has_a_vision_column_that_toggles() {
-        let mut app = crate::web::snapshot::tests::test_app();
-        app.registry.models.insert(0, crate::config::ModelEntry { alias: "local".into(), model: "qwen".into(), note: "on my box".into(), ..Default::default() });
-        assert_eq!((MODEL_COLS[VISION_COL], MODEL_COLS[NOTE_COL]), ("vision", "note / test"));
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 30)).unwrap();
-        term.draw(|f| draw_models(f, &mut app)).unwrap();
-        let b = term.backend().buffer();
-        let screen: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect();
-        assert!(screen.iter().any(|l| l.contains("vision") && l.contains("note / test")), "{}", screen.join("\n"));
-        let row = |alias: &str| screen.iter().find(|l| l.contains(&format!(" {alias} "))).cloned().unwrap_or_default();
-        let (on, off) = (theme::g("◉", "y"), theme::g("·", "-"));
-        assert!(row("local").contains(&format!(" {off} ")) && row("local").contains("on my box"), "{}", row("local"));
-        assert!(row("astra").contains(&format!(" {on} ")), "the built-in aliases see: {}", row("astra"));
-
-        app.models_ui.row = 0;
-        app.models_ui.col = VISION_COL;
-        models_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.registry.models[0].vision && app.models_ui.dirty);
-        assert!(app.overlays.is_empty(), "a yes/no opens no editor");
-        models_key(&mut app, KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
-        assert!(!app.registry.models[0].vision);
-        apply_edit(&mut app, &EditTarget::ModelCell(0, VISION_COL), " Yes ");
-        assert!(app.registry.models[0].vision);
-        apply_edit(&mut app, &EditTarget::ModelCell(0, VISION_COL), "no");
-        assert!(!app.registry.models[0].vision);
-        apply_edit(&mut app, &EditTarget::ModelCell(0, NOTE_COL), "still mine");
-        assert_eq!(app.registry.models[0].note, "still mine");
-        // the note column opens the editor with the note in it
-        app.models_ui.col = NOTE_COL;
-        models_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match app.overlays.last() {
-            Some(Overlay::Edit { target: EditTarget::ModelCell(0, NOTE_COL), input, .. }) => assert_eq!(input.text(), "still mine"),
-            _ => panic!("⏎ on the note edits it"),
-        }
+    fn the_instructions_are_edited_in_place_over_several_lines() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            on_field(&mut app, "worker-small", "instructions");
+            press(&mut app, KeyCode::Backspace);
+            assert!(app.edit.as_ref().is_some_and(|e| e.multiline));
+            typed(&mut app, "first");
+            studio_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+            typed(&mut app, "second");
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| draw_studio(f, &mut app)).unwrap();
+            let b = term.backend().buffer();
+            let screen: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+            assert!(screen.contains("   first") && screen.contains("   second") && screen.contains("alt+⏎ new line"), "{screen}");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["worker-small"].instructions, "first\nsecond");
+            assert!(!app.studio.dirty);
+        });
     }
 }

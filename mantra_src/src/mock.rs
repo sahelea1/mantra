@@ -13,6 +13,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+/// A turn in progress: its id, the flag that cancels it, and the steering messages queued for it.
+type ActiveTurn = (String, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>);
+
 struct Thread {
     cwd: PathBuf,
     role: String,
@@ -22,7 +25,7 @@ struct Thread {
     turn_approval: String,
     model: String,
     turns: u32,
-    active: Option<(String, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>)>,
+    active: Option<ActiveTurn>,
     tokens: u64,
     /// The part of `tokens` that was the thread's prefix re-read from the cache (see `tokens`).
     cached: u64,
@@ -600,9 +603,30 @@ async fn solo(e: &Em, text: &str) -> Outcome {
     Outcome::Done
 }
 
+/// The modules the demo's swarm phase writes one test each for (`mock_plan` with `swarm`).
+const SWARM_MODULES: &[&str] = &["models", "config", "store", "parse", "format", "cli", "errors", "paths", "clock", "log"];
+
+/// Whether a planning prompt's goal asks for a swarm: the demo planner then adds a phase of
+/// `worker-swarm` tasks, so `--demo` and the swarm e2e exercise the class. Only the goal counts —
+/// the rest of the brief names `worker-swarm` among the roles every time.
+pub(crate) fn wants_swarm(prompt: &str) -> bool {
+    let goal = prompt.split("USER REQUEST:").nth(1).map(|rest| rest.split("\n\nProject directory:").next().unwrap_or(rest)).unwrap_or("");
+    goal.to_lowercase().contains("swarm")
+}
+
+/// What the demo planner says once its plan is in (all three mock backends).
+pub(crate) fn mock_plan_said(swarm: bool) -> String {
+    if swarm {
+        format!("Plan submitted: **4 phases**, {} tasks.\n\n1. Foundations — models + config (parallel)\n2. Features — API, auth, web UI (parallel)\n3. Tests — one per module, by a swarm\n4. Integration — wiring + docs", 7 + SWARM_MODULES.len())
+    } else {
+        "Plan submitted: **3 phases**, 7 tasks.\n\n1. Foundations — models + config (parallel)\n2. Features — API, auth, web UI (parallel)\n3. Integration — wiring + docs".into()
+    }
+}
+
 /// Shared with `mock_claude.rs` (WP10.6): the same demo plan, so a phase spawned by a Claude-backed
-/// planner looks identical to one spawned by a Codex-backed planner.
-pub(crate) fn mock_plan(first: bool) -> Value {
+/// planner looks identical to one spawned by a Codex-backed planner. `swarm` (`wants_swarm`) adds
+/// a phase of many tiny same-shaped tasks — a test per module — for `worker-swarm`.
+pub(crate) fn mock_plan(first: bool, swarm: bool) -> Value {
     let t = |id: &str, title: &str, role: &str, scope: &str, prompt: &str| json!({"id": id, "title": title, "role": role, "scope": [scope], "prompt": prompt, "acceptance": "builds, tests pass"});
     let mut p1_tasks = vec![
         t("p1-models", "Domain models", "worker-small", "src/models/**", "Create the core domain model types with serde derives and constructors."),
@@ -612,23 +636,31 @@ pub(crate) fn mock_plan(first: bool) -> Value {
     if std::env::var("MANTRA_MOCK_BADMODEL").is_ok() {
         p1_tasks.push(t("p1-badmodel", "Feature flags", "worker-small", "src/flags/**", "Add a simple feature-flag lookup."));
     }
+    let mut phases = vec![
+        json!({"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": p1_tasks,
+         "gate": {"checks": ["test -d src", "echo gate-ok"], "focus": "consistent naming", "criteria": "models and config compile together"}}),
+        json!({"id": "p2", "name": "Features", "goal": "The main features, in parallel", "tasks": [
+            t("p2-api", "HTTP API", "worker-big", "src/api/**", "Implement the REST handlers for the domain models with validation."),
+            t("p2-auth", "Auth", "worker-big", "src/auth/**", "Implement token auth middleware with tests."),
+            t("p2-ui", "Web UI", "worker-small", "web/**", "Build the minimal web UI pages for the API.")],
+         "gate": {"checks": ["test -d src/api", "echo gate-ok"], "focus": "API ↔ auth integration", "criteria": "all features wired, tests green"}}),
+        json!({"id": "p3", "name": "Integration", "goal": "Wire everything and document it", "tasks": [
+            t("p3-wire", "Wire-up", "worker-big", "src/app/**", "Wire API, auth and config into the app entrypoint."),
+            t("p3-docs", "Docs", "worker-small", "docs/**", "Write the README section and API docs.")],
+         "gate": {"checks": ["echo gate-ok"], "focus": "end-to-end flow", "criteria": "app starts, docs accurate"}}),
+    ];
+    if swarm {
+        // Ids end in the module's name, never in a suffix the mock workers act on (`-api`, `-ui`, `-auth`).
+        let tests: Vec<Value> = SWARM_MODULES.iter().map(|m| t(&format!("sw-{m}"), &format!("Test: {m}"), "worker-swarm", &format!("tests/{m}/**"), &format!("Add one unit test for the {m} module under tests/{m}/ — nothing else."))).collect();
+        phases.insert(2, json!({"id": "sw", "name": "Tests", "goal": "One test per module, written at once by a swarm", "tasks": tests,
+            "gate": {"checks": ["echo gate-ok"], "focus": "one test per module, nothing else touched", "criteria": "every module has a test"}}));
+    }
+    let summary = if swarm { "Four phases: shared foundations, the features in parallel, a test per module by a swarm, then integration and docs." } else { "Three phases: shared foundations first, then the features in parallel, then integration and docs." };
     json!({"plan": {
         "title": "Build the requested feature set",
-        "summary": "Three phases: shared foundations first, then the features in parallel, then integration and docs.",
+        "summary": summary,
         "orchestrator_brief": "Workers are independent inside a phase. Watch p2-auth closely (security-sensitive).",
-        "phases": [
-            {"id": "p1", "name": "Foundations", "goal": "Shared models and configuration", "tasks": p1_tasks,
-             "gate": {"checks": ["test -d src", "echo gate-ok"], "focus": "consistent naming", "criteria": "models and config compile together"}},
-            {"id": "p2", "name": "Features", "goal": "The main features, in parallel", "tasks": [
-                t("p2-api", "HTTP API", "worker-big", "src/api/**", "Implement the REST handlers for the domain models with validation."),
-                t("p2-auth", "Auth", "worker-big", "src/auth/**", "Implement token auth middleware with tests."),
-                t("p2-ui", "Web UI", "worker-small", "web/**", "Build the minimal web UI pages for the API.")],
-             "gate": {"checks": ["test -d src/api", "echo gate-ok"], "focus": "API ↔ auth integration", "criteria": "all features wired, tests green"}},
-            {"id": "p3", "name": "Integration", "goal": "Wire everything and document it", "tasks": [
-                t("p3-wire", "Wire-up", "worker-big", "src/app/**", "Wire API, auth and config into the app entrypoint."),
-                t("p3-docs", "Docs", "worker-small", "docs/**", "Write the README section and API docs.")],
-             "gate": {"checks": ["echo gate-ok"], "focus": "end-to-end flow", "criteria": "app starts, docs accurate"}}
-        ],
+        "phases": phases,
         "final_checks": ["echo final-ok"]
     }})
 }
@@ -639,13 +671,13 @@ async fn planner(e: &Em, text: &str) -> Outcome {
         step!(e.command("ls -R | head -30", "Cargo.toml\nREADME.md\nsrc\nsrc/lib.rs\nsrc/main.rs\ntests", 0).await);
         step!(e.command("cat README.md", "# demo\nA small demo project for Mantra.", 0).await);
         step!(e.think("**Designing phases**\n\nFoundations must land before features. The three features are independent → one parallel phase with disjoint scopes. Integration and docs last.").await);
-        let first = text.contains("[mantra:plan]");
-        let r = e.tool("mantra_submit_plan", mock_plan(first)).await;
+        let (first, swarm) = (text.contains("[mantra:plan]"), wants_swarm(text));
+        let r = e.tool("mantra_submit_plan", mock_plan(first, swarm)).await;
         if r.starts_with("REJECTED") {
             step!(e.think("**Fixing the plan**\n\nTwo parallel tasks claimed the same scope. Giving the config loader its own directory.").await);
-            let _ = e.tool("mantra_submit_plan", mock_plan(false)).await;
+            let _ = e.tool("mantra_submit_plan", mock_plan(false, swarm)).await;
         }
-        step!(e.say("Plan submitted: **3 phases**, 7 tasks.\n\n1. Foundations — models + config (parallel)\n2. Features — API, auth, web UI (parallel)\n3. Integration — wiring + docs").await);
+        step!(e.say(&mock_plan_said(swarm)).await);
         return Outcome::Done;
     }
     if text.contains("[mantra:reprompt]") {
@@ -811,7 +843,7 @@ async fn worker(e: &Em, text: &str) -> Outcome {
     } else if !text.contains("[from") {
         step!(e.think(&format!("**{title}**\n\nReading the surrounding code to match existing conventions.")).await);
         step!(e.command(&format!("rg -n \"struct|fn\" {dir} || true"), "src/lib.rs:3:pub fn greet(name: &str) -> String {", 0).await);
-        // Akasha (`--demo --pattern mantra-swarm`): the models worker, in a group, shares the one
+        // Akasha (`--demo` switches it on): the models worker, in a group, shares the one
         // fact the others will need — unless the notes it was briefed with already hold it. One
         // author, so the group's notes hold it once.
         if dir == "src/models" && e.offers("mantra_akasha_note") && !text.contains(AKASHA_NOTE) {

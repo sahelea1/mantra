@@ -175,14 +175,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, rows[5], app, &placeholder, theme::VIOLET, !app.canvas_focus);
     draw_suggestions(f, rows[5], app);
     let hints: Vec<(&str, &str)> = if app.canvas_focus {
-        vec![("←→", "select"), ("1-9", "jump"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("+/-", "effort"), ("p", "plan"), ("d", "diff"), ("s", "studio"), ("tab", "type")]
+        vec![("←→ 1-9", "select"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("p", "plan"), ("tab", "type")]
     } else {
         let mode: &'static str = match app.settings.approval_mode.as_str() {
             "never" => "approvals: never ask",
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("alt+←→", "select"), ("⏎ empty", "zoom"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
+        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
     };
     footer(f, rows[6], &hints);
 }
@@ -445,7 +445,7 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     l.push(Line::default());
     let chain: Vec<String> = p.flow.finale.iter().map(|s| format!("{} {}", p.role(&s.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default(), s.role)).collect();
     l.push(Line::from(Span::styled(format!("   flow  plan → phases (parallel workers → {} gate) → {}", p.flow.phase_gate, chain.join(" → ")), theme::dim())));
-    l.push(Line::from(Span::styled("   /pattern to switch · s or /studio to edit · /models for models & effort", theme::faint())));
+    l.push(Line::from(Span::styled("   /pattern to switch · /studio to edit · /models for models & providers", theme::faint())));
     if !app.unfinished_runs.is_empty() {
         let n = app.unfinished_runs.len();
         l.push(Line::default());
@@ -500,8 +500,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let dimmed = matches!(v, V::NotStarted | V::Queued);
     let gst = if dimmed { theme::faint() } else { theme::bold(theme::fg(base)) };
     let glyph = role.map(|r| theme::role_glyph(&r.glyph)).unwrap_or_else(|| "◇".into());
-    let title_end = cv.spans(x - 1, y, &[Span::raw(" "), Span::styled(format!("{glyph} "), gst), Span::styled(trunc(&t.id, (iw - 6).max(4) as usize), if dimmed { theme::dim() } else { theme::bold(theme::text()) }), Span::raw(" ")], iw);
-    let _ = title_end;
+    cv.spans(x - 1, y, &[Span::raw(" "), Span::styled(format!("{glyph} "), gst), Span::styled(trunc(&t.id, (iw - 6).max(4) as usize), if dimmed { theme::dim() } else { theme::bold(theme::text()) }), Span::raw(" ")], iw);
     let mark = match v {
         V::Running => anim::spinner().to_string(),
         V::Waiting => theme::g("⚑", "!").to_string(),
@@ -1046,17 +1045,15 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
             None => adhoc.push(wk),
         }
     }
-    if !adhoc.is_empty() {
-        if aw >= 20 {
-            ay += 1;
-            cv.put(ax, ay, "ad-hoc fixes", theme::dim());
-            ay += 1;
-            for wk in adhoc {
-                let a = wk.agent.and_then(|a| app.agents.get(&a));
-                let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 4 };
-                worker_card(cv, r, run, &wk.task, Some(wk), a, wk.agent.is_some() && wk.agent == sel, app);
-                ay += 5;
-            }
+    if !adhoc.is_empty() && aw >= 20 {
+        ay += 1;
+        cv.put(ax, ay, "ad-hoc fixes", theme::dim());
+        ay += 1;
+        for wk in adhoc {
+            let a = wk.agent.and_then(|a| app.agents.get(&a));
+            let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 4 };
+            worker_card(cv, r, run, &wk.task, Some(wk), a, wk.agent.is_some() && wk.agent == sel, app);
+            ay += 5;
         }
     }
 }

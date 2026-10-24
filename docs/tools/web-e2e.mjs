@@ -4,19 +4,28 @@
 // message → command approval → approve flow, starting a run from the Team screen, plan review,
 // approving the plan, phase-1 workers appearing, talking to a worker, its diff, the question
 // band, the pulse/runs/inbox/settings screens — and saves the screenshots the README/docs use.
+// Since 0.8 also the configuration the web shares with the TUI: settings, models and providers
+// (a provider from a key against the demo's mock API), patterns, MCP, and stopping a run.
 //
 // Two passes, run by web-e2e.sh against two separate `mantra --demo` processes (the question
 // band only appears when the backend was started with MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1 —
 // see mock.rs — so it needs its own run rather than a flag flipped mid-scenario):
 //   node web-e2e.mjs main   (default) — solo approval, start a run, workers, worker chat + diff,
-//                                        pulse/runs/settings; captures 4 of the 5 required shots.
+//                                        pulse/runs/settings; captures 4 of the 5 required shots;
+//                                        then settings, models, providers, patterns, MCP, and
+//                                        stop the run → start the next from the Run screen.
 //   node web-e2e.mjs ask               — same run shape, then waits for and answers the question
 //                                        band; captures the 5th (the inbox shot, while pending).
 //
 // Env vars:
 //   MANTRA_E2E_BASE        base URL of the running web server (default http://127.0.0.1:7788)
 //   MANTRA_E2E_PASS        the --web-password given to mantra (default "test")
-//   MANTRA_E2E_OUT         where to write docs/img/web-*.png (default ../img next to this file)
+//   MANTRA_E2E_OUT         where to write the web-*.png shots (default ../img next to this file,
+//                          the tracked docs/img — point it elsewhere for a check that should not
+//                          touch them); a failed step's screenshot goes here too
+//   MANTRA_BIN             a mantra binary to start for this run (`--demo --headless --web` on
+//                          MANTRA_E2E_BASE's address, a fresh MANTRA_HOME, the password above) and
+//                          stop afterwards; unset, a server is expected to be running already
 //   MANTRA_E2E_PW_MODULES  a node_modules dir to load playwright from when it isn't resolvable
 //                          the normal way (see loadPlaywright() below)
 //
@@ -25,6 +34,9 @@
 // script dying on the first assertion and hiding how much of the UI actually works.
 
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +44,28 @@ const BASE = process.env.MANTRA_E2E_BASE || 'http://127.0.0.1:7788';
 const PASSWORD = process.env.MANTRA_E2E_PASS || 'test';
 const OUT = process.env.MANTRA_E2E_OUT || path.join(HERE, '..', 'img');
 const MODE = (process.argv[2] || 'main').trim();
+const BIN = process.env.MANTRA_BIN || '';
+
+// MANTRA_BIN: start the server this run drives, the way web-e2e.sh does — a fresh home, the demo
+// at MOCK_SPEED 4, the question-band mock env for the `ask` pass — and say where its log is.
+async function startServer() {
+    // Something already answering there would be driven instead of the binary asked for.
+    if (await fetch(BASE + '/').then(() => true, () => false)) throw new Error(BASE + ' is taken already — stop what is listening there, or set MANTRA_E2E_BASE to a free address');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mantra-e2e-'));
+    const log = path.join(home, 'mantra.log');
+    const addr = new URL(BASE).host;
+    const env = Object.assign({}, process.env, { MANTRA_HOME: home, MANTRA_WEB_PASSWORD: PASSWORD, MANTRA_MOCK_SPEED: '4' }, MODE === 'ask' ? { MANTRA_MOCK_ASK: '1', MANTRA_MOCK_ASK_USER: '1' } : {});
+    const out = fs.openSync(log, 'w');
+    const child = spawn(BIN, ['--demo', '--headless', '--web', '--web-listen', addr], { env, stdio: ['ignore', out, out] });
+    // never left behind: not by a failed step, not by an exception
+    process.on('exit', () => child.kill());
+    for (let i = 0; i < 150; i++) {
+        if (child.exitCode !== null) throw new Error('mantra exited before the web server came up — ' + log);
+        try { await fetch(BASE + '/'); console.log('started ' + BIN + ' (MANTRA_HOME=' + home + ', log ' + log + ')'); return child; } catch (_) { await new Promise((r) => setTimeout(r, 200)); }
+    }
+    child.kill();
+    throw new Error('timed out waiting for ' + BASE + ' — ' + log);
+}
 
 // `playwright` is not a repo dependency (this is a scratchpad-committed test tool, not a crate);
 // resolve it the normal way first (a local `npm i playwright` anywhere from this file up to the
@@ -57,6 +91,8 @@ async function loadPlaywright() {
 
 async function main() {
     const { chromium, devices } = await loadPlaywright();
+    const server = BIN ? await startServer() : null;
+    fs.mkdirSync(OUT, { recursive: true });
     const b = await chromium.launch();
     let fails = 0;
     const errs = [];
@@ -83,7 +119,12 @@ async function main() {
     };
     const nav = async (p, route) => { await p.evaluate((r) => window.Mantra.act.nav(r), route); await p.waitForTimeout(400); };
     const shot = async (p, name) => { const f = path.join(OUT, name); await p.screenshot({ path: f }); shots.push(f); };
-    const failShot = (tag, name) => path.join(OUT, '..', '..', 'tmp-e2e-fail-' + tag + '-' + name.replace(/\W+/g, '-') + '.png');
+    const failShot = (tag, name) => path.join(OUT, 'tmp-e2e-fail-' + tag + '-' + name.replace(/\W+/g, '-') + '.png');
+    // A command as the page sends it: `{ok, d}` with the reply's data, or `{ok: false, e}`.
+    const req = (p, cmd, args, timeout) => p.evaluate(([c, a, t]) => window.Mantra.act.request(c, a, t).then((d) => ({ ok: true, d }), (e) => ({ ok: false, e: e.message })), [cmd, args || {}, timeout || 30000]);
+    const must = async (p, cmd, args, timeout) => { const r = await req(p, cmd, args, timeout); if (!r.ok) throw new Error(cmd + ': ' + r.e); return r.d; };
+    const refused = async (p, cmd, args, words) => { const r = await req(p, cmd, args); if (r.ok) throw new Error(cmd + ' was not refused'); if (!r.e.includes(words)) throw new Error(cmd + ': "' + r.e + '" does not say "' + words + '"'); return r.e; };
+    const field = (st, key) => st.fields.find((f) => f.key === key);
 
     async function step(tag, page, name, fn) {
         const t = Date.now();
@@ -106,9 +147,18 @@ async function main() {
     if (MODE === 'ask') {
         // Dedicated pass: the question band only appears when this mantra process was started
         // with MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1 (mock.rs) — the shell script starts a
-        // fresh backend with those set for this mode.
-        await step('ask', driver, 'start run → plan review', async () => {
+        // fresh backend with those set for this mode. That script is the Codex mock's, and the
+        // built-ins run on bija: the run goes on a copy of mantra-default whose roles are on the
+        // demo's Codex models (`sol-codex`, …), saved through the web like any pattern.
+        await step('ask', driver, 'a pattern on the Codex mock → start run → plan review', async () => {
+            const models = (await must(driver, 'models_get')).models.map((m) => m.alias);
+            const p = (await must(driver, 'pattern_get', { name: 'mantra-default' })).pattern;
+            for (const r of Object.values(p.roles)) if (models.includes(r.model + '-codex')) r.model = r.model + '-codex';
+            for (const r of Object.values(p.roles)) if (r.fallback && models.includes(r.fallback + '-codex')) r.fallback = r.fallback + '-codex';
+            await must(driver, 'pattern_save', { name: 'e2e-on-codex', pattern: p });
             await nav(driver, '/');
+            await driver.waitForSelector('.start-row option[value="e2e-on-codex"]', { state: 'attached', timeout: 15000 });
+            await driver.selectOption('.start-row select', 'e2e-on-codex');
             await driver.fill('textarea.goal', 'Add a REST API with auth and a small web UI');
             await driver.click('button:has-text("Start run")');
             await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
@@ -130,6 +180,15 @@ async function main() {
             await shot(phone, 'web-inbox-phone.png');
         });
         await step('ask', driver, 'answer the question band', async () => {
+            // The mock's p2-ui leaves its scope at about this moment, and the mock orchestrator
+            // answers one event a turn — an answer that reaches it inside another turn (as the
+            // result of the mantra_wait it is in) is not relayed. Answer once p2-ui is done and
+            // the orchestrator is between turns, so the answer starts a turn of its own.
+            await driver.waitForFunction(() => {
+                const s = window.Mantra.store.S;
+                const orch = [...s.agents.values()].find((a) => a.role_kind === 'orchestrator' && a.in_run);
+                return (s.run.workers || []).some((w) => w.task_id === 'p2-ui' && w.state === 'done') && orch && !orch.busy;
+            }, null, { timeout: 30000 });
             await driver.fill('.band.question input, .band.question textarea', 'cursor pagination, page size 50');
             await driver.click('.band.question button[type=submit]');
             await driver.waitForFunction(() => !window.Mantra.store.S.run.question, null, { timeout: 15000 });
@@ -216,9 +275,165 @@ async function main() {
             await phone.waitForTimeout(500);
             await shot(phone, 'web-settings-phone.png');
         });
+
+        // ── 0.8: the configuration the web shares with the TUI ──────────────────────────────────
+        await step('main', driver, 'settings: get → set → set back (and a refusal says why)', async () => {
+            const st = await must(driver, 'settings_get');
+            if (field(st, 'web.password').value === 'hunter2' || !['set', 'not set'].includes(field(st, 'web.password').value)) throw new Error('the web password reads ' + field(st, 'web.password').value);
+            const was = field(st, 'approval_mode').value;
+            const to = was === 'never' ? 'untrusted' : 'never';
+            // through the page: the Solo section, its Approvals select, the one saving indicator
+            await nav(driver, '/settings/solo');
+            await driver.selectOption('#fld-approval_mode', to);
+            await driver.waitForFunction((v) => { const c = window.Mantra.store.S.ui.cfg; return c && c.settings && c.settings.fields.find((f) => f.key === 'approval_mode').value === v; }, to, { timeout: 8000 });
+            if (field(await must(driver, 'settings_get'), 'approval_mode').value !== to) throw new Error('approval_mode did not change');
+            const back = await must(driver, 'settings_set', { key: 'approval_mode', value: was });
+            if (field(back.settings, 'approval_mode').value !== was) throw new Error('approval_mode did not go back');
+            await refused(driver, 'settings_set', { key: 'fps', value: '1000' }, 'from 4 to 60');
+            // a refusal typed into a field shows next to it
+            await nav(driver, '/settings/appearance');
+            await driver.fill('#fld-fps', '1000');
+            await driver.press('#fld-fps', 'Enter');
+            await driver.waitForSelector('.fld.has-err .fld-err:has-text("from 4 to 60")', { timeout: 5000 });
+            await driver.press('#fld-fps', 'Escape');
+        });
+
+        await step('main', driver, 'models: get → set a cell in the table → revert; keys come back masked', async () => {
+            const m = await must(driver, 'models_get');
+            const luna = m.models.find((x) => x.alias === 'luna');
+            if (!luna) throw new Error('no luna in models_get');
+            await nav(driver, '/settings/models');
+            const row = driver.locator('.mt.models [data-alias="luna"]');
+            await row.locator('button[aria-label^="More fields"]').click();
+            await row.locator('button[aria-label^="Note:"]').click();
+            await row.locator('input.cell-input').fill('set from the web e2e');
+            await row.locator('input.cell-input').press('Enter');
+            await driver.waitForFunction(() => { const c = window.Mantra.store.S.ui.cfg; return c.models.models.find((x) => x.alias === 'luna').note === 'set from the web e2e'; }, null, { timeout: 8000 });
+            const back = await must(driver, 'model_set', { alias: 'luna', field: 'note', value: luna.note });
+            if (back.registry.models.find((x) => x.alias === 'luna').note !== luna.note) throw new Error('the note did not go back');
+            await refused(driver, 'model_set', { alias: 'luna', field: 'context', value: 'lots' }, '200k');
+            // a pasted key never comes back
+            const set = await must(driver, 'provider_set', { id: 'bija', field: 'api_key', value: 'e2e-secret-key-1234' });
+            const shown = JSON.stringify(set.registry);
+            if (shown.includes('e2e-secret-key') || set.registry.providers.find((p) => p.id === 'bija').api_key !== '••••1234') throw new Error('the key is not masked: ' + shown.slice(0, 200));
+            await must(driver, 'provider_set', { id: 'bija', field: 'api_key', value: '' });
+        });
+
+        await step('main', driver, 'provider from a key against the demo’s mock API: probe, import one model, delete it', async () => {
+            const m = await must(driver, 'models_get');
+            const url = m.providers.find((p) => p.id === 'bija').base_url;
+            // The literal URL is the bija provider itself: the key goes into it, and every model
+            // the mock lists is configured already — nothing to import there.
+            const same = await must(driver, 'provider_from_key', { key: 'e2e-any-key-5678', base_url: url }, 60000);
+            if (same.provider !== 'bija' || same.probe_error || !same.candidates.length || same.candidates.some((c) => c.state !== 'configured')) throw new Error('the bija URL: ' + JSON.stringify(same).slice(0, 300));
+            if (JSON.stringify(same).includes('e2e-any-key')) throw new Error('the key came back');
+            await must(driver, 'provider_set', { id: 'bija', field: 'api_key', value: '' });
+            // The same server as localhost is a provider of its own ("local"), whose models are all
+            // new: the whole flow, through the Add-provider sheet.
+            const local = url.replace('127.0.0.1', 'localhost');
+            await nav(driver, '/settings/models');
+            await driver.click('button:has-text("Add provider")');
+            await driver.fill('#ap-key', 'e2e-unknown-prefix-key');
+            await driver.waitForSelector('#ap-url', { timeout: 5000 });
+            await driver.waitForSelector('.sheet .fld-hint:has-text("names no provider")', { timeout: 5000 });
+            await driver.fill('#ap-url', local);
+            await driver.click('.sheet button:has-text("Probe")');
+            await driver.waitForSelector('.sheet .check-row', { timeout: 60000 });
+            await driver.click('.sheet button:has-text("None")');
+            // the list is redrawn on the next frame: wait for it, or check() finds the box still ticked
+            await driver.waitForFunction(() => !document.querySelector('.sheet .check-row:not(.done) input:checked'), null, { timeout: 5000 });
+            const pick = await driver.locator('.sheet .check-row:not(.done) .mono').first().textContent();
+            await driver.locator('.sheet .check-row:not(.done) input').first().check();
+            await driver.click('.sheet button:has-text("Add 1 model")');
+            await driver.waitForFunction((model) => { const c = window.Mantra.store.S.ui.cfg; return !window.Mantra.store.S.ui.sheet && c.models.models.some((x) => x.provider === 'local' && x.model === model); }, pick, { timeout: 10000 });
+            const added = (await must(driver, 'models_get')).models.find((x) => x.provider === 'local' && x.model === pick);
+            if (!added) throw new Error('the imported model is not in models_get');
+            // delete it in the table (behind its confirm sheet), then the provider
+            await driver.locator('.mt.models [data-alias="' + added.alias + '"] button[aria-label^="Delete "]').click();
+            await driver.click('.sheet button:has-text("Delete")');
+            await driver.waitForFunction((a) => !window.Mantra.store.S.ui.cfg.models.models.some((x) => x.alias === a), added.alias, { timeout: 8000 });
+            const gone = await must(driver, 'provider_delete', { id: 'local' });
+            if (gone.registry.providers.some((p) => p.id === 'local')) throw new Error('the provider is still there');
+        });
+
+        await step('main', driver, 'patterns: get → save a copy → an invalid save lists its errors → delete', async () => {
+            const got = await must(driver, 'pattern_get', { name: 'mantra-default' });
+            if (got.tag !== 'default' || !got.pattern.roles['worker-swarm'] || got.pattern.roles['worker-swarm'].parallel !== 16) throw new Error('pattern_get: ' + JSON.stringify(got).slice(0, 200));
+            await nav(driver, '/patterns/mantra-default');
+            await driver.waitForSelector('#pe-desc', { timeout: 8000 });
+            await driver.fill('#pe-desc', 'my e2e take on the default');
+            await driver.click('button:has-text("Save as copy")');
+            await driver.fill('.sheet input[aria-label="Name of the copy"]', 'e2e-pattern');
+            await driver.click('.sheet button:has-text("Save copy")');
+            await driver.waitForFunction(() => location.pathname.endsWith('/patterns/e2e-pattern'), null, { timeout: 8000 });
+            await driver.waitForSelector('.pe-titles .tag.t-yours', { timeout: 8000 });
+            const list = await must(driver, 'patterns_list');
+            const mine = list.patterns.find((x) => x.name === 'e2e-pattern');
+            if (!mine || mine.tag !== 'yours' || mine.description !== 'my e2e take on the default') throw new Error('patterns_list: ' + JSON.stringify(mine));
+            // invalid: refused with every reason, in the editor too
+            const bad = JSON.parse(JSON.stringify((await must(driver, 'pattern_get', { name: 'e2e-pattern' })).pattern));
+            bad.roles.planner.kind = 'boss';
+            await refused(driver, 'pattern_save', { name: 'e2e-pattern', pattern: bad }, 'kind must be one of');
+            await driver.fill('input[aria-label="Workers at once of worker-swarm"]', '999');
+            await driver.locator('.pe-acts button:has-text("Save")').first().click();
+            await driver.waitForSelector('.pe-errors:has-text("parallel must be from 1 to 128")', { timeout: 8000 });
+            await driver.click('.pe-acts button:has-text("Delete")');
+            await driver.click('.sheet button:has-text("Delete")');
+            await driver.waitForFunction(() => location.pathname.endsWith('/settings/patterns'), null, { timeout: 8000 });
+            if ((await must(driver, 'patterns_list')).patterns.some((x) => x.name === 'e2e-pattern')) throw new Error('e2e-pattern is still listed');
+        });
+
+        await step('main', driver, 'MCP: the demo server answers its test', async () => {
+            const t = await must(driver, 'mcp_test', { name: 'demo' }, 60000);
+            if (!/tool/.test(t.report)) throw new Error('mcp_test: ' + t.report);
+            await refused(driver, 'mcp_test', { name: 'nope' }, 'no MCP server named nope');
+            await nav(driver, '/settings/mcp');
+            await driver.locator('[data-mcp="demo"] button:has-text("Test")').click();
+            await driver.waitForSelector('[data-mcp="demo"] .mcp-test.ok', { timeout: 60000 });
+        });
+
+        await step('main', driver, 'model test: a probe agent answers', async () => {
+            const t = await must(driver, 'model_test', { alias: 'luna' }, 150000);
+            if (!/^ok/.test(t.status)) throw new Error('model_test: ' + JSON.stringify(t));
+        });
+
+        await step('main', driver, 'run: start one from the Run screen → Stop (confirm) → start the next → delete', async () => {
+            // The demo's run is over by now (Land / Delete, and the start card under it); a run
+            // that is over hands its screen to the next one.
+            const startFromCard = async (goal, pattern, width) => {
+                const before = await driver.evaluate(() => (window.Mantra.store.S.run || {}).id || null);
+                await driver.waitForSelector('textarea.goal', { timeout: 10000 });
+                await driver.fill('textarea.goal', goal);
+                if (pattern) await driver.selectOption('.start-row select', pattern);
+                if (width) await driver.fill('.par-wrap input', String(width));
+                await driver.click('.start-row button:has-text("Start run")');
+                await driver.waitForFunction(([o, pt]) => { const r = window.Mantra.store.S.run; return r && r.id !== o && r.active && (!pt || r.pattern === pt); }, [before, pattern], { timeout: 20000 });
+                return driver.evaluate(() => window.Mantra.store.S.run.id);
+            };
+            await nav(driver, '/run');
+            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && !r.active; }, null, { timeout: 60000 });
+            await driver.waitForSelector('.run-hero button:has-text("Delete")', { timeout: 5000 });
+            const first = await startFromCard('Add a changelog page', 'mantra-lean', 2);
+            await nav(driver, '/run');
+            await driver.click('.run-hero button:has-text("Stop")');
+            await driver.click('.sheet button:has-text("Stop run")');
+            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && !r.active && r.stage.stopped; }, null, { timeout: 20000 });
+            await driver.waitForSelector('.run-stopped', { timeout: 5000 });
+            await refused(driver, 'run_stop', {}, 'no active run to stop');
+            // the start card is right there again
+            await startFromCard('Add a status page');
+            await must(driver, 'run_stop');
+            await driver.waitForSelector('.run-hero button:has-text("Delete")', { timeout: 10000 });
+            await driver.click('.run-hero button:has-text("Delete")');
+            await driver.click('.sheet button:has-text("Delete")');
+            await driver.waitForFunction(() => !window.Mantra.store.S.run, null, { timeout: 20000 });
+            const runs = await must(driver, 'runs_list');
+            if (!runs.runs.some((x) => x.id === first && x.stage === 'stopped')) throw new Error('the stopped run is not in the runs list: ' + JSON.stringify(runs.runs.map((x) => [x.id, x.stage])));
+        });
     }
 
     await b.close();
+    if (server) server.kill();
     console.log(shots.length ? 'SCREENSHOTS\n' + shots.join('\n') : 'no screenshots taken');
     console.log(errs.length ? 'PAGE ERRORS\n' + errs.join('\n') : 'no page errors');
     console.log(fails ? `${fails} FAILED [${MODE}]` : `ALL PASS [${MODE}]`);

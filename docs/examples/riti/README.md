@@ -10,6 +10,11 @@ the ones a real build of an Android app was run with), and two patterns that use
 - `riti-split.toml` — the previous heavy flow (separate security sweep, review every 3 minutes),
   kept as `riti-split`.
 
+These files were written for 0.6, when every gateway went through Codex (`kind = "codex"`, the
+Responses API); they still load, and run on Codex. On 0.8 you would paste the gateway's key in
+`/models` instead — Mantra adds it as a bija provider and lists its models — and point the
+pattern's roles at those aliases.
+
 The key is read from the `RITI_API_KEY` environment variable (`env_key`); nothing in these files
 is secret. Notes from the runs:
 

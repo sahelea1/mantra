@@ -675,10 +675,8 @@ impl Agent {
             "agentMessage" => {
                 let text = s("text");
                 let it = self.get_or_insert(&id, Kind::Agent);
-                if !text.is_empty() || done {
-                    if !text.is_empty() {
-                        it.text = text;
-                    }
+                if !text.is_empty() {
+                    it.text = text;
                 }
                 it.done = done;
                 it.touch();

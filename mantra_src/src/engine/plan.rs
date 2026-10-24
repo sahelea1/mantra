@@ -45,6 +45,11 @@ pub struct Gate {
     pub criteria: String,
 }
 
+/// The two halves of a rejection for a plan that arrived as text: what happened, and the one
+/// thing that fixes it for good.
+const AS_STRING: &str = "`plan` arrived as a string of JSON text, and that text is not valid JSON";
+const AS_OBJECT: &str = "Pass `plan` as a JSON object in the call's arguments, not as a string: nothing in it needs escaping then.";
+
 impl Plan {
     /// Parse leniently: accepts the plan object directly or wrapped as {"plan": {...}} or as a JSON
     /// string, and a nested list or object sent as its JSON text (`"phases": "[{…}]"`) — a model
@@ -55,8 +60,12 @@ impl Plan {
             Some(p) => p.clone(),
             None => v.clone(),
         };
+        // A model that stringifies the whole plan has to escape every quote inside it twice — the
+        // commands in gate `checks` break that at a few thousand characters, and a message that
+        // only quotes the parser's column sends the model back to fiddle with the string. Say what
+        // to do instead: the object itself, which needs no escaping at all.
         let mut v = match &v {
-            Value::String(s) => serde_json::from_str::<Value>(s).map_err(|e| format!("plan is not valid JSON: {e}"))?,
+            Value::String(s) => serde_json::from_str::<Value>(s).map_err(|e| format!("{AS_STRING} ({e}). {AS_OBJECT}"))?,
             _ => v,
         };
         unstring(&mut v, "phases", Value::is_array);
@@ -75,7 +84,7 @@ impl Plan {
                 }
             }
         }
-        serde_json::from_value::<Plan>(v).map_err(|e| format!("plan does not match the schema: {e}"))
+        serde_json::from_value::<Plan>(v).map_err(|e| format!("plan does not match the schema: {e}. {AS_OBJECT}"))
     }
 
     pub fn validate(&self, pattern: &Pattern) -> Result<(), Vec<String>> {
@@ -94,8 +103,12 @@ impl Plan {
             if ph.tasks.is_empty() {
                 errs.push(format!("{pname}: has no tasks"));
             }
-            if ph.tasks.len() > pattern.settings.max_tasks_per_phase {
-                errs.push(format!("{pname}: {} tasks exceeds max_tasks_per_phase = {}", ph.tasks.len(), pattern.settings.max_tasks_per_phase));
+            // A phase that uses a class of its own (worker-swarm) may be wider than the setting.
+            let limit = pattern.phase_task_limit(ph.tasks.iter().map(|t| t.role.as_str()));
+            if ph.tasks.len() > limit {
+                let cap = pattern.settings.max_tasks_per_phase;
+                let why = if limit == cap { format!("max_tasks_per_phase = {cap}") } else { format!("the {limit} a phase with its roles may hold (max_tasks_per_phase = {cap}, or twice a role's own parallel)") };
+                errs.push(format!("{pname}: {} tasks exceeds {why}", ph.tasks.len()));
             }
             for t in &ph.tasks {
                 if t.id.trim().is_empty() {
@@ -211,7 +224,7 @@ fn scopes_overlap(a: &str, b: &str) -> bool {
 fn unstring(obj: &mut Value, key: &str, wanted: fn(&Value) -> bool) {
     let Some(slot) = obj.get_mut(key) else { return };
     let Value::String(text) = &*slot else { return };
-    if let Some(parsed) = serde_json::from_str::<Value>(text).ok().filter(|p| wanted(p)) {
+    if let Some(parsed) = serde_json::from_str::<Value>(text).ok().filter(wanted) {
         *slot = parsed;
     }
 }
@@ -298,32 +311,62 @@ mod tests {
         bad2.phases[0].tasks[1].role = "qa".into();
         assert!(bad2.validate(&p).is_err());
     }
-    /// `--swarm N` / `--parallel N` must be reachable: phases run one after another, so the per
-    /// phase task cap is the ceiling on what runs at once, and the run's copy raises it to N. A
-    /// `--swarm 64` planner that cuts 64 tasks into a phase is accepted; a smaller N leaves the cap.
+    /// `n` tasks of `role` in one phase, disjoint scopes.
+    fn phase_of(n: usize, role: &str) -> Plan {
+        let tasks: Vec<Value> = (0..n).map(|i| json!({"id": format!("t{i}"), "role": role, "prompt": "do one small thing well", "scope": [format!("src/m{i}/**")]})).collect();
+        serde_json::from_value(json!({"title": "T", "phases": [{"name": "A", "tasks": tasks, "gate": {"checks": ["true"]}}]})).unwrap()
+    }
+
+    /// A phase of the shared pool's roles holds `max_tasks_per_phase` tasks; one that uses a class
+    /// of its own holds twice that class's cap when that is more — a 32-task swarm phase fits the
+    /// default pattern as it ships, a 33rd task does not, and mixing in a big task changes nothing.
+    #[test]
+    fn a_swarm_phase_may_hold_twice_its_class_cap() {
+        let p = Pattern::builtin();
+        assert!(phase_of(8, "worker-small").validate(&p).is_ok());
+        let errs = phase_of(9, "worker-small").validate(&p).unwrap_err();
+        assert_eq!(errs, vec!["A: 9 tasks exceeds max_tasks_per_phase = 8".to_string()]);
+        assert!(phase_of(32, "worker-swarm").validate(&p).is_ok(), "{:?}", phase_of(32, "worker-swarm").validate(&p));
+        let errs = phase_of(33, "worker-swarm").validate(&p).unwrap_err();
+        assert!(errs[0].contains("33 tasks exceeds the 32 a phase with its roles may hold") && errs[0].contains("max_tasks_per_phase = 8"), "{errs:?}");
+        let mut mixed = phase_of(31, "worker-swarm");
+        mixed.phases[0].tasks[0].role = "worker-big".into();
+        assert!(mixed.validate(&p).is_ok(), "{:?}", mixed.validate(&p));
+    }
+
+    /// `--parallel N` must be reachable: phases run one after another, so the per-phase task cap
+    /// is the ceiling on what runs at once, and the run's copy raises it to N for the shared pool
+    /// (and the swarm's own cap with it); a smaller N leaves the cap.
     #[test]
     fn a_runs_parallel_override_lets_a_phase_hold_that_many_tasks() {
-        let phase_of = |n: usize| -> Plan {
-            let tasks: Vec<Value> = (0..n).map(|i| json!({"id": format!("t{i}"), "role": "worker-small", "prompt": "do one small thing well", "scope": [format!("src/m{i}/**")]})).collect();
-            serde_json::from_value(json!({"title": "T", "phases": [{"name": "A", "tasks": tasks, "gate": {"checks": ["true"]}}]})).unwrap()
-        };
-        let mut swarm = Pattern::builtin_swarm();
-        assert!(phase_of(64).validate(&swarm).is_err(), "the pattern's own cap is 32");
-        swarm.set_parallel(64);
-        assert_eq!((swarm.settings.max_parallel, swarm.settings.max_tasks_per_phase), (64, 64));
-        assert!(phase_of(64).validate(&swarm).is_ok(), "{:?}", phase_of(64).validate(&swarm));
-        assert!(phase_of(65).validate(&swarm).unwrap_err()[0].contains("exceeds max_tasks_per_phase = 64"));
-        let mut few = Pattern::builtin_swarm();
+        let mut p = Pattern::builtin();
+        assert!(phase_of(64, "worker-small").validate(&p).is_err(), "the pattern's own cap is 8");
+        p.set_parallel(64);
+        assert_eq!((p.settings.max_parallel, p.settings.max_tasks_per_phase), (64, 64));
+        assert!(phase_of(64, "worker-small").validate(&p).is_ok(), "{:?}", phase_of(64, "worker-small").validate(&p));
+        assert!(phase_of(65, "worker-small").validate(&p).unwrap_err()[0].contains("exceeds max_tasks_per_phase = 64"));
+        assert!(phase_of(128, "worker-swarm").validate(&p).is_ok(), "twice the swarm's 64");
+        let mut few = Pattern::builtin();
         few.set_parallel(4);
-        assert_eq!((few.settings.max_parallel, few.settings.max_tasks_per_phase), (4, 32), "fewer at once, same plan");
-        let mut default = Pattern::builtin();
-        default.set_parallel(16);
-        assert_eq!((default.settings.max_parallel, default.settings.max_tasks_per_phase), (16, 16));
+        assert_eq!((few.settings.max_parallel, few.settings.max_tasks_per_phase), (4, 8), "fewer at once, same plan");
+        assert!(phase_of(9, "worker-swarm").validate(&few).is_err(), "4 at once: twice that is below the setting's 8");
     }
     #[test]
     fn lenient_parse() {
         let v = json!({"plan": serde_json::to_string(&sample()).unwrap()});
         assert!(Plan::from_value(&v).is_ok());
+    }
+    /// A planner that stringified its plan and double-escaped the quotes inside a gate command
+    /// (what a live run looped on for ten minutes) is told to send the object, not where the
+    /// string broke.
+    #[test]
+    fn a_broken_plan_string_is_told_to_send_the_object() {
+        let text = r#"{"title": "T", "phases": [{"gate": {"checks": ["python3 -c \\"import x\\""]}, "tasks": []}]}"#;
+        let err = Plan::from_value(&json!({"plan": text})).expect_err("the inner quote ends the string early");
+        assert!(err.starts_with("`plan` arrived as a string of JSON text"), "{err}");
+        assert!(err.contains("Pass `plan` as a JSON object"), "{err}");
+        let err = Plan::from_value(&json!({"plan": {"title": "T", "phases": "not json"}})).expect_err("prose");
+        assert!(err.contains("does not match the schema") && err.contains("Pass `plan` as a JSON object"), "{err}");
     }
     #[test]
     fn nested_lists_sent_as_json_text_are_read() {

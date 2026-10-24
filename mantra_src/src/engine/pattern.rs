@@ -37,6 +37,12 @@ pub struct Role {
     /// enabled one). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
+    /// How many agents of this (worker) role may run at once — a class of its own, counted apart
+    /// from the rest. A role without it shares `settings.max_parallel` with the other roles
+    /// without one. `worker-swarm` is the built-in user: many tiny tasks, 16 at a time, without
+    /// crowding the big and small workers out of their slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<usize>,
 }
 
 impl Default for Role {
@@ -54,6 +60,7 @@ impl Default for Role {
             instructions: String::new(),
             max_tokens: None,
             fallback: None,
+            parallel: None,
         }
     }
 }
@@ -62,15 +69,16 @@ impl Default for Role {
 pub const EFFORT_AUTO: &str = "auto";
 
 /// What `effort = "auto"` resolves to for one spawn. Planning, supervising and gating are
-/// `medium`; a worker is `low` when its role says it is small (`worker-small`) and `medium`
-/// otherwise; a finale step is `high`, whatever its kind. A role that names a concrete effort never
-/// comes through here.
+/// `medium`; a worker is `low` when its role says it is small or one of a swarm (`worker-small`,
+/// `worker-swarm`) and `medium` otherwise; a finale step is `high`, whatever its kind. A role
+/// that names a concrete effort never comes through here.
 pub fn auto_effort(kind: &str, role_name: &str, finale: bool) -> &'static str {
     if finale {
         return "high";
     }
+    let name = role_name.to_lowercase();
     match kind {
-        "worker" if role_name.to_lowercase().contains("small") => "low",
+        "worker" if name.contains("small") || name.contains("swarm") => "low",
         _ => "medium",
     }
 }
@@ -85,22 +93,13 @@ pub const PUSH_MODES: &[&str] = &["none", "urgent", "all"];
 pub const SHARED_CHARS_MIN: usize = 1_024;
 pub const SHARED_CHARS_MAX: usize = 262_144;
 
-/// What `{max_parallel}` in a role's instructions becomes when the agent is briefed: the run's own
-/// number, so a swarm started with `--swarm 24` is told 24 and not the pattern file's 8.
-pub const MAX_PARALLEL_PLACEHOLDER: &str = "{max_parallel}";
-
-/// `instructions` with `{max_parallel}` replaced by `n` (text without the placeholder is returned as is).
-pub fn with_max_parallel(instructions: &str, n: usize) -> String {
-    instructions.replace(MAX_PARALLEL_PLACEHOLDER, &n.to_string())
-}
-
-/// The numbers `--parallel N`, `--swarm N` and `/swarm N` accept. bija is light, so the ceiling is
+/// The numbers `--parallel N` and a role's `parallel` accept. bija is light, so the ceiling is
 /// generous; past `PARALLEL_NOTE_ABOVE` the provider's rate limits are what binds, and the run says so.
 pub const PARALLEL_RANGE: std::ops::RangeInclusive<usize> = 1..=128;
 pub const PARALLEL_NOTE_ABOVE: usize = 32;
 
-/// Parses a parallelism count for a run (`--parallel N` and friends), refusing anything outside
-/// `PARALLEL_RANGE` with a sentence that says what fits.
+/// Parses a parallelism count (`--parallel N`, a role's `parallel` typed in the Studio), refusing
+/// anything outside `PARALLEL_RANGE` with a sentence that says what fits.
 pub fn parse_parallel(s: &str) -> std::result::Result<usize, String> {
     let bad = || format!("'{s}' is not a number of workers from {} to {}", PARALLEL_RANGE.start(), PARALLEL_RANGE.end());
     let n: usize = s.trim().parse().map_err(|_| bad())?;
@@ -182,19 +181,13 @@ impl Default for PatternSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct FinaleStep {
     pub role: String,
     pub task: String,
     /// Allow this step to spawn ad-hoc workers.
     pub may_spawn: bool,
-}
-
-impl Default for FinaleStep {
-    fn default() -> Self {
-        FinaleStep { role: String::new(), task: String::new(), may_spawn: false }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -219,7 +212,7 @@ impl Default for Flow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Pattern {
     pub name: String,
@@ -259,12 +252,6 @@ impl Default for Group {
     }
 }
 
-impl Default for Pattern {
-    fn default() -> Self {
-        Pattern { name: String::new(), description: String::new(), settings: PatternSettings::default(), roles: BTreeMap::new(), flow: Flow::default(), source_dir: None, groups: vec![] }
-    }
-}
-
 impl Pattern {
     /// The balanced built-in: plan → phases, each closed by a fresh read-only QA gate with
     /// automatic fix workers → one QA pass over the run's diff → planner verification.
@@ -283,15 +270,9 @@ impl Pattern {
         builtin_thorough()
     }
 
-    /// Many small parallel workers on bija: the bija default with a wider fan-out, a planner
-    /// told to cut the work fine and an orchestrator told to keep every slot busy.
-    pub fn builtin_swarm() -> Pattern {
-        builtin_swarm()
-    }
-
     /// The names of the patterns that ship inside the binary (`load` finds them without a file).
     pub fn names() -> Vec<&'static str> {
-        vec![NAME_DEFAULT, NAME_LEAN, NAME_THOROUGH, NAME_CLAUDE, NAME_BIJA, NAME_SWARM]
+        vec![NAME_DEFAULT, NAME_LEAN, NAME_THOROUGH]
     }
 
     /// A built-in pattern by name (slug-insensitive), if `name` is one of `names()`.
@@ -300,48 +281,8 @@ impl Pattern {
             NAME_DEFAULT => Some(Pattern::builtin()),
             NAME_LEAN => Some(Pattern::builtin_lean()),
             NAME_THOROUGH => Some(Pattern::builtin_thorough()),
-            NAME_CLAUDE => Some(Pattern::builtin_claude()),
-            NAME_BIJA => Some(Pattern::builtin_bija()),
-            NAME_SWARM => Some(Pattern::builtin_swarm()),
             _ => None,
         }
-    }
-
-    /// The default pattern with every role on bija, Mantra's own harness: each alias `x` becomes
-    /// its twin `x-api` (the same model through an API key — `config::bija_alias`), fallbacks
-    /// included. Built from `builtin()` like `builtin_claude`, so the two cannot drift apart on
-    /// anything but the models; it needs no Codex install at all, and in `--demo` the `*-api`
-    /// aliases reach the mock server through the real `bija` binary.
-    pub fn builtin_bija() -> Pattern {
-        let mut p = Pattern::builtin();
-        p.name = NAME_BIJA.into();
-        p.description = format!("{} — every role on bija, the built-in harness", p.description);
-        for role in p.roles.values_mut() {
-            role.model = crate::config::bija_alias(&role.model);
-            if let Some(f) = role.fallback.as_mut().filter(|f| !f.trim().is_empty()) {
-                *f = crate::config::bija_alias(f);
-            }
-        }
-        p
-    }
-
-    /// The default pattern with planner/manager/orchestrator moved to a Claude Code model (`fable51`) and
-    /// workers to another (`sonnet5`) — gate roles are left on their Codex models, so this exercises
-    /// a genuinely mixed-backend run (`v02plan.md` §10.6). Built by editing `builtin()` in memory
-    /// rather than a second definition, so the two patterns can never silently drift apart on
-    /// anything but the models.
-    pub fn builtin_claude() -> Pattern {
-        let mut p = Pattern::builtin();
-        p.name = NAME_CLAUDE.into();
-        p.description = format!("{} — planner/orchestrator on Claude Code (fable51), workers on Claude Code (sonnet5)", p.description);
-        for role in p.roles.values_mut() {
-            match role.kind.as_str() {
-                "planner" | "manager" | "orchestrator" => role.model = "fable51".into(),
-                "worker" => role.model = "sonnet5".into(),
-                _ => {}
-            }
-        }
-        p
     }
 
     pub fn from_toml(s: &str) -> Result<Pattern> {
@@ -358,14 +299,49 @@ impl Pattern {
         self.roles.get(name)
     }
 
-    /// `--parallel N` / `--swarm N` / `/swarm N` on the run's own copy: up to `n` workers at once.
-    /// Phases run one after another and a plan may give a phase no more than `max_tasks_per_phase`
-    /// tasks, so that cap rises with `n` too — or N past it could never be reached (a `--swarm 64`
-    /// planner that cut 64 tasks would be refused). A smaller `n` leaves the cap alone: a phase of
-    /// 32 tasks four at a time is still a fine plan.
+    /// `--parallel N` on the run's own copy: one number the user chose, for every class — the
+    /// shared pool (`max_parallel`) and each role with a cap of its own (`parallel`). Phases run
+    /// one after another and a plan may give a phase no more than `max_tasks_per_phase` tasks
+    /// (`phase_task_limit`), so that cap rises with `n` too — or N past it could never be reached
+    /// by the shared pool. A smaller `n` leaves the cap alone: a phase of 32 tasks four at a time
+    /// is still a fine plan.
     pub fn set_parallel(&mut self, n: usize) {
         self.settings.max_parallel = n;
         self.settings.max_tasks_per_phase = self.settings.max_tasks_per_phase.max(n);
+        for role in self.roles.values_mut().filter(|r| r.parallel.is_some()) {
+            role.parallel = Some(n);
+        }
+    }
+
+    /// How many agents of `role` may run at once: the role's own `parallel`, or — a role without
+    /// one, or a name this pattern does not have — the shared `settings.max_parallel`.
+    pub fn cap_of(&self, role: &str) -> usize {
+        self.roles.get(role).and_then(|r| r.parallel).unwrap_or(self.settings.max_parallel)
+    }
+
+    /// Whether `role` is a class of its own (`parallel` set) rather than one of the shared pool.
+    pub fn has_own_cap(&self, role: &str) -> bool {
+        self.roles.get(role).map(|r| r.parallel.is_some()).unwrap_or(false)
+    }
+
+    /// The most tasks a phase that uses `roles` may hold: `settings.max_tasks_per_phase`, or twice
+    /// the largest own cap among them when that is more — a swarm phase is meant to be wider than
+    /// the shared pool, and a 32-task phase of 16-at-once workers is two waves, not a bad plan.
+    pub fn phase_task_limit<'a>(&self, roles: impl IntoIterator<Item = &'a str>) -> usize {
+        let widest = roles.into_iter().filter_map(|r| self.roles.get(r).and_then(|r| r.parallel)).max().unwrap_or(0);
+        self.settings.max_tasks_per_phase.max(widest.saturating_mul(2))
+    }
+
+    /// One line on how many run at once: the shared pool, then each worker class of its own
+    /// (`4 at once · worker-swarm 16`) — what a briefing or a journal line says about the width.
+    pub fn parallel_summary(&self) -> String {
+        let mut s = format!("{} at once", self.settings.max_parallel);
+        for (n, r) in self.roles.iter().filter(|(_, r)| r.kind == "worker") {
+            if let Some(cap) = r.parallel {
+                s.push_str(&format!(" · {n} {cap}"));
+            }
+        }
+        s
     }
 
     /// The manager role's name, when the flow names one that exists (`""` in `flow.manager`
@@ -407,6 +383,12 @@ impl Pattern {
             }
             if !PERMISSIONS.contains(&r.permission.as_str()) {
                 errs.push(format!("role '{n}': permission must be one of {} (got '{}')", PERMISSIONS.join(", "), r.permission));
+            }
+            match r.parallel {
+                Some(p) if !PARALLEL_RANGE.contains(&p) => errs.push(format!("role '{n}': parallel must be from {} to {} (got {p})", PARALLEL_RANGE.start(), PARALLEL_RANGE.end())),
+                // only workers are spawned many at a time; on any other kind the number would be read by nothing
+                Some(_) if r.kind != "worker" => errs.push(format!("role '{n}': parallel is for worker roles (this one is a {})", r.kind)),
+                _ => {}
             }
         }
         let need = |role: &str, kind: &str, what: &str, errs: &mut Vec<String>| match self.roles.get(role) {
@@ -486,6 +468,7 @@ impl Pattern {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only tests ask since the fresh-install variants went
     pub fn path_for(name: &str) -> PathBuf {
         crate::config::patterns_dir().join(format!("{}.toml", crate::util::slug(name)))
     }
@@ -497,10 +480,23 @@ impl Pattern {
         Ok(p)
     }
 
-    /// Load by name: `<project>/.mantra/patterns/` if a repo ships one (Mantra never creates it), then `~/.mantra/patterns/`, then built-in.
+    /// Where pattern files are looked up, in order: `<project>/.mantra/patterns/` if a repo ships
+    /// one (Mantra never creates it), then `~/.mantra/patterns/`.
+    fn dirs(project: &Path) -> [PathBuf; 2] {
+        [project.join(".mantra").join("patterns"), crate::config::patterns_dir()]
+    }
+
+    /// The file `load` reads for `name`, if there is one.
+    fn file_of(name: &str, project: &Path) -> Option<PathBuf> {
+        let file = format!("{}.toml", crate::util::slug(name));
+        Pattern::dirs(project).into_iter().map(|d| d.join(&file)).find(|p| p.is_file())
+    }
+
+    /// Load by name: a file (`dirs`), then a built-in, then — for a built-in 0.8 retired
+    /// (`RETIRED`) — `mantra-default`, with one line in the log.
     pub fn load(name: &str, project: &Path) -> Result<Pattern> {
         let file = format!("{}.toml", crate::util::slug(name));
-        for dir in [project.join(".mantra").join("patterns"), crate::config::patterns_dir()] {
+        for dir in Pattern::dirs(project) {
             let p = dir.join(&file);
             if let Ok(s) = std::fs::read_to_string(&p) {
                 let mut pat = Pattern::from_toml(&s).map_err(|e| anyhow!("{}: {e}", p.display()))?;
@@ -511,12 +507,16 @@ impl Pattern {
         if let Some(p) = Pattern::builtin_named(name) {
             return Ok(p);
         }
+        if is_retired(name) {
+            log_retired_once(name);
+            return Ok(Pattern::builtin());
+        }
         Err(anyhow!("pattern '{name}' not found"))
     }
 
     pub fn list(project: &Path) -> Vec<String> {
         let mut v: Vec<String> = Pattern::names().into_iter().map(String::from).collect();
-        for dir in [project.join(".mantra").join("patterns"), crate::config::patterns_dir()] {
+        for dir in Pattern::dirs(project) {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
                     let p = e.path();
@@ -534,18 +534,158 @@ impl Pattern {
     }
 }
 
+/// The patterns list API the web's patterns page and the TUI's run picker are built on: a pattern
+/// as a list shows it, a copy under a new name, a file deleted — each with the reasons it refuses.
+impl Pattern {
+    /// Where this pattern comes from, as a list shows it: "default" (the built-in
+    /// `mantra-default`), "built-in", "edited" (a file shadows a built-in) or "yours".
+    pub fn tag(&self) -> &'static str {
+        match (Pattern::builtin_named(&self.name).is_some(), self.source_dir.is_some()) {
+            (true, false) if self.name == NAME_DEFAULT => "default",
+            (true, false) => "built-in",
+            (true, true) => "edited",
+            (false, _) => "yours",
+        }
+    }
+
+    /// What a list of patterns shows of this one (the web's patterns page and run picker): enough
+    /// to choose by — the roles with their model and width — without the instructions.
+    pub fn summary(&self) -> PatternSummary {
+        let roles = self
+            .ordered_roles()
+            .into_iter()
+            .map(|(name, r)| RoleSummary { name, kind: r.kind, glyph: r.glyph, model: r.model, effort: r.effort, parallel: r.parallel })
+            .collect();
+        PatternSummary { name: self.name.clone(), description: self.description.clone(), tag: self.tag(), max_parallel: self.settings.max_parallel, roles, error: None }
+    }
+
+    /// `summary()` of every pattern `list` names, in its order; one whose file does not load
+    /// still shows — it may be mid-edit — with the reason in `error` and nothing else.
+    pub fn summaries(project: &Path) -> Vec<PatternSummary> {
+        Pattern::list(project)
+            .into_iter()
+            .map(|name| match Pattern::load(&name, project) {
+                Ok(p) => p.summary(),
+                Err(e) => {
+                    // the reason, without the file's path in front of it (the row already names it)
+                    let e = e.to_string();
+                    let why = e.split_once(".toml: ").map(|(_, why)| why).unwrap_or(&e).lines().next().unwrap_or_default().to_string();
+                    let tag = if Pattern::builtin_named(&name).is_some() { "edited" } else { "yours" };
+                    PatternSummary { name, description: String::new(), tag, max_parallel: 0, roles: vec![], error: Some(why) }
+                }
+            })
+            .collect()
+    }
+
+    /// A copy of this pattern under `name` (slugged), validated and written beside the original —
+    /// a project's own pattern stays in the project, anything else goes to `~/.mantra/patterns/`.
+    /// Refused, with every reason: a name that is empty, a built-in's, or another pattern's file
+    /// already; and whatever `validate` finds. Returns the copy as `load` will read it, and its path.
+    pub fn save_as(&self, name: &str, project: &Path) -> std::result::Result<(Pattern, PathBuf), Vec<String>> {
+        let slug = crate::util::slug(name);
+        if slug.is_empty() {
+            return Err(vec!["a pattern needs a name".into()]);
+        }
+        if slug != crate::util::slug(&self.name) {
+            if Pattern::builtin_named(&slug).is_some() {
+                return Err(vec![format!("'{slug}' is a built-in pattern — pick another name")]);
+            }
+            if let Some(p) = Pattern::file_of(&slug, project) {
+                return Err(vec![format!("a pattern named '{slug}' exists already ({}) — pick another name or delete it first", p.display())]);
+            }
+        }
+        let copy = Pattern { name: slug, source_dir: Some(self.source_dir.clone().unwrap_or_else(crate::config::patterns_dir)), ..self.clone() };
+        copy.validate()?;
+        let path = copy.save().map_err(|e| vec![format!("could not save {}: {e}", copy.name)])?;
+        Ok((copy, path))
+    }
+
+    /// Delete the file `load` reads for `name` (an edited built-in is then the built-in again).
+    /// Refused for a built-in without a file, a name nothing answers to, and a file that ships
+    /// with the project — Mantra does not delete files in your repository.
+    pub fn delete_file(name: &str, project: &Path) -> std::result::Result<PathBuf, String> {
+        let Some(path) = Pattern::file_of(name, project) else {
+            return Err(if Pattern::builtin_named(name).is_some() { format!("'{name}' is built in — there is no file to delete") } else { format!("no pattern '{name}'") });
+        };
+        let [shipped, _] = Pattern::dirs(project);
+        if path.starts_with(shipped) {
+            return Err(format!("'{name}' comes with this project ({}) — Mantra does not delete files in your repository", path.display()));
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("could not delete {}: {e}", path.display()))?;
+        Ok(path)
+    }
+}
+
+/// One pattern as a list shows it (`Pattern::summary`): serialized as is for the web.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PatternSummary {
+    pub name: String,
+    pub description: String,
+    /// "default" | "built-in" | "edited" | "yours" (`Pattern::tag`).
+    pub tag: &'static str,
+    /// The width of the shared pool: the worker roles without a `parallel` of their own.
+    pub max_parallel: usize,
+    /// In display order (`ordered_roles`).
+    pub roles: Vec<RoleSummary>,
+    /// Why the pattern's file does not load; everything but the name and tag is empty then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One role of a `PatternSummary`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RoleSummary {
+    pub name: String,
+    pub kind: String,
+    pub glyph: String,
+    pub model: String,
+    pub effort: String,
+    /// The role's own cap (`Role::parallel`); `None` = it shares `max_parallel`.
+    pub parallel: Option<usize>,
+}
+
 // ───────────────────────────── built-in patterns ─────────────────────────────
 //
-// Three patterns ship in the binary; `mantra-default-claude` and `mantra-default-bija` are
-// `mantra-default` with models moved, and `mantra-swarm` is the bija one cut for a wide fan-out.
-// The roles they share (planner, manager, orchestrator, workers, the phase QA) are defined once.
+// Three patterns ship in the binary. The roles they share (planner, manager, orchestrator, the
+// three worker classes, the phase QA) are defined once.
 
 pub const NAME_DEFAULT: &str = "mantra-default";
 pub const NAME_LEAN: &str = "mantra-lean";
 pub const NAME_THOROUGH: &str = "mantra-thorough";
-pub const NAME_CLAUDE: &str = "mantra-default-claude";
-pub const NAME_BIJA: &str = "mantra-default-bija";
-pub const NAME_SWARM: &str = "mantra-swarm";
+
+/// Built-ins 0.8 retired. The swarm became a worker class of every pattern (`worker-swarm`), and
+/// with the built-ins on bija themselves the bija and Claude Code copies of the default had
+/// nothing left to differ in. A name of one in settings.toml, a run's state or `--pattern` reads
+/// as `mantra-default`; a file of that name is somebody's own pattern and loads as such.
+pub const RETIRED: &[&str] = &["mantra-swarm", "mantra-default-bija", "mantra-default-claude"];
+
+/// Whether `name` (slug-insensitive) is one of the `RETIRED` built-ins.
+pub fn is_retired(name: &str) -> bool {
+    RETIRED.contains(&crate::util::slug(name).as_str())
+}
+
+/// The name a pattern called `name` goes by now: `mantra-default` for a retired built-in that no
+/// file answers to, else `name` itself — what a session shows and saves as its pattern for new
+/// runs, so a settings.toml from 0.7 stops naming one that is gone.
+pub fn current_name(name: &str, project: &Path) -> String {
+    if is_retired(name) && Pattern::file_of(name, project).is_none() {
+        NAME_DEFAULT.into()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The one log line a retired name gets, once per name and process — `load` runs on every web
+/// snapshot, and a session started with `--pattern mantra-swarm` keeps asking for it.
+fn log_retired_once(name: &str) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let slug = crate::util::slug(name);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&slug) {
+        crate::mlog!("pattern '{slug}' was retired in 0.8 — loading {NAME_DEFAULT} (every built-in has the worker-swarm class now)");
+        seen.push(slug);
+    }
+}
 
 /// The budget rule every built-in role ends with.
 const BUDGET: &str = "Do not re-read files you already read. Do not run the full test suite more than once per turn unless it failed.";
@@ -554,6 +694,7 @@ const PLANNER_INSTRUCTIONS: &str = "You are the Planner of a multi-agent softwar
 Look at the existing code only as far as the plan needs (an empty project needs no exploration).
 Split the work into sequential PHASES. Tasks inside a phase run in parallel on isolated copies of the repo, so they must not depend on each other and must own disjoint files: declare each task's `scope` as path globs. Anything sequential goes into a later phase.
 Size the plan to the goal: a small goal is one or two phases and a few tasks, submitted in your first turn. Small, well-bounded changes go to worker-small, broad or tricky work to worker-big.
+Use worker-swarm only when a phase is many (6+) small, independent, same-shaped tasks (per-file migrations, a test per module, repetitive edits); then cut one task per unit of work. Everything else goes to worker-small or worker-big.
 Every phase ends with a gate: shell `checks` that run as-is on this machine (build, tests, lint; prefer what already exists) and a line on what QA should focus on. Keep the tooling later gates need (virtualenvs, node_modules, build caches) until the last phase; cleanup belongs there.
 Write each worker prompt so it stands alone (workers see only their own prompt): the goal, the files, the interfaces to match, how to verify. Add `orchestrator_brief`: what to watch in this project, in a few lines.
 Stop as soon as the plan is submitted.";
@@ -576,6 +717,10 @@ const WORKER_BIG_INSTRUCTIONS: &str = "You are a senior implementation worker. B
 Read only what the task needs. Before finishing, run the build and the tests that cover your scope, once; fix what you broke and stop. Do not run the whole project's suite unless your scope is the whole project.
 Report what changed and how you verified it.";
 
+const WORKER_SWARM_INSTRUCTIONS: &str = "You are one worker of a swarm: many agents at once, each on one small, self-contained, mechanical task. Your prompt is all you need: do exactly that task with the smallest change that does it.
+Do not explore outside your scope, refactor, or touch anything the task does not name. Verify with the build, tests or lint of the files you touched, once; never the whole suite.
+Report in two lines: what changed, how you verified it.";
+
 const QA_INSTRUCTIONS: &str = "You are the QA agent of a phase gate. You verify and report; you never fix. Your role is read-only: do not edit, create or delete files.
 Your prompt has the gate check results, the phase's diff and the previous round's report. Start from the diff and read a file in full only when the diff cannot answer a question. Look for what the checks cannot see: parallel changes that do not fit together (naming, interfaces, duplicated logic, missing wiring), new behaviour without tests, anything that misses the phase goal. Do not re-run checks Mantra already ran green.
 Report once with mantra_gate_report. pass=true only when the goal is met and the checks are green. On fail list every finding as: file path, what is wrong, what to change, precise enough that a worker needs nothing else; set big=true only when the fixes span several files or need design work. Mantra sends your findings to a fix worker and starts a fresh QA round: you do not continue, so put everything in the report.";
@@ -591,10 +736,6 @@ Skip nits. Finish with mantra_gate_report.";
 const SECURITY_INSTRUCTIONS: &str = "You are the security agent. Review the run's diff and the gate reports in your prompt, not the whole repo, for vulnerabilities: injection, authn/authz gaps, secrets in code or logs, unsafe deserialization, path traversal, missing input validation, risky new dependencies.
 Fix each real issue with the smallest change that keeps behaviour intact, and add a test for it. Skip style points and hypotheticals you cannot tie to a concrete path in the diff. Run the affected tests once at the end, then report with mantra_gate_report.";
 
-const SWARM_PLANNER: &str = "You plan for a swarm of up to {max_parallel} workers running at the same time. Split the work into many small, independent, self-contained tasks with disjoint scopes — more small tasks beat fewer large ones; every task must be doable by one worker alone in a few minutes, from its prompt only.";
-
-const SWARM_ORCHESTRATOR: &str = "Keep the swarm full: spawn tasks as soon as their scope is free, up to {max_parallel} at once.";
-
 const PLANNER_FINALE_TASK: &str = "Verify the original requirements against the run's diff and the gate and finale reports in this prompt. Read a file only to settle a doubt; run the plan's final checks once. If a requirement is really missing or broken, spawn a fix worker with mantra_spawn_adhoc (a precise prompt, a scope), mantra_wait, and re-verify only that. Spawn nothing for nits. Report with mantra_gate_report.";
 
 const PLANNER_FINALE_TASK_THOROUGH: &str = "Check the full plan and the original requirements against the actual code, using the run's diff and the gate and finale reports in this prompt as the starting point. Verify behaviour: run it, and do visual checks if the project has a UI. If something is missing or wrong, spawn fix workers with mantra_spawn_adhoc, then verify that again. Report with mantra_gate_report.";
@@ -604,12 +745,6 @@ const SECURITY_FINALE_TASK: &str = "Do a security sweep of everything built in t
 
 fn with_budget(instructions: &str) -> String {
     format!("{instructions}\n{BUDGET}")
-}
-
-/// `paragraph` added to a built-in role's instructions, the budget rule kept last.
-fn with_paragraph(instructions: &str, paragraph: &str) -> String {
-    let base = instructions.strip_suffix(&format!("\n{BUDGET}")).unwrap_or(instructions);
-    with_budget(&format!("{base}\n{paragraph}"))
 }
 
 fn planner_role() -> Role {
@@ -680,6 +815,23 @@ fn worker_big_role() -> Role {
     }
 }
 
+/// The swarm class: many tiny, independent tasks at once, counted apart from the big and small
+/// workers (`parallel`), so a 20-task phase of per-file edits neither waits four at a time nor
+/// takes the slots a hard task needs. The planner is told to use it only where it fits.
+fn worker_swarm_role() -> Role {
+    Role {
+        kind: "worker".into(),
+        glyph: "∴".into(),
+        color: "amber".into(),
+        model: "luna".into(),
+        effort: EFFORT_AUTO.into(),
+        description: "Many tiny, independent tasks at once".into(),
+        instructions: with_budget(WORKER_SWARM_INSTRUCTIONS),
+        parallel: Some(16),
+        ..Role::default()
+    }
+}
+
 /// The phase gate: read-only, a fresh agent every round. It verifies and reports; fixes go to workers.
 fn qa_role() -> Role {
     Role {
@@ -698,12 +850,15 @@ fn qa_role() -> Role {
 /// A pattern with the roles every built-in shares and no manager, no finale yet.
 fn base_pattern(name: &str, description: &str) -> Pattern {
     let mut p = Pattern { name: name.into(), description: description.into(), ..Pattern::default() };
-    for (n, r) in [("planner", planner_role()), ("orchestrator", orchestrator_role()), ("worker-small", worker_small_role()), ("worker-big", worker_big_role()), ("qa", qa_role())] {
+    for (n, r) in [("planner", planner_role()), ("orchestrator", orchestrator_role()), ("worker-small", worker_small_role()), ("worker-big", worker_big_role()), ("worker-swarm", worker_swarm_role()), ("qa", qa_role())] {
         p.roles.insert(n.into(), r);
     }
     p.flow = Flow { planner: "planner".into(), manager: String::new(), orchestrator: "orchestrator".into(), phase_gate: "qa".into(), on_reprompt: "planner".into(), finale: vec![] };
     // 200k is plenty for any one task; a bigger window only lets an agent cycle tools for hours.
     p.settings.context_cap = 200_000;
+    // The workers share one Akasha block — inert until akasha is switched on, and then it works
+    // out of the box.
+    p.groups = vec![Group { name: "builders".into(), roles: p.worker_roles(), ..Group::default() }];
     p
 }
 
@@ -775,34 +930,13 @@ fn builtin_thorough() -> Pattern {
         },
     );
     // The heavy flow spends tokens on purpose: efforts are explicit, not "auto".
-    for (name, effort) in [("planner", "max"), ("manager", "high"), ("orchestrator", "high"), ("worker-small", "medium"), ("worker-big", "high"), ("qa", "high")] {
+    for (name, effort) in [("planner", "max"), ("manager", "high"), ("orchestrator", "high"), ("worker-small", "medium"), ("worker-big", "high"), ("worker-swarm", "low"), ("qa", "high")] {
         if let Some(r) = p.roles.get_mut(name) {
             r.effort = effort.into();
         }
     }
     p.flow.manager = "manager".into();
     p.flow.finale = vec![finale("qa-heavy", QA_FINALE_TASK, false), finale("security", SECURITY_FINALE_TASK, false), finale("planner", PLANNER_FINALE_TASK_THOROUGH, true)];
-    p
-}
-
-/// The bija default cut for many cheap workers: wider in both directions (8 at once, 32 tasks a
-/// phase), and the planner and orchestrator told so. `{max_parallel}` stays a placeholder here —
-/// the run fills in its own number when it briefs them, which is what makes `--swarm N` per run.
-/// The workers share one Akasha group, inert while the feature is off.
-fn builtin_swarm() -> Pattern {
-    let mut p = Pattern::builtin_bija();
-    p.name = NAME_SWARM.into();
-    p.description = "Swarm: many small parallel workers on bija — plan into many independent tasks, run up to N at once (`--swarm N`)".into();
-    p.settings.max_parallel = 8;
-    p.settings.max_tasks_per_phase = 32;
-    for role in p.roles.values_mut() {
-        match role.kind.as_str() {
-            "planner" => role.instructions = with_paragraph(&role.instructions, SWARM_PLANNER),
-            "orchestrator" => role.instructions = with_paragraph(&role.instructions, SWARM_ORCHESTRATOR),
-            _ => {}
-        }
-    }
-    p.groups = vec![Group { name: "builders".into(), roles: p.worker_roles(), ..Group::default() }];
     p
 }
 
@@ -828,9 +962,8 @@ mod tests {
 
     #[test]
     fn names_list_every_builtin_and_each_loads_by_name() {
-        let names = Pattern::names();
-        for n in ["mantra-default", "mantra-lean", "mantra-thorough", "mantra-default-claude", "mantra-default-bija", "mantra-swarm"] {
-            assert!(names.contains(&n), "{n}");
+        assert_eq!(Pattern::names(), vec!["mantra-default", "mantra-lean", "mantra-thorough"]);
+        for n in Pattern::names() {
             let p = Pattern::load(n, Path::new("/nonexistent")).unwrap_or_else(|e| panic!("{n}: {e}"));
             assert_eq!(p.name, n);
             assert!(Pattern::list(Path::new("/nonexistent")).contains(&n.to_string()));
@@ -840,10 +973,37 @@ mod tests {
         assert_eq!(Pattern::builtin_named("Mantra Lean").map(|p| p.name), Some("mantra-lean".to_string()));
     }
 
+    /// The built-ins 0.8 retired load as `mantra-default` — from settings.toml, a run's state or
+    /// `--pattern` alike, all of which go through `load` — and are no longer listed; a file of
+    /// that name is somebody's own pattern and loads as such.
+    #[test]
+    fn retired_builtins_load_as_the_default_unless_a_file_has_the_name() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("project");
+            for n in RETIRED.iter().copied().chain(["Mantra Swarm"]) {
+                assert!(is_retired(n), "{n}");
+                assert!(Pattern::builtin_named(n).is_none(), "{n} is not a built-in any more");
+                assert_eq!(Pattern::load(n, &project).unwrap(), Pattern::builtin(), "{n}");
+                assert_eq!(current_name(n, &project), NAME_DEFAULT, "{n}");
+                assert!(!Pattern::list(&project).iter().any(|l| is_retired(l)), "not listed without a file");
+            }
+            assert_eq!(current_name("mine", &project), "mine", "anything else is left as it is");
+            assert!(!is_retired(NAME_DEFAULT));
+            // a file of the user's under a retired name is theirs
+            let mine = Pattern { name: "mantra-swarm".into(), description: "my old swarm".into(), ..Pattern::builtin_lean() };
+            mine.save().unwrap();
+            let loaded = Pattern::load("mantra-swarm", &project).unwrap();
+            assert_eq!((loaded.name.as_str(), loaded.description.as_str(), loaded.tag()), ("mantra-swarm", "my old swarm", "yours"));
+            assert_eq!(current_name("mantra-swarm", &project), "mantra-swarm");
+            assert!(Pattern::list(&project).contains(&"mantra-swarm".to_string()));
+            assert_eq!(Pattern::load("mantra-default-bija", &project).unwrap().name, NAME_DEFAULT, "the others still migrate");
+        });
+    }
+
     #[test]
     fn every_builtin_role_uses_a_default_registry_model_and_a_usable_effort() {
         let reg = crate::config::Registry::defaults();
-        for p in all_builtins().into_iter().filter(|p| p.name != NAME_CLAUDE) {
+        for p in all_builtins() {
             for (n, r) in &p.roles {
                 assert!(reg.get(&r.model).is_some(), "{}: role '{n}' uses unknown model alias '{}'", p.name, r.model);
                 if r.effort != EFFORT_AUTO {
@@ -986,58 +1146,6 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("permission") && e.contains("sometimes")), "{errs:?}");
     }
 
-    #[test]
-    fn builtin_claude_is_valid_and_moves_only_planner_orchestrator_worker_models() {
-        let p = Pattern::builtin_claude();
-        assert!(p.validate().is_ok(), "{:?}", p.validate());
-        assert_eq!(p.name, "mantra-default-claude");
-        for (name, role) in &p.roles {
-            match role.kind.as_str() {
-                "planner" | "manager" | "orchestrator" => assert_eq!(role.model, "fable51", "role '{name}'"),
-                "worker" => assert_eq!(role.model, "sonnet5", "role '{name}'"),
-                "gate" => assert_ne!(role.model, "fable51", "gate role '{name}' must keep its Codex model — only planner/orchestrator/worker move"),
-                _ => {}
-            }
-        }
-        // It is the new default with models moved, nothing else.
-        let d = Pattern::builtin();
-        assert_eq!(p.flow, d.flow);
-        assert_eq!(p.settings, d.settings);
-        assert_eq!(p.roles.keys().collect::<Vec<_>>(), d.roles.keys().collect::<Vec<_>>());
-        for (n, r) in &p.roles {
-            assert_eq!(r.instructions, d.roles[n].instructions, "role '{n}'");
-            assert_eq!(r.effort, d.roles[n].effort, "role '{n}'");
-        }
-        // Loadable by name (`Pattern::load`), the same way "mantra-default" always is.
-        let loaded = Pattern::load("mantra-default-claude", Path::new("/nonexistent")).unwrap();
-        assert_eq!(loaded, p);
-        assert!(Pattern::list(Path::new("/nonexistent")).contains(&"mantra-default-claude".to_string()));
-    }
-
-    /// Every role of the default pattern on its bija twin (`x` → `x-api`), nothing else changed —
-    /// and a fresh registry can run it: no Codex, and no key check for a Bija provider.
-    #[test]
-    fn builtin_bija_is_the_default_pattern_with_every_alias_on_its_bija_twin() {
-        let p = Pattern::builtin_bija();
-        assert!(p.validate().is_ok(), "{:?}", p.validate());
-        assert_eq!(p.name, "mantra-default-bija");
-        let d = Pattern::builtin();
-        assert_eq!(p.flow, d.flow);
-        assert_eq!(p.settings, d.settings);
-        assert_eq!(p.roles.keys().collect::<Vec<_>>(), d.roles.keys().collect::<Vec<_>>());
-        let reg = crate::config::Registry::defaults();
-        for (n, r) in &p.roles {
-            let base = &d.roles[n];
-            assert_eq!(r.model, format!("{}-api", base.model), "role '{n}'");
-            assert_eq!(reg.backend_of(&reg.resolve(&r.model)), crate::config::ProviderKind::Bija, "role '{n}' runs on bija");
-            let want_fallback = base.fallback.clone().map(|f| if f.trim().is_empty() { f } else { format!("{f}-api") });
-            assert_eq!(r.fallback, want_fallback, "role '{n}'");
-            assert_eq!((&r.instructions, &r.effort, &r.kind, &r.sandbox), (&base.instructions, &base.effort, &base.kind, &base.sandbox), "role '{n}'");
-        }
-        assert!(reg.preflight(&p).is_empty(), "{:?}", reg.preflight(&p));
-        assert_eq!(Pattern::load("mantra-default-bija", Path::new("/nonexistent")).unwrap(), p);
-    }
-
     /// Lean prompts: short, budget-aware, and the gate role is told never to fix.
     #[test]
     fn built_in_prompts_are_short_and_budget_aware() {
@@ -1066,6 +1174,7 @@ mod tests {
         assert_eq!(auto_effort("orchestrator", "orchestrator", false), "medium");
         assert_eq!(auto_effort("worker", "worker-big", false), "medium");
         assert_eq!(auto_effort("worker", "worker-small", false), "low");
+        assert_eq!(auto_effort("worker", "worker-swarm", false), "low", "a swarm task is small by definition");
         assert_eq!(auto_effort("gate", "qa", false), "medium");
         for kind in ["planner", "gate", "worker"] {
             assert_eq!(auto_effort(kind, "qa-heavy", true), "high", "finale roles think hard");
@@ -1081,44 +1190,159 @@ mod tests {
         assert_eq!(back.roles["worker-big"].effort, "auto");
     }
 
-    /// The swarm is the bija default with a wider fan-out: the same roles on the same `-api`
-    /// models, 8 at once and 32 tasks a phase, the planner and orchestrator told about the swarm
-    /// with the run's number filled in at briefing, and the workers in one inert Akasha group.
+    /// Every built-in has the swarm class: `worker-swarm` beside the small and big workers — on
+    /// `luna`, low effort (explicit in the heavy flow, `auto` → low elsewhere), 16 at once of its
+    /// own — all three workers in one `builders` Akasha group (inert until akasha is on), and a
+    /// planner told when the class fits and when it does not.
     #[test]
-    fn builtin_swarm_is_the_bija_default_cut_for_a_wide_fan_out() {
-        let p = Pattern::builtin_swarm();
-        assert!(p.validate().is_ok(), "{:?}", p.validate());
-        assert_eq!(p.name, "mantra-swarm");
-        assert!(p.description.starts_with("Swarm: many small parallel workers on bija") && p.description.contains("`--swarm N`"), "{}", p.description);
-        assert_eq!((p.settings.max_parallel, p.settings.max_tasks_per_phase), (8, 32));
-        let b = Pattern::builtin_bija();
-        assert_eq!(p.flow, b.flow);
-        assert_eq!(p.roles.keys().collect::<Vec<_>>(), b.roles.keys().collect::<Vec<_>>());
-        for (n, r) in &p.roles {
-            assert_eq!((&r.model, &r.effort, &r.kind, &r.sandbox), (&b.roles[n].model, &b.roles[n].effort, &b.roles[n].kind, &b.roles[n].sandbox), "role '{n}'");
-            if !matches!(r.kind.as_str(), "planner" | "orchestrator") {
-                assert_eq!(r.instructions, b.roles[n].instructions, "role '{n}' is unchanged");
-            }
+    fn every_builtin_has_the_swarm_class_the_builders_group_and_the_planner_paragraph() {
+        for p in all_builtins() {
+            let s = &p.roles["worker-swarm"];
+            assert_eq!((s.kind.as_str(), s.glyph.as_str(), s.color.as_str(), s.model.as_str(), s.parallel), ("worker", "∴", "amber", "luna", Some(16)), "{}", p.name);
+            assert_eq!(s.description, "Many tiny, independent tasks at once");
+            let effort = if s.effort == EFFORT_AUTO { auto_effort(&s.kind, "worker-swarm", false) } else { s.effort.as_str() };
+            assert_eq!(effort, "low", "{}", p.name);
+            assert!(s.instructions.contains("one small, self-contained, mechanical task") && s.instructions.contains("Report in two lines") && s.instructions.ends_with(BUDGET), "{}", s.instructions);
+            // the big and small workers share the pool; the swarm counts apart
+            assert_eq!((p.roles["worker-small"].parallel, p.roles["worker-big"].parallel), (None, None), "{}", p.name);
+            assert_eq!((p.cap_of("worker-swarm"), p.cap_of("worker-big"), p.cap_of("worker-small")), (16, p.settings.max_parallel, p.settings.max_parallel));
+            assert!(p.has_own_cap("worker-swarm") && !p.has_own_cap("worker-big") && !p.has_own_cap("nope"));
+            assert_eq!(p.groups, vec![Group { name: "builders".into(), roles: vec!["worker-big".into(), "worker-small".into(), "worker-swarm".into()], shared_chars: 16_384, push: "urgent".into(), auto: true }], "{}", p.name);
+            let planner = &p.roles["planner"].instructions;
+            assert!(planner.contains("Use worker-swarm only when a phase is many (6+) small, independent, same-shaped tasks (per-file migrations, a test per module, repetitive edits); then cut one task per unit of work. Everything else goes to worker-small or worker-big."), "{planner}");
+            assert!(planner.starts_with("You are the Planner") && planner.ends_with(BUDGET));
+            let toml = p.to_toml();
+            assert!(toml.contains("parallel = 16") && toml.contains("[[groups]]") && toml.contains("name = \"builders\""), "{toml}");
         }
-        let planner = &p.roles["planner"].instructions;
-        assert!(planner.starts_with(PLANNER_INSTRUCTIONS) && planner.ends_with(BUDGET), "base first, budget last: {planner}");
-        assert!(planner.contains("You plan for a swarm of up to {max_parallel} workers running at the same time."), "{planner}");
-        assert!(p.roles["orchestrator"].instructions.contains("Keep the swarm full: spawn tasks as soon as their scope is free, up to {max_parallel} at once."));
-        // what the agents are told: the run's number, never the placeholder
-        let told = with_max_parallel(planner, p.settings.max_parallel);
-        assert!(told.contains("a swarm of up to 8 workers") && !told.contains(MAX_PARALLEL_PLACEHOLDER), "{told}");
-        assert!(with_max_parallel(planner, 24).contains("a swarm of up to 24 workers"));
-        assert!(with_max_parallel(&p.roles["orchestrator"].instructions, 24).contains("up to 24 at once"));
-        assert_eq!(with_max_parallel("no placeholder here", 3), "no placeholder here");
-        // one group of every worker role, with the defaults
-        assert_eq!(p.groups, vec![Group { name: "builders".into(), roles: vec!["worker-big".into(), "worker-small".into()], shared_chars: 16_384, push: "urgent".into(), auto: true }]);
-        assert_eq!(p.groups[0].roles, p.worker_roles());
-        // listed, loadable by name, and its TOML carries the group
-        assert!(Pattern::list(Path::new("/nonexistent")).contains(&"mantra-swarm".to_string()));
-        assert_eq!(Pattern::load("mantra-swarm", Path::new("/nonexistent")).unwrap(), p);
-        let toml = p.to_toml();
-        assert!(toml.contains("[[groups]]") && toml.contains("name = \"builders\""), "{toml}");
-        assert!(crate::config::Registry::defaults().preflight(&p).is_empty());
+        assert_eq!(Pattern::builtin().parallel_summary(), "4 at once · worker-swarm 16");
+        assert_eq!(Pattern::builtin_lean().parallel_summary(), "3 at once · worker-swarm 16");
+    }
+
+    /// `parallel` is 1..=128 and for workers only; a role written without it (every role of a
+    /// file from before it) writes no `parallel` key back, and one with it round-trips.
+    #[test]
+    fn role_parallel_is_validated_and_round_trips() {
+        for (role, n, words) in [("worker-swarm", 0, &["role 'worker-swarm'", "parallel must be from 1 to 128", "got 0"][..]), ("worker-big", 129, &["from 1 to 128", "got 129"]), ("qa", 4, &["role 'qa'", "parallel is for worker roles", "gate"])] {
+            let mut p = Pattern::builtin();
+            p.roles.get_mut(role).unwrap().parallel = Some(n);
+            let errs = p.validate().expect_err(role).join(" | ");
+            for w in words {
+                assert!(errs.contains(w), "{role}={n}: '{w}' missing in {errs}");
+            }
+            assert!(Pattern::from_toml(&p.to_toml()).is_err(), "the same through the TOML");
+        }
+        for n in [1, 128] {
+            let mut p = Pattern::builtin();
+            p.roles.get_mut("worker-big").unwrap().parallel = Some(n);
+            assert!(p.validate().is_ok(), "{n}: {:?}", p.validate());
+            assert_eq!(Pattern::from_toml(&p.to_toml()).unwrap(), p);
+        }
+        // a role of a file from before the field: none, and none written back
+        let old = Pattern::builtin().to_toml().replace("parallel = 16\n", "");
+        let p = Pattern::from_toml(&old).unwrap();
+        assert_eq!(p.roles["worker-swarm"].parallel, None, "it shares the pool then");
+        assert_eq!(p.cap_of("worker-swarm"), p.settings.max_parallel);
+        assert!(!p.to_toml().lines().any(|l| l.starts_with("parallel =")), "nothing new in an old file");
+    }
+
+    /// `--parallel N` sets every class: the shared pool and each role with a cap of its own —
+    /// never giving one to a role without — and room for N tasks a phase when the pattern had less.
+    #[test]
+    fn set_parallel_sets_every_class() {
+        let mut p = Pattern::builtin();
+        p.set_parallel(8);
+        assert_eq!((p.settings.max_parallel, p.cap_of("worker-swarm"), p.cap_of("worker-big")), (8, 8, 8));
+        assert_eq!((p.roles["worker-big"].parallel, p.roles["worker-swarm"].parallel), (None, Some(8)), "the big worker still shares the pool");
+        assert_eq!(p.settings.max_tasks_per_phase, 8, "8 fits the pattern's 8 tasks a phase");
+        p.set_parallel(64);
+        assert_eq!((p.settings.max_parallel, p.cap_of("worker-swarm"), p.settings.max_tasks_per_phase), (64, 64, 64));
+        p.set_parallel(2);
+        assert_eq!((p.settings.max_parallel, p.cap_of("worker-swarm"), p.settings.max_tasks_per_phase), (2, 2, 64), "a smaller N leaves the phase cap");
+        assert!(p.validate().is_ok());
+    }
+
+    /// A phase may hold `max_tasks_per_phase` tasks, or twice the widest own cap among the roles
+    /// it uses — so a 32-task swarm phase fits the default pattern as it is.
+    #[test]
+    fn the_phase_task_limit_widens_for_a_class_of_its_own() {
+        let p = Pattern::builtin();
+        assert_eq!(p.phase_task_limit(["worker-big", "worker-small"]), 8);
+        assert_eq!(p.phase_task_limit(["worker-big", "worker-swarm"]), 32);
+        assert_eq!(p.phase_task_limit(["worker-nope"]), 8, "an unknown role is the shared pool");
+        assert_eq!(p.phase_task_limit([]), 8);
+        let mut narrow = Pattern::builtin();
+        narrow.roles.get_mut("worker-swarm").unwrap().parallel = Some(2);
+        assert_eq!(narrow.phase_task_limit(["worker-swarm"]), 8, "never below the setting");
+    }
+
+    /// `summary` is what a list shows — name, description, tag, the pool's width and every role
+    /// with its model and cap — and `summaries` covers every listed pattern, a broken file too.
+    #[test]
+    fn summaries_name_the_roles_with_their_caps_and_say_why_a_file_does_not_load() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("project");
+            let s = Pattern::builtin().summary();
+            assert_eq!((s.name.as_str(), s.tag, s.max_parallel, s.error.as_ref()), (NAME_DEFAULT, "default", 4, None));
+            assert_eq!(s.description, Pattern::builtin().description);
+            assert_eq!(s.roles.first().map(|r| (r.name.as_str(), r.kind.as_str())), Some(("planner", "planner")), "in display order");
+            let swarm = s.roles.iter().find(|r| r.name == "worker-swarm").unwrap();
+            assert_eq!((swarm.glyph.as_str(), swarm.model.as_str(), swarm.effort.as_str(), swarm.parallel), ("∴", "luna", "auto", Some(16)));
+            assert_eq!(s.roles.iter().find(|r| r.name == "worker-big").unwrap().parallel, None);
+            let json = serde_json::to_value(&s).unwrap();
+            assert!(json.get("error").is_none() && json["roles"].as_array().map(|r| r.len()) == Some(s.roles.len()), "{json}");
+            assert_eq!(Pattern::builtin_lean().summary().tag, "built-in");
+            // a file shadowing a built-in is "edited", one of the user's own "yours", a broken one says why
+            Pattern::builtin_lean().save().unwrap();
+            Pattern { name: "mine".into(), ..Pattern::builtin() }.save().unwrap();
+            std::fs::write(crate::config::patterns_dir().join("broken.toml"), "name = [").unwrap();
+            let all = Pattern::summaries(&project);
+            let tag = |n: &str| all.iter().find(|s| s.name == n).map(|s| s.tag);
+            assert_eq!((tag(NAME_DEFAULT), tag(NAME_LEAN), tag(NAME_THOROUGH), tag("mine")), (Some("default"), Some("edited"), Some("built-in"), Some("yours")));
+            let broken = all.iter().find(|s| s.name == "broken").expect("a broken file still shows");
+            assert!(broken.error.as_deref().map(|e| !e.is_empty() && !e.contains(".toml:")).unwrap_or(false), "{:?}", broken.error);
+            assert!(broken.roles.is_empty() && broken.tag == "yours");
+        });
+    }
+
+    /// `save_as` writes a validated copy under a new name and hands it back as `load` reads it;
+    /// it refuses an empty name, a built-in's, an existing file's and an invalid pattern, with
+    /// every reason. `delete_file` removes the user's file (an edited built-in is the built-in
+    /// again) and refuses what has no file or ships with the project.
+    #[test]
+    fn save_as_copies_under_a_new_name_and_delete_file_removes_only_files_of_yours() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("project");
+            let base = Pattern::builtin();
+            let (copy, path) = base.save_as("My Split", &project).unwrap();
+            assert_eq!((copy.name.as_str(), copy.tag()), ("my-split", "yours"));
+            assert_eq!(path, crate::config::patterns_dir().join("my-split.toml"));
+            assert_eq!(Pattern::load("my-split", &project).unwrap(), copy, "what load reads");
+            assert_eq!(base.name, NAME_DEFAULT, "the original is untouched");
+            for (name, why) in [(" ", "needs a name"), ("mantra-lean", "is a built-in"), ("my-split", "exists already")] {
+                let errs = base.save_as(name, &project).expect_err(name);
+                assert!(errs.iter().any(|e| e.contains(why)), "{name}: {errs:?}");
+            }
+            assert!(copy.save_as("my-split", &project).is_ok(), "its own name is a plain save");
+            let mut bad = copy.clone();
+            bad.flow.phase_gate = "nope".into();
+            bad.roles.get_mut("planner").unwrap().permission = "sometimes".into();
+            assert_eq!(bad.save_as("other", &project).expect_err("invalid").len(), 2, "every reason");
+            assert!(!crate::config::patterns_dir().join("other.toml").exists(), "nothing written");
+            // delete
+            assert_eq!(Pattern::delete_file("my-split", &project).unwrap(), path);
+            assert!(Pattern::load("my-split", &project).is_err());
+            assert!(Pattern::delete_file("my-split", &project).unwrap_err().contains("no pattern 'my-split'"));
+            assert!(Pattern::delete_file(NAME_LEAN, &project).unwrap_err().contains("built in"));
+            Pattern { description: "my lean".into(), ..Pattern::builtin_lean() }.save().unwrap();
+            assert_eq!(Pattern::load(NAME_LEAN, &project).unwrap().tag(), "edited");
+            Pattern::delete_file(NAME_LEAN, &project).unwrap();
+            assert_eq!(Pattern::load(NAME_LEAN, &project).unwrap(), Pattern::builtin_lean(), "the built-in again");
+            let shipped = project.join(".mantra").join("patterns");
+            std::fs::create_dir_all(&shipped).unwrap();
+            std::fs::write(shipped.join("team.toml"), Pattern { name: "team".into(), ..Pattern::builtin() }.to_toml()).unwrap();
+            assert!(Pattern::delete_file("team", &project).unwrap_err().contains("comes with this project"));
+            assert!(shipped.join("team.toml").exists());
+        });
     }
 
     /// `[[groups]]` is validated like everything else in a pattern: each row is one broken group
@@ -1158,15 +1382,16 @@ mod tests {
     /// what it was. A group written by hand with only a name and roles gets the defaults.
     #[test]
     fn patterns_without_groups_round_trip_unchanged_and_groups_take_defaults() {
-        for p in all_builtins().into_iter().filter(|p| p.name != NAME_SWARM) {
-            assert!(p.groups.is_empty(), "{}", p.name);
-            let toml = p.to_toml();
-            assert!(!toml.contains("groups"), "{}: nothing new in an old pattern's file", p.name);
+        for p in all_builtins() {
+            // the built-ins have `builders` now; a file written before groups is one without
+            let old = Pattern { groups: vec![], ..p };
+            let toml = old.to_toml();
+            assert!(!toml.contains("groups"), "{}: nothing new in an old pattern's file", old.name);
             let back = Pattern::from_toml(&toml).unwrap();
-            assert_eq!(back, p);
-            assert_eq!(back.to_toml(), toml, "{}", p.name);
+            assert_eq!(back, old);
+            assert_eq!(back.to_toml(), toml, "{}", old.name);
         }
-        let hand = format!("{}\n[[groups]]\nname = \"builders\"\nroles = [\"worker-small\"]\n", Pattern::builtin().to_toml());
+        let hand = format!("{}\n[[groups]]\nname = \"builders\"\nroles = [\"worker-small\"]\n", Pattern { groups: vec![], ..Pattern::builtin() }.to_toml());
         let p = Pattern::from_toml(&hand).unwrap();
         assert_eq!(p.groups, vec![Group { name: "builders".into(), roles: vec!["worker-small".into()], ..Group::default() }]);
         assert_eq!((p.groups[0].shared_chars, p.groups[0].push.as_str(), p.groups[0].auto), (16_384, "urgent", true));

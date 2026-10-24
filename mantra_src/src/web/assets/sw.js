@@ -10,7 +10,7 @@ const VERSION = 'mantra-shell-__MANTRA_SW_VERSION__';
 const SHELL = [
     '/', '/manifest.webmanifest', '/assets/app.css',
     '/assets/crypto.js', '/assets/transport.js', '/assets/ui/dom.js', '/assets/ui/fmt.js', '/assets/ui/store.js',
-    '/assets/ui/parts.js', '/assets/ui/agent.js', '/assets/ui/screens.js', '/assets/app.js',
+    '/assets/ui/parts.js', '/assets/ui/agent.js', '/assets/ui/screens.js', '/assets/ui/config.js', '/assets/app.js',
     '/icons/icon.svg', '/icons/icon-192.png', '/icons/badge-96.png',
 ];
 const META = 'mantra-meta';

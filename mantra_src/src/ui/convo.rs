@@ -265,7 +265,7 @@ pub fn draw(f: &mut Frame, area: Rect, agent: &mut Agent, verbose: bool, footer:
     let mut lines: Vec<Line<'static>> = vec![];
     for i in first..agent.items.len() {
         let it = &mut agent.items[i];
-        let tight = matches!(it.kind, Kind::Tool { .. } | Kind::Notice { .. }) && i > first && matches!(agent_kind_prev(&lines), true);
+        let tight = matches!(it.kind, Kind::Tool { .. } | Kind::Notice { .. }) && i > first && agent_kind_prev(&lines);
         if !lines.is_empty() && !tight {
             lines.push(Line::default());
         }

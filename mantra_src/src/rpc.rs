@@ -183,24 +183,19 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs:
         let tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::with_capacity(1 << 16, stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let v: Value = match serde_json::from_str(line) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                crate::mlog!("bad json from codex: {e}: {}", crate::util::trunc(line, 200));
-                                continue;
-                            }
-                        };
-                        route(v, &pending, &in_tx);
-                    }
-                    Ok(None) | Err(_) => break,
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
                 }
+                let v: Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::mlog!("bad json from codex: {e}: {}", crate::util::trunc(line, 200));
+                        continue;
+                    }
+                };
+                route(v, &pending, &in_tx);
             }
             // fail all pending requests
             if let Ok(mut p) = pending.lock() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check of MCP servers and the screen tools: two whole Mandala runs in `--demo`, one on
-# the real `bija` binary (mantra-default-bija), one on the Claude Code mock (mantra-default-claude),
-# with the demo's stand-in MCP server (`mantra mock-mcp`, registered as `demo` for every role) and
+# the real `bija` binary (mantra-default), one on the Claude Code mock (a pattern file of the run's
+# own, `on-claude`, written below), with the demo's stand-in MCP server (`mantra mock-mcp`, registered as `demo` for every role) and
 # a stand-in screen capture. No API calls, no key, no cost, no real screen. A sibling of
 # bija-e2e.sh, which checks the plain bija run.
 #
@@ -97,7 +97,7 @@ run_demo() {
 }
 
 # ── bija ────────────────────────────────────────────────────────────────────────────────────
-run_demo bija mantra-default-bija
+run_demo bija mantra-default
 sessions="$home/bija/sessions"
 if grep -lq '"mcp__demo__scene_info"' "$sessions"/*/transcript.jsonl 2>/dev/null; then
   pass "bija: a worker called mcp__demo__scene_info through bija's MCP client"
@@ -122,7 +122,40 @@ else
 fi
 
 # ── Claude Code (the mock) ──────────────────────────────────────────────────────────────────
-run_demo claude mantra-default-claude
+# No built-in runs on Claude Code, so the run gets a pattern of its own: the default's shape with
+# the planner, orchestrator and workers on the demo's Claude Code models, the gate on the default's.
+mkdir -p "$tmp/claude/home/patterns"
+cat >"$tmp/claude/home/patterns/on-claude.toml" <<'TOML'
+name = "on-claude"
+description = "planner, orchestrator and workers on Claude Code (mcp-e2e)"
+
+[roles.planner]
+kind = "planner"
+model = "fable51"
+effort = "auto"
+sandbox = "read-only"
+
+[roles.orchestrator]
+kind = "orchestrator"
+model = "fable51"
+effort = "auto"
+sandbox = "read-only"
+
+[roles.worker-small]
+model = "sonnet5"
+effort = "auto"
+
+[roles.worker-big]
+model = "sonnet5"
+effort = "auto"
+
+[roles.qa]
+kind = "gate"
+model = "terra"
+effort = "auto"
+sandbox = "read-only"
+TOML
+run_demo claude on-claude
 log="$home/logs/mantra.log"
 if grep -Eq 'claude [0-9]+: .*"mcp__demo__scene_info"' "$log" 2>/dev/null; then
   pass "claude: the agent's scene_info call reached Mantra (mantra.log)"

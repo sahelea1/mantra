@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod protocol;
 #[allow(dead_code)]
 pub mod push;
+pub mod ops;
 pub mod qr;
 #[allow(dead_code)]
 pub mod remote;
@@ -393,6 +394,8 @@ pub struct Link {
     pub remote: Option<Arc<remote::Remote>>,
     pub push: Option<PushLink>,
     pub info: LinkInfo,
+    /// What the configuration commands share with the event loop (`ops::Shared`).
+    pub shared: Arc<ops::Shared>,
 }
 
 impl Link {
@@ -412,6 +415,9 @@ pub struct Web {
     push: Option<PushLink>,
     vapid_public: Option<String>,
     info: LinkInfo,
+    shared: Arc<ops::Shared>,
+    /// The pattern generation (`ops::Shared::patterns_gen`) the publisher's list was read at.
+    patterns_seen: u64,
 }
 
 impl Web {
@@ -460,11 +466,11 @@ impl Web {
         }
         let remote = cfg.relay.as_ref().map(|relay| Arc::new(remote::Remote::start(remote::RemoteConfig { relay: relay.clone(), site: cfg.remote_site.clone().unwrap_or_else(|| remote::relay_origin(relay)), password: cfg.password.clone(), dir: cfg.dir.clone(), headless: cfg.headless }, reg.clone(), tx.clone())));
         let env = snapshot::Env { tls: info.tls, listen: info.urls.first().cloned(), headless: cfg.headless, push: push_link.is_some() };
-        Ok(Web { cfg, reg, ctl_rx, publisher: snapshot::Publisher::new(env), server, remote, push: push_link, vapid_public, info })
+        Ok(Web { cfg, reg, ctl_rx, publisher: snapshot::Publisher::new(env), server, remote, push: push_link, vapid_public, info, shared: Arc::default(), patterns_seen: 0 })
     }
 
     pub fn link(&self) -> Link {
-        Link { reg: self.reg.clone(), remote: self.remote.clone(), push: self.push.clone(), info: self.info.clone() }
+        Link { reg: self.reg.clone(), remote: self.remote.clone(), push: self.push.clone(), info: self.info.clone(), shared: self.shared.clone() }
     }
 
     /// Next control message (hello) from a connection; pending forever if the channel is gone.
@@ -475,6 +481,8 @@ impl Web {
     /// Diff the App against the last publish and broadcast the delta (if any). Skipped while no
     /// client is connected — a hello always publishes first, so nobody ever sees a stale base.
     pub fn publish(&mut self, app: &App) {
+        // A `model_test` is answered once its probe agent is done, whoever is still watching.
+        ops::settle(&self.shared, &self.reg, app);
         if self.reg.joined() == 0 {
             return;
         }
@@ -482,6 +490,12 @@ impl Web {
     }
 
     fn publish_now(&mut self, app: &App) {
+        let gen = self.shared.patterns_gen();
+        if gen != self.patterns_seen {
+            // a pattern was saved or deleted: the start-run picker shows it now, not in 10 s
+            self.patterns_seen = gen;
+            self.publisher.invalidate_patterns();
+        }
         let remote = self.remote.as_ref().map(|r| r.info());
         let Some(d) = self.publisher.publish(app, remote) else { return };
         let local: Arc<str> = ServerMsg::Delta(Box::new(d.clone())).to_json().into();

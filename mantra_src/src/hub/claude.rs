@@ -384,6 +384,7 @@ fn mcp_tool_list(dynamic_tools: &[Value]) -> Value {
 /// `-p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
 /// --session-id|--resume <id> --model <m> [--effort e] [--autocompact n] [--append-system-prompt ...]
 /// [--strict-mcp-config --mcp-config '…'] <sandbox args> [--bare]` (§10.1, §10.4).
+#[allow(clippy::too_many_arguments)] // one per part of the command line; a struct would only rename them
 fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effort: &str, session_id: &str, resume: bool, base_args: &[String]) -> Vec<String> {
     let mut a: Vec<String> = base_args.to_vec();
     a.extend(["-p".into(), "--input-format".into(), "stream-json".into(), "--output-format".into(), "stream-json".into(), "--verbose".into()]);
@@ -1265,7 +1266,7 @@ mod tests {
         let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
         agent.last_event = std::time::Instant::now() - std::time::Duration::from_secs(500);
         let think = json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 150, "session_id": "s"});
-        feed(&mut tr, &mut agent, &[think.clone()]);
+        feed(&mut tr, &mut agent, std::slice::from_ref(&think));
         assert!(agent.turn_active);
         assert_eq!(agent.activity, "thinking · 150");
         assert!(agent.last_event.elapsed().as_secs() < 5, "a heartbeat is an event");
@@ -1318,10 +1319,10 @@ mod tests {
 
         let mut tr = Translator::new(1, 200_000, true);
         let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
-        feed(&mut tr, &mut agent, &[state.clone()]);
+        feed(&mut tr, &mut agent, std::slice::from_ref(&state));
         assert_eq!(tr.window(), Some(980_000), "a subscription login trusts the window the CLI announced");
         assert_eq!(agent.ctx_window, None, "no real counts exist yet — none may be invented just to carry the window");
-        feed(&mut tr, &mut agent, &[call.clone()]);
+        feed(&mut tr, &mut agent, std::slice::from_ref(&call));
         assert_eq!(agent.ctx_window, Some(980_000), "the very first turn's gauge already knows the real window");
         assert_eq!(agent.ctx_used, 5_100);
 

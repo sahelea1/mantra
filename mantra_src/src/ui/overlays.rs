@@ -1,9 +1,8 @@
 //! Modal overlays.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, Overlay, PatternChoice, Screen};
+use crate::app::{App, Overlay, PatternChoice, Screen, Select, SelectThen};
 use crate::engine::run::{HaltReason, Stage};
-use crate::ui::input::Act;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -38,146 +37,19 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) -> Option<usize> {
         Overlay::Inbox { sel } => inbox(f, area, app, *sel),
         Overlay::Plan { scroll } => return Some(plan(f, area, app, *scroll)),
         Overlay::Halt { scroll } => return halt(f, area, app, *scroll),
-        Overlay::Edit { title, input, target } => edit(f, area, title, input, target),
-        Overlay::Patterns { sel, list } => patterns(f, area, app, *sel, list),
+        Overlay::NewRun { sel, list, goal } => new_run(f, area, app, *sel, list, goal.as_ref()),
+        Overlay::Select(s) => select(f, area, s),
         Overlay::Discover(st) => discover(f, area, st),
         Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
-        Overlay::Web => web(f, area, app),
-        Overlay::Remote => remote(f, area, app),
+        Overlay::Qr => super::settings::draw_qr(f, area, app),
         Overlay::Akasha { scroll, group } => return Some(akasha(f, area, app, group.as_deref(), *scroll)),
     }
     None
 }
 
-/// Wrapped lines of `text` in `width` columns, each styled `st` (the link is ~110 chars).
-fn wrapped(text: &str, width: usize, indent: &str, st: ratatui::style::Style) -> Vec<Line<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let w = width.saturating_sub(indent.chars().count()).max(8);
-    chars.chunks(w).map(|c| Line::from(vec![Span::raw(indent.to_string()), Span::styled(c.iter().collect::<String>(), st)])).collect()
-}
-
-/// `/web`: where the web UI is and how it is protected.
-fn web(f: &mut Frame, area: Rect, app: &App) {
-    let w = 84u16.min(area.width.saturating_sub(2));
-    let inner = w.saturating_sub(4) as usize;
-    let k = |a: &str| Span::styled(format!("  {a:<12}"), theme::bold(theme::accent()));
-    let mut l: Vec<Line> = vec![];
-    match app.web.as_ref().map(|x| &x.info).filter(|i| i.listen.is_some()) {
-        None => {
-            l.push(Line::from(Span::styled("  The web UI is off.", theme::text())));
-            l.push(Line::default());
-            l.push(Line::from(Span::styled("  mantra --web                                   this machine (http://127.0.0.1:7777)", theme::muted())));
-            l.push(Line::from(Span::styled("  mantra --web 0.0.0.0:7777 --web-tls            your phone on the LAN (needs a password:", theme::muted())));
-            l.push(Line::from(Span::styled("                                                 MANTRA_WEB_PASSWORD or --web-password)", theme::muted())));
-            l.push(Line::from(Span::styled("  mantra --remote                                from anywhere, end-to-end encrypted", theme::muted())));
-        }
-        Some(i) => {
-            for (n, u) in i.urls.iter().enumerate() {
-                l.push(Line::from(vec![k(if n == 0 { "open" } else { "" }), Span::styled(u.clone(), theme::bold(theme::fg(theme::CYAN)))]));
-            }
-            let tls = if i.self_signed {
-                format!("on — Mantra's own certificate; install its CA on each device from {}/cert.pem", i.urls.first().cloned().unwrap_or_default())
-            } else if i.tls {
-                "on — your certificate".to_string()
-            } else {
-                "off — phones can't install the app or get notifications over http (--web-tls)".to_string()
-            };
-            let mut first = true;
-            for line in wrapped(&tls, inner.saturating_sub(14), "", if i.tls { theme::fg(theme::GREEN) } else { theme::fg(theme::AMBER) }) {
-                let mut spans = vec![k(if first { "https" } else { "" })];
-                spans.extend(line.spans);
-                l.push(Line::from(spans));
-                first = false;
-            }
-            let pw = if i.password { "on".to_string() } else { "off — localhost only".to_string() };
-            l.push(Line::from(vec![k("password"), Span::styled(pw, if i.password { theme::fg(theme::GREEN) } else { theme::muted() })]));
-            let subs = app.web.as_ref().and_then(|x| x.push.as_ref()).filter(|_| i.push).map(|p| p.store.lock().map(|s| s.list().len()).unwrap_or(0));
-            let push = match subs {
-                Some(n) => format!("on · {n} device{} subscribed", if n == 1 { "" } else { "s" }),
-                None => "off".into(),
-            };
-            l.push(Line::from(vec![k("push"), Span::styled(push, theme::muted())]));
-            let n = app.web.as_ref().map(|x| x.reg.count(crate::web::ConnKind::Local)).unwrap_or(0);
-            l.push(Line::from(vec![k("browsers"), Span::styled(format!("{n} connected"), theme::muted())]));
-        }
-    }
-    l.push(Line::default());
-    l.push(Line::from(Span::styled("  /remote for the relay link · esc", theme::faint())));
-    let r = centered(area, w, l.len() as u16 + 2);
-    clear(f, area, r);
-    f.render_widget(Paragraph::new(l).block(block("web", theme::TEAL)), r);
-}
-
-/// `/remote`: link, code, password and a scannable QR code; `r` rotates the identity.
-fn remote(f: &mut Frame, area: Rect, app: &App) {
-    let Some(rem) = app.web.as_ref().and_then(|x| x.remote.as_ref()) else {
-        let l = vec![
-            Line::from(Span::styled("  Remote access is off.", theme::text())),
-            Line::default(),
-            Line::from(Span::styled("  mantra --remote      reach this session from anywhere through remote.mantra.codes;", theme::muted())),
-            Line::from(Span::styled("                       end-to-end encrypted — the relay only ever sees ciphertext", theme::muted())),
-            Line::default(),
-            Line::from(Span::styled("  esc", theme::faint())),
-        ];
-        let r = centered(area, 90, l.len() as u16 + 2);
-        clear(f, area, r);
-        f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
-        return;
-    };
-    let info = rem.info();
-    let qr: Option<Vec<String>> = info.qr.as_ref().filter(|_| !theme::ascii()).map(|rows| {
-        let m: Vec<Vec<bool>> = rows.iter().map(|r| r.chars().map(|c| c == '1').collect()).collect();
-        crate::web::qr::half_blocks(&m, 2)
-    });
-    let qr_w = qr.as_ref().and_then(|q| q.first()).map(|r| r.chars().count() as u16).unwrap_or(0);
-    let w = 86u16.max(qr_w + 6).min(area.width.saturating_sub(2));
-    let inner = w.saturating_sub(4) as usize;
-    let k = |a: &str| Span::styled(format!("  {a:<10}"), theme::bold(theme::accent()));
-    let mut l: Vec<Line> = vec![];
-    let (state, col) = match (info.connected, &info.last_error) {
-        (true, _) => (format!("connected · {} client{}", info.clients, if info.clients == 1 { "" } else { "s" }), theme::GREEN),
-        (false, Some(e)) => (format!("reconnecting — {e}"), theme::AMBER),
-        (false, None) => ("connecting…".to_string(), theme::AMBER),
-    };
-    let relay_txt = format!("{}  ", info.relay);
-    // The relay address and label are fixed-ish; the status (an error message) is the part
-    // that can run long, so it alone gets truncated to whatever room is left on the line.
-    let state_budget = inner.saturating_sub(12 + crate::util::width(&relay_txt)).max(8);
-    l.push(Line::from(vec![k("relay"), Span::styled(relay_txt, theme::muted()), Span::styled(crate::util::trunc(&state, state_budget), theme::fg(col))]));
-    match &info.link {
-        Some(link) => {
-            let mut first = true;
-            for line in wrapped(link, inner.saturating_sub(12), "", theme::bold(theme::fg(theme::CYAN))) {
-                let mut spans = vec![k(if first { "link" } else { "" })];
-                spans.extend(line.spans);
-                l.push(Line::from(spans));
-                first = false;
-            }
-        }
-        None => l.push(Line::from(vec![k("link"), Span::styled("deriving the key…", theme::dim())])),
-    }
-    l.push(Line::from(vec![k("code"), Span::styled(info.code.clone().unwrap_or_default(), theme::bold(theme::text())), Span::styled("  + the password, at remote.mantra.codes", theme::faint())]));
-    l.push(Line::from(vec![k("password"), Span::styled(info.password.clone().unwrap_or_default(), theme::bold(theme::fg(theme::SAFFRON)))]));
-    // The QR only when it fits whole: a clipped code doesn't scan.
-    let room = area.height.saturating_sub(l.len() as u16 + 6);
-    if let Some(q) = qr.filter(|q| q.len() as u16 <= room && qr_w + 4 <= w) {
-        l.push(Line::default());
-        let pad = " ".repeat(((inner as u16).saturating_sub(qr_w) / 2) as usize);
-        let st = ratatui::style::Style::default().fg(ratatui::style::Color::White).bg(ratatui::style::Color::Black);
-        for row in q {
-            l.push(Line::from(vec![Span::raw(pad.clone()), Span::styled(row, st)]));
-        }
-    } else if info.link.is_some() {
-        l.push(Line::from(Span::styled("  (enlarge the terminal to show the QR code)", theme::faint())));
-    }
-    l.push(Line::default());
-    l.push(Line::from(Span::styled("  the link — or the code + password — opens this session: share it like a key", theme::faint())));
-    l.push(Line::from(Span::styled("  r new link (the old one stops working) · esc", theme::faint())));
-    let r = centered(area, w, l.len() as u16 + 2);
-    clear(f, area, r);
-    f.render_widget(Paragraph::new(l).block(block("remote", theme::VIOLET)), r);
-}
-
+/// The keys of the screens, grouped as they work: everywhere, in a chat (Solo, a zoom, the
+/// stage's prompt), on the stage, and on the config screens — whose one editing model is said
+/// once, for all three.
 fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
     let w = 104u16.min(area.width.saturating_sub(2));
     // keys in a column as wide as the longest one; descriptions wrap under themselves, a
@@ -190,41 +62,37 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         h("everywhere"),
         k("ctrl+o", "switch Solo ⇄ Mandala"),
         k("ctrl+k", "model picker (←→ effort)"),
-        k("alt+↑ / alt+↓", "raise / lower reasoning effort (shift+↑↓ works too)"),
-        k("ctrl+d", "diff viewer for the focused agent"),
-        k("ctrl+e", "verbose log (full reasoning, output, diffs)"),
         k("ctrl+g", "inbox: approvals & alerts from all agents"),
-        k("ctrl+t · F2", "toggle side panel / pulse feed"),
-        k("ctrl+l", "redraw the screen"),
-        k("/web · /remote", "web UI address & security · remote link, code, password, QR"),
+        k("ctrl+e", "verbose log (full reasoning, output, diffs)"),
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
-        k("pgup / pgdn", "scroll (mouse wheel too)"),
-        k("/", "commands (tab completes) · ! runs a shell command"),
+        k("pgup / pgdn · ctrl+l", "scroll (mouse wheel too) · redraw the screen"),
+        k("/ · F1", "commands — tab completes them and their arguments (@names, groups, agents) · this help"),
         gap(),
-        h("solo"),
-        k("⏎ / alt+⏎", "send / newline (or end a line with \\)"),
-        k("esc", "clear the input (never interrupts)"),
+        h("chat (solo, a zoomed agent, the stage's prompt)"),
+        k("⏎ / alt+⏎", "send / newline (or end a line with \\) · ! runs a shell command in Solo"),
+        k("⏎ while it works", "queue behind the current turn · ctrl+f sends the queue and the input now"),
+        k("backspace · ctrl+x", "on an empty input: the last queued message back to edit · drop the whole queue"),
+        k("alt+↑ / alt+↓", "raise / lower reasoning effort (shift+↑↓ works too)"),
         k("shift+tab", "cycle approvals: untrusted → on-request → never"),
+        k("ctrl+d · ctrl+t (F2)", "diff viewer for the focused agent · side panel (Solo, zoom) / pulse feed (stage)"),
+        k("esc", "clear the input; in a zoom, back to the overview (it never interrupts)"),
         gap(),
-        h("busy-agent chat (solo, zoom, @name)"),
-        k("⏎", "queue a message behind the current turn (shown as a chip above the input)"),
-        k("ctrl+f", "force-send: deliver the queue + input into the running turn right now"),
-        k("backspace", "on an empty input, pops the last queued message back in to edit"),
-        k("ctrl+x", "on an empty input, discards the whole queue"),
-        gap(),
-        h("mandala stage"),
-        k("tab", "toggle between typing and navigating the canvas"),
-        k("←→↑↓ · alt+←→ · 1-9", "select an agent · jump straight to the nth and zoom in"),
-        k("⏎", "zoom into the selected agent (esc to come back to the overview)"),
-        k("space", "pause / resume the whole run; a halted run resumes only on space, also after m"),
-        k("e", "on a halted run: the whole message and what fixes it"),
-        k("r · x · c · +/-", "retry (or restart crashed) · interrupt · compact · effort"),
-        k("m", "switch model for the selected agent (fixes a halt where the provider rejected it)"),
-        k("p · a", "plan · approve plan (during review)"),
-        k("/akasha [group]", "the shared notes of the run's agent groups (experimental)"),
+        h("stage (tab: typing ⇄ navigating the canvas)"),
+        k("←→↑↓ · 1-9 · ⏎", "select an agent · jump to the nth and zoom in · zoom into the selected (esc back)"),
+        k("space · e", "pause / resume the run (a halted run resumes only on space) · a halt's whole message"),
+        k("r · x · c", "retry (or restart a crashed agent) · interrupt · compact"),
+        k("m · +/-", "switch the selected agent's model (fixes a rejected model) · its effort"),
+        k("p · a", "plan · approve the plan (during review)"),
         k("@name msg", "message one agent directly; plain text re-prompts the planner"),
-        k("s", "open the pattern studio"),
-        k("/runs", "this project's runs: ⏎ resume where it stopped · D delete (branches, worktrees, journal)"),
+        k("/stop · /runs", "stop the run for good · this project's runs: resume, land or delete"),
+        gap(),
+        h("config screens (/models, /studio, /settings)"),
+        k("type · ⏎", "type over the selected field, or ⏎ to edit it; ⏎ again saves the file, esc puts it back"),
+        k("←→ · space", "change a choice, flip an on/off (in the models grid ←→ move: +/- and space change)"),
+        k("ctrl+n", "add: a provider from its key, a model, Codex or Claude Code · a role · an MCP server"),
+        k("del del", "delete the row (press twice)"),
+        k("ctrl+t · ctrl+d", "test a model or an MCP server · ask a provider for its models"),
+        k("tab · esc", "the next pane or grid · back to where you came from"),
     ]
     .concat();
     let r = centered(area, w, l.len() as u16 + 3);
@@ -271,10 +139,14 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
     let start = if n <= vis { 0 } else { sel.saturating_sub(vis / 2).min(n - vis) };
     let window = if n > vis { format!(" · {}-{} of {n}", start + 1, start + vis) } else { String::new() };
     let mut l = vec![Line::from(Span::styled(format!("  for: {}{window}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
+    let mut band = None;
     for (i, m) in app.registry.models.iter().enumerate().skip(start).take(vis) {
         let is_cur = cur.map(|a| a.model_alias == m.alias).unwrap_or(false);
         let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
-        let st = if i == sel { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
+        let st = if i == sel { theme::bold(theme::accent()) } else { theme::text() };
+        if i == sel {
+            band = Some(l.len());
+        }
         let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
         let via = if narrow { app.registry.provider_name(&m.provider) } else { format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider)) };
         // Two aliases can point at the same model id through different providers — the provider
@@ -284,8 +156,8 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         let (mw, vw) = if narrow { (14, 15) } else { (18, 27) };
         let mut row = vec![
             Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
-            // width + 1: a 10-char alias must not touch the model id next to it
-            Span::styled(format!("{:<11}", trunc(&m.alias, 10)), st),
+            // width + 1: an 11-character alias (`astra-codex`) must not touch the model id
+            Span::styled(format!("{:<12}", trunc(&m.alias, 11)), st),
             Span::styled(format!("{:<mw$}", trunc(&m.model, mw - 1)), theme::muted()),
             Span::styled(format!(" {:<vw$}", trunc(&via, vw - 1)), theme::dim()),
             Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
@@ -321,13 +193,121 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
     l.push(Line::default());
     let keys = if narrow { "  ↑↓ model · ←→ effort · ⏎ switch · +/- c ctx · e edit models · esc" } else { "  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc" };
     l.push(Line::from(Span::styled(keys, theme::faint())));
-    f.render_widget(Paragraph::new(l).block(block("model & effort", theme::SAFFRON)), r);
+    let blk = block("model & effort", theme::SAFFRON);
+    let inner = blk.inner(r);
+    f.render_widget(Paragraph::new(l).block(blk), r);
+    if let Some(y) = band {
+        form::band_line(f.buffer_mut(), inner, y, 0);
+    }
+}
+
+/// `/run` and `/pattern`: the patterns (name, tag, description; the one new runs use marked), and
+/// for `/run` the goal to start on the selected one.
+fn new_run(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoice], goal: Option<&crate::ui::input::Input>) {
+    let w = 104u16.min(area.width.saturating_sub(2));
+    let iw = w.saturating_sub(2) as usize;
+    let goal_rows = goal.map(|g| g.layout(iw.saturating_sub(9)).0.len().clamp(1, 4)).unwrap_or(0);
+    // the list, a blank line and the keys inside the border — and the goal with a blank line after it
+    let h = list.len() as u16 + 4 + if goal.is_some() { goal_rows as u16 + 1 } else { 0 };
+    let r = centered(area, w, h);
+    clear(f, area, r);
+    let title = if goal.is_some() { "new run" } else { "pattern for new runs" };
+    let blk = block(title, theme::VIOLET);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    let nw = list.iter().map(|p| w_of(&p.name)).max().unwrap_or(0).max(14) + 2;
+    let mark = format!("  {} for new runs", theme::g("●", "*"));
+    let mut l: Vec<Line> = vec![];
+    for (i, p) in list.iter().enumerate() {
+        let is = i == sel;
+        let on = p.name == app.pattern_name;
+        let st = if is { theme::bold(theme::accent()) } else { theme::bold(theme::text()) };
+        let tag_st = match p.tag {
+            "default" => theme::fg(theme::GREEN),
+            "yours" | "edited" => theme::fg(theme::VIOLET),
+            _ => theme::faint(),
+        };
+        // the description takes what the name, the tag and the mark leave, a column short of the border
+        let dw = iw.saturating_sub(3 + nw + 10 + if on { w_of(&mark) } else { 0 });
+        let (about, about_st) = match &p.about {
+            Ok(d) => (trunc(d, dw), theme::muted()),
+            Err(e) => (trunc(&format!("{} does not load: {e}", theme::g("⚠", "!")), dw), theme::fg(theme::RED)),
+        };
+        l.push(Line::from(vec![
+            Span::styled(format!("  {:<nw$}", p.name), st),
+            Span::styled(format!("{:<10}", p.tag), tag_st),
+            Span::styled(format!("{about:<dw$}"), about_st),
+            Span::styled(if on { mark.clone() } else { String::new() }, theme::fg(theme::GREEN)),
+        ]));
+    }
+    l.push(Line::default());
+    let mut cursor = None;
+    if let Some(g) = goal {
+        let gw = iw.saturating_sub(9);
+        let (rows, cr, cc) = g.layout(gw);
+        let start = cr.saturating_sub(goal_rows - 1);
+        if g.is_empty() {
+            l.push(Line::from(vec![Span::styled("  goal › ", theme::bold(theme::accent())), Span::styled("describe what to build — the planner takes it from there", theme::faint())]));
+        }
+        for (k, row) in rows.iter().enumerate().skip(start).take(goal_rows).filter(|_| !g.is_empty()) {
+            let lead = if k == start { "  goal › " } else { "         " };
+            l.push(Line::from(vec![Span::styled(lead, theme::bold(theme::accent())), Span::styled(row.clone(), theme::text())]));
+        }
+        cursor = Some((inner.x + 9 + cc as u16, inner.y + (list.len() + 1 + cr - start) as u16));
+        l.push(Line::default());
+    }
+    let keys = match form::armed(&app.confirm) {
+        Some(what) => format!("  del again to delete {what} · esc keeps it"),
+        // with a goal typed, del is the goal's
+        None if goal.is_some_and(|g| !g.text().is_empty()) => "  ↑↓ pattern · ⏎ start the run · ctrl+e edit it in the studio · esc".into(),
+        None if goal.is_some() => "  ↑↓ pattern · ⏎ start the run · ctrl+e edit it in the studio · del delete yours · esc".into(),
+        None => "  ↑↓ pattern · ⏎ use it for new runs · e edit it in the studio · del delete yours · esc".into(),
+    };
+    l.push(Line::from(Span::styled(keys, theme::faint())));
+    f.render_widget(Paragraph::new(l), inner);
+    form::band_line(f.buffer_mut(), inner, sel, 0);
+    if let Some(c) = cursor {
+        f.set_cursor_position(c);
+    }
+}
+
+/// A short list to choose from (`Overlay::Select`): label and detail, ticks when it takes several.
+fn select(f: &mut Frame, area: Rect, s: &Select) {
+    let lw = s.items.iter().map(|c| w_of(&c.label)).max().unwrap_or(0) + 2;
+    let dw = s.items.iter().map(|c| w_of(&c.detail)).max().unwrap_or(0);
+    let tick = if s.multi { 4 } else { 0 };
+    // a column of space each side of the text, inside the border
+    let w = ((2 + tick + lw + dw + 4) as u16).clamp(44, 100);
+    let r = centered(area, w, s.items.len() as u16 + 4);
+    clear(f, area, r);
+    let blk = block(&s.title, theme::VIOLET);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    let room = (inner.width as usize).saturating_sub(2 + tick + lw);
+    let vis = (inner.height as usize).saturating_sub(2).max(1);
+    let start = form::scroll_for(s.sel, 0, vis, s.items.len());
+    let mut l: Vec<Line> = vec![];
+    for (i, c) in s.items.iter().enumerate().skip(start).take(vis) {
+        let st = if i == s.sel { theme::bold(theme::accent()) } else { theme::text() };
+        let mut spans = vec![Span::raw("  ")];
+        if s.multi {
+            spans.push(Span::styled(if c.on { "[x] " } else { "[ ] " }, st));
+        }
+        spans.push(Span::styled(format!("{:<lw$}", c.label), st));
+        spans.push(Span::styled(trunc(&c.detail, room), theme::muted()));
+        l.push(Line::from(spans));
+    }
+    l.push(Line::default());
+    let keys = if s.multi { "  ↑↓ · space tick · ⏎ take the ticked ones · esc" } else { "  ↑↓ · ⏎ choose · esc" };
+    l.push(Line::from(Span::styled(keys, theme::faint())));
+    f.render_widget(Paragraph::new(l), inner);
+    form::band_line(f.buffer_mut(), inner, s.sel, start);
 }
 
 fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: usize, scroll: usize) -> Option<usize> {
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     clear(f, area, r);
-    let Some(a) = app.agents.get(&agent) else { return None };
+    let a = app.agents.get(&agent)?;
     let blk = block(&format!("changes · {}", a.name), theme::AMBER);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
@@ -447,7 +427,7 @@ fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> usize {
 
 /// The halt in full: the band cuts the message to one line, the backend's error can be long.
 fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
-    let Some(run) = app.run.as_ref() else { return None };
+    let run = app.run.as_ref()?;
     let w = 100u16.min(area.width.saturating_sub(2));
     let tw = w.saturating_sub(4) as usize;
     let mut l: Vec<Line<'static>> = vec![];
@@ -488,19 +468,6 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
     let hint = if run.halt.is_some() { format!(" space resume · m model{more} · esc ") } else { " esc ".into() };
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
     Some(max)
-}
-
-/// `/akasha [group]`: opens the notes overlay, or says in a toast why there is nothing to open —
-/// no run, a run without groups (Akasha off, or a pattern with none), or a group it does not have.
-pub fn open_akasha(app: &mut App, group: &str) {
-    let groups: Vec<String> = app.run.as_ref().map(|r| r.akasha.keys().cloned().collect()).unwrap_or_default();
-    if groups.is_empty() {
-        app.toast("no akasha groups in this run", crate::agent::Level::Info);
-    } else if !group.is_empty() && !groups.iter().any(|g| g == group) {
-        app.toast(format!("no akasha group '{group}' in this run (it has: {})", groups.join(", ")), crate::agent::Level::Info);
-    } else {
-        app.overlays.push(Overlay::Akasha { scroll: 0, group: (!group.is_empty()).then(|| group.to_string()) });
-    }
 }
 
 /// The run's shared notes, one section per group, each the block exactly as its agents read it
@@ -564,33 +531,12 @@ fn akasha_lines(rendered: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn is_multiline(t: &EditTarget) -> bool {
-    matches!(t, EditTarget::RoleField(_, f) if f == "instructions" || f == "description") || matches!(t, EditTarget::FlowStep(_, f) if f == "task")
-}
-
-fn edit(f: &mut Frame, area: Rect, title: &str, input: &crate::ui::input::Input, target: &EditTarget) {
-    let ml = is_multiline(target);
-    let h = if ml { area.height.saturating_sub(6).min(24) } else { 5 };
-    let r = centered(area, 90, h);
-    clear(f, area, r);
-    let blk = block(title, theme::VIOLET);
-    let inner = blk.inner(r);
-    f.render_widget(blk, r);
-    let (rows, cr, cc) = input.layout(inner.width.saturating_sub(2) as usize);
-    let vh = inner.height.saturating_sub(1) as usize;
-    let start = if cr >= vh { cr + 1 - vh } else { 0 };
-    let lines: Vec<Line> = rows.iter().skip(start).take(vh).map(|s| Line::from(Span::styled(format!(" {s}"), theme::text()))).collect();
-    f.render_widget(Paragraph::new(lines), inner);
-    f.set_cursor_position((inner.x + 1 + cc as u16, inner.y + (cr - start) as u16));
-    let hint = if ml { " ⏎ newline · ctrl+s apply · esc cancel " } else { " ⏎ apply · esc cancel " };
-    f.render_widget(Paragraph::new(Span::styled(hint, theme::faint())), Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(1), width: inner.width, height: 1 });
-}
-
 fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     use crate::discover::CState;
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     clear(f, area, r);
-    let blk = block("discover models", theme::SAFFRON);
+    let title = st.origin.as_ref().map(|h| format!("models of {h}")).unwrap_or_else(|| "discover models".into());
+    let blk = block(&title, theme::SAFFRON);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let w = inner.width as usize;
@@ -622,9 +568,13 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     let room = (inner.height as usize).saturating_sub(head + 2).max(1);
     let sel = st.sel.min(vis.len().saturating_sub(1));
     let start = sel.saturating_sub(room.saturating_sub(1));
+    let mut band = None;
     for (row, &i) in vis.iter().enumerate().skip(start).take(room) {
         let c = &st.items[i];
         let is = row == sel;
+        if is {
+            band = Some(l.len());
+        }
         let mark = match (c.state, c.selected) {
             (CState::Configured, _) => format!(" {} ", theme::g("✓", "v")),
             (_, true) => "[x]".to_string(),
@@ -635,16 +585,19 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
             (Some(n), false) => format!("{} assumed", fmt_tokens(n)),
             (None, _) => "codex knows".to_string(),
         };
-        let eff = if c.efforts.is_empty() { "—".to_string() } else { format!("{}…{}", c.efforts.first().unwrap(), c.efforts.last().unwrap()) };
+        let eff = match (c.efforts.first(), c.efforts.last()) {
+            (Some(a), Some(b)) => format!("{a}…{b}"),
+            _ => "—".to_string(),
+        };
         let (status, scol) = match c.state {
             CState::New => ("new", theme::GREEN),
             CState::Update => ("fill missing", theme::AMBER),
             CState::Configured => ("configured", theme::FAINT),
         };
         let base = if c.state == CState::Configured { theme::dim() } else { theme::text() };
-        let st_row = if is { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { base };
+        let st_row = if is { theme::bold(theme::accent()) } else { base };
         l.push(Line::from(vec![
-            Span::styled(format!("{}{} ", if is { theme::g("▶", ">") } else { " " }, mark), st_row),
+            Span::styled(format!(" {} ", mark), st_row),
             Span::styled(format!("{:<10} ", trunc(&c.provider, 10)), if is { st_row } else { theme::muted() }),
             Span::styled(format!("{:<mw$} ", trunc(&c.model, mw)), st_row),
             Span::styled(format!("{:<14} ", trunc(&ctx, 14)), if c.context_known { theme::muted() } else { theme::fg(theme::AMBER) }),
@@ -656,6 +609,9 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
         l.push(Line::from(Span::styled(if st.items.is_empty() { "  no models found" } else { "  nothing matches the filter" }, theme::dim())));
     }
     f.render_widget(Paragraph::new(l), inner);
+    if let Some(y) = band {
+        form::band_line(f.buffer_mut(), inner, y, 0);
+    }
     let (note, keys) = if w >= 112 {
         (" unknown context → assumed 200k (edit in /models) · effort only where the provider reports reasoning support", " type to filter · ↑↓ move · space select · tab all/none · ⏎ add selected & save · esc close")
     } else {
@@ -663,43 +619,6 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     };
     let foot = vec![Line::from(Span::styled(note, theme::faint())), Line::from(Span::styled(keys, theme::bold(theme::accent())))];
     f.render_widget(Paragraph::new(foot), Rect { y: inner.y + inner.height.saturating_sub(2), height: 2.min(inner.height), ..inner });
-}
-
-fn patterns(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoice]) {
-    let r = centered(area, 110, list.len() as u16 + 5);
-    clear(f, area, r);
-    let iw = r.width.saturating_sub(2) as usize;
-    let nw = list.iter().map(|p| w_of(&p.name)).max().unwrap_or(0).max(14) + 2;
-    let active = format!("  {} active", theme::g("●", "*"));
-    let mut l: Vec<Line> = list
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let is = i == sel;
-            let on = p.name == app.pattern_name;
-            let st = if is { theme::bold(theme::accent()) } else { theme::bold(theme::text()) };
-            let tag_st = match p.tag {
-                "default" => theme::fg(theme::GREEN),
-                "yours" | "edited" => theme::fg(theme::VIOLET),
-                _ => theme::faint(),
-            };
-            // the description takes what the name, the tag and the active mark leave
-            let dw = iw.saturating_sub(3 + nw + 10 + 1 + if on { w_of(&active) } else { 0 });
-            let (about, about_st) = match &p.about {
-                Ok(d) => (trunc(d, dw), theme::muted()),
-                Err(e) => (trunc(&format!("{} does not load: {e}", theme::g("⚠", "!")), dw), theme::fg(theme::RED)),
-            };
-            Line::from(vec![
-                Span::styled(format!(" {} {:<nw$}", if is { theme::g("▶", ">") } else { " " }, p.name), st),
-                Span::styled(format!("{:<10}", p.tag), tag_st),
-                Span::styled(about, about_st),
-                Span::styled(if on { active.clone() } else { String::new() }, theme::fg(theme::GREEN)),
-            ])
-        })
-        .collect();
-    l.push(Line::default());
-    l.push(Line::from(Span::styled("  ⏎ use for new runs · e edit in studio · esc", theme::faint())));
-    f.render_widget(Paragraph::new(l).block(block("patterns", theme::VIOLET)), r);
 }
 
 fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine::state::RunSummary], confirm: bool, others: usize) {
@@ -710,7 +629,7 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
     let id_w = inner_w.saturating_sub(2 + 32 + 1 + 18 + 1 + 9 + 2).max(8);
     let mut l: Vec<Line> = vec![Line::from(Span::styled(format!("   {:<32} {:<18} {:>9}  {}", "run", "stage", "updated", "id"), theme::faint()))];
     if list.is_empty() {
-        l.push(Line::from(Span::styled("   no runs for this project yet — ctrl+o starts one", theme::dim())));
+        l.push(Line::from(Span::styled("   no runs for this project yet — /run starts one", theme::dim())));
     }
     for (i, run) in list.iter().enumerate() {
         let cur = app.run.as_ref().map(|x| x.id == run.id).unwrap_or(false);
@@ -720,11 +639,13 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
             theme::fg(theme::ROSE)
         } else if unfinished {
             theme::fg(theme::AMBER)
+        } else if run.stage_label() == "stopped" {
+            theme::muted()
         } else {
             theme::fg(theme::GREEN)
         };
         l.push(Line::from(vec![
-            Span::styled(format!(" {} {:<32}", if i == sel { theme::g("▶", ">") } else { " " }, trunc(&run.title(), 32)), st),
+            Span::styled(format!("   {:<32}", trunc(&run.title(), 32)), st),
             Span::styled(format!(" {:<18}", trunc(&run.stage_label(), 18)), stage_style),
             Span::styled(format!(" {:>9}", fmt_ago(run.updated_unix)), theme::faint()),
             Span::styled(format!("  {}", trunc(&run.id, id_w)), theme::faint()),
@@ -736,16 +657,73 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
         let id = list.get(sel).map(|r| r.title()).unwrap_or_default();
         l.push(Line::from(Span::styled(format!("  delete {id} — its branches, worktrees and journal? y / n"), theme::bold(theme::fg(theme::ROSE)))));
     } else {
-        let mut hint = "  ⏎ resume where it stopped · D delete · esc".to_string();
+        let mut hint = "  ⏎ open (resume where it stopped) · D delete · esc".to_string();
         if others > 0 {
             hint.push_str(&format!("   ({others} run{} in other projects: mantra runs)", if others == 1 { "" } else { "s" }));
         }
         l.push(Line::from(Span::styled(hint, theme::faint())));
     }
-    f.render_widget(Paragraph::new(l).block(block("runs", theme::VIOLET)), r);
+    let blk = block("runs", theme::VIOLET);
+    let inner = blk.inner(r);
+    f.render_widget(Paragraph::new(l).block(blk), r);
+    if !list.is_empty() {
+        form::band_line(f.buffer_mut(), inner, 1 + sel.min(list.len() - 1), 0);
+    }
 }
 
 // ───────────────────────────── keys ─────────────────────────────
+
+/// Delete on the new-run overlay's pattern: a file of yours goes on the second press (an edited
+/// built-in is the built-in again); a built-in has none to delete. Returns the list as it is now.
+fn delete_pattern(app: &mut App, list: Vec<PatternChoice>, sel: usize) -> Vec<PatternChoice> {
+    let Some((name, tag)) = list.get(sel).map(|p| (p.name.clone(), p.tag)) else { return list };
+    if !matches!(tag, "yours" | "edited") {
+        app.toast(format!("{name} is built in — there is no file to delete"), crate::agent::Level::Info);
+        return list;
+    }
+    if !form::confirm(&mut app.confirm, &name) {
+        return list;
+    }
+    match crate::engine::pattern::Pattern::delete_file(&name, &app.project) {
+        Ok(path) => {
+            let after = if tag == "edited" { format!(" — {name} is the built-in again") } else { String::new() };
+            app.toast(format!("deleted {}{after}", home_rel(&path)), crate::agent::Level::Ok);
+            // new runs and the Studio leave a pattern that is gone
+            if tag == "yours" && app.pattern_name == name {
+                app.pattern_name = crate::engine::pattern::NAME_DEFAULT.into();
+            }
+            if app.studio.pattern.name == name && !app.studio.dirty {
+                if let Ok(p) = crate::engine::pattern::Pattern::load(&app.pattern_name, &app.project) {
+                    app.studio.pattern = p;
+                }
+            }
+            PatternChoice::all(&app.project)
+        }
+        Err(e) => {
+            app.toast(e, crate::agent::Level::Warn);
+            list
+        }
+    }
+}
+
+/// What choosing in a `Select` does.
+fn chosen(app: &mut App, s: &Select) {
+    let key = s.items.get(s.sel).map(|c| c.key.clone()).unwrap_or_default();
+    match s.then {
+        SelectThen::AddMenu => super::models::add_chosen(app, &key),
+        SelectThen::AddModelOn => super::models::add_model_on(app, &key),
+        SelectThen::Akasha => app.overlays.push(Overlay::Akasha { scroll: 0, group: Some(key) }),
+        SelectThen::Respawn => {
+            if let Ok(a) = key.parse() {
+                app.respawn_agent(a);
+            }
+        }
+        SelectThen::SoloMcp => {
+            let ticked: Vec<String> = s.items.iter().filter(|c| c.on).map(|c| c.key.clone()).collect();
+            super::settings::solo_mcp_chosen(app, &ticked);
+        }
+    }
+}
 
 pub fn key(app: &mut App, k: KeyEvent) {
     let Some(top) = app.overlays.pop() else { return };
@@ -758,23 +736,9 @@ pub fn key(app: &mut App, k: KeyEvent) {
             KeyCode::PageDown => Some(Overlay::Help { scroll: scroll + 10 }),
             _ => None,
         },
-        Overlay::Web => match k.code {
+        Overlay::Qr => match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
-            _ => Some(Overlay::Web),
-        },
-        Overlay::Remote => match k.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
-            KeyCode::Char('r') if !ctrl => {
-                match app.web.as_ref().and_then(|w| w.remote.clone()) {
-                    Some(r) => {
-                        r.rotate();
-                        app.toast("new remote link — the old link, code and QR no longer work", crate::agent::Level::Ok);
-                    }
-                    None => app.toast("remote access is off (mantra --remote)", crate::agent::Level::Info),
-                }
-                Some(Overlay::Remote)
-            }
-            _ => Some(Overlay::Remote),
+            _ => Some(Overlay::Qr),
         },
         Overlay::ModelPicker { mut sel, target } => {
             let n = app.registry.models.len().max(1);
@@ -816,6 +780,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 }
                 KeyCode::Char('e') => {
                     app.enter_screen(Screen::Models);
+                    app.models_ui.providers = false;
                     app.models_ui.row = sel;
                     None
                 }
@@ -827,19 +792,17 @@ pub fn key(app: &mut App, k: KeyEvent) {
                         let i = STEPS.iter().position(|x| *x >= cur).unwrap_or(STEPS.len() - 1) as i64;
                         let j = (i + d).clamp(0, STEPS.len() as i64 - 1) as usize;
                         m.context_window = Some(STEPS[j]);
-                        let _ = app.registry.save();
-                        app.toast("context window changed — applies to new agents", crate::agent::Level::Info);
+                        match app.save_registry() {
+                            Ok(()) => app.toast("context window changed — applies to new agents", crate::agent::Level::Info),
+                            Err(e) => app.toast(e, crate::agent::Level::Error),
+                        }
                     }
                     Some(Overlay::ModelPicker { sel, target })
                 }
+                // the context window typed in place, in /models (no popup of its own)
                 KeyCode::Char('c') => {
-                    if let Some(m) = app.registry.models.get(sel) {
-                        let mut input = crate::ui::input::Input::default();
-                        input.set(&m.context_window.map(|c| c.to_string()).unwrap_or_default());
-                        let title = format!("{} · context (accepts 400k / 1m)", m.alias);
-                        app.overlays.push(Overlay::ModelPicker { sel, target });
-                        app.overlays.push(Overlay::Edit { title, input, target: EditTarget::ModelCell(sel, 3) });
-                    }
+                    app.enter_screen(Screen::Models);
+                    super::models::edit_model_cell(app, sel, super::models::CONTEXT_COL);
                     None
                 }
                 _ => Some(Overlay::ModelPicker { sel, target }),
@@ -890,7 +853,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 }
                 KeyCode::Enter if sel < n => {
                     let a = app.approvals[sel].agent;
-                    app.screen = if Some(a) == app.solo { Screen::Solo } else { Screen::Zoom(a) };
+                    app.set_screen(if Some(a) == app.solo { Screen::Solo } else { Screen::Zoom(a) });
                     None
                 }
                 _ => Some(Overlay::Inbox { sel }),
@@ -928,7 +891,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
             // input instead — it's handled globally in App::on_key, before overlays are dispatched.
             KeyCode::Char('f') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.canvas_focus = false;
-                app.screen = Screen::Stage;
+                app.set_screen(Screen::Stage);
                 None
             }
             _ => Some(Overlay::Plan { scroll }),
@@ -962,20 +925,94 @@ pub fn key(app: &mut App, k: KeyEvent) {
             }
             _ => Some(Overlay::Halt { scroll }),
         },
-        Overlay::Edit { title, mut input, target } => {
-            let ml = is_multiline(&target);
-            if k.code == KeyCode::Esc {
-                None
-            } else if (ctrl && k.code == KeyCode::Char('s')) || (!ml && k.code == KeyCode::Enter) {
-                let text = input.text();
-                crate::ui::studio::apply_edit(app, &target, text.trim_end());
-                None
-            } else {
-                if ml && k.code == KeyCode::Enter {
-                    input.insert_str("\n");
-                } else if let Act::Submit = input.key(k) {
+        Overlay::NewRun { mut sel, list, mut goal } => {
+            let n = list.len();
+            let broken = list.get(sel).filter(|p| p.about.is_err()).map(|p| p.name.clone());
+            let name = list.get(sel).map(|p| p.name.clone()).unwrap_or_default();
+            // e edits the pattern in the Studio — ctrl+e while there is a goal to type an e into
+            let edit = k.code == KeyCode::Char('e') && (goal.is_none() || ctrl);
+            match k.code {
+                KeyCode::Esc => None,
+                KeyCode::Up => {
+                    sel = sel.saturating_sub(1);
+                    Some(Overlay::NewRun { sel, list, goal })
                 }
-                Some(Overlay::Edit { title, input, target })
+                KeyCode::Down => {
+                    sel = (sel + 1).min(n.saturating_sub(1));
+                    Some(Overlay::NewRun { sel, list, goal })
+                }
+                // a pattern whose file does not load would only fail the run (and the Studio
+                // cannot open it): say so, stay here
+                KeyCode::Enter | KeyCode::Char('e') if (k.code == KeyCode::Enter || edit) && broken.is_some() => {
+                    app.toast(format!("{} does not load — fix its .toml file first", broken.unwrap_or_default()), crate::agent::Level::Warn);
+                    Some(Overlay::NewRun { sel, list, goal })
+                }
+                KeyCode::Char('e') if edit => {
+                    app.pattern_name = name;
+                    app.studio.dirty = false;
+                    app.open_studio();
+                    None
+                }
+                // with a goal being typed, delete is the goal's (forward delete)
+                KeyCode::Delete if !goal.as_ref().is_some_and(|g| !g.text().is_empty()) => {
+                    let list = delete_pattern(app, list, sel);
+                    sel = sel.min(list.len().saturating_sub(1));
+                    Some(Overlay::NewRun { sel, list, goal })
+                }
+                KeyCode::Enter if !k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => match goal {
+                    None => {
+                        app.choose_pattern(&name);
+                        None
+                    }
+                    Some(g) if g.text().trim().is_empty() => {
+                        app.toast("describe what to build first", crate::agent::Level::Info);
+                        Some(Overlay::NewRun { sel, list, goal: Some(g) })
+                    }
+                    Some(g) => {
+                        app.choose_pattern(&name);
+                        app.start_run(g.text().trim());
+                        None
+                    }
+                },
+                _ => {
+                    if let Some(g) = goal.as_mut() {
+                        g.key(k);
+                    }
+                    Some(Overlay::NewRun { sel, list, goal })
+                }
+            }
+        }
+        Overlay::Select(mut s) => {
+            let n = s.items.len();
+            match k.code {
+                KeyCode::Esc => None,
+                KeyCode::Up => {
+                    s.sel = s.sel.saturating_sub(1);
+                    Some(Overlay::Select(s))
+                }
+                KeyCode::Down => {
+                    s.sel = (s.sel + 1).min(n.saturating_sub(1));
+                    Some(Overlay::Select(s))
+                }
+                KeyCode::Char(' ') if s.multi => {
+                    if let Some(c) = s.items.get_mut(s.sel) {
+                        c.on = !c.on;
+                    }
+                    Some(Overlay::Select(s))
+                }
+                KeyCode::Enter if n > 0 => {
+                    chosen(app, &s);
+                    None
+                }
+                // a letter: the next row whose label starts with it
+                KeyCode::Char(c) if !ctrl && c.is_alphanumeric() => {
+                    let c = c.to_ascii_lowercase();
+                    if let Some(i) = (1..=n).map(|d| (s.sel + d) % n).find(|i| s.items[*i].label.to_lowercase().starts_with(c)) {
+                        s.sel = i;
+                    }
+                    Some(Overlay::Select(s))
+                }
+                _ => Some(Overlay::Select(s)),
             }
         }
         Overlay::Discover(mut st) => {
@@ -1038,43 +1075,6 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 _ => Some(Overlay::Discover(st)),
             }
         }
-        Overlay::Patterns { mut sel, list } => match k.code {
-            KeyCode::Esc => None,
-            KeyCode::Up => {
-                sel = sel.saturating_sub(1);
-                Some(Overlay::Patterns { sel, list })
-            }
-            KeyCode::Down => {
-                sel = (sel + 1).min(list.len().saturating_sub(1));
-                Some(Overlay::Patterns { sel, list })
-            }
-            // a pattern whose file does not load would only fail the next run (and the studio
-            // cannot open it): say so, stay here
-            KeyCode::Enter | KeyCode::Char('e') if list.get(sel).map(|p| p.about.is_err()).unwrap_or(false) => {
-                app.toast(format!("{} does not load — fix its .toml file first", list[sel].name), crate::agent::Level::Warn);
-                Some(Overlay::Patterns { sel, list })
-            }
-            KeyCode::Enter => {
-                if let Some(p) = list.get(sel).map(|p| &p.name) {
-                    app.pattern_name = p.clone();
-                    app.studio.dirty = false;
-                    if let Ok(pt) = crate::engine::pattern::Pattern::load(p, &app.project) {
-                        app.studio.pattern = pt;
-                    }
-                    app.toast(format!("new runs use pattern {p}"), crate::agent::Level::Ok);
-                }
-                None
-            }
-            KeyCode::Char('e') => {
-                if let Some(p) = list.get(sel).map(|p| &p.name) {
-                    app.pattern_name = p.clone();
-                    app.studio.dirty = false;
-                    app.open_studio();
-                }
-                None
-            }
-            _ => Some(Overlay::Patterns { sel, list }),
-        },
         Overlay::Runs { mut sel, mut list, confirm, others } => {
             let n = list.len();
             if confirm {
@@ -1139,6 +1139,17 @@ mod tests {
         app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default()
     }
 
+    fn press(app: &mut App, c: KeyCode) {
+        key(app, KeyEvent::new(c, KeyModifiers::NONE));
+    }
+
+    fn screen_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::super::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect()
+    }
+
     /// The overlay is the block as the agents read it: the header, then each note on its own line
     /// with its head, an urgent one marked, a note over several lines kept together under its text.
     #[test]
@@ -1164,9 +1175,10 @@ mod tests {
     }
 
     /// `/akasha` with nothing to show is a toast, not an empty box; an unknown group names the
-    /// groups there are; the overlay scrolls and closes on esc.
+    /// groups there are; one group opens straight away, several ask which (a selector), and the
+    /// overlay scrolls and closes on esc.
     #[test]
-    fn akasha_opens_only_on_a_run_with_groups_and_closes_on_esc() {
+    fn akasha_opens_the_one_group_or_asks_which() {
         let mut app = crate::web::snapshot::tests::test_app();
         app.command("/akasha");
         assert!(app.overlays.is_empty());
@@ -1183,15 +1195,23 @@ mod tests {
         app.command("/akasha testers");
         assert!(app.overlays.is_empty());
         assert_eq!(toast(&app), "no akasha group 'testers' in this run (it has: builders)");
-        app.command("/akasha builders");
-        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, group: Some(name) }) if name == "builders"), "the one named");
-        let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
-        key(&mut app, press(KeyCode::Down));
-        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 1, .. })));
-        key(&mut app, press(KeyCode::Esc));
-        assert!(app.overlays.is_empty());
         app.command("/akasha");
-        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { group: None, .. })), "every group");
+        assert!(matches!(app.overlays.pop(), Some(Overlay::Akasha { group: Some(g), .. }) if g == "builders"), "the only group, straight in");
+        if let Some(r) = app.run.as_mut() {
+            r.akasha.insert("reviewers".into(), crate::engine::akasha::Block::new("reviewers", 4_096));
+        }
+        app.command("/akasha");
+        let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("a selector of the groups") };
+        assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["builders", "reviewers"]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, group: Some(name) }) if name == "reviewers"), "the one chosen");
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 1, .. })));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty());
+        app.command("/akasha builders");
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { group: Some(name), .. }) if name == "builders"), "the one named");
     }
 
     /// Left open after the run is gone, the overlay says there is nothing rather than drawing an
@@ -1200,11 +1220,140 @@ mod tests {
     fn the_overlay_without_blocks_says_so() {
         let mut app = crate::web::snapshot::tests::test_app();
         app.overlays.push(Overlay::Akasha { scroll: 7, group: None });
-        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer();
-        let screen: String = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
+        let screen = screen_of(&mut app, 100, 30);
         assert!(screen.contains("no akasha groups in this run") && screen.contains("akasha"), "{screen}");
         assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, .. })), "clamped");
+    }
+
+    /// `/run` without a goal opens the new-run overlay: the patterns, the one for new runs
+    /// selected and marked, a goal typed under them; ⏎ on an empty goal says what is missing, on a
+    /// goal starts the run on the selected pattern. `/pattern` is the same list without a goal.
+    #[tokio::test]
+    async fn run_without_a_goal_picks_a_pattern_and_asks_for_the_goal() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("newrun-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project;
+            app.command("/run");
+            let Some(Overlay::NewRun { sel: 0, list, goal: Some(_) }) = app.overlays.last() else { panic!("the new-run overlay") };
+            assert_eq!(list.iter().take(3).map(|p| p.name.as_str()).collect::<Vec<_>>(), crate::engine::pattern::Pattern::names());
+            let s = screen_of(&mut app, 120, 30);
+            assert!(s.contains("mantra-default") && s.contains("default") && s.contains("for new runs") && s.contains("goal ›"), "{s}");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(toast(&app), "describe what to build first");
+            press(&mut app, KeyCode::Down);
+            for c in "e2e: build it".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert!(matches!(app.overlays.last(), Some(Overlay::NewRun { goal: Some(g), .. }) if g.text() == "e2e: build it"), "an e is typed into the goal, not an edit");
+            assert!(!screen_of(&mut app, 120, 30).contains("del delete"), "with a goal typed, del is the goal's");
+            press(&mut app, KeyCode::Delete);
+            assert!(app.confirm.is_none() && !toast(&app).contains("built in"), "no pattern delete while typing");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.overlays.is_empty());
+            let run = app.run.as_ref().expect("started");
+            assert_eq!((run.pattern.name.as_str(), run.brief.as_str()), (crate::engine::pattern::NAME_LEAN, "e2e: build it"));
+            assert_eq!(app.pattern_name, crate::engine::pattern::NAME_LEAN, "and it is the pattern for new runs");
+            app.run = None;
+            app.command("/pattern");
+            assert!(matches!(app.overlays.last(), Some(Overlay::NewRun { sel: 1, goal: None, .. })), "the one for new runs selected");
+            press(&mut app, KeyCode::Up);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.pattern_name, crate::engine::pattern::NAME_DEFAULT);
+            assert!(app.run.is_none(), "choosing starts nothing");
+        });
+    }
+
+    /// Delete on the pattern list removes a file of yours on the second press (new runs go back
+    /// to the default); a built-in has no file and says so.
+    #[test]
+    fn delete_twice_on_the_pattern_list_removes_a_pattern_of_yours() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("delete-project");
+            std::fs::create_dir_all(&project).unwrap();
+            crate::engine::pattern::Pattern::builtin().save_as("mine", &project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project;
+            app.pattern_name = "mine".into();
+            app.command("/pattern");
+            let Some(Overlay::NewRun { sel, list, goal: None }) = app.overlays.last() else { panic!("the pattern list") };
+            assert_eq!(list[*sel].name, "mine", "the one for new runs selected");
+            press(&mut app, KeyCode::Delete);
+            assert!(matches!(app.overlays.last(), Some(Overlay::NewRun { list, .. }) if list.iter().any(|p| p.name == "mine")), "armed only");
+            assert!(screen_of(&mut app, 120, 30).contains("del again to delete mine"));
+            press(&mut app, KeyCode::Delete);
+            assert!(toast(&app).starts_with("deleted ") && toast(&app).contains("mine.toml"), "{}", toast(&app));
+            let Some(Overlay::NewRun { list, .. }) = app.overlays.last() else { panic!("still open") };
+            assert!(list.iter().all(|p| p.name != "mine"), "gone from the list");
+            assert!(!crate::config::patterns_dir().join("mine.toml").exists());
+            assert_eq!(app.pattern_name, crate::engine::pattern::NAME_DEFAULT, "new runs leave a pattern that is gone");
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Up);
+            }
+            press(&mut app, KeyCode::Delete);
+            assert!(toast(&app).contains("is built in"), "{}", toast(&app));
+        });
+    }
+
+    /// `/respawn` with no agent named and none of the run's in view asks which (a selector of the
+    /// stage's agents); with one named it respawns that one; with no run it says so.
+    #[tokio::test]
+    async fn respawn_without_a_target_asks_which_agent() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.command("/respawn");
+            assert_eq!(toast(&app), "no run agent to respawn");
+            let mut run = crate::engine::run::Run::new(std::path::PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+            run.planner = Some(41);
+            run.orchestrator = Some(42);
+            app.agents.insert(41, crate::agent::Agent::new(41, "planner", "planner", std::path::PathBuf::from(".")));
+            app.agents.insert(42, crate::agent::Agent::new(42, "orchestrator", "orchestrator", std::path::PathBuf::from(".")));
+            app.run = Some(run);
+            app.command("/respawn");
+            let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("an agent selector") };
+            assert_eq!(s.items.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), vec!["planner", "orchestrator"]);
+            assert_eq!(s.then, SelectThen::Respawn);
+            app.overlays.clear();
+            app.command("/respawn nobody");
+            assert_eq!(toast(&app), "no agent named nobody in this run");
+        });
+    }
+
+    /// Tab completes a command, then its argument: the run's Akasha groups, its agents; `@` on the
+    /// stage completes an agent's name.
+    #[test]
+    fn tab_completes_commands_and_their_arguments() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.input.set("/se");
+        assert_eq!(app.suggestions().iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/settings"]);
+        let mut run = crate::engine::run::Run::new(std::path::PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.akasha.insert("builders".into(), crate::engine::akasha::Block::new("builders", 16_384));
+        run.planner = Some(41);
+        app.agents.insert(41, crate::agent::Agent::new(41, "planner", "planner", std::path::PathBuf::from(".")));
+        app.run = Some(run);
+        app.input.set("/akasha b");
+        assert_eq!(app.suggestions().iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["/akasha builders"]);
+        app.input.set("/respawn pl");
+        assert_eq!(app.suggestions().iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["/respawn planner"]);
+        app.input.set("/respawn planner");
+        assert!(app.suggestions().is_empty(), "typed out: nothing more to offer");
+        app.input.set("@pl");
+        assert!(app.suggestions().is_empty(), "@names belong to the stage");
+        app.screen = Screen::Stage;
+        assert_eq!(app.suggestions().iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["@planner "]);
+    }
+
+    /// The model picker's alias column fits an 11-character alias (the `-codex` ones) and keeps a
+    /// space before the model id.
+    #[test]
+    fn the_picker_fits_an_eleven_character_alias() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        let s = screen_of(&mut app, 140, 30);
+        let row = s.lines().find(|l| l.contains("astra-codex")).expect("its row");
+        let after = &row[row.find("astra-codex").unwrap() + "astra-codex".len()..];
+        assert!(after.starts_with(' ') && !after.starts_with("…"), "{row}");
     }
 }

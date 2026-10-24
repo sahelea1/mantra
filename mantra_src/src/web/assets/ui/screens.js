@@ -1,4 +1,5 @@
-// Mantra web UI — screens: Team, Run, Pulse, Inbox, Runs, Settings, More, Login, Connect.
+// Mantra web UI — screens: Team, Run, Pulse, Inbox, Runs, More, Login, Connect, and the cards the
+// Settings sections are made of (ui/config.js lays those out).
 'use strict';
 (function (M) {
     const h = M.h, F = M.fmt, P = M.parts;
@@ -14,36 +15,64 @@
     }
 
     // ── Team ─────────────────────────────────────────────────────────────────────────────────────
-    const DEFAULT_PATTERN = 'mantra-default';
-    function startRunCard() {
+    // The tag a picker row carries: what the pattern is, beside its name.
+    const TAG_SUFFIX = { default: ' (default)', edited: ' (edited)' };
+    // `opts.title`: "Start a new run" where one just ended (the Run screen of a stopped run).
+    function startRunCard(opts) {
+        opts = opts || {};
         const s = S();
         const app = s.app || {};
         // pattern_list: built-ins first (mantra-default leading), then the user's own; an older
         // server only sends the names.
         const pats = app.pattern_list || (app.patterns || []).map((name) => ({ name, description: '', builtin: false }));
-        const pat = s.ui.runPattern || app.pattern_name || (pats[0] && pats[0].name) || '';
+        const pat = s.ui.runPattern && pats.some((p) => p.name === s.ui.runPattern) ? s.ui.runPattern : app.pattern_name || (pats[0] && pats[0].name) || '';
         const cur = pats.find((p) => p.name === pat);
-        const opt = (p) => h('option', { value: p.name, key: p.name, selected: p.name === pat }, p.name + (p.name === DEFAULT_PATTERN ? ' (default)' : ''));
+        const opt = (p) => h('option', { value: p.name, key: p.name, selected: p.name === pat }, p.name + (TAG_SUFFIX[p.tag] || ''));
         const builtins = pats.filter((p) => p.builtin), own = pats.filter((p) => !p.builtin);
         const goal = s.ui.runGoal || '';
+        const width = s.ui.runParallel || '';
         const start = () => {
             const g = (S().ui.runGoal || '').trim();
             if (!g) return;
-            M.act.cmd('start_run', { goal: g, pattern: pat || undefined }, { busyKey: 'start-run', ok: 'Run started' })
-                .then(() => { S().ui.runGoal = ''; M.act.nav('/run'); }, () => { });
+            const w = String(S().ui.runParallel || '').trim();
+            const n = Number(w);
+            s.ui.runErr = null;
+            // a width that is not a number goes as typed: Mantra says what fits
+            M.act.cmd('start_run', { goal: g, pattern: pat || undefined, parallel: w ? (Number.isInteger(n) ? n : w) : undefined }, { busyKey: 'start-run', ok: 'Run started', quiet: true })
+                .then(() => { S().ui.runGoal = ''; S().ui.runParallel = ''; M.act.nav('/run'); }, (e) => { S().ui.runErr = e.message; M.act.changed(); });
         };
-        return card('Start a run', [
-            h('p', { class: 'sec-sub' }, 'A planner breaks the goal into phases, workers build them in parallel, a gate checks every phase.'),
-            h('textarea', { class: 'input goal', rows: 3, value: goal, placeholder: 'What should the team build? e.g. “Add OAuth login with GitHub, with tests”', 'aria-label': 'Run goal', oninput: (e) => { s.ui.runGoal = e.target.value; M.act.changed(); }, onkeydown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); start(); } } }),
+        return card(opts.title || 'Start a run', [
+            h('p', { class: 'sec-sub', key: 'sub' }, 'A planner breaks the goal into phases, workers build them in parallel, a gate checks every phase.'),
+            h('textarea', { class: 'input goal', key: 'goal', rows: 3, value: goal, placeholder: 'What should the team build? e.g. “Add OAuth login with GitHub, with tests”', 'aria-label': 'Run goal', oninput: (e) => { s.ui.runGoal = e.target.value; M.act.changed(); }, onkeydown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); start(); } } }),
             // A grid, so the pattern's description stays under the picker on a phone too (where
             // the button drops below both).
-            h('div', { class: 'start-row' },
+            h('div', { class: 'start-row', key: 'row' },
                 pats.length ? h('label', { class: 'select-wrap', key: 'pick' }, h('span', { class: 'select-label' }, 'Pattern'),
                     h('select', { class: 'select', value: pat, onchange: (e) => { s.ui.runPattern = e.target.value; M.act.changed(); } },
                         builtins.length && own.length ? [h('optgroup', { label: 'Built-in', key: 'b' }, builtins.map(opt)), h('optgroup', { label: 'Yours', key: 'o' }, own.map(opt))] : pats.map(opt))) : null,
+                h('label', { class: 'select-wrap par-wrap', key: 'par', title: 'For this run only, in every worker class' + (cur && cur.max_parallel ? ' — the pattern says ' + cur.max_parallel : '') },
+                    h('span', { class: 'select-label' }, 'Workers at once'),
+                    h('input', { class: 'input num', type: 'number', min: 1, max: 128, inputmode: 'numeric', value: width, placeholder: cur && cur.max_parallel ? String(cur.max_parallel) : 'pattern', 'aria-label': 'Workers at once (empty: what the pattern says)', oninput: (e) => { s.ui.runParallel = e.target.value; s.ui.runErr = null; M.act.changed(); } })),
                 cur && cur.description ? h('p', { class: 'pat-desc', key: 'desc', title: cur.description }, cur.description) : null,
                 P.btn('Start run', start, { kind: 'primary', icon: 'play', busyKey: 'start-run', disabled: !goal.trim() || s.conn.state !== 'open', key: 'go' })),
-        ], { icon: 'run', key: 'startrun' });
+            s.ui.runErr ? h('div', { class: 'fld-err', key: 'err', role: 'alert' }, s.ui.runErr) : null,
+        ], { icon: 'run', key: opts.key || 'startrun' });
+    }
+
+    // Stop and Delete, behind a confirm sheet wherever a run is shown.
+    function stopRun() {
+        M.act.sheet({
+            kind: 'confirm', danger: true, title: 'Stop this run?', confirm: 'Stop run',
+            body: 'Every agent of the run stops now. The run is kept as stopped: Runs opens it again, to land what it built or to delete it.',
+            run: () => M.act.cmd('run_stop', {}),
+        });
+    }
+    function deleteRun(id, title, after) {
+        M.act.sheet({
+            kind: 'confirm', danger: true, title: 'Delete run ' + (title || id) + '?', confirm: 'Delete',
+            body: 'Removes its branches and worktrees from your repository and its journal from ~/.mantra. What you landed stays in your branch.',
+            run: () => M.act.cmd('run_delete', { id }, { ok: 'Deleted' }).then(after || (() => { }), () => { }),
+        });
     }
 
     function unfinishedCard() {
@@ -80,7 +109,8 @@
         const agents = M.store.agentList();
         if (!agents.length) kids.push(P.empty('team', 'No agents yet', s.run ? 'The run is starting its first agent…' : 'Start a Solo session or a run.', [P.btn('New Solo session', () => M.act.cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && M.act.nav('/agent/' + d.agent)), { kind: 'primary' })]));
         else kids.push(h('div', { class: 'team', key: 'team' }, P.teamList()));
-        if (!s.run) { kids.push(startRunCard()); kids.push(unfinishedCard()); }
+        // no run, or one that is over (stopped, failed, done): the next one starts right here
+        if (!s.run || !s.run.active) { kids.push(startRunCard()); kids.push(unfinishedCard()); }
         return page('team', kids);
     }
 
@@ -131,19 +161,24 @@
         }
         const st = run.stage || {};
         const plan = s.plan;
+        const over = st.kind === 'done' || st.kind === 'failed';
         const kids = [];
         kids.push(h('div', { class: 'run-hero', key: 'hero' },
             h('div', { class: 'run-hero-top' },
                 h('span', { class: 'run-hero-id' }, h('span', { class: 'mono dim' }, run.id), h('span', { class: 'dim' }, ' · ' + run.pattern)),
-                run.landable ? P.btn('Land', () => M.act.sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => M.act.cmd('land', {}, { ok: 'Landing…' }) }), { kind: 'primary', icon: 'land', sm: true }) : null,
-                st.kind === 'done' || st.kind === 'failed' ? null : run.halted ? heroResume(P.haltPrimary(run.halted)) : P.btn('Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: 'pause', busyKey: 'resume' })),
+                run.landable ? P.btn('Land', () => M.act.sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => M.act.cmd('land', {}, { ok: 'Landing…' }) }), { kind: 'primary', icon: 'land', sm: true, key: 'land' }) : null,
+                over ? null : run.halted ? heroResume(P.haltPrimary(run.halted)) : P.btn('Pause', () => M.act.cmd('pause_resume', {}, { busyKey: 'resume' }), { sm: true, icon: 'pause', busyKey: 'resume', key: 'pause' }),
+                over ? P.btn('Delete', () => deleteRun(run.id, run.title, () => M.act.nav('/')), { sm: true, icon: 'trash', kind: 'danger-ghost', key: 'delete' })
+                    : P.btn('Stop', stopRun, { sm: true, icon: 'stop', kind: 'danger-ghost', key: 'stop' })),
             h('h1', { class: 'run-title' }, run.title || run.brief),
             run.title && run.title !== run.brief ? h('div', { class: 'run-brief dim' }, F.trunc(run.brief, 200)) : null,
             P.stageRail(run, plan, true),
             h('div', { class: 'run-stats' },
                 stat('elapsed', F.durShort(run.elapsed_ms)), stat('tokens', F.tokens(run.total_tokens), F.cached(run.total_tokens, run.cached_tokens)), stat('busy', String(run.busy_count || 0))),
             run.branch ? h('div', { class: 'run-branch mono dim' }, '⎇ ' + run.branch) : null,
-            st.error ? h('div', { class: 'errbox' }, icon('alert'), h('span', null, st.error)) : null));
+            st.stopped ? h('div', { class: 'run-stopped' }, '■ You stopped this run. ' + (run.landable ? 'Land merges what it built; ' : '') + 'Delete removes it, branches and all.')
+                : st.error ? h('div', { class: 'errbox' }, icon('alert'), h('span', null, st.error)) : null));
+        if (over) kids.push(startRunCard({ title: 'Start a new run', key: 'startnew' }));
         // The review card below replaces the review band here.
         kids.push(P.haltBand(run), P.questionBand(run));
         if (st.kind === 'review' && plan) {
@@ -278,6 +313,20 @@
         }
         M.act.changed();
     }
+    // What a row of the runs list offers: the open run is stopped while it runs; any other is
+    // opened (read-only once it is over) or resumed, and deleted.
+    function runActions(x) {
+        const s = S();
+        const busy = !!(s.run && s.run.active);
+        if (x.open && busy) return P.btn('Stop', stopRun, { sm: true, icon: 'stop', kind: 'danger-ghost', key: 'stop' });
+        const open = () => M.act.cmd('run_resume', { id: x.id }, { busyKey: 'resume-' + x.id, ok: x.unfinished ? 'Run resumed' : 'Run opened' }).then(() => M.act.nav('/run'), () => { });
+        return [
+            x.open ? P.btn('Show', () => M.act.nav('/run'), { sm: true, icon: 'run', key: 'show', kind: 'ghost' })
+                : x.error ? null : P.btn(x.unfinished ? 'Resume' : 'Open', open, { sm: true, icon: x.unfinished ? 'play' : 'run', busyKey: 'resume-' + x.id, disabled: busy, key: 'open', title: busy ? 'A run is active — stop it first' : null }),
+            P.iconBtn('trash', () => deleteRun(x.id, x.title, loadRuns), 'Delete run', { key: 'del' }),
+        ];
+    }
+
     function runsScreen() {
         const s = S();
         const r = s.ui.runs;
@@ -296,9 +345,7 @@
                         h('span', { class: 'dim' }, x.open && s.run ? P.stageWhere(s.run) : x.stage), h('span', { class: 'spacer' }), h('span', { class: 'dim sm' }, x.ago || (x.updated_at ? F.ago(x.updated_at * 1000) : ''))),
                     h('div', { class: 'run-row-brief' }, h('code', { class: 'mono dim' }, x.id), x.brief ? h('span', { class: 'dim' }, ' · ' + F.trunc(x.brief, 120)) : null),
                     x.error ? h('div', { class: 'run-row-err' }, x.error) : null),
-                h('div', { class: 'run-row-acts' },
-                    !x.open && x.unfinished ? P.btn('Resume', () => M.act.cmd('run_resume', { id: x.id }, { busyKey: 'resume-' + x.id, ok: 'Run resumed' }).then(() => M.act.nav('/run'), () => { }), { sm: true, icon: 'play', busyKey: 'resume-' + x.id, disabled: !!s.run }) : null,
-                    !x.open ? P.iconBtn('trash', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Delete run ' + (x.title || x.id) + '?', body: 'Removes its state and journal from ~/.mantra. Branches and worktrees in your repo are not touched.', confirm: 'Delete', run: () => M.act.cmd('run_delete', { id: x.id }, { ok: 'Deleted' }).then(loadRuns) }), 'Delete run') : null)))));
+                h('div', { class: 'run-row-acts' }, runActions(x))))));
         }
         if (r.others) kids.push(h('p', { class: 'foot-note', key: 'others' }, F.plural(r.others, 'run') + ' in other projects — use ', h('code', null, 'mantra runs'), ' in a terminal.'));
         return page('runs', kids);
@@ -327,9 +374,9 @@
         return card('Notifications', kids, { key: 'notif', icon: 'bell' });
     }
 
-    function appearanceCard() {
+    function appearanceCard(title) {
         const s = S();
-        return card('Appearance', [
+        return card(title || 'Appearance', [
             h('div', { class: 'set-row', key: 'theme' }, h('span', null, 'Theme'), P.segmented(s.ui.theme, [['system', 'System'], ['dark', 'Dark'], ['light', 'Light']], (v) => { M.store.setPref('theme', v); M.act.applyPrefs(); }, 'Theme')),
             h('div', { class: 'set-row', key: 'motion' }, h('span', null, 'Motion'), P.segmented(s.ui.motion, [['system', 'System'], ['reduce', 'Reduced']], (v) => { M.store.setPref('motion', v); M.act.applyPrefs(); }, 'Motion')),
             P.toggle(s.ui.verbose, (on) => M.store.setPref('verbose', on), 'Verbose transcript', 'expand reasoning and command output', { key: 'verbose' }),
@@ -461,10 +508,6 @@
         return card('Session', [h('div', { class: 'form-row' }, P.btn('Log out', () => M.act.logout(), { icon: 'logout', sm: true }))], { key: 'session', icon: 'lock' });
     }
 
-    function settingsScreen() {
-        return page('settings', [notificationsCard(), appearanceCard(), rolesCard(), remoteCard(), certCard(), sessionCard(), aboutCard()], 'narrow');
-    }
-
     // ── More (phone) ─────────────────────────────────────────────────────────────────────────────
     function moreScreen() {
         const s = S();
@@ -476,7 +519,7 @@
             h('div', { class: 'card flush', key: 'nav' },
                 nav('/pulse', 'pulse', 'Pulse', run ? (s.pulse.length ? F.trunc(s.pulse[s.pulse.length - 1].text, 60) : 'the run journal') : 'the run journal'),
                 nav('/runs', 'runs', 'Runs', 'past and unfinished runs in this project'),
-                nav('/settings', 'settings', 'Settings', 'notifications, appearance, remote access')),
+                nav('/settings', 'settings', 'Settings', 'models, patterns, MCP, notifications, remote access')),
             h('div', { class: 'card sec', key: 'theme' }, h('div', { class: 'set-row' }, h('span', null, 'Theme'), P.segmented(s.ui.theme, [['system', 'Auto'], ['dark', 'Dark'], ['light', 'Light']], (v) => { M.store.setPref('theme', v); M.act.applyPrefs(); }, 'Theme'))),
             h('p', { class: 'foot-note', key: 'ver' }, 'Mantra ' + ((s.app && s.app.version) || '') + ' · ' + (s.conn.mode === 'relay' ? 'remote' : 'local')),
         ]);
@@ -553,5 +596,8 @@
                         P.iconBtn('trash', () => R.forget(d.sid), 'Forget')))) : null));
     }
 
-    M.screens = { teamScreen, runScreen, pulseScreen, pulseList, inboxScreen, runsScreen, loadRuns, settingsScreen, moreScreen, loginScreen, connectScreen, page, card };
+    M.screens = {
+        teamScreen, runScreen, pulseScreen, pulseList, inboxScreen, runsScreen, loadRuns, moreScreen, loginScreen, connectScreen, page, card,
+        startRunCard, stopRun, deleteRun, notificationsCard, appearanceCard, rolesCard, remoteCard, certCard, sessionCard, aboutCard,
+    };
 })(window.Mantra = window.Mantra || {});

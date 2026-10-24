@@ -115,22 +115,37 @@ def _sh(v) -> str:
 
 # ── ANSI → cell grid ────────────────────────────────────────────────────────────
 class Cell:
-    __slots__ = ("ch", "fg", "bold")
+    __slots__ = ("ch", "fg", "bold", "bg", "ul")
 
-    def __init__(self, ch=" ", fg=DEFAULT_FG, bold=False):
-        self.ch, self.fg, self.bold = ch, fg, bold
+    def __init__(self, ch=" ", fg=DEFAULT_FG, bold=False, bg=None, ul=False):
+        self.ch, self.fg, self.bold, self.bg, self.ul = ch, fg, bold, bg, ul
+
+
+class Pen:
+    """The SGR state a cell is painted with: colours (a background only where one is set — the
+    selected-row band, a zoom header), weight, underline, reverse video."""
+
+    __slots__ = ("fg", "bold", "bg", "ul", "rev")
+
+    def __init__(self):
+        self.fg, self.bold, self.bg, self.ul, self.rev = DEFAULT_FG, False, None, False, False
+
+    def cell(self, ch: str) -> Cell:
+        if self.rev:
+            return Cell(ch, self.bg or BG, self.bold, self.fg, self.ul)
+        return Cell(ch, self.fg, self.bold, self.bg, self.ul)
 
 
 def parse(ansi: str, cols: int, rows: int) -> list[list[Cell]]:
     grid = [[Cell() for _ in range(cols)] for _ in range(rows)]
     for y, line in enumerate(ansi.split("\n")[:rows]):
         line = OSC.sub("", line)
-        fg, bold, x = DEFAULT_FG, False, 0
+        pen, x = Pen(), 0
         pos = 0
         while pos < len(line) and x < cols:
             m = SGR.match(line, pos)
             if m:
-                fg, bold = _sgr(m.group(1), fg, bold)
+                _sgr(m.group(1), pen)
                 pos = m.end()
                 continue
             m = CSI.match(line, pos)
@@ -141,39 +156,62 @@ def parse(ansi: str, cols: int, rows: int) -> list[list[Cell]]:
             pos += 1
             if ch == "\x1b":
                 continue
-            grid[y][x] = Cell(ch, fg, bold)
+            grid[y][x] = pen.cell(ch)
             x += 1
     return grid
 
 
-def _sgr(params: str, fg, bold):
+def _colour(parts: list[str], i: int):
+    """The colour of a `38;…` / `48;…` sequence at `parts[i]`, and how many parts it used."""
+    mode = int(parts[i + 1] or 0) if i + 1 < len(parts) else 0
+    if mode == 2 and i + 4 < len(parts):
+        return tuple(int(parts[i + 2 + k] or 0) for k in range(3)), 4
+    if mode == 5 and i + 2 < len(parts):
+        return _xterm256(int(parts[i + 2] or 0)), 2
+    return None, 0
+
+
+def _sgr(params: str, pen: Pen):
     parts = [p for p in params.replace(":", ";").split(";")]
     i = 0
     while i < len(parts):
         p = parts[i] or "0"
         n = int(p) if p.isdigit() else 0
         if n == 0:
-            fg, bold = DEFAULT_FG, False
+            pen.__init__()
         elif n == 1:
-            bold = True
+            pen.bold = True
         elif n == 22:
-            bold = False
+            pen.bold = False
+        elif n == 4:
+            pen.ul = True
+        elif n == 24:
+            pen.ul = False
+        elif n == 7:
+            pen.rev = True
+        elif n == 27:
+            pen.rev = False
         elif n == 39:
-            fg = DEFAULT_FG
+            pen.fg = DEFAULT_FG
+        elif n == 49:
+            pen.bg = None
         elif 30 <= n <= 37:
-            fg = ANSI16[n - 30]
+            pen.fg = ANSI16[n - 30]
         elif 90 <= n <= 97:
-            fg = ANSI16[n - 90 + 8]
-        elif n == 38 and i + 1 < len(parts):
-            mode = int(parts[i + 1] or 0)
-            if mode == 2 and i + 4 < len(parts):
-                fg = tuple(int(parts[i + 2 + k] or 0) for k in range(3))
-                i += 4
-            elif mode == 5 and i + 2 < len(parts):
-                fg = _xterm256(int(parts[i + 2] or 0))
-                i += 2
+            pen.fg = ANSI16[n - 90 + 8]
+        elif 40 <= n <= 47:
+            pen.bg = ANSI16[n - 40]
+        elif 100 <= n <= 107:
+            pen.bg = ANSI16[n - 100 + 8]
+        elif n in (38, 48):
+            c, used = _colour(parts, i)
+            if c is not None:
+                if n == 38:
+                    pen.fg = c
+                else:
+                    pen.bg = c
+            i += used
         i += 1
-    return fg, bold
 
 
 def _xterm256(n: int):
@@ -241,9 +279,15 @@ class Painter:
         y0 = bar + pad
         for y, row in enumerate(grid):
             for x, cell in enumerate(row):
+                px, py = pad + x * self.cw, y0 + y * self.ch
+                # a background first (spaces have them too: a band runs across a whole row)
+                if cell.bg is not None:
+                    d.rectangle([px, py, px + self.cw - 1, py + self.ch - 1], fill=cell.bg)
+                if cell.ul:
+                    uy = py + round(self.ch * 0.90)
+                    d.line([(px, uy), (px + self.cw - 1, uy)], fill=cell.fg, width=max(1, self.size // 14))
                 if cell.ch in (" ", " ", ""):
                     continue
-                px, py = pad + x * self.cw, y0 + y * self.ch
                 if cell.ch in SPECIAL:
                     _draw_special(d, cell.ch, px, py, self.cw, self.ch, cell.fg)
                     continue

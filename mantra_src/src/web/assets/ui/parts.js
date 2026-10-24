@@ -243,7 +243,8 @@
             default: cur = 0;
         }
         const halted = !!run.halted || st.kind === 'failed';
-        return segs.map((s, i) => Object.assign(s, { state: i < cur ? 'done' : i === cur ? (halted ? (st.kind === 'failed' ? 'bad' : 'halt') : run.want_review && s.id === 'review' ? 'review' : 'cur') : 'todo' }));
+        // a run the user stopped ended where they stopped it: amber, not a failure's red
+        return segs.map((s, i) => Object.assign(s, { state: i < cur ? 'done' : i === cur ? (halted ? (st.kind === 'failed' && !st.stopped ? 'bad' : 'halt') : run.want_review && s.id === 'review' ? 'review' : 'cur') : 'todo' }));
     }
     function stageRail(run, plan, full) {
         const segs = stageSegments(run, plan);
@@ -276,10 +277,10 @@
         const s = S(), run = s.run;
         if (!run) return null;
         const st = run.stage || {};
-        const kindTone = run.halted ? 'halt' : st.kind === 'done' ? 'done' : st.kind === 'failed' ? 'bad' : run.want_review ? 'review' : 'live';
+        const kindTone = run.halted || st.stopped ? 'halt' : st.kind === 'done' ? 'done' : st.kind === 'failed' ? 'bad' : run.want_review ? 'review' : 'live';
         return h('button', { type: 'button', key: 'runcard', class: 'card run-card tone-' + kindTone + (opts.compact ? ' compact' : ''), onclick: () => M.act.nav('/run') },
             h('div', { class: 'run-card-top' },
-                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? stoppedWord(run.halted) : st.kind === 'done' ? 'complete' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
+                h('span', { class: 'run-state' }, h('i', { class: 'dot' }), run.halted ? stoppedWord(run.halted) : st.kind === 'done' ? 'complete' : st.stopped ? 'stopped' : st.kind === 'failed' ? 'failed' : run.want_review ? 'plan review' : run.active ? 'running' : 'paused'),
                 h('span', { class: 'run-id', title: run.id + ' · ' + run.pattern }, run.id)),
             h('div', { class: 'run-name' }, F.trunc(run.title || run.brief, opts.compact ? 90 : 160)),
             !opts.compact && run.title && run.title !== run.brief ? h('div', { class: 'run-goal' }, F.trunc(run.brief, 200)) : null,

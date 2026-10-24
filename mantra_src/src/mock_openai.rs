@@ -1,6 +1,6 @@
 //! `--demo` for the Bija backend: an in-process mock OpenAI Chat Completions server (SPEC §9.5),
-//! scripted per `mantra-role:` like `mock.rs`, so `mantra --demo --pattern mantra-default-bija`
-//! drives the real `bija` binary end to end with zero API calls.
+//! scripted per `mantra-role:` like `mock.rs`, so a `mantra --demo` run on bija models drives the
+//! real `bija` binary end to end with zero API calls.
 //!
 //! `mock.rs` *is* the agent (it fakes a whole Codex app-server); this file is only the model
 //! behind one. The real `bija` runs the loop, executes `write_file` itself, forwards `mantra_*`
@@ -327,13 +327,15 @@ fn planner(turn: &Turn) -> Reply {
         // `mock_plan(true)` gives two parallel tasks one scope on purpose: the engine rejects it
         // and the resubmission exercises the same fix-and-retry path a real planner takes. Two
         // resubmissions at most, then text — never a loop against the engine's nudges.
+        // a goal that asks for a swarm gets a phase of worker-swarm tasks too
+        let swarm = crate::mock::wants_swarm(p);
         if turn.step == 0 {
-            return Reply::call("mantra_submit_plan", crate::mock::mock_plan(p.contains("[mantra:plan]"))).thinking("**Designing phases**\n\nFoundations must land before features; the three features are independent, so they run as one parallel phase with disjoint scopes. Integration and docs last.").after(900);
+            return Reply::call("mantra_submit_plan", crate::mock::mock_plan(p.contains("[mantra:plan]"), swarm)).thinking("**Designing phases**\n\nFoundations must land before features; the three features are independent, so they run as one parallel phase with disjoint scopes. Integration and docs last.").after(900);
         }
         if turn.last_result.starts_with("REJECTED") && turn.step < 3 {
-            return Reply::call("mantra_submit_plan", crate::mock::mock_plan(false)).thinking("**Fixing the plan**\n\nTwo parallel tasks claimed the same scope. Giving the config loader its own directory.");
+            return Reply::call("mantra_submit_plan", crate::mock::mock_plan(false, swarm)).thinking("**Fixing the plan**\n\nTwo parallel tasks claimed the same scope. Giving the config loader its own directory.");
         }
-        return Reply::say("Plan submitted: **3 phases**, 7 tasks.\n\n1. Foundations — models + config (parallel)\n2. Features — API, auth, web UI (parallel)\n3. Integration — wiring + docs");
+        return Reply::say(crate::mock::mock_plan_said(swarm));
     }
     if p.contains("[mantra:finale]") || p.contains("[mantra:event]") {
         let report = Reply::call("mantra_gate_report", json!({"pass": true, "summary": "Every plan item is implemented; the final checks pass."})).thinking("**Final verification**\n\nComparing the plan against the run's diff and the reports so far.");
@@ -397,7 +399,7 @@ fn worker(turn: &Turn) -> Reply {
     let h: u64 = id.bytes().map(u64::from).sum();
     let write = Reply::call("write_file", json!({"path": file, "content": content})).thinking(format!("**{title}**\n\nA small, self-contained type in `{dir}/` matches the task.")).after(400 + (h % 5) * 300);
     let report = Reply::say(format!("Implemented **{title}** in `{file}`.{}\n\nSTATUS: done\nSUMMARY: added {camel} with a constructor and `run`; the change stays within {dir}/.", what_i_saw(turn)));
-    // Akasha (`--demo --pattern mantra-swarm`): the models worker, in a group (the tool is
+    // Akasha (`--demo` switches it on): the models worker, in a group (the tool is
     // offered only then), shares the one fact the others will need first — unless the notes it
     // was briefed with already hold it. One author, so the group's notes hold it once.
     let mut steps = vec![];
@@ -716,7 +718,7 @@ mod tests {
         assert!(first.calls[0].0.starts_with("call_"));
         // The arguments arrive in many pieces (the plan has a `↔` in it) and must reassemble exactly.
         let plan: Value = serde_json::from_str(&first.calls[0].2).unwrap();
-        assert_eq!(plan, crate::mock::mock_plan(true));
+        assert_eq!(plan, crate::mock::mock_plan(true, false));
         assert!(first.usage["prompt_tokens"].as_u64().unwrap() > 300);
         assert!(first.usage["completion_tokens"].as_u64().unwrap() > 12);
         assert_eq!(first.usage["prompt_tokens_details"]["cached_tokens"], 0, "nothing to cache on the first request");
@@ -725,7 +727,7 @@ mod tests {
         history.extend(answered(&first.calls[0], "REJECTED: phase p1: tasks p1-models and p1-config overlap in scope"));
         let second = parse_sse(&post(port, &request(PLANNER, history.clone(), &offered, true)).await.body);
         assert_eq!(second.calls.len(), 1);
-        assert_eq!(serde_json::from_str::<Value>(&second.calls[0].2).unwrap(), crate::mock::mock_plan(false), "the fixed plan");
+        assert_eq!(serde_json::from_str::<Value>(&second.calls[0].2).unwrap(), crate::mock::mock_plan(false, false), "the fixed plan");
         assert_ne!(second.calls[0].0, first.calls[0].0, "call ids are unique");
         assert!(second.usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap() > 0);
 
@@ -733,6 +735,33 @@ mod tests {
         let third = parse_sse(&post(port, &request(PLANNER, history, &offered, true)).await.body);
         assert!(third.calls.is_empty() && third.finish == "stop", "{third:?}");
         assert!(third.text.contains("3 phases"), "{}", third.text);
+    }
+
+    /// A goal that asks for a swarm gets a fourth phase: ten tiny same-shaped tasks for
+    /// worker-swarm, one per module — and the plan validates against the default pattern as it
+    /// ships (ten tasks is past the shared pool's eight, within the swarm's 32). The roles list in
+    /// the brief names worker-swarm every time; only the goal decides.
+    #[tokio::test]
+    async fn a_goal_asking_for_a_swarm_gets_a_phase_of_swarm_tasks() {
+        let port = server().await;
+        let offered = ["mantra_submit_plan"];
+        let brief = |goal: &str| user(&format!("[mantra:plan]\nUSER REQUEST:\n{goal}\n\nProject directory: /tmp/x\nWorker roles you can assign:\n- worker-swarm — up to 16 at once: Many tiny, independent tasks at once (model luna, effort auto)\n"));
+        let pattern = crate::engine::pattern::Pattern::builtin();
+        for (goal, swarm) in [("build a tiny todo CLI, its tests by a swarm", true), ("build a tiny todo CLI", false)] {
+            let r = parse_sse(&post(port, &request(PLANNER, vec![brief(goal)], &offered, true)).await.body);
+            let sent: Value = serde_json::from_str(&r.calls[0].2).unwrap();
+            assert_eq!(sent, crate::mock::mock_plan(true, swarm), "{goal}");
+            let mut plan = crate::engine::plan::Plan::from_value(&crate::mock::mock_plan(false, swarm)).unwrap();
+            plan.normalize();
+            assert!(plan.validate(&pattern).is_ok(), "{goal}: {:?}", plan.validate(&pattern));
+            let swarm_tasks: Vec<usize> = plan.phases.iter().map(|ph| ph.tasks.iter().filter(|t| t.role == "worker-swarm").count()).collect();
+            if swarm {
+                assert_eq!(swarm_tasks, vec![0, 0, 10, 0], "one phase of ten swarm tasks, after the features");
+            } else {
+                assert!(swarm_tasks.iter().all(|n| *n == 0), "{swarm_tasks:?}");
+            }
+        }
+        assert!(crate::mock::mock_plan_said(true).contains("4 phases") && crate::mock::mock_plan_said(true).contains("17 tasks"));
     }
 
     #[tokio::test]

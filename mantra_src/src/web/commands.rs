@@ -1,5 +1,6 @@
 //! The web command table (design §6): each command is validated and executed on the App task,
 //! through the same App methods the keyboard uses, and answered with a `result` (or `items`).
+//! The configuration commands 0.8 added (settings, models, providers, patterns) are in `ops`.
 
 use super::protocol::{Command, ItemsMsg, ServerMsg};
 use super::{ConnKind, Inbound};
@@ -71,6 +72,10 @@ impl App {
             });
             return;
         }
+        // A probe of a provider, an MCP server or a model: answered once it is done.
+        if self.web_config_later(conn, req, &cmd) {
+            return;
+        }
         let from_relay = self.web.as_ref().and_then(|l| l.reg.kind(conn)) == Some(ConnKind::Relay);
         let res = self.run_web_command(cmd, from_relay);
         crate::mlog!("web: {name} → {}", if res.is_ok() { "ok" } else { "error" });
@@ -133,12 +138,15 @@ impl App {
                 self.with_run(|r, c| r.user_input(c, text.trim_end()));
                 ok()
             }
-            Command::StartRun { goal, pattern } => {
+            Command::StartRun { goal, pattern, parallel } => {
                 if self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
                     return Err("a run is already open".into());
                 }
                 if goal.trim().is_empty() {
                     return Err("describe the goal".into());
+                }
+                if let Some(n) = parallel {
+                    crate::engine::pattern::parse_parallel(&n.to_string())?;
                 }
                 if let Some(p) = pattern.filter(|p| !p.is_empty()) {
                     if !Pattern::list(&self.project).contains(&p) {
@@ -147,7 +155,7 @@ impl App {
                     self.pattern_name = p;
                 }
                 let before = self.run.as_ref().map(|r| r.id.clone());
-                self.start_run(goal.trim());
+                self.start_run_with(goal.trim(), None, parallel);
                 match &self.run {
                     Some(r) if Some(&r.id) != before.as_ref() => Ok(json!({"run": r.id})),
                     _ => Err(self.toast.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| "the run could not start".into())),
@@ -380,7 +388,8 @@ impl App {
                 if self.delete_run(&r) {
                     ok()
                 } else {
-                    Err("that run is open".into())
+                    // still active, or open in another Mantra: `delete_run` said which
+                    Err(self.toast.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| "that run is open".into()))
                 }
             }
             Command::NewSolo => {
@@ -467,7 +476,24 @@ impl App {
                 r.rotate();
                 serde_json::to_value(r.info()).map_err(|e| e.to_string())
             }
-            Command::FetchItems { .. } | Command::PushTest { .. } => Err("internal: handled above".into()),
+            cmd @ (Command::RunStop
+            | Command::PatternsList
+            | Command::PatternGet { .. }
+            | Command::PatternSave { .. }
+            | Command::PatternDelete { .. }
+            | Command::SettingsGet
+            | Command::SettingsSet { .. }
+            | Command::McpSet { .. }
+            | Command::McpRemove { .. }
+            | Command::ModelsGet
+            | Command::ModelSet { .. }
+            | Command::ModelAdd { .. }
+            | Command::ModelDelete { .. }
+            | Command::ProviderSet { .. }
+            | Command::ProviderDelete { .. }
+            | Command::ModelsImport { .. }
+            | Command::AddBackend { .. }) => self.web_config(cmd, from_relay),
+            Command::FetchItems { .. } | Command::PushTest { .. } | Command::ProviderFromKey { .. } | Command::McpTest { .. } | Command::ModelTest { .. } => Err("internal: handled above".into()),
         }
     }
 }
@@ -502,7 +528,7 @@ mod tests {
         std::mem::forget(_c);
         let reg = WebRegistryHandle::new(ctl);
         let h = reg.register(ConnKind::Local);
-        app.web = Some(Link { reg, remote: None, push: None, info: LinkInfo::default() });
+        app.web = Some(Link { reg, remote: None, push: None, info: LinkInfo::default(), shared: Default::default() });
         add_agent(&mut app, 1, "solo");
         app.solo = Some(1);
         let rx = app.hub.test_register(1);
@@ -611,7 +637,7 @@ mod tests {
         let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), Pattern::builtin(), "goal".into());
         run_.stage = Stage::Planning;
         app.run = Some(run_);
-        let r = run(&mut app, &mut h, 1, Command::StartRun { goal: "another".into(), pattern: None });
+        let r = run(&mut app, &mut h, 1, Command::StartRun { goal: "another".into(), pattern: None, parallel: None });
         assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("a run is already open")), "{r:?}");
         let r = run(&mut app, &mut h, 2, Command::PlanApprove);
         assert!(matches!(r, ServerMsg::Result(ref x) if x.error.as_deref() == Some("no plan to approve")));
@@ -813,6 +839,7 @@ mod tests {
                 let a = app.agents.get_mut(&id).unwrap();
                 a.role = "worker-small".into();
                 a.model_alias = "sol".into();
+                a.backend = crate::config::ProviderKind::Bija; // where the default models run
             }
             app.agents.get_mut(&4).unwrap().status = crate::agent::Status::Stopped;
             run_.workers.push(worker("p1-done", 2, WState::Done));
@@ -843,6 +870,7 @@ mod tests {
             let planner: AgentId = 2;
             add_agent(&mut app, planner, "planner");
             app.agents.get_mut(&planner).unwrap().role = "planner".into();
+            app.agents.get_mut(&planner).unwrap().backend = crate::config::ProviderKind::Bija; // where the default models run
             run_.planner = Some(planner);
             let msg = "planner (astra via zai): Unexpected message role.".to_string();
             run_.halt = Some(crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent: Some(planner), message: msg.clone(), full: msg, since: Instant::now() });
@@ -867,5 +895,341 @@ mod tests {
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert!(app.toast.is_none(), "{:?}", app.toast);
         });
+    }
+
+    // ─── the configuration commands (`web::ops`) ───
+
+    /// A command's answer as a test reads it: the data of a success, or the error text.
+    fn ask(app: &mut App, h: &mut crate::web::ConnHandle, cmd: Command) -> Result<Value, String> {
+        match run(app, h, 1, cmd) {
+            ServerMsg::Result(r) if r.ok => Ok(r.data.unwrap_or_default()),
+            ServerMsg::Result(r) => Err(r.error.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The same for a command answered later, from a task: waits for it.
+    async fn ask_later(app: &mut App, h: &mut crate::web::ConnHandle, cmd: Command) -> Result<Value, String> {
+        app.web_command(Inbound { conn: h.id, req: 7, cmd });
+        let m = tokio::time::timeout(std::time::Duration::from_secs(20), h.recv()).await.expect("an answer in time").expect("the connection is open");
+        match m {
+            crate::web::Outbound::Text(t) => match serde_json::from_str::<ServerMsg>(&t).unwrap() {
+                ServerMsg::Result(r) if r.ok => Ok(r.data.unwrap_or_default()),
+                ServerMsg::Result(r) => Err(r.error.unwrap_or_default()),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn secret(s: &str) -> crate::web::protocol::Secret {
+        crate::web::protocol::Secret(s.into())
+    }
+
+    /// `run_stop` ends the active run as "stopped" (the stage says so, not "failed"), and says
+    /// when there is none; `start_run` takes a width for this run within the range.
+    #[test]
+    fn run_stop_stops_the_active_run_and_start_run_checks_its_width() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            assert_eq!(ask(&mut app, &mut h, Command::RunStop), Err("no active run to stop".into()));
+            let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), Pattern::builtin(), "goal".into());
+            run_.stage = Stage::Planning;
+            app.run = Some(run_);
+            let id = app.run.as_ref().unwrap().id.clone();
+            assert_eq!(ask(&mut app, &mut h, Command::RunStop).map(|d| d["run"].as_str().map(String::from)), Ok(Some(id)));
+            let r = app.run.as_ref().unwrap();
+            assert!(!r.is_active());
+            let view = crate::web::snapshot::run_view(&app, r);
+            assert!(view.stage.stopped && view.stage.kind == "failed" && view.stage.label == "stopped", "{:?}", view.stage);
+            assert_eq!(ask(&mut app, &mut h, Command::RunStop), Err("no active run to stop".into()), "stopping twice");
+            for n in [0, 129] {
+                let e = ask(&mut app, &mut h, Command::StartRun { goal: "next".into(), pattern: None, parallel: Some(n) }).unwrap_err();
+                assert!(e.contains("from 1 to 128"), "{n}: {e}");
+            }
+            app.run = None;
+        });
+    }
+
+    /// The patterns API end to end: the list, one to edit, a copy saved and refused, deleted —
+    /// and a deleted pattern that new runs used makes way for the default.
+    #[test]
+    fn patterns_are_listed_edited_copied_and_deleted() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            let list = ask(&mut app, &mut h, Command::PatternsList).unwrap();
+            let names: Vec<&str> = list["patterns"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()).collect();
+            assert_eq!(names, Pattern::names());
+            assert_eq!(list["current"], app.pattern_name.as_str());
+            assert!(ask(&mut app, &mut h, Command::PatternGet { name: "nope".into() }).unwrap_err().contains("not found"));
+            let got = ask(&mut app, &mut h, Command::PatternGet { name: "mantra-default".into() }).unwrap();
+            assert_eq!((got["tag"].as_str(), got["builtin"].as_bool(), got["yours"].as_bool()), (Some("default"), Some(true), Some(false)));
+            assert_eq!(got["pattern"]["roles"]["worker-swarm"]["parallel"], 16);
+            assert!(got["toml"].as_str().unwrap().contains("[roles.worker-swarm]"));
+            assert!(got["options"]["kinds"].as_array().unwrap().iter().any(|k| k == "worker"));
+
+            // a copy under a new name: yours, and the start-run picker hears of it
+            let mut p = got["pattern"].clone();
+            p["description"] = json!("my take");
+            let saved = ask(&mut app, &mut h, Command::PatternSave { name: "My Copy".into(), pattern: p.clone() }).unwrap();
+            assert_eq!((saved["name"].as_str(), saved["tag"].as_str()), (Some("my-copy"), Some("yours")));
+            assert_eq!(Pattern::load("my-copy", &app.project).unwrap().description, "my take");
+            assert!(app.web.as_ref().unwrap().shared.patterns_gen() > 0, "the cached pattern list is stale now");
+            // refused (the copy edited, so its JSON names it): every reason, one per line
+            let mut bad = p.clone();
+            bad["name"] = json!("my-copy");
+            bad["roles"]["planner"]["kind"] = json!("boss");
+            bad["settings"]["max_parallel"] = json!(0);
+            let e = ask(&mut app, &mut h, Command::PatternSave { name: "my-copy".into(), pattern: bad }).unwrap_err();
+            assert!(e.lines().count() >= 2 && e.contains("kind must be one of") && e.contains("max_parallel"), "{e}");
+            assert!(ask(&mut app, &mut h, Command::PatternSave { name: "mantra-lean".into(), pattern: p.clone() }).unwrap_err().contains("built-in"));
+            assert!(ask(&mut app, &mut h, Command::PatternSave { name: "x".into(), pattern: json!({"roles": 3}) }).unwrap_err().starts_with("not a pattern"));
+            // the built-in edited in place: a file of its own, "edited"; deleted, it is the built-in again
+            let edited = ask(&mut app, &mut h, Command::PatternSave { name: "mantra-default".into(), pattern: p }).unwrap();
+            assert_eq!(edited["tag"], "edited");
+            assert!(ask(&mut app, &mut h, Command::PatternDelete { name: "mantra-default".into() }).is_ok());
+            assert!(ask(&mut app, &mut h, Command::PatternDelete { name: "mantra-default".into() }).unwrap_err().contains("built in"));
+
+            // deleting the pattern new runs use: both fall back to the default
+            app.settings.default_pattern = "my-copy".into();
+            app.pattern_name = "my-copy".into();
+            assert!(ask(&mut app, &mut h, Command::PatternDelete { name: "my-copy".into() }).is_ok());
+            assert_eq!((app.settings.default_pattern.as_str(), app.pattern_name.as_str()), ("mantra-default", "mantra-default"));
+            assert!(ask(&mut app, &mut h, Command::PatternDelete { name: "my-copy".into() }).unwrap_err().contains("no pattern"));
+        });
+    }
+
+    /// `settings_get` never says the password, `settings_set` refuses what `set_field` refuses,
+    /// and a remote session may not change the password that guards it.
+    #[test]
+    fn settings_hide_the_password_and_validate_what_is_set() {
+        let (mut app, mut h, _rx) = wired();
+        app.settings.web.password = "hunter2-secret".into();
+        let got = ask(&mut app, &mut h, Command::SettingsGet).unwrap();
+        assert!(!got.to_string().contains("hunter2"), "{got}");
+        let field = |v: &Value, key: &str| v["fields"].as_array().unwrap().iter().find(|f| f["key"] == key).cloned().unwrap();
+        assert_eq!((field(&got, "web.password")["kind"].as_str(), field(&got, "web.password")["value"].as_str()), (Some("secret"), Some("set")));
+        assert_eq!(field(&got, "fps")["max"], 60);
+        assert!(field(&got, "default_model")["options"].as_array().unwrap().iter().any(|o| o == "luna"));
+        assert!(ask(&mut app, &mut h, Command::SettingsSet { key: "fps".into(), value: secret("1000") }).unwrap_err().contains("from 4 to 60"));
+        assert!(ask(&mut app, &mut h, Command::SettingsSet { key: "default_model".into(), value: secret("nope") }).unwrap_err().contains("not in /models"));
+        let set = ask(&mut app, &mut h, Command::SettingsSet { key: "default_model".into(), value: secret("luna") }).unwrap();
+        assert_eq!(set["note"], "Solo's next session (/new) uses it");
+        assert_eq!(field(&set["settings"], "default_model")["value"], "luna");
+        let set = ask(&mut app, &mut h, Command::SettingsSet { key: "approval_mode".into(), value: secret("never") }).unwrap();
+        assert_eq!((set["note"].as_str(), app.settings.approval_mode.as_str()), (Some(""), "never"));
+        let mut remote = app.web.as_ref().unwrap().reg.register(ConnKind::Relay);
+        assert!(ask(&mut app, &mut remote, Command::SettingsSet { key: "web.password".into(), value: secret("x") }).unwrap_err().contains("not from a remote session"));
+        assert_eq!(app.settings.web.password, "hunter2-secret");
+        assert!(ask(&mut app, &mut remote, Command::SettingsSet { key: "notify".into(), value: secret("off") }).is_ok(), "anything else is fine from there");
+    }
+
+    /// MCP servers from the web: added from a command line, switched, removed — saved to
+    /// settings.toml as `mantra mcp` saves them; an env value never comes back.
+    #[test]
+    fn mcp_servers_are_added_switched_and_removed_on_disk() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.demo = false;
+            let env = Some([("TOKEN".to_string(), secret("tok-123456"))].into());
+            let got = ask(&mut app, &mut h, Command::McpSet { name: "blender".into(), command: Some("uvx blender-mcp".into()), args: None, env, enabled: None }).unwrap();
+            assert!(!got.to_string().contains("tok-123456"), "{got}");
+            let row = got["settings"]["mcp"].as_array().unwrap().iter().find(|m| m["name"] == "blender").cloned().unwrap();
+            assert_eq!((row["line"].as_str(), row["env"].clone(), row["enabled"].as_bool()), (Some("uvx blender-mcp"), json!(["TOKEN"]), Some(true)));
+            let disk = || crate::config::Settings::load_on_disk().unwrap().mcp_servers;
+            assert_eq!(disk()["blender"].args, vec!["blender-mcp".to_string()]);
+            assert!(app.settings.mcp_servers.contains_key("blender"), "the session has it too");
+            ask(&mut app, &mut h, Command::McpSet { name: "blender".into(), command: None, args: None, env: None, enabled: Some(false) }).unwrap();
+            assert!(!disk()["blender"].enabled && disk()["blender"].env.contains_key("TOKEN"));
+            assert!(ask(&mut app, &mut h, Command::McpSet { name: "a/b".into(), command: Some("uvx".into()), args: None, env: None, enabled: None }).unwrap_err().contains("letters"));
+            assert!(ask(&mut app, &mut h, Command::McpSet { name: "ghost".into(), command: None, args: None, env: None, enabled: Some(true) }).unwrap_err().contains("no MCP server named ghost"));
+            ask(&mut app, &mut h, Command::McpRemove { name: "blender".into() }).unwrap();
+            assert!(disk().is_empty() && app.settings.mcp_servers.is_empty());
+            assert!(ask(&mut app, &mut h, Command::McpRemove { name: "blender".into() }).unwrap_err().contains("none configured"));
+        });
+    }
+
+    /// `mcp_test` is answered from a task once the server has spoken — here, failed to start.
+    #[tokio::test]
+    async fn mcp_test_is_answered_once_the_server_has_spoken() {
+        let (mut app, mut h, _rx) = wired();
+        assert!(ask_later(&mut app, &mut h, Command::McpTest { name: "nope".into() }).await.unwrap_err().contains("no MCP server named nope"));
+        app.settings.mcp_servers.insert("ghost".into(), crate::config::McpServer { command: "/nonexistent/mantra-test-mcp".into(), ..Default::default() });
+        let e = ask_later(&mut app, &mut h, Command::McpTest { name: "ghost".into() }).await.unwrap_err();
+        assert!(e.contains("could not start"), "{e}");
+    }
+
+    /// The registry as the web sees it: keys as dots and their last four, the Codex account as a
+    /// row of its own, whether each add-on backend can be added.
+    #[test]
+    fn models_get_masks_keys_and_shows_the_codex_account() {
+        let (mut app, mut h, _rx) = wired();
+        app.registry.providers[0].api_key = Some("sk-proj-abcdefgh1234".into());
+        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
+        let got = ask(&mut app, &mut h, Command::ModelsGet).unwrap();
+        assert!(!got.to_string().contains("abcdefgh"), "{got}");
+        let providers = got["providers"].as_array().unwrap();
+        assert_eq!((providers[0]["id"].as_str(), providers[0]["account"].as_bool(), providers[0]["models"].as_u64()), (Some("openai"), Some(true), Some(4)));
+        let bija = providers.iter().find(|p| p["id"] == "bija").unwrap();
+        assert_eq!((bija["api_key"].as_str(), bija["key_set"].as_bool(), bija["wire"].as_str()), (Some("••••1234"), Some(true), Some("openai")));
+        let sol = got["models"].as_array().unwrap().iter().find(|m| m["alias"] == "sol").unwrap();
+        assert_eq!((sol["provider"].as_str(), sol["backend"].as_str(), sol["default"].as_bool()), (Some("bija"), Some("bija"), Some(true)));
+        assert_eq!(got["backends"]["codex"]["added"], true);
+    }
+
+    /// A model cell from the web lands in models.toml; a refused one changes nothing, and Solo's
+    /// default model follows a new alias.
+    #[test]
+    fn model_set_round_trips_through_models_toml() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.demo = false;
+            assert!(ask(&mut app, &mut h, Command::ModelSet { alias: "luna".into(), field: "context".into(), value: "lots".into() }).unwrap_err().contains("200k"));
+            let got = ask(&mut app, &mut h, Command::ModelSet { alias: "luna".into(), field: "note".into(), value: "quick one".into() }).unwrap();
+            assert_eq!(got["alias"], "luna");
+            assert_eq!(crate::config::Registry::load().get("luna").map(|m| m.note.clone()).as_deref(), Some("quick one"));
+            ask(&mut app, &mut h, Command::ModelSet { alias: "luna".into(), field: "context".into(), value: "128k".into() }).unwrap();
+            assert_eq!(crate::config::Registry::load().get("luna").and_then(|m| m.context_window), Some(128_000));
+            let got = ask(&mut app, &mut h, Command::ModelSet { alias: "sol".into(), field: "alias".into(), value: "sun".into() }).unwrap();
+            assert_eq!((got["alias"].as_str(), app.settings.default_model.as_str()), (Some("sun"), "sun"), "the default follows");
+            assert!(crate::config::Registry::load().get("sun").is_some());
+            assert!(ask(&mut app, &mut h, Command::SettingsSet { key: "notify".into(), value: secret("off") }).is_ok(), "and later settings still save");
+        });
+    }
+
+    /// Models added and deleted: the last one and Solo's default stay.
+    #[test]
+    fn model_add_and_delete_keep_the_default() {
+        let (mut app, mut h, _rx) = wired();
+        let got = ask(&mut app, &mut h, Command::ModelAdd { provider: "bija".into(), model: Some("mx-5.2".into()), alias: None }).unwrap();
+        assert_eq!(got["alias"], "mx-5.2");
+        assert!(got["registry"]["models"].as_array().unwrap().iter().any(|m| m["alias"] == "mx-5.2"));
+        assert!(ask(&mut app, &mut h, Command::ModelAdd { provider: "nowhere".into(), model: None, alias: None }).unwrap_err().contains("no provider named nowhere"));
+        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "mx-5.2".into() }).is_ok());
+        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "mx-5.2".into() }).unwrap_err().contains("no model named"));
+        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "sol".into() }).unwrap_err().contains("Solo's default model"));
+        app.registry.models.retain(|m| m.alias == "sol");
+        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "sol".into() }).unwrap_err().contains("last model"));
+    }
+
+    /// A provider cell from the web lands in models.toml — a pasted key as well, which no reply
+    /// shows — and a new id takes its models along.
+    #[test]
+    fn provider_set_round_trips_and_never_echoes_the_key() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            app.demo = false;
+            let got = ask(&mut app, &mut h, Command::ProviderSet { id: "bija".into(), field: "api_key".into(), value: secret("sk-test-0123456789") }).unwrap();
+            assert!(!got.to_string().contains("0123456789") && got.to_string().contains("••••6789"), "{got}");
+            let reg = crate::config::Registry::load();
+            assert_eq!(reg.providers.iter().find(|p| p.id == "bija").and_then(|p| p.api_key.as_deref()), Some("sk-test-0123456789"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(crate::config::Registry::path()).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "a key in models.toml makes it yours only");
+            }
+            assert!(ask(&mut app, &mut h, Command::ProviderSet { id: "bija".into(), field: "wire".into(), value: secret("grpc") }).unwrap_err().contains("openai"));
+            assert!(ask(&mut app, &mut h, Command::ProviderSet { id: "openai".into(), field: "name".into(), value: secret("x") }).unwrap_err().contains("Codex account"));
+            let got = ask(&mut app, &mut h, Command::ProviderSet { id: "bija".into(), field: "id".into(), value: secret("main") }).unwrap();
+            assert_eq!(got["id"], "main");
+            let reg = crate::config::Registry::load();
+            assert!(reg.providers.iter().any(|p| p.id == "main") && reg.models.iter().all(|m| m.provider == "main"));
+        });
+    }
+
+    /// A provider goes with its models; the Codex row with the whole account; never Solo's default.
+    #[test]
+    fn provider_delete_takes_its_models_and_keeps_the_default() {
+        let (mut app, mut h, _rx) = wired();
+        let gw = crate::provider_key::add_provider(&mut app.registry, &crate::provider_key::provider_from_key("k", Some("https://inference.test-gateway.dev/v1"))).unwrap();
+        app.registry.models.push(crate::config::ModelEntry { alias: "fast".into(), provider: gw.clone(), model: "fast-1".into(), ..Default::default() });
+        assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: gw }).unwrap()["models"], 1);
+        assert!(app.registry.get("fast").is_none());
+        assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "bija".into() }).unwrap_err().contains("Solo's default model"));
+        assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "openai".into() }).unwrap_err().contains("no Codex models"));
+        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
+        assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: "openai".into() }).unwrap()["models"], 4);
+        assert!(app.registry.codex_account_models().is_empty());
+        assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "nope".into() }).unwrap_err().contains("no provider named nope"));
+    }
+
+    /// The key flow from the web: what a key looks like without adding anything, then the
+    /// provider added and its list asked for off the App task — a refused key keeps it.
+    #[tokio::test]
+    async fn provider_from_key_drafts_then_probes_off_the_app_task() {
+        use axum::routing::get;
+        let (mut app, mut h, _rx) = wired();
+        let draft = ask_later(&mut app, &mut h, Command::ProviderFromKey { key: secret("sk-abc-123"), base_url: None, probe: Some(false) }).await.unwrap();
+        let guess = crate::config::bija_default_provider().base_url;
+        assert_eq!((draft["draft"]["base_url"].as_str(), draft["draft"]["guessed"].as_bool()), (Some(guess.as_str()), Some(true)), "the key's prefix names the API");
+        assert!(!draft.to_string().contains("sk-abc-123"));
+        assert_eq!(draft["draft"]["existing"], "bija", "a fresh install's provider is at that URL: the key would go into it");
+        assert_eq!(app.registry.providers.len(), 1, "a draft adds nothing");
+        let unknown = ask_later(&mut app, &mut h, Command::ProviderFromKey { key: secret("ip_x"), base_url: None, probe: Some(false) }).await.unwrap();
+        assert_eq!((unknown["draft"]["needs_url"].as_bool(), unknown["draft"]["existing"].is_null()), (Some(true), true));
+        assert!(ask_later(&mut app, &mut h, Command::ProviderFromKey { key: secret("ip_x"), base_url: None, probe: None }).await.unwrap_err().contains("base URL"));
+
+        let server = axum::Router::new().route(
+            "/v1/models",
+            get(|hd: axum::http::HeaderMap| async move {
+                if hd.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer good-key") {
+                    (axum::http::StatusCode::OK, r#"{"data":[{"id":"alpha","context_length":64000},{"id":"beta"}]}"#)
+                } else {
+                    (axum::http::StatusCode::UNAUTHORIZED, r#"{"error":{"message":"bad key"}}"#)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, server).await.ok() });
+        let got = ask_later(&mut app, &mut h, Command::ProviderFromKey { key: secret("good-key"), base_url: Some(url.clone()), probe: None }).await.unwrap();
+        assert_eq!(got["provider"], "local");
+        let models: Vec<&str> = got["candidates"].as_array().unwrap().iter().filter_map(|c| c["model"].as_str()).collect();
+        assert_eq!(models, ["alpha", "beta"]);
+        assert!(got["candidates"][0]["selected"].as_bool().unwrap() && got["probe_error"].is_null());
+        assert!(!got.to_string().contains("good-key"), "{got}");
+        let refused = ask_later(&mut app, &mut h, Command::ProviderFromKey { key: secret("bad-key"), base_url: Some(url), probe: None }).await.unwrap();
+        assert!(refused["probe_error"].as_str().unwrap().starts_with("the key was refused"), "{refused}");
+        assert_eq!(app.registry.providers.iter().filter(|p| p.id == "local").count(), 1, "the same URL is the same provider");
+
+        // the chosen rows, imported once
+        let pick = vec![crate::web::ops::CandidateView { model: "alpha".into(), context: Some(64_000), context_known: true, ..Default::default() }];
+        let got = ask(&mut app, &mut h, Command::ModelsImport { provider: "local".into(), candidates: pick.clone() }).unwrap();
+        assert_eq!((got["added"].as_u64(), app.registry.get("alpha").map(|m| m.provider.as_str())), (Some(1), Some("local")));
+        assert!(ask(&mut app, &mut h, Command::ModelsImport { provider: "local".into(), candidates: pick }).unwrap_err().contains("there already"));
+        assert!(ask(&mut app, &mut h, Command::ModelsImport { provider: "local".into(), candidates: vec![] }).unwrap_err().contains("nothing selected"));
+        assert!(ask(&mut app, &mut h, Command::ModelsImport { provider: "nowhere".into(), candidates: vec![Default::default()] }).unwrap_err().contains("no provider"));
+    }
+
+    /// `model_test` waits for its probe agent: answered with the row's result once the agent's
+    /// turn is over (`on_turn_done` takes it out of `probes`).
+    #[tokio::test]
+    async fn model_test_is_answered_when_its_probe_is_done() {
+        let (mut app, mut h, _rx) = wired();
+        assert_eq!(ask(&mut app, &mut h, Command::ModelTest { alias: "nope".into() }), Err("unknown model".into()));
+        app.web_command(Inbound { conn: h.id, req: 9, cmd: Command::ModelTest { alias: "luna".into() } });
+        assert!(h.rx.try_recv().is_err(), "not answered while the probe runs");
+        let (probe, _) = app.probes.iter().find(|(_, (a, _))| a == "luna").map(|(id, x)| (*id, x.clone())).expect("a probe agent");
+        let link = app.web.clone().unwrap();
+        crate::web::ops::settle(&link.shared, &link.reg, &app);
+        assert!(h.rx.try_recv().is_err(), "still running");
+        app.probes.remove(&probe);
+        app.models_ui.status.insert("luna".into(), "ok 0.4s · \"OK\"".into());
+        crate::web::ops::settle(&link.shared, &link.reg, &app);
+        match reply(&mut h) {
+            ServerMsg::Result(r) => assert_eq!((r.req, r.ok, r.data.unwrap()["status"].as_str().map(String::from)), (9, true, Some("ok 0.4s · \"OK\"".into()))),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The add-on backends: the demo's are mocks, added whatever is installed, once.
+    #[test]
+    fn add_backend_adds_once_and_knows_its_kinds() {
+        let (mut app, mut h, _rx) = wired();
+        assert_eq!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap()["added"], 4);
+        assert_eq!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap()["added"], 0);
+        assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "claude-code".into() }).unwrap()["added"].as_u64().unwrap() > 0);
+        assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "vim".into() }).unwrap_err().contains("codex or claude-code"));
     }
 }

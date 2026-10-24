@@ -25,6 +25,12 @@ pub enum AppEvent {
     /// The answer to an agent's tool call worked out off the event loop (Solo's screenshot), for
     /// `on_event` to hand on as `Cmd::Respond`.
     ToolAnswer { agent: AgentId, id: Value, result: Value },
+    /// A provider added from its key answered `GET /models` (`App::probe_provider`). Carries the
+    /// provider's id and host, never its key.
+    Probed { provider: String, host: String, result: Result<Vec<crate::discover::Found>, String> },
+    /// An MCP server was started, asked for its tools and stopped (`App::mcp_test_server`): one
+    /// line for its row in `/settings`.
+    McpTested { name: String, result: Result<String, String> },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -34,17 +40,41 @@ pub enum Screen {
     Zoom(AgentId),
     Studio,
     Models,
+    Settings,
 }
 
-#[derive(Clone, Debug)]
+impl Screen {
+    /// The screens that edit configuration (`ui::form`'s rules): leaving one returns to where it
+    /// was opened from, and ctrl+t / ctrl+d mean the screen's own row actions there.
+    pub fn is_config(self) -> bool {
+        matches!(self, Screen::Studio | Screen::Models | Screen::Settings)
+    }
+}
+
+/// What a field being edited in place (`ui::form::Edit`) belongs to.
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditTarget {
+    /// The Studio: a role's field.
     RoleField(String, String),
+    /// The Studio: one of the pattern's `[settings]`.
     Setting(String),
+    /// The Studio: the pattern's own `name` or `description`.
+    PatternField(String),
     FlowStep(usize, String),
-    ModelCell(usize, usize),
-    ProviderCell(usize, usize),
+    /// The Studio's list: the name of a role being added (ctrl+n).
     NewRole,
-    NewPattern,
+    /// `/models`: a cell of the models grid (row into `registry.models`, column).
+    ModelCell(usize, usize),
+    /// `/models`: a cell of the providers grid (index into `registry.providers`, column).
+    ProviderCell(usize, usize),
+    /// `/models`, a provider from its key: the key, then the base URL.
+    KeyFlowKey,
+    KeyFlowUrl,
+    /// `/settings`: a field by its `settings_ops::Field::key`.
+    SettingField(String),
+    /// `/settings`, a new MCP server: its name, then its command line.
+    McpName,
+    McpCommand,
 }
 
 pub enum Overlay {
@@ -55,54 +85,75 @@ pub enum Overlay {
     Plan { scroll: usize },
     /// `e` on a halted stage: the halt's whole message (the band shows one line of it).
     Halt { scroll: usize },
-    Edit { title: String, input: Input, target: EditTarget },
-    /// `/pattern`: every pattern new runs can use, read once when the picker opens.
-    Patterns { sel: usize, list: Vec<PatternChoice> },
+    /// `/run` and `/pattern`: every pattern new runs can use (read once when it opens), and for
+    /// `/run` the goal to start it on (`goal: Some`).
+    NewRun { sel: usize, list: Vec<PatternChoice>, goal: Option<Input> },
+    /// A short list to pick one (or, `multi`, several) from: the add menu of `/models`, an
+    /// Akasha group, an agent to respawn, Solo's MCP servers.
+    Select(Select),
     Discover(DiscoverState),
     /// `/runs`: this project's runs — resume (⏎) or delete (D, then y).
     Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
-    /// `/web`: the local web UI's addresses and security.
-    Web,
-    /// `/remote`: the relay link, code, password and QR (`r` rotates).
-    Remote,
+    /// The remote link's QR code, as large as the terminal allows (⏎ on the link in `/settings`).
+    Qr,
     /// `/akasha [group]`: the run's shared notes, every group's block or the one named.
     Akasha { scroll: usize, group: Option<String> },
 }
 
-/// One row of the `/pattern` picker.
+/// A selector's rows and what choosing does.
+pub struct Select {
+    pub title: String,
+    pub items: Vec<Choice>,
+    pub sel: usize,
+    /// Space ticks rows, ⏎ takes the ticked ones; otherwise ⏎ takes the selected row.
+    pub multi: bool,
+    pub then: SelectThen,
+}
+
+pub struct Choice {
+    /// What choosing passes on (a group's name, an agent's id, a provider's id).
+    pub key: String,
+    pub label: String,
+    pub detail: String,
+    /// Ticked, in a `multi` selector.
+    pub on: bool,
+}
+
+/// What a `Select` does with the row (or rows) chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectThen {
+    /// `/models` ctrl+n: a provider from its key, a model, Codex, Claude Code.
+    AddMenu,
+    /// "A model on an existing provider": the provider it goes on.
+    AddModelOn,
+    /// `/akasha` with several groups: the one to show.
+    Akasha,
+    /// `/respawn` with no agent in view: the run agent to respawn.
+    Respawn,
+    /// `/settings`: the MCP servers Solo gets (`solo_mcp`).
+    SoloMcp,
+}
+
+/// The rows of `/models`' add menu (`SelectThen::AddMenu`), by key.
+pub const ADD_KEY: &str = "key";
+pub const ADD_MODEL: &str = "model";
+pub const ADD_CODEX: &str = "codex";
+pub const ADD_CLAUDE: &str = "claude";
+
+/// One row of the new-run overlay's pattern list.
 pub struct PatternChoice {
     pub name: String,
-    /// "default", "built-in", "edited" (a file shadows a built-in) or "yours".
+    /// "default", "built-in", "edited" (a file shadows a built-in) or "yours" (`Pattern::tag`).
     pub tag: &'static str,
     /// The pattern's description, or why its file does not load.
     pub about: Result<String, String>,
 }
 
 impl PatternChoice {
-    /// Every pattern `Pattern::list` finds (the built-ins first, `mantra-default` leading), loaded
-    /// once for its description and to tell a built-in from a file.
+    /// Every pattern `Pattern::list` finds (the built-ins first, `mantra-default` leading), as
+    /// `Pattern::summaries` describes them.
     pub fn all(project: &std::path::Path) -> Vec<PatternChoice> {
-        Pattern::list(project)
-            .into_iter()
-            .map(|name| {
-                let loaded = Pattern::load(&name, project);
-                let builtin = Pattern::builtin_named(&name).is_some();
-                let from_file = loaded.as_ref().map(|p| p.source_dir.is_some()).unwrap_or(true);
-                let tag = match (builtin, from_file) {
-                    (true, false) if name == crate::engine::pattern::NAME_DEFAULT => "default",
-                    (true, false) => "built-in",
-                    (true, true) => "edited",
-                    (false, _) => "yours",
-                };
-                // the reason, without the file's path in front of it (the row already names it)
-                let why = |e: anyhow::Error| {
-                    let e = e.to_string();
-                    let why = e.split_once(".toml: ").map(|(_, why)| why).unwrap_or(&e);
-                    why.lines().next().unwrap_or_default().to_string()
-                };
-                PatternChoice { about: loaded.map(|p| p.description).map_err(why), name, tag }
-            })
-            .collect()
+        Pattern::summaries(project).into_iter().map(|s| PatternChoice { about: s.error.map_or(Ok(s.description), Err), name: s.name, tag: s.tag }).collect()
     }
 }
 
@@ -118,6 +169,9 @@ pub struct DiscoverState {
     pub skipped: Vec<String>,
     pub sel: usize,
     pub filter: Input,
+    /// The host of a provider just added from its key: the import then says "<host>: N models
+    /// added" — the end of that flow — rather than counting what changed.
+    pub origin: Option<String>,
 }
 
 impl DiscoverState {
@@ -158,6 +212,8 @@ pub struct StudioState {
     pub architect: Option<AgentId>,
     pub input: Input,
     pub flash: Option<Instant>,
+    /// When the pattern was last saved: the header says so for a moment (a commit saves).
+    pub saved: Option<Instant>,
 }
 
 pub struct ModelsState {
@@ -166,36 +222,82 @@ pub struct ModelsState {
     pub providers: bool,
     pub status: HashMap<String, String>,
     pub dirty: bool,
+    /// When models.toml was last saved: the header says so for a moment (a commit saves).
+    pub saved: Option<Instant>,
+    /// A provider being added from its API key, between the key and the models it lists.
+    pub keyflow: Option<KeyFlow>,
 }
 
+/// `/models`' "provider from an API key", step by step: the key (an `Edit` while typed), the base
+/// URL its prefix suggests, then the probe of the provider's model list.
+#[derive(Default)]
+pub struct KeyFlow {
+    /// The key once typed; kept here only until the provider holds it.
+    pub key: String,
+    /// The URL `provider_key::provider_from_key` guessed for the key ("" when it could not).
+    pub guess: String,
+    /// The provider added and the host being asked for its models: the spinner line.
+    pub probing: Option<(String, String)>,
+}
+
+/// `/settings`: the selected row and what the screen keeps between frames.
+#[derive(Default)]
+pub struct SettingsState {
+    pub sel: usize,
+    /// The patterns `default_pattern` cycles through, read when the screen opens (`Pattern::list`
+    /// reads directories — not something to do every frame).
+    pub patterns: Vec<String>,
+    /// An MCP server's last ctrl+t ("testing…", "ok · 3 tools", "error: …").
+    pub mcp_status: BTreeMap<String, String>,
+    /// A new MCP server's name, between its name field and its command line field (ctrl+n).
+    pub mcp_name: Option<String>,
+}
+
+/// The commands, as `/` lists and completes them. Settings that were commands are rows of
+/// `/settings`; effort, approvals and the screens have keys (`MOVED`).
 pub const COMMANDS: &[(&str, &str)] = &[
-    ("/model", "switch model (picker)"),
-    ("/effort", "set reasoning effort: auto|low|medium|high|xhigh|max"),
-    ("/approvals", "approval mode: untrusted|on-request|never"),
-    ("/new", "start a fresh Solo session"),
-    ("/compact", "compact the current agent's context"),
-    ("/diff", "open the changes viewer"),
-    ("/mandala", "open the Mandala stage"),
-    ("/run", "start a Mandala run: /run <goal>"),
-    ("/swarm", "start a swarm run, N workers at once: /swarm <N> <goal>"),
-    ("/pattern", "choose the pattern for new runs"),
-    ("/experimental", "experimental features: /experimental [name on|off]"),
-    ("/mcp", "MCP servers, and which Solo gets: /mcp [solo <name|*|none>]"),
-    ("/runs", "this project's runs: resume or delete"),
-    ("/plan", "show the run's plan"),
-    ("/akasha", "the run's shared notes: /akasha [group]"),
+    ("/run", "start a run: pick a pattern, give the goal"),
+    ("/runs", "this project's runs: resume, land or delete"),
+    ("/stop", "stop the active run (/runs keeps it)"),
     ("/pause", "pause / resume the run"),
-    ("/respawn", "respawn the focused agent in place (planner/orchestrator/gate/finale/worker)"),
-    ("/land", "merge the finished run branch into your branch"),
-    ("/studio", "pattern studio (roles, flow, architect agent)"),
-    ("/models", "model registry (context, efforts, providers)"),
+    ("/plan", "show the run's plan"),
+    ("/land", "merge the finished run into your branch"),
+    ("/respawn", "respawn a run agent in place: /respawn [agent]"),
+    ("/akasha", "the run's shared notes: /akasha [group]"),
     ("/inbox", "approvals & alerts"),
-    ("/web", "web UI: address, TLS, password (mantra --web)"),
-    ("/remote", "remote link, code, password & QR (mantra --remote)"),
-    ("/verbose", "toggle verbose log (ctrl+e)"),
+    ("/pattern", "choose the pattern for new runs"),
+    ("/studio", "pattern studio: roles, flow, architect"),
+    ("/models", "models & providers: add from a key, test"),
+    ("/settings", "Solo, runs, MCP, web & remote, appearance"),
+    ("/model", "switch model (picker; ←→ effort)"),
+    ("/new", "start a fresh Solo session"),
+    ("/compact", "compact the focused agent's context"),
+    ("/diff", "open the changes viewer"),
     ("/help", "keys & commands"),
     ("/quit", "exit Mantra"),
 ];
+
+/// Commands 0.8 folded into `/settings` and keys, and where each went: typed by hand, one says
+/// so (for one release) instead of "unknown command".
+pub const MOVED: &[(&str, &str)] = &[
+    ("/swarm", "/swarm is gone: worker-swarm is a class of every pattern (/studio)"),
+    ("/experimental", "experimental features are in /settings (Features)"),
+    ("/mcp", "MCP servers are in /settings"),
+    ("/web", "the web UI's address and security are in /settings (Web & remote)"),
+    ("/remote", "the remote link, code and QR are in /settings (Web & remote)"),
+    ("/effort", "effort: alt+↑↓, or ←→ in the model picker (ctrl+k)"),
+    ("/approvals", "approvals: shift+tab cycles them; /settings sets them"),
+    ("/verbose", "the verbose log is ctrl+e"),
+    ("/mandala", "the Mandala stage is ctrl+o"),
+];
+
+/// One line of the `/` suggestions: what tab puts in the input, and what it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suggestion {
+    pub text: String,
+    pub label: String,
+    pub about: String,
+}
 
 pub struct App {
     pub settings: Settings,
@@ -204,14 +306,19 @@ pub struct App {
     pub hub: Hub,
     pub agents: BTreeMap<AgentId, Agent>,
     pub screen: Screen,
-    /// The screen `/studio` or `/models` was opened from. Leaving them returns exactly there, so a
-    /// zoom (or Solo while a run is up) survives a trip through the Studio instead of being
-    /// guessed at from whether a run exists.
+    /// The screen a config screen (`Screen::is_config`) was opened from. Leaving it returns
+    /// exactly there, so a zoom (or Solo while a run is up) survives a trip through the Studio
+    /// instead of being guessed at from whether a run exists.
     screen_before: Option<Screen>,
     pub overlays: Vec<Overlay>,
     pub input: Input,
+    /// The field being edited in place on a config screen (`ui::form`): one at a time, wherever
+    /// it is — the screens draw it in their cell and send it the keys.
+    pub edit: Option<crate::ui::form::Edit>,
+    /// A Delete waiting for its second press (`ui::form::confirm`).
+    pub confirm: Option<crate::ui::form::Confirm>,
     pub solo: Option<AgentId>,
-    /// The MCP servers the current Solo agent was started with (`/mcp` says which).
+    /// The MCP servers the current Solo agent was started with (`/settings` says which).
     pub solo_mcp: Vec<String>,
     pub run: Option<Run>,
     pub approvals: Vec<Approval>,
@@ -238,6 +345,7 @@ pub struct App {
     pub demo: bool,
     pub studio: StudioState,
     pub models_ui: ModelsState,
+    pub settings_ui: SettingsState,
     pub suggest: usize,
     pub notes: Vec<String>,
     pub pattern_name: String,
@@ -255,7 +363,7 @@ pub struct App {
     /// Set on every Stage↔Zoom switch; drives a brief header tint so a jump never feels silent.
     pub flash_screen: Option<Instant>,
     /// The web layer, when `--web` / `--remote` is on: replies to web commands, the relay
-    /// identity for `/remote`, push subscriptions.
+    /// identity `/settings` shows, push subscriptions.
     pub web: Option<crate::web::Link>,
 }
 
@@ -337,33 +445,7 @@ fn mcp_refused_toast(settings: &Settings) -> Option<String> {
     Some(format!("MCP server `{}` skipped: {}{more} — rename it in settings.toml", first.0, first.1))
 }
 
-/// `/mcp`'s one line: every configured server (`off` when disabled), what the current Solo agent
-/// was started with, and how to change that.
-fn mcp_summary(settings: &Settings, solo_has: &[String]) -> String {
-    if settings.mcp_servers.is_empty() {
-        return "no MCP servers — add one with `mantra mcp add <name> -- <command> [args…]`".into();
-    }
-    let list: Vec<String> = settings.mcp_servers.iter().map(|(name, s)| if s.enabled { name.clone() } else { format!("{name} (off)") }).collect();
-    let solo = if solo_has.is_empty() { "none".to_string() } else { solo_has.join(", ") };
-    format!("MCP: {} · Solo has: {solo} · /mcp solo <name|*|none>", list.join(", "))
-}
-
-/// `/mcp solo <arg>` → the new `solo_mcp`: `*` every enabled server, `none` none, else the names
-/// (space- or comma-separated), each of which must be configured.
-fn parse_solo_mcp(settings: &Settings, arg: &str) -> Result<Vec<String>, String> {
-    let words: Vec<&str> = arg.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
-    match words.as_slice() {
-        [] => Err("usage: /mcp solo <name|*|none>".into()),
-        ["*"] => Ok(vec!["*".into()]),
-        ["none"] => Ok(vec![]),
-        names => match names.iter().find(|n| !settings.mcp_servers.contains_key(**n)) {
-            Some(unknown) => Err(format!("no MCP server named {unknown} — `mantra mcp` lists them")),
-            None => Ok(names.iter().map(|n| n.to_string()).collect()),
-        },
-    }
-}
-
-/// `mantra experimental` and `/experimental`: every experimental feature, on or off, with its line.
+/// `mantra experimental`: every experimental feature, on or off, with its line.
 pub fn experimental_list(settings: &Settings) -> Vec<String> {
     crate::config::EXPERIMENTAL.iter().map(|(name, about)| format!("{name:<8} {:<3}  {about}", if settings.experimental_on(name) { "on" } else { "off" })).collect()
 }
@@ -393,6 +475,44 @@ pub fn save_experimental(name: &str, on: bool) -> Result<Settings, String> {
     }
     s.save().map_err(|e| format!("could not save {}: {e}", path.display()))?;
     Ok(s)
+}
+
+/// How long a config screen's header says "saved" after a commit wrote its file.
+pub const SAVED_SHOWN: Duration = Duration::from_millis(2000);
+
+/// Settings `settings_ops::takes_effect` says apply at the next start but this app applies the
+/// moment they change (`App::apply_settings`, the event loop's frame rate and mouse capture).
+const APPLIED_LIVE: &[&str] = &["glyphs", "colors", "reduce_motion", "mouse", "fps"];
+
+/// Whether this app applies setting `key` the moment it changes, whatever `takes_effect` says.
+pub fn applied_live(key: &str) -> bool {
+    APPLIED_LIVE.contains(&key)
+}
+
+/// `/settings`' ctrl+t on an MCP server: started, handshake, tool list, stopped — within
+/// `MCP_TEST_BUDGET` — and one line on how that went ("ok · 4 tools · blender-mcp 1.1", or the
+/// error with the last thing the server wrote on stderr).
+async fn mcp_probe(server: &crate::config::McpServer) -> Result<String, String> {
+    let mut c = crate::mcp::Client::launch(server)?;
+    let outcome = tokio::time::timeout(crate::MCP_TEST_BUDGET, async {
+        c.initialize().await?;
+        c.list_tools().await
+    })
+    .await;
+    let why = match outcome {
+        Ok(Ok(tools)) => {
+            let n = tools.len();
+            let who = if c.server.is_empty() { String::new() } else { format!(" · {}", c.server) };
+            return Ok(format!("ok · {n} tool{}{who}", if n == 1 { "" } else { "s" }));
+        }
+        Ok(Err(e)) => e,
+        Err(_) => format!("no answer within {} s", crate::MCP_TEST_BUDGET.as_secs()),
+    };
+    let tail = c.last_words().await;
+    Err(match tail.lines().last() {
+        Some(last) => format!("{why} — {}", last.trim()),
+        None => why,
+    })
 }
 
 fn toml_str(s: &str) -> String {
@@ -816,8 +936,11 @@ impl Ctx for Ctxt<'_> {
 }
 
 impl App {
-    pub fn new(settings: Settings, registry: Registry, project: PathBuf, hub: Hub, tx: UnboundedSender<AppEvent>, demo: bool) -> App {
-        let pattern_name = settings.default_pattern.clone();
+    pub fn new(mut settings: Settings, registry: Registry, project: PathBuf, hub: Hub, tx: UnboundedSender<AppEvent>, demo: bool) -> App {
+        // A settings.toml from 0.7 may name a built-in that is gone (`pattern::RETIRED`): it reads
+        // as the default, and the next save of the settings writes that.
+        let pattern_name = crate::engine::pattern::current_name(&settings.default_pattern, &project);
+        settings.default_pattern = pattern_name.clone();
         let pattern = Pattern::load(&pattern_name, &project).unwrap_or_else(|_| Pattern::builtin());
         let sel0 = pattern.ordered_roles().first().map(|(n, _)| StudioSel::Role(n.clone())).unwrap_or(StudioSel::Settings);
         let unfinished_runs: Vec<String> = crate::engine::state::unfinished(&project).into_iter().map(|r| r.id).collect();
@@ -841,6 +964,8 @@ impl App {
             screen_before: None,
             overlays: vec![],
             input: Input::default(),
+            edit: None,
+            confirm: None,
             solo: None,
             solo_mcp: vec![],
             run: None,
@@ -857,8 +982,9 @@ impl App {
             ctrl_c_count: 0,
             tx,
             demo,
-            studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None },
-            models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false },
+            studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None, saved: None },
+            models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false, saved: None, keyflow: None },
+            settings_ui: SettingsState::default(),
             suggest: 0,
             notes: vec![],
             pattern_name,
@@ -890,6 +1016,12 @@ impl App {
             || self.run.as_ref().map(|r| (r.is_active() && !r.halted() && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
             || self.studio.flash.map(|f| f.elapsed() < Duration::from_millis(900)).unwrap_or(false)
             || self.flash_screen.map(|f| f.elapsed() < Duration::from_millis(450)).unwrap_or(false)
+            // the config screens: a probe's or a test's spinner, "del again" until it lapses,
+            // "saved" until it fades
+            || self.models_ui.keyflow.as_ref().is_some_and(|k| k.probing.is_some())
+            || self.settings_ui.mcp_status.values().any(|s| s == "testing…")
+            || self.confirm.as_ref().is_some_and(|c| c.at.elapsed() < crate::ui::form::CONFIRM_WITHIN + Duration::from_millis(100))
+            || [self.models_ui.saved, self.studio.saved].iter().flatten().any(|t| t.elapsed() < SAVED_SHOWN + Duration::from_millis(100))
     }
 
     /// Something on screen shows a running clock (the run timer, "halted for", agent ages), so an
@@ -968,7 +1100,7 @@ impl App {
         // the startup toast goes away; Solo's own log keeps it where its missing tools show
         if let Some(why) = self.hub.bridge_problem().filter(|_| backend == crate::config::ProviderKind::ClaudeCode) {
             if let Some(a) = self.agents.get_mut(&id) {
-                a.notice(Level::Warn, &bridge_problem_line(&why));
+                a.notice(Level::Warn, bridge_problem_line(&why));
             }
         }
     }
@@ -996,7 +1128,7 @@ impl App {
     ///
     /// `[mcp_servers]` is written as the file has it now, not as this session read it: `mantra mcp
     /// add` from another terminal while the app is open must survive the next model pick.
-    pub(crate) fn save_settings(&self) {
+    pub(crate) fn save_settings(&mut self) {
         if self.demo {
             return;
         }
@@ -1004,12 +1136,16 @@ impl App {
         if let Some(servers) = on_disk_mcp_servers() {
             s.mcp_servers = servers;
         }
-        let _ = s.save();
+        // A settings.toml that does not parse is never written over (`Settings::save`): the
+        // change holds for this session, and the toast says what to fix.
+        if let Err(e) = s.save() {
+            self.toast(format!("{e}"), Level::Error);
+        }
     }
 
     /// Takes `[mcp_servers]` from settings.toml as it is now, so a `mantra mcp add|remove|enable|
     /// disable` made while the app is open reaches the next Solo (`/new`), the next run and
-    /// `/mcp`. The demo keeps its own (the stand-in server, in memory only); no file, or one that
+    /// `/settings`. The demo keeps its own (the stand-in server, in memory only); no file, or one that
     /// does not parse, keeps what the session has.
     pub(crate) fn refresh_mcp_servers(&mut self) {
         if self.demo {
@@ -1035,20 +1171,37 @@ impl App {
         if jump && crate::ui::theme::motion() {
             self.flash_screen = Some(Instant::now());
         }
+        if s != self.screen {
+            // an edit and a first Delete belong to the screen they were made on; so does a key
+            // still being typed (a probe already under way delivers its models wherever one is)
+            self.edit = None;
+            self.confirm = None;
+            if self.models_ui.keyflow.as_ref().is_some_and(|k| k.probing.is_none()) {
+                self.models_ui.keyflow = None;
+            }
+        }
         self.screen = s;
     }
 
-    /// Open Studio/Models remembering the screen underneath them, so `leave_screen` can put the
+    /// Open a config screen remembering the screen underneath it, so `leave_screen` can put the
     /// user back. A Studio→picker→Models hop must not record Studio as the way back (leaving
     /// would strand the user on a screen they already left), so only a returnable screen is kept.
     pub fn enter_screen(&mut self, s: Screen) {
-        if !matches!(self.screen, Screen::Studio | Screen::Models) {
+        if !self.screen.is_config() {
             self.screen_before = Some(self.screen);
         }
         self.set_screen(s);
     }
 
-    /// Leave Studio/Models for wherever they were opened from. Two cases have nothing to return
+    /// `/settings`: what the screen offers is read as it opens — the patterns there are, and the
+    /// MCP servers as settings.toml has them now (`mantra mcp` may have changed them meanwhile).
+    pub fn open_settings(&mut self) {
+        self.refresh_mcp_servers();
+        self.settings_ui.patterns = Pattern::list(&self.project);
+        self.enter_screen(Screen::Settings);
+    }
+
+    /// Leave a config screen for wherever it was opened from. Two cases have nothing to return
     /// to and keep the old rule (the stage while a run exists, Solo otherwise): nothing was
     /// recorded (state restored from before this existed), or the remembered zoom is on an agent
     /// that has since gone, which would draw an empty view with no way to tell why.
@@ -1076,7 +1229,7 @@ impl App {
             Screen::Zoom(a) => Some(a),
             Screen::Stage => self.stage_nodes().get(self.sel).copied(),
             Screen::Studio => self.studio.architect,
-            Screen::Models => None,
+            Screen::Models | Screen::Settings => None,
         }
     }
 
@@ -1303,10 +1456,11 @@ impl App {
         self.start_run_with(goal, None, None);
     }
 
-    /// `start_run` on `pattern` instead of the session's (`/swarm`), and with `max_parallel`
-    /// overriding the pattern's for this run only (`--parallel N`, `--swarm N`, `/swarm N`): the
-    /// number goes into the run's own copy of the pattern — its `pattern.toml`, which a resume
-    /// reads back — and never into the saved pattern.
+    /// `start_run` on `pattern` instead of the session's, and with `max_parallel` overriding the
+    /// pattern's width for this run only (`--parallel N`): one number for every worker class —
+    /// the shared pool and each role with a cap of its own (`Pattern::set_parallel`). It goes into
+    /// the run's own copy of the pattern — its `pattern.toml`, which a resume reads back — and
+    /// never into the saved pattern.
     pub fn start_run_with(&mut self, goal: &str, pattern: Option<&str>, max_parallel: Option<usize>) {
         if self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
             self.toast("a run is already active — re-prompt it from the stage, or /pause", Level::Warn);
@@ -1320,9 +1474,15 @@ impl App {
                 return;
             }
         };
-        let (from_pattern, tasks_from_pattern) = (pattern.settings.max_parallel, pattern.settings.max_tasks_per_phase);
+        // what the journal says about an override: only when it changes a number
+        let mut width_note = None;
         if let Some(n) = max_parallel {
+            let (said, tasks_said) = (pattern.parallel_summary(), pattern.settings.max_tasks_per_phase);
             pattern.set_parallel(n);
+            if pattern.parallel_summary() != said {
+                let tasks = if n > tasks_said { format!(", and up to {n} tasks a phase (it says {tasks_said})") } else { String::new() };
+                width_note = Some(format!("{n} at once in every worker class for this run (the pattern says {said}){tasks}"));
+            }
         }
         if self.demo {
             // Every demo role gets the stand-in server (`mantra mock-mcp`, registered by main.rs)
@@ -1337,7 +1497,7 @@ impl App {
             // Shown where the user is looking: as a toast, and in the Solo log if one exists.
             if let Some(a) = self.solo.and_then(|s| self.agents.get_mut(&s)) {
                 for p in &problems {
-                    a.notice(Level::Warn, &format!("cannot start the run — {p}"));
+                    a.notice(Level::Warn, format!("cannot start the run — {p}"));
                 }
             }
             self.toast(format!("cannot start: {}", problems[0]), Level::Error);
@@ -1360,9 +1520,8 @@ impl App {
             run.log("⚠", "amber", line);
         }
         self.journal_bridge_problem(&mut run);
-        if let Some(n) = max_parallel.filter(|n| *n != from_pattern) {
-            let tasks = if n > tasks_from_pattern { format!(", and up to {n} tasks a phase (it says {tasks_from_pattern})") } else { String::new() };
-            run.log("⚙", "blue", format!("up to {n} workers at once for this run (the pattern says {from_pattern}){tasks}"));
+        if let Some(note) = width_note {
+            run.log("⚙", "blue", note);
         }
         if let Some(n) = max_parallel.filter(|n| *n > crate::engine::pattern::PARALLEL_NOTE_ABOVE) {
             run.log("⚙", "amber", format!("{n} at once: the provider's rate limits are the ceiling now, not Mantra"));
@@ -1373,6 +1532,19 @@ impl App {
         self.screen = Screen::Stage;
         self.sel = 0;
         self.sel_follow = None;
+    }
+
+    /// Stop the active run for good (`Run::stop`): its agents shut down, the run saved as
+    /// "stopped" and openable read-only from `/runs` (to land or delete), and the way clear for
+    /// the next `/run`. Says so when there is nothing to stop; returns whether it stopped one.
+    pub fn stop_run(&mut self) -> bool {
+        if !self.run.as_ref().map(|r| r.is_active()).unwrap_or(false) {
+            self.toast("no active run to stop", Level::Info);
+            return false;
+        }
+        self.with_run(|r, c| r.stop(c));
+        self.toast("run stopped — /run starts a new one; /runs still has this one", Level::Ok);
+        true
     }
 
     /// Record a failed sandbox probe (done once at startup, never in demo mode). The welcome
@@ -1455,7 +1627,7 @@ impl App {
         if let Some(cur) = &self.run {
             if cur.id == r.id {
                 if cur.is_active() {
-                    self.toast("this run is open and active — /pause won't do, it has to finish or fail first", Level::Warn);
+                    self.toast("this run is still active — stop it first, then delete it", Level::Warn);
                     return false;
                 }
                 self.run = None;
@@ -1558,10 +1730,12 @@ impl App {
         prompt_agent(&self.hub, &mut self.agents, id, "Reply with exactly: OK".into(), true, Send::Auto);
     }
 
-    /// Discover models: Codex's catalog + every custom provider (`only` = one provider id).
+    /// Discover models: every custom provider, and Codex's catalog when its account has models
+    /// (`only` = one provider id). Without Codex nothing asks for it: it is an add-on backend.
     pub fn discover(&mut self, only: Option<String>) {
         let mut sources: Vec<String> = vec![];
-        if only.is_none() {
+        let codex = only.is_none() && !self.registry.codex_account_models().is_empty();
+        if codex {
             sources.push("codex".into());
         }
         let provs: Vec<crate::config::ProviderEntry> = self.registry.providers.iter().filter(|p| !p.id.is_empty() && p.id != "openai" && only.as_ref().map(|o| *o == p.id).unwrap_or(true)).cloned().collect();
@@ -1575,11 +1749,11 @@ impl App {
         sources.extend(net_provs.iter().map(|p| p.id.clone()));
         let hosts = net_provs.iter().filter_map(|p| p.host().map(|h| (p.id.clone(), h))).collect();
         let skipped = drafts.iter().map(|p| format!("{}: skipped (draft) — {}", p.id, p.draft_reason().unwrap_or_default())).collect();
-        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default() }));
+        self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default(), origin: None }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
             self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
         }
-        if only.is_none() {
+        if codex {
             let cmd = self.hub.codex_cmd.clone();
             let args = self.registry.provider_args();
             let cwd = self.project.clone();
@@ -1634,15 +1808,12 @@ impl App {
             self.toast("nothing selected", Level::Info);
             return;
         }
-        match self.registry.save() {
-            Ok(()) => {
-                self.models_ui.dirty = false;
-                self.toast(format!("added {added}, updated {updated} model(s) — saved to models.toml"), Level::Ok);
-            }
-            Err(e) => {
-                self.models_ui.dirty = true;
-                self.toast(format!("added {added}, updated {updated}, but saving failed: {e}"), Level::Error);
-            }
+        match self.save_registry() {
+            Ok(()) => match &st.origin {
+                Some(host) => self.toast(format!("{host}: {added} model{} added", if added == 1 { "" } else { "s" }), Level::Ok),
+                None => self.toast(format!("added {added}, updated {updated} model(s) — saved to models.toml"), Level::Ok),
+            },
+            Err(e) => self.toast(format!("added {added}, updated {updated}, but {e}"), Level::Error),
         }
     }
 
@@ -1681,6 +1852,199 @@ impl App {
         }
     }
 
+    // ─── settings ───
+
+    /// One change from `/settings` or the web's settings page (`Field::key`, the value as text):
+    /// `Settings::set_field` validates it, `apply_settings` saves and applies it. `Ok` says when
+    /// it takes effect ("" = now), `Err` why it was refused — nothing changed then. The MCP servers
+    /// are read from settings.toml first: `solo_mcp` may name one `mantra mcp add` just made.
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<&'static str, String> {
+        self.refresh_mcp_servers();
+        let mut s = self.settings.clone();
+        s.set_field(key, value)?;
+        self.apply_settings(s)?;
+        Ok(if applied_live(key) { "" } else { crate::settings_ops::takes_effect(key) })
+    }
+
+    /// Makes `s` the session's settings — refused when its model is not in /models or its
+    /// pattern does not load — saves them (not in the demo, `save_settings`) and applies what
+    /// can apply live: the approval mode to Solo's thread, the pattern for new runs, the side
+    /// panel, the glyphs, colours and motion (`theme::init` again, the screen redrawn whole; the
+    /// event loop picks up `fps` and `mouse` itself). The rest is read where it is used: the next
+    /// Solo session, the next run, the next start.
+    pub fn apply_settings(&mut self, s: Settings) -> Result<(), String> {
+        if self.registry.get(&s.default_model).is_none() {
+            return Err(format!("model alias '{}' is not in /models", s.default_model));
+        }
+        if s.default_pattern != self.settings.default_pattern {
+            Pattern::load(&s.default_pattern, &self.project).map_err(|e| e.to_string())?;
+            self.pattern_name = s.default_pattern.clone();
+        }
+        if s.side_panel != self.settings.side_panel {
+            self.side_panel = s.side_panel;
+        }
+        let looks = (s.glyphs != self.settings.glyphs || s.colors != self.settings.colors || s.reduce_motion != self.settings.reduce_motion).then(|| s.clone());
+        let approvals = (s.approval_mode != self.settings.approval_mode).then(|| s.approval_mode.clone());
+        self.settings = s;
+        if let Some(s) = looks {
+            crate::ui::theme::init(&s);
+            self.force_clear = true;
+        }
+        match approvals {
+            Some(mode) => self.set_approval_mode(&mode),
+            None => self.save_settings(),
+        }
+        Ok(())
+    }
+
+    /// The effort a new Solo session starts its model on: the model's `default_effort` in
+    /// models.toml, which `/settings` edits beside the model.
+    pub fn set_default_effort(&mut self, effort: &str) -> Result<(), String> {
+        let alias = self.registry.resolve(&self.settings.default_model).alias;
+        let Some(m) = self.registry.models.iter_mut().find(|m| m.alias == alias) else { return Err(format!("model alias '{alias}' is not in /models")) };
+        if !m.efforts().iter().any(|e| e == effort) {
+            return Err(format!("{}: one of {}", m.alias, m.efforts().join(", ")));
+        }
+        m.default_effort = effort.to_string();
+        self.save_registry()
+    }
+
+    // ─── MCP servers ───
+
+    /// Changes the MCP servers the way `mantra mcp` does: in settings.toml as it is on disk —
+    /// `save_settings` writes the file's table, not the session's — then takes the session's copy
+    /// (and `solo_mcp`, which a removal may shorten) from what was saved. The demo's servers live
+    /// in memory only, and change there.
+    pub(crate) fn change_mcp(&mut self, f: impl FnOnce(&mut Settings) -> Result<(), String>) -> Result<(), String> {
+        if self.demo {
+            return f(&mut self.settings);
+        }
+        let mut disk = Settings::load_on_disk()?;
+        f(&mut disk)?;
+        disk.save().map_err(|e| format!("could not save settings.toml: {e}"))?;
+        self.settings.mcp_servers = disk.mcp_servers;
+        self.settings.solo_mcp = disk.solo_mcp;
+        Ok(())
+    }
+
+    /// A new MCP server from its name and its command line as typed (`uvx blender-mcp`).
+    pub fn mcp_add_server(&mut self, name: &str, command_line: &str) -> Result<(), String> {
+        let words = crate::settings_ops::parse_command_line(command_line)?;
+        let Some((command, args)) = words.split_first() else { return Err(format!("{}: a server needs a command", name.trim())) };
+        let server = crate::config::McpServer { command: command.clone(), args: args.to_vec(), ..Default::default() };
+        self.change_mcp(|s| s.mcp_add(name.trim(), server))
+    }
+
+    /// Removes a server, and its name from `solo_mcp` with it.
+    pub fn mcp_remove_server(&mut self, name: &str) -> Result<(), String> {
+        self.settings_ui.mcp_status.remove(name);
+        self.change_mcp(|s| {
+            s.mcp_remove(name)?;
+            s.solo_mcp.retain(|n| n != name);
+            Ok(())
+        })
+    }
+
+    pub fn mcp_set_server_enabled(&mut self, name: &str, on: bool) -> Result<(), String> {
+        self.change_mcp(|s| s.mcp_set_enabled(name, on))
+    }
+
+    /// Starts the server, asks for its tools and stops it, off the event loop; the line for its
+    /// row arrives as `AppEvent::McpTested`.
+    pub fn mcp_test_server(&mut self, name: &str) {
+        let Some(server) = self.settings.mcp_servers.get(name).cloned() else { return };
+        self.settings_ui.mcp_status.insert(name.to_string(), "testing…".into());
+        let (tx, name) = (self.tx.clone(), name.to_string());
+        tokio::spawn(async move {
+            let result = mcp_probe(&server).await;
+            let _ = tx.send(AppEvent::McpTested { name, result });
+        });
+    }
+
+    // ─── providers & backends ───
+
+    /// A provider from its API key and base URL (`provider_key::provider_from_key`): added — or
+    /// the key put into the provider already at that URL — and models.toml saved. Returns its id.
+    /// The key goes into models.toml (0600) and nowhere else: not into a toast, not into the log.
+    pub fn add_provider_from_key(&mut self, key: &str, base_url: &str) -> Result<String, String> {
+        let draft = crate::provider_key::provider_from_key(key, Some(base_url));
+        let id = crate::provider_key::add_provider(&mut self.registry, &draft)?;
+        self.save_registry()?;
+        Ok(id)
+    }
+
+    /// Asks provider `id` for its models off the event loop; `AppEvent::Probed` brings the answer
+    /// (`on_probed` offers them for import). Returns the host asked, for the spinner line.
+    pub fn probe_provider(&mut self, id: &str) -> Option<String> {
+        let p = self.registry.providers.iter().find(|p| p.id == id)?.clone();
+        let host = p.host().unwrap_or_else(|| p.base_url.clone());
+        let (tx, provider, h) = (self.tx.clone(), p.id.clone(), host.clone());
+        tokio::task::spawn_blocking(move || {
+            let result = crate::provider_key::probe(&p);
+            let _ = tx.send(AppEvent::Probed { provider, host: h, result });
+        });
+        Some(host)
+    }
+
+    /// A provider's models are in: the discovery picker with them (a short list pre-selected), or
+    /// why there are none. The provider stays either way — models can be added to it by hand.
+    fn on_probed(&mut self, provider: String, host: String, result: Result<Vec<crate::discover::Found>, String>) {
+        self.models_ui.keyflow = None;
+        match result {
+            Ok(found) if found.is_empty() => self.toast(format!("{host} lists no models — add them by hand (ctrl+n)"), Level::Info),
+            Ok(found) => {
+                let items = crate::provider_key::candidates(&self.registry, &provider, &found);
+                self.overlays.push(Overlay::Discover(DiscoverState { items, loading: vec![], hosts: vec![], errors: vec![], skipped: vec![], sel: 0, filter: Input::default(), origin: Some(host) }));
+            }
+            Err(e) => {
+                // a provider's error page may quote the key it was sent
+                let key = self.registry.providers.iter().find(|p| p.id == provider).and_then(|p| p.api_key.clone()).unwrap_or_default();
+                let e = if key.trim().len() >= 8 { e.replace(key.trim(), &crate::ui::form::mask(&key)) } else { e };
+                self.toast(format!("{host}: {e} — the provider is kept"), Level::Warn);
+            }
+        }
+    }
+
+    /// Codex or Claude Code as an add-on backend: its default models, once its CLI is on PATH (in
+    /// the demo the mocks stand in for both). Saved; returns how many models it added.
+    pub fn add_backend(&mut self, backend: crate::provider_key::Backend) -> Result<usize, String> {
+        let added = if self.demo { crate::provider_key::add_backend_with(&mut self.registry, backend, true)? } else { crate::provider_key::add_backend(&mut self.registry, backend)? };
+        if added > 0 {
+            self.save_registry()?;
+        }
+        Ok(added)
+    }
+
+    /// Every model on Codex's own account, gone in one go — the Codex row's Delete. Saved.
+    pub fn remove_codex_account(&mut self) -> Result<usize, String> {
+        let n = self.registry.remove_codex_account();
+        if n > 0 {
+            self.save_registry()?;
+        }
+        Ok(n)
+    }
+
+    /// models.toml written, the `/models` header told — except in the demo, whose registry points
+    /// bija at its mock server and holds the mock backends' models: like its settings it is never
+    /// saved, and a change there lives until the demo ends.
+    pub fn save_registry(&mut self) -> Result<(), String> {
+        if self.demo {
+            self.models_ui.dirty = false;
+            return Ok(());
+        }
+        match self.registry.save() {
+            Ok(()) => {
+                self.models_ui.dirty = false;
+                self.models_ui.saved = Some(Instant::now());
+                Ok(())
+            }
+            Err(e) => {
+                self.models_ui.dirty = true;
+                Err(format!("could not save models.toml: {e}"))
+            }
+        }
+    }
+
     // ─────────────────────────── events ───────────────────────────
 
     pub fn on_event(&mut self, ev: AppEvent) {
@@ -1702,6 +2066,16 @@ impl App {
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
             AppEvent::Web(i) => self.web_command(i),
             AppEvent::ToolAnswer { agent, id, result } => self.hub.send(agent, Cmd::Respond { id, result }),
+            AppEvent::Probed { provider, host, result } => self.on_probed(provider, host, result),
+            AppEvent::McpTested { name, result } => {
+                let line = match result {
+                    Ok(ok) => ok,
+                    Err(e) => format!("error: {e}"),
+                };
+                if self.settings.mcp_servers.contains_key(&name) {
+                    self.settings_ui.mcp_status.insert(name, line);
+                }
+            }
         }
     }
 
@@ -1993,7 +2367,7 @@ impl App {
                         ("Run this command?".to_string(), format!("$ {cmd}{}", params.get("reason").and_then(|r| r.as_str()).map(|r| format!("\n  reason: {r}")).unwrap_or_default()))
                     }
                     "item/fileChange/requestApproval" | "applyPatchApproval" => ("Apply these file changes?".into(), params.get("reason").and_then(|r| r.as_str()).unwrap_or("the agent wants to write files").to_string()),
-                    "item/permissions/requestApproval" => ("Grant extra permissions?".into(), format!("{}", crate::util::trunc(&params.get("permissions").map(|p| p.to_string()).unwrap_or_default(), 200))),
+                    "item/permissions/requestApproval" => ("Grant extra permissions?".into(), crate::util::trunc(&params.get("permissions").map(|p| p.to_string()).unwrap_or_default(), 200).to_string()),
                     _ => {
                         let q = params.pointer("/questions/0/question").and_then(|q| q.as_str()).unwrap_or("The agent has a question");
                         ("Agent question (type your answer, ⏎ to send)".into(), q.to_string())
@@ -2093,15 +2467,7 @@ impl App {
     fn on_term(&mut self, e: Event) {
         match e {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-            Event::Paste(s) => {
-                if let Some(Overlay::Edit { input, .. }) = self.overlays.last_mut() {
-                    input.insert_str(&s);
-                } else if self.screen == Screen::Studio && self.studio.focus == 2 {
-                    self.studio.input.insert_str(&s);
-                } else {
-                    self.input.insert_str(&s);
-                }
-            }
+            Event::Paste(s) => self.paste(&s),
             Event::Mouse(m) => {
                 let delta = match m.kind {
                     MouseEventKind::ScrollUp => 3i32,
@@ -2134,6 +2500,44 @@ impl App {
         }
     }
 
+    /// A paste goes where typing would: the field being edited (one line, unless it takes
+    /// several), the new-run goal, the discovery filter, the Studio's architect, the chat input.
+    /// On a config screen with nothing being edited it starts editing the selected field, as
+    /// typing its first character would.
+    fn paste(&mut self, s: &str) {
+        let one_line = |s: &str| s.trim_end_matches(['\r', '\n']).replace("\r\n", " ").replace(['\r', '\n'], " ");
+        match self.overlays.last_mut() {
+            Some(Overlay::NewRun { goal: Some(goal), .. }) => return goal.insert_str(s),
+            Some(Overlay::Discover(st)) => return st.filter.insert_str(&one_line(s)),
+            None if self.edit.is_none() && self.screen.is_config() && !(self.screen == Screen::Studio && self.studio.focus == 2) => {
+                let Some(first) = s.chars().find(|c| !c.is_control() && !c.is_whitespace()) else { return };
+                self.config_key(KeyEvent::new(KeyCode::Char(first), KeyModifiers::NONE));
+                let Some(e) = self.edit.as_mut() else { return };
+                let rest: String = s.chars().skip_while(|c| *c != first).skip(1).collect();
+                return e.input.insert_str(&if e.multiline { rest } else { one_line(&rest) });
+            }
+            _ => {}
+        }
+        if let Some(e) = self.edit.as_mut() {
+            let s = if e.multiline { s.to_string() } else { one_line(s) };
+            e.input.insert_str(&s);
+        } else if self.screen == Screen::Studio && self.studio.focus == 2 {
+            self.studio.input.insert_str(s);
+        } else {
+            self.input.insert_str(s);
+        }
+    }
+
+    /// The keys of the config screen on view.
+    fn config_key(&mut self, k: KeyEvent) {
+        match self.screen {
+            Screen::Studio => crate::ui::studio::studio_key(self, k),
+            Screen::Models => crate::ui::models::models_key(self, k),
+            Screen::Settings => crate::ui::settings::settings_key(self, k),
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -2142,12 +2546,17 @@ impl App {
             self.ctrl_c_press();
             return;
         }
+        // A field being edited takes every other key: ⏎ keeps it, esc brings the old value back
+        // (`ui::form`) — nothing global fires in the middle of a word.
+        if self.edit.is_some() && self.overlays.is_empty() && self.screen.is_config() {
+            return self.config_key(k);
+        }
         if ctrl && k.code == KeyCode::Char('o') {
             self.overlays.clear();
-            self.screen = match self.screen {
+            self.set_screen(match self.screen {
                 Screen::Solo => Screen::Stage,
                 _ => Screen::Solo,
-            };
+            });
             return;
         }
         if ctrl && k.code == KeyCode::Char('e') && self.overlays.is_empty() {
@@ -2159,7 +2568,9 @@ impl App {
             self.force_clear = true;
             return;
         }
-        if (ctrl && k.code == KeyCode::Char('t')) || k.code == KeyCode::F(2) {
+        // ctrl+t and ctrl+d belong to the chat screens; a config screen's own are row actions
+        // (test, discover), handled by the screen below
+        if ((ctrl && k.code == KeyCode::Char('t')) || k.code == KeyCode::F(2)) && !self.screen.is_config() {
             if self.screen == Screen::Stage {
                 self.pulse_panel = !self.pulse_panel;
             } else {
@@ -2178,7 +2589,7 @@ impl App {
             self.overlays.push(Overlay::ModelPicker { sel, target });
             return;
         }
-        if ctrl && k.code == KeyCode::Char('d') && self.overlays.is_empty() {
+        if ctrl && k.code == KeyCode::Char('d') && self.overlays.is_empty() && !self.screen.is_config() {
             if let Some(a) = self.focus_agent() {
                 self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
             }
@@ -2206,7 +2617,9 @@ impl App {
             self.overlays.push(Overlay::Help { scroll: 0 });
             return;
         }
-        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !matches!(self.overlays.last(), Some(Overlay::Diff { .. }) | Some(Overlay::Plan { .. }) | Some(Overlay::Halt { .. }) | Some(Overlay::Help { .. })) {
+        // page keys scroll the log in view, unless what is in front pages through its own list
+        let pages_itself = matches!(self.overlays.last(), Some(Overlay::Diff { .. } | Overlay::Plan { .. } | Overlay::Halt { .. } | Overlay::Help { .. } | Overlay::Discover(_))) || (self.overlays.is_empty() && self.screen.is_config());
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !pages_itself {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
         }
@@ -2248,10 +2661,8 @@ impl App {
                 }
             }
         }
-        match self.screen {
-            Screen::Studio => return crate::ui::studio::studio_key(self, k),
-            Screen::Models => return crate::ui::studio::models_key(self, k),
-            _ => {}
+        if self.screen.is_config() {
+            return self.config_key(k);
         }
         // effort / approvals shortcuts
         if (alt || k.modifiers.contains(KeyModifiers::SHIFT)) && matches!(k.code, KeyCode::Up | KeyCode::Down) && !(self.screen == Screen::Stage && self.canvas_focus) {
@@ -2260,10 +2671,8 @@ impl App {
             }
             return;
         }
-        if self.screen == Screen::Stage {
-            if self.stage_key(k) {
-                return;
-            }
+        if self.screen == Screen::Stage && self.stage_key(k) {
+            return;
         }
         // Backspace on an empty input pops the last queued message back into the input to edit.
         if k.code == KeyCode::Backspace && self.input.is_empty() {
@@ -2274,9 +2683,11 @@ impl App {
                 }
             }
         }
-        // slash suggestions navigation
+        // suggestions: ↑↓ pick, tab completes, ⏎ completes a command or its argument and runs it
+        // (an @name only completes: the message comes after it)
         let sugg = self.suggestions();
         if !sugg.is_empty() {
+            let pick = &sugg[self.suggest.min(sugg.len() - 1)];
             match k.code {
                 KeyCode::Up => {
                     self.suggest = self.suggest.saturating_sub(1);
@@ -2287,14 +2698,13 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    let c = sugg[self.suggest.min(sugg.len() - 1)].0;
-                    self.input.set(&format!("{c} "));
+                    self.input.set(&pick.text);
+                    self.suggest = 0;
                     return;
                 }
-                KeyCode::Enter => {
-                    let c = sugg[self.suggest.min(sugg.len() - 1)].0;
-                    if self.input.text().trim() != c {
-                        self.input.set(c);
+                KeyCode::Enter if !pick.text.starts_with('@') => {
+                    if self.input.text().trim() != pick.text.trim() {
+                        self.input.set(pick.text.trim_end());
                     }
                 }
                 _ => {}
@@ -2385,7 +2795,6 @@ impl App {
                     self.land_on_overview();
                 }
             }
-            KeyCode::Char('i') => self.overlays.push(Overlay::Inbox { sel: 0 }),
             KeyCode::Char('x') => {
                 if let Some(a) = selected {
                     self.interrupt_by_user(a);
@@ -2418,11 +2827,6 @@ impl App {
                     self.step_effort(a, -1);
                 }
             }
-            KeyCode::Char('d') => {
-                if let Some(a) = selected {
-                    self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
-                }
-            }
             KeyCode::Char('c') => {
                 if let Some(a) = selected {
                     self.compact_agent(a);
@@ -2437,7 +2841,6 @@ impl App {
                     self.overlays.push(Overlay::ModelPicker { sel, target: Some(a) });
                 }
             }
-            KeyCode::Char('s') => self.open_studio(),
             KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
             KeyCode::Char('/') | KeyCode::Char('@') => {
                 self.canvas_focus = false;
@@ -2467,12 +2870,61 @@ impl App {
         true
     }
 
-    pub fn suggestions(&self) -> Vec<(&'static str, &'static str)> {
+    /// What the input could become: a command for `/…`, a command's argument for `/akasha …`
+    /// (the run's groups) and `/respawn …` (its agents), an agent for `@…` on the stage. A
+    /// parameter is never to be typed out: this completes it, a selector asks for a missing one.
+    pub fn suggestions(&self) -> Vec<Suggestion> {
         let t = self.input.text();
-        if !t.starts_with('/') || t.contains(' ') || t.contains('\n') {
+        if t.contains('\n') {
             return vec![];
         }
-        COMMANDS.iter().filter(|(c, _)| c.starts_with(t.as_str())).copied().collect()
+        if let Some(name) = t.strip_prefix('@') {
+            if self.screen != Screen::Stage || name.contains(char::is_whitespace) {
+                return vec![];
+            }
+            return self.run_agent_choices().into_iter().filter(|c| c.label.starts_with(name)).map(|c| Suggestion { text: format!("@{} ", c.label), label: format!("@{}", c.label), about: c.detail }).collect();
+        }
+        if !t.starts_with('/') {
+            return vec![];
+        }
+        let Some((cmd, arg)) = t.split_once(' ') else {
+            return COMMANDS.iter().filter(|(c, _)| c.starts_with(t.as_str())).map(|(c, d)| Suggestion { text: format!("{c} "), label: c.to_string(), about: d.to_string() }).collect();
+        };
+        if arg.contains(' ') {
+            return vec![];
+        }
+        let options: Vec<(String, String)> = match cmd {
+            "/akasha" => self.akasha_choices().into_iter().map(|c| (c.label, c.detail)).collect(),
+            "/respawn" => self.run_agent_choices().into_iter().map(|c| (c.label, c.detail)).collect(),
+            _ => vec![],
+        };
+        options.into_iter().filter(|(o, _)| o.starts_with(arg) && o != arg).map(|(o, about)| Suggestion { text: format!("{cmd} {o}"), label: o, about }).collect()
+    }
+
+    /// The run's Akasha groups: name, then how many notes and who shares them.
+    pub fn akasha_choices(&self) -> Vec<Choice> {
+        let Some(r) = &self.run else { return vec![] };
+        r.akasha
+            .values()
+            .map(|b| {
+                let roles = r.pattern.groups.iter().find(|g| g.name == b.group).map(|g| g.roles.join(", ")).unwrap_or_default();
+                let n = b.entries.len();
+                Choice { key: b.group.clone(), label: b.group.clone(), detail: format!("{n} note{} · {roles}", if n == 1 { "" } else { "s" }), on: false }
+            })
+            .collect()
+    }
+
+    /// The run's agents as the stage shows them (card order): name, then role and model.
+    pub fn run_agent_choices(&self) -> Vec<Choice> {
+        let Some(r) = &self.run else { return vec![] };
+        self.stage_nodes()
+            .into_iter()
+            .map(|a| {
+                let role = r.role_name_of(a).unwrap_or_default();
+                let model = self.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
+                Choice { key: a.to_string(), label: r.name_of(a), detail: if role.is_empty() { model } else { format!("{role} · {model}") }, on: false }
+            })
+            .collect()
     }
 
     pub fn open_studio(&mut self) {
@@ -2497,6 +2949,12 @@ impl App {
         let more = if self.ctrl_c_count == 1 { "ctrl+c ×2 more quits" } else { "ctrl+c once more quits" };
         if !self.overlays.is_empty() {
             self.overlays.pop();
+            return;
+        }
+        // a field being edited goes back to what it was, as esc does there
+        if self.edit.is_some() && self.screen.is_config() {
+            self.config_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            self.edit = None;
             return;
         }
         if !self.input.is_empty() {
@@ -2668,72 +3126,36 @@ impl App {
                     }
                 }
             }
-            "/effort" => match target {
-                Some(a) if !arg.is_empty() => self.set_effort(a, arg),
-                _ => self.toast("usage: /effort auto|low|medium|high|xhigh|max", Level::Info),
-            },
-            "/approvals" => {
-                if ["untrusted", "on-request", "never"].contains(&arg) {
-                    self.set_approval_mode(arg);
-                } else {
-                    self.toast("usage: /approvals untrusted|on-request|never", Level::Info);
-                }
-            }
             "/new" | "/clear" => {
                 self.start_solo();
-                self.screen = Screen::Solo;
+                self.set_screen(Screen::Solo);
                 self.toast("fresh session", Level::Ok);
             }
-            "/compact" => {
-                if let Some(a) = target {
-                    self.compact_agent(a);
-                }
-            }
+            "/compact" => match target {
+                Some(a) => self.compact_agent(a),
+                None => self.toast("no agent in view to compact", Level::Info),
+            },
             "/diff" => {
                 if let Some(a) = target {
                     self.overlays.push(Overlay::Diff { agent: a, file: 0, scroll: 0 });
                 }
             }
-            "/mandala" | "/stage" => self.screen = Screen::Stage,
-            "/solo" => self.screen = Screen::Solo,
-            "/run" => {
-                if arg.is_empty() {
-                    self.screen = Screen::Stage;
-                    self.toast("describe what to build in the stage prompt", Level::Info);
-                } else {
-                    self.start_run(arg);
-                }
-            }
-            "/swarm" => {
-                let (n, goal) = arg.split_once(char::is_whitespace).map(|(n, g)| (n, g.trim())).unwrap_or((arg, ""));
-                match crate::engine::pattern::parse_parallel(n) {
-                    Ok(n) if !goal.is_empty() => self.start_run_with(goal, Some(crate::engine::pattern::NAME_SWARM), Some(n)),
-                    Ok(_) => self.toast("usage: /swarm <N> <goal>", Level::Info),
-                    Err(e) => self.toast(format!("/swarm: {e}"), Level::Warn),
-                }
-            }
-            "/pattern" => {
-                if arg.is_empty() {
-                    let list = PatternChoice::all(&self.project);
-                    let sel = list.iter().position(|p| p.name == self.pattern_name).unwrap_or(0);
-                    self.overlays.push(Overlay::Patterns { sel, list });
-                } else {
-                    self.pattern_name = arg.to_string();
-                    self.toast(format!("pattern for new runs: {arg}"), Level::Info);
-                }
-            }
-            "/experimental" => self.experimental_command(arg),
-            "/mcp" => self.mcp_command(arg),
+            "/stage" => self.set_screen(Screen::Stage),
+            "/solo" => self.set_screen(Screen::Solo),
+            "/run" if arg.is_empty() => self.open_new_run(true),
+            "/run" => self.start_run(arg),
+            "/pattern" if arg.is_empty() => self.open_new_run(false),
+            "/pattern" => self.choose_pattern(arg),
             "/runs" => self.open_runs(),
+            "/stop" => {
+                self.stop_run();
+            }
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
-            "/akasha" => crate::ui::overlays::open_akasha(self, arg),
+            "/akasha" => self.open_akasha(arg),
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
-            "/respawn" => match target {
-                Some(a) => self.respawn_agent(a),
-                None => self.toast("no agent focused", Level::Info),
-            },
+            "/respawn" => self.respawn_command(arg, target),
             "/land" => {
                 if self.run.as_ref().map(|r| r.stage == Stage::Done).unwrap_or(false) {
                     self.with_run(|r, c| r.land(c));
@@ -2743,90 +3165,78 @@ impl App {
             }
             "/studio" => self.open_studio(),
             "/models" => self.enter_screen(Screen::Models),
+            "/settings" => self.open_settings(),
             "/inbox" => self.overlays.push(Overlay::Inbox { sel: 0 }),
-            "/web" => self.overlays.push(Overlay::Web),
-            "/remote" => self.overlays.push(Overlay::Remote),
-            "/verbose" => self.verbose = !self.verbose,
-            _ => self.toast(format!("unknown command {cmd} — /help"), Level::Warn),
+            _ => match MOVED.iter().find(|(c, _)| *c == cmd) {
+                Some((_, there)) => self.toast(*there, Level::Info),
+                None => self.toast(format!("unknown command {cmd} — /help"), Level::Warn),
+            },
         }
     }
 
-    /// `/experimental` lists the features; `/experimental <name> on|off` switches one in
-    /// settings.toml and for runs started from now on. A run already open keeps what it started
-    /// with: its agents were briefed and given their tools at spawn.
-    fn experimental_command(&mut self, arg: &str) {
-        let words: Vec<&str> = arg.split_whitespace().collect();
-        let (name, on) = match words.as_slice() {
-            [] => {
-                // One toast line (70 columns at 80): `akasha: on — shared notes for agent groups ·
-                // /experimental akasha off` — the about up to its parenthesis, and the command
-                // that flips it.
-                let feats = crate::config::EXPERIMENTAL;
-                let list = feats
-                    .iter()
-                    .map(|(name, about)| format!("{name}: {} — {}", if self.settings.experimental_on(name) { "on" } else { "off" }, about.split(" (").next().unwrap_or(about)))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                let how = match feats {
-                    [(name, _)] => format!("/experimental {name} {}", if self.settings.experimental_on(name) { "off" } else { "on" }),
-                    _ => "/experimental <name> on|off".to_string(),
-                };
-                self.toast(format!("{list} · {how}"), Level::Info);
-                return;
-            }
-            [name, "on"] => (*name, true),
-            [name, "off"] => (*name, false),
-            _ => {
-                self.toast("usage: /experimental [name on|off]", Level::Info);
-                return;
-            }
-        };
-        match save_experimental(name, on) {
-            Ok(_) => {
-                self.settings.experimental.retain(|f| f != name);
-                if on {
-                    self.settings.experimental.push(name.to_string());
+    /// The new-run overlay: every pattern, the one new runs use selected — with a goal to type
+    /// (`/run`, ⏎ starts) or without (`/pattern`, ⏎ chooses).
+    pub fn open_new_run(&mut self, with_goal: bool) {
+        let list = PatternChoice::all(&self.project);
+        let sel = list.iter().position(|p| p.name == self.pattern_name).unwrap_or(0);
+        self.overlays.push(Overlay::NewRun { sel, list, goal: with_goal.then(Input::default) });
+    }
+
+    /// `--pattern <name>` for this session: a built-in 0.8 retired reads as the one that runs in
+    /// its place (`pattern::current_name`), so the stage never names a pattern that is gone.
+    pub fn session_pattern(&mut self, name: &str) {
+        self.pattern_name = crate::engine::pattern::current_name(name, &self.project);
+    }
+
+    /// The pattern new runs use from now on (this session; `/settings` saves a default). The
+    /// Studio opens on it, unless it has unsaved changes of its own.
+    pub fn choose_pattern(&mut self, name: &str) {
+        let name = crate::engine::pattern::current_name(name, &self.project);
+        match Pattern::load(&name, &self.project) {
+            Ok(p) => {
+                if !self.studio.dirty {
+                    self.studio.pattern = p;
                 }
-                let open = self.run.as_ref().map(|r| r.is_active()).unwrap_or(false);
-                let tail = if open { "; the open run changes only after a restart of Mantra" } else { "" };
-                let what = if on { "on, saved — new runs use it" } else { "off, saved — new runs go without it" };
-                self.toast(format!("{name} {what}{tail}"), Level::Ok);
+                self.toast(format!("new runs use pattern {name}"), Level::Ok);
+                self.pattern_name = name;
             }
-            Err(e) => self.toast(e, Level::Warn),
+            Err(e) => self.toast(format!("pattern error: {e}"), Level::Warn),
         }
     }
 
-    /// `/mcp` names the configured servers and the ones the current Solo agent has; `/mcp solo
-    /// <name|*|none>` sets `solo_mcp` in settings.toml (in memory only in the demo). The running
-    /// Solo keeps its servers — its backend launched them with it — so the change is for the next.
-    fn mcp_command(&mut self, arg: &str) {
-        self.refresh_mcp_servers();
-        let (sub, rest) = arg.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
-        match sub {
-            "" => self.toast(mcp_summary(&self.settings, &self.solo_mcp), Level::Info),
-            "solo" => {
-                let list = match parse_solo_mcp(&self.settings, rest) {
-                    Ok(l) => l,
-                    Err(e) => return self.toast(e, Level::Warn),
-                };
-                if !self.demo {
-                    let saved = Settings::load_on_disk().and_then(|mut s| {
-                        s.solo_mcp = list.clone();
-                        s.save().map_err(|e| format!("could not save settings.toml: {e}"))
-                    });
-                    if let Err(e) = saved {
-                        return self.toast(e, Level::Warn);
-                    }
-                }
-                let what = match list.as_slice() {
-                    [] => "none".to_string(),
-                    [all] if all == "*" => "every enabled server".to_string(),
-                    names => names.join(", "),
-                };
-                self.settings.solo_mcp = list;
-                self.toast(format!("Solo MCP: {what} — applies to the next agent (/new)"), Level::Ok);
+    /// `/akasha [group]`: the notes of the group named; with none, the only group straight away,
+    /// or a selector of the groups there are — and a toast when there is nothing to show (no run,
+    /// a run without groups: Akasha off or a pattern with none, a group it does not have).
+    pub fn open_akasha(&mut self, group: &str) {
+        let groups = self.akasha_choices();
+        if groups.is_empty() {
+            self.toast("no akasha groups in this run", Level::Info);
+        } else if !group.is_empty() && !groups.iter().any(|g| g.key == group) {
+            let have: Vec<String> = groups.into_iter().map(|g| g.key).collect();
+            self.toast(format!("no akasha group '{group}' in this run (it has: {})", have.join(", ")), Level::Info);
+        } else if !group.is_empty() || groups.len() == 1 {
+            let group = if group.is_empty() { groups[0].key.clone() } else { group.to_string() };
+            self.overlays.push(Overlay::Akasha { scroll: 0, group: Some(group) });
+        } else {
+            self.overlays.push(Overlay::Select(Select { title: "akasha · which group".into(), items: groups, sel: 0, multi: false, then: SelectThen::Akasha }));
+        }
+    }
+
+    /// `/respawn [agent]`: the agent named, else the run agent in view, else a selector of the
+    /// run's agents.
+    fn respawn_command(&mut self, name: &str, target: Option<AgentId>) {
+        let agents = self.run_agent_choices();
+        if !name.is_empty() {
+            match agents.iter().find(|c| c.label.eq_ignore_ascii_case(name.trim_start_matches('@'))).and_then(|c| c.key.parse::<AgentId>().ok()) {
+                Some(a) => self.respawn_agent(a),
+                None => self.toast(format!("no agent named {name} in this run"), Level::Warn),
             }
-            _ => self.toast("usage: /mcp [solo <name|*|none>]", Level::Info),
+        } else if let Some(a) = target.filter(|a| self.in_run(*a)) {
+            self.respawn_agent(a);
+        } else if agents.is_empty() {
+            self.toast("no run agent to respawn", Level::Info);
+        } else {
+            self.overlays.push(Overlay::Select(Select { title: "respawn · which agent".into(), items: agents, sel: 0, multi: false, then: SelectThen::Respawn }));
         }
     }
 
@@ -2859,50 +3269,129 @@ mod tests {
         assert!(list[..n].iter().all(|p| p.about.as_ref().map(|d| !d.is_empty()).unwrap_or(false)));
     }
 
-    /// `/swarm 24 <goal>` starts a run of mantra-swarm with 24 at once in the run's own copy of
-    /// the pattern; the saved pattern, the session's pattern and `/run` stay as they were.
+    /// `--parallel N` (`start_run_with(…, Some(N))`) sets every worker class of the run's own copy
+    /// of the pattern — the shared pool and the swarm's own cap — and journals it; the saved
+    /// pattern, the session's pattern and a plain `/run` stay as they were. `/swarm` is gone.
     #[tokio::test]
-    async fn swarm_starts_a_run_with_the_override_in_the_runs_pattern_copy() {
+    async fn parallel_sets_every_class_in_the_runs_pattern_copy() {
         crate::web::snapshot::tests::with_mantra_home(|| {
-            let project = std::env::temp_dir().join(format!("mantra-swarm-cmd-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
+            let project = std::env::temp_dir().join(format!("mantra-parallel-{}-{}", std::process::id(), crate::web::snapshot::now_ms()));
             std::fs::create_dir_all(&project).unwrap();
             let mut app = crate::web::snapshot::tests::test_app();
             app.project = project.clone();
             let session_pattern = app.pattern_name.clone();
-            for bad in ["/swarm", "/swarm 24", "/swarm 0 build it", "/swarm many build it"] {
-                app.command(bad);
-                assert!(app.run.is_none(), "{bad}: nothing starts");
-            }
-            app.command("/swarm 24 build the parser");
+            assert!(!COMMANDS.iter().any(|(c, _)| *c == "/swarm"), "the swarm is a worker class now, not a command");
+            app.command("/swarm 24 build it");
+            assert!(app.run.is_none(), "/swarm starts nothing");
+            app.start_run_with("build the parser", None, Some(24));
             let run = app.run.as_ref().expect("the run started");
-            assert_eq!((run.pattern.name.as_str(), run.pattern.settings.max_parallel), (crate::engine::pattern::NAME_SWARM, 24));
-            let copy = std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap();
-            let copy = Pattern::from_toml(&copy).unwrap();
-            assert_eq!(copy.settings.max_parallel, 24, "a resume reads the run's copy back");
-            assert!(run.pulse.iter().any(|p| p.text.contains("up to 24 workers at once") && p.text.contains("the pattern says 8")), "journaled");
-            assert_eq!(copy.settings.max_tasks_per_phase, 32, "24 fits the pattern's 32 tasks a phase");
-            assert!(!run.pulse.iter().any(|p| p.text.contains("rate limits")), "24 is within what Mantra handles");
-            assert!(!Pattern::path_for(crate::engine::pattern::NAME_SWARM).exists(), "the saved pattern is never written");
-            assert_eq!(Pattern::load(crate::engine::pattern::NAME_SWARM, &project).unwrap().settings.max_parallel, 8);
+            assert_eq!((run.pattern.name.as_str(), run.pattern.settings.max_parallel, run.pattern.cap_of("worker-swarm")), (crate::engine::pattern::NAME_DEFAULT, 24, 24));
+            let copy = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
+            assert_eq!((copy.settings.max_parallel, copy.cap_of("worker-swarm"), copy.settings.max_tasks_per_phase), (24, 24, 24), "a resume reads the run's copy back");
+            assert_eq!(copy.roles["worker-big"].parallel, None, "the big worker still shares the pool");
+            let said = run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
+            assert!(said.iter().any(|t| t == "24 at once in every worker class for this run (the pattern says 4 at once · worker-swarm 16), and up to 24 tasks a phase (it says 8)"), "journaled: {said:?}");
+            assert!(!said.iter().any(|t| t.contains("rate limits")), "24 is within what Mantra handles");
+            assert!(!Pattern::path_for(crate::engine::pattern::NAME_DEFAULT).exists(), "the saved pattern is never written");
+            assert_eq!(Pattern::load(crate::engine::pattern::NAME_DEFAULT, &project).unwrap().cap_of("worker-swarm"), 16);
             assert_eq!(app.pattern_name, session_pattern, "the session's pattern for /run is unchanged");
             // past 32 the run says what the ceiling is now
             app.run = None;
-            app.command("/swarm 64 build the parser");
+            app.start_run_with("build the parser", None, Some(64));
             let run = app.run.as_ref().expect("the run started");
-            assert_eq!(run.pattern.settings.max_parallel, 64);
+            assert_eq!((run.pattern.settings.max_parallel, run.pattern.cap_of("worker-swarm"), run.pattern.settings.max_tasks_per_phase), (64, 64, 64));
             assert!(run.pulse.iter().any(|p| p.text.contains("rate limits")), "the note above 32");
-            // 64 at once needs room for 64 tasks in a phase, or the planner's plan is refused
-            assert_eq!(run.pattern.settings.max_tasks_per_phase, 64);
-            assert!(run.pulse.iter().any(|p| p.text.contains("and up to 64 tasks a phase (it says 32)")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
-            let copy = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
-            assert_eq!(copy.settings.max_tasks_per_phase, 64, "and a resume keeps it");
-            // and a plain run keeps the pattern's own number
+            // and a plain run keeps the pattern's own numbers, without a word about them
             app.run = None;
             app.start_run("build the parser");
             let run = app.run.as_ref().expect("the run started");
-            assert_eq!((run.pattern.name.as_str(), run.pattern.settings.max_parallel), (session_pattern.as_str(), Pattern::load(&session_pattern, &project).unwrap().settings.max_parallel));
+            let saved = Pattern::load(&session_pattern, &project).unwrap();
+            assert_eq!((run.pattern.settings.max_parallel, run.pattern.cap_of("worker-swarm")), (saved.settings.max_parallel, saved.cap_of("worker-swarm")));
+            assert!(!run.pulse.iter().any(|p| p.text.contains("in every worker class")));
             app.run = None;
             let _ = std::fs::remove_dir_all(&project);
+        });
+    }
+
+    /// `stop_run` ends the active run for good — saved as "stopped", finished, its owner file
+    /// released — so a second `/run` that was refused before now starts, and the stopped run can
+    /// be deleted from `/runs` (it was refused while active).
+    #[tokio::test]
+    async fn a_stopped_run_makes_way_for_the_next_and_can_be_deleted() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("stop-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project.clone();
+            assert!(!app.stop_run(), "nothing to stop yet");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("no active run to stop"));
+            app.start_run("build the parser");
+            let (id, dir) = app.run.as_ref().map(|r| (r.id.clone(), r.dir.clone())).unwrap();
+            app.start_run("build something else");
+            assert_eq!(app.run.as_ref().map(|r| r.id.as_str()), Some(id.as_str()), "one active run at a time");
+            let row = || crate::engine::state::list_all().into_iter().find(|r| r.id == id).expect("the run is listed");
+            assert!(!app.delete_run(&row()), "an active run is not deleted");
+            assert!(app.toast.as_ref().map(|t| t.0.contains("stop it first")).unwrap_or(false), "{:?}", app.toast);
+            assert!(app.stop_run());
+            let run = app.run.as_ref().unwrap();
+            assert!(!run.is_active());
+            assert_eq!(run.stage, crate::engine::run::Stage::Failed(crate::engine::run::STOPPED_BY_USER.into()));
+            assert!(app.toast.as_ref().map(|t| t.0.starts_with("run stopped")).unwrap_or(false), "{:?}", app.toast);
+            assert_eq!((row().stage_label(), row().unfinished()), ("stopped".to_string(), false), "/runs shows it stopped, not unfinished");
+            assert!(crate::engine::state::Owner::load(&dir).is_none(), "the owner file is released");
+            assert!(!app.stop_run(), "stopping twice does nothing");
+            assert!(app.delete_run(&row()), "a stopped run can be deleted");
+            assert!(app.run.is_none() && !dir.exists());
+            app.start_run("build something else");
+            assert!(app.run.as_ref().map(|r| r.is_active() && r.id != id).unwrap_or(false), "the next run starts");
+            app.run = None;
+        });
+    }
+
+    /// A built-in 0.8 retired reads as `mantra-default` wherever its name comes from: settings.toml
+    /// (`App::new`), `--pattern` (`session_pattern`), a name that reaches a run's start anyway, and
+    /// a run's state with no `pattern.toml` beside it — while a file of that name is the user's own
+    /// pattern.
+    #[tokio::test]
+    async fn retired_pattern_names_read_as_the_default() {
+        use crate::engine::pattern::{NAME_DEFAULT, RETIRED};
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("retired-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let app_with = |default_pattern: &str| {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+                let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+                App::new(Settings { default_pattern: default_pattern.into(), ..Settings::default() }, Registry::defaults(), project.clone(), hub, tx, true)
+            };
+            for old in RETIRED {
+                let app = app_with(old);
+                assert_eq!((app.pattern_name.as_str(), app.studio.pattern.name.as_str(), app.settings.default_pattern.as_str()), (NAME_DEFAULT, NAME_DEFAULT, NAME_DEFAULT), "settings.toml naming {old}");
+            }
+            // --pattern mantra-swarm: the session takes the default's name
+            let mut app = app_with(NAME_DEFAULT);
+            app.session_pattern("mantra-swarm");
+            assert_eq!(app.pattern_name, NAME_DEFAULT);
+            // and a retired name that reaches a run's start anyway runs the default
+            app.pattern_name = "mantra-swarm".into();
+            app.start_run("build the parser");
+            let (id, dir) = app.run.as_ref().map(|r| (r.id.clone(), r.dir.clone())).unwrap();
+            assert_eq!(app.run.as_ref().map(|r| r.pattern.name.as_str()), Some(NAME_DEFAULT));
+            // a run's state naming one, its pattern.toml gone: it reopens on the default
+            app.stop_run();
+            app.run = None;
+            std::fs::remove_file(dir.join("pattern.toml")).unwrap();
+            let state = std::fs::read_to_string(dir.join("state.json")).unwrap().replace("\"pattern\": \"mantra-default\"", "\"pattern\": \"mantra-default-claude\"");
+            assert!(state.contains("mantra-default-claude"), "the fixture names the retired pattern");
+            std::fs::write(dir.join("state.json"), state).unwrap();
+            let row = crate::engine::state::list_all().into_iter().find(|r| r.id == id).unwrap();
+            app.resume_run(row);
+            assert_eq!(app.run.as_ref().map(|r| r.pattern.name.as_str()), Some(NAME_DEFAULT));
+            app.run = None;
+            // a file of the user's under a retired name is theirs
+            Pattern { name: "mantra-swarm".into(), description: "mine".into(), ..Pattern::builtin_lean() }.save().unwrap();
+            let app = app_with("mantra-swarm");
+            assert_eq!((app.pattern_name.as_str(), app.studio.pattern.description.as_str()), ("mantra-swarm", "mine"));
         });
     }
 
@@ -2930,29 +3419,29 @@ mod tests {
         });
     }
 
-    /// `/experimental akasha on|off` saves settings.toml as it is on disk — not the session's
-    /// settings, which the demo has pointed at its mocks — and mirrors the switch for new runs.
+    /// An experimental feature is switched in `/settings` (Features): the session and
+    /// settings.toml both — the demo's session only, its settings point at its mocks. `/experimental`
+    /// says where the switch went. `mantra experimental` (`save_experimental`) leaves a settings.toml
+    /// that does not parse alone rather than replacing it with the defaults.
     #[test]
     fn experimental_switches_save_the_file_and_the_session() {
         crate::web::snapshot::tests::with_mantra_home(|| {
-            let mut app = crate::web::snapshot::tests::test_app();
-            app.settings.codex_command = vec!["mock-codex".into()];
-            app.command("/experimental");
-            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-            assert_eq!(t, "akasha: off — shared notes for agent groups · /experimental akasha on");
-            assert!(crate::util::width(&t) <= 70, "fits the toast at 80 columns");
-            app.command("/experimental akasha on");
-            assert!(app.settings.experimental_on("akasha"));
-            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-            assert!(t.contains("akasha on, saved"), "{t}");
-            let saved = Settings::load();
-            assert!(saved.experimental_on("akasha"));
-            assert_ne!(saved.codex_command, vec!["mock-codex".to_string()], "only the switch is saved");
-            app.command("/experimental akasha off");
+            let mut demo = crate::web::snapshot::tests::test_app();
+            demo.command("/experimental akasha on");
+            assert_eq!(demo.toast.as_ref().map(|t| t.0.as_str()), Some("experimental features are in /settings (Features)"));
+            assert!(!demo.settings.experimental_on("akasha"), "typed by hand, it switches nothing");
+            assert_eq!(demo.set_setting("experimental.akasha", "on"), Ok("new runs use it"));
+            assert!(demo.settings.experimental_on("akasha"));
+            assert!(!crate::config::home().join("settings.toml").exists(), "the demo saves nothing");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            app.set_setting("experimental.akasha", "on").unwrap();
+            assert!(app.settings.experimental_on("akasha") && Settings::load().experimental_on("akasha"));
+            app.set_setting("experimental.akasha", "off").unwrap();
             assert!(!app.settings.experimental_on("akasha") && !Settings::load().experimental_on("akasha"));
-            app.command("/experimental warp on");
-            let t = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-            assert!(t.contains("unknown experimental feature 'warp'") && t.contains("akasha"), "{t}");
+            let e = app.set_setting("experimental.warp", "on").unwrap_err();
+            assert!(e.contains("unknown experimental feature 'warp'") && e.contains("akasha"), "{e}");
             // a settings.toml that does not parse is left alone, not replaced by the defaults
             let path = crate::config::home().join("settings.toml");
             std::fs::write(&path, "default_model = [broken").unwrap();
@@ -2961,12 +3450,81 @@ mod tests {
         });
     }
 
+    /// The command table: the 19 commands of 0.8, each with its line; the ones folded into
+    /// `/settings` and keys say where they went when typed, and are not offered.
+    #[test]
+    fn the_command_table_is_the_nineteen_and_the_moved_say_where() {
+        let names: Vec<&str> = COMMANDS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(names, vec!["/run", "/runs", "/stop", "/pause", "/plan", "/land", "/respawn", "/akasha", "/inbox", "/pattern", "/studio", "/models", "/settings", "/model", "/new", "/compact", "/diff", "/help", "/quit"]);
+        assert!(COMMANDS.iter().all(|(_, d)| !d.is_empty() && crate::util::width(d) <= 48), "each line fits the suggestions");
+        let mut app = crate::web::snapshot::tests::test_app();
+        for (cmd, there) in MOVED {
+            assert!(!names.contains(cmd), "{cmd} is not offered");
+            app.command(cmd);
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some(*there), "{cmd}");
+            assert!(app.overlays.is_empty(), "{cmd} opens nothing");
+            assert!(crate::util::width(there) <= 70, "{cmd}: fits a toast at 80 columns");
+        }
+        app.command("/frobnicate");
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("unknown command")));
+        // the new ones
+        app.command("/settings");
+        assert_eq!(app.screen, Screen::Settings);
+        app.command("/stop");
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("no active run to stop"));
+        app.input.set("/s");
+        assert_eq!(app.suggestions().iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/stop", "/studio", "/settings"]);
+    }
+
+    /// `--pattern mantra-swarm`: the session takes the name of the pattern that runs in its place
+    /// (the default), so the stage's crumb never names one 0.8 retired; another name is kept.
+    #[test]
+    fn a_retired_pattern_name_never_reaches_the_crumb() {
+        let mut app = screen_app();
+        app.project = PathBuf::from("/nonexistent");
+        app.set_screen(Screen::Stage);
+        for old in crate::engine::pattern::RETIRED {
+            app.session_pattern(old);
+            let rows = frame(&mut app, 120, 30);
+            assert!(rows[0].contains("pattern ◈ mantra-default") && !rows[0].contains(old), "{old}: {}", rows[0]);
+        }
+        app.session_pattern("mine");
+        assert_eq!(app.pattern_name, "mine");
+    }
+
+    /// `set_setting` round-trips each kind of field through settings.toml, refuses what cannot
+    /// be (a model that is not in /models) without changing anything, and says when it applies.
+    #[test]
+    fn set_setting_round_trips_through_settings_toml() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("/nonexistent"), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            assert_eq!(app.set_setting("default_model", "luna"), Ok("Solo's next session (/new) uses it"));
+            assert_eq!(app.set_setting("approval_mode", "never"), Ok(""));
+            assert_eq!(app.set_setting("default_pattern", "mantra-lean"), Ok(""));
+            assert_eq!(app.pattern_name, "mantra-lean", "new runs use it at once");
+            assert_eq!(app.set_setting("side_panel", "off"), Ok(""));
+            assert!(!app.side_panel, "applied live");
+            assert_eq!(app.set_setting("fps", "24"), Ok(""), "the event loop reads it live");
+            assert_eq!(app.set_setting("web.tls", "on"), Ok("applies at the next start"));
+            let disk = Settings::load_on_disk().unwrap();
+            assert_eq!((disk.default_model.as_str(), disk.approval_mode.as_str(), disk.default_pattern.as_str(), disk.side_panel, disk.fps, disk.web.tls), ("luna", "never", "mantra-lean", false, 24, true));
+            let e = app.set_setting("default_model", "nonesuch").unwrap_err();
+            assert!(e.contains("not in /models"), "{e}");
+            assert!(app.set_setting("default_pattern", "nonesuch").is_err());
+            assert_eq!((app.settings.default_model.as_str(), app.settings.default_pattern.as_str()), ("luna", "mantra-lean"), "a refusal changes nothing");
+            assert_eq!(Settings::load_on_disk().unwrap().default_model, "luna");
+        });
+    }
+
     /// The architect writes `[[groups]]` like any other part of a pattern, through the same
     /// validation: a good group lands in the Studio, a broken one comes back as INVALID.
     #[test]
     fn the_architect_writes_groups_through_the_pattern_validation() {
         let mut app = crate::web::snapshot::tests::test_app();
-        let swarm = Pattern::builtin_swarm();
+        let swarm = Pattern::builtin();
+        assert!(!swarm.groups.is_empty(), "the built-in has its builders group");
         let (msg, ok) = app.architect_tool("mantra_write_pattern", &json!({"toml": swarm.to_toml()}));
         assert!(ok, "{msg}");
         assert_eq!(app.studio.pattern.groups, swarm.groups);
@@ -3061,8 +3619,7 @@ mod tests {
         let mut reg = Registry::defaults();
         reg.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), env_key: "MANTRA_TEST_NO_SUCH_VAR".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "testing".into(), provider: "riti".into(), model: "testing".into(), ..Default::default() });
-        let mut settings = Settings::default();
-        settings.default_model = "testing".into();
+        let settings = Settings { default_model: "testing".into(), ..Default::default() };
         let mut pattern = Pattern::builtin();
         for r in pattern.roles.values_mut() {
             r.model = "testing".into();
@@ -3116,24 +3673,52 @@ mod tests {
     }
 
     /// Solo is no run agent with a backend fixed at spawn: a model on another backend simply
-    /// starts a new Solo session there — a fresh install's Solo is on bija, `sol` one pick away.
+    /// starts a new Solo session there — a fresh install's Solo is on bija, Codex's `sol` one pick
+    /// away once Codex is added.
     #[tokio::test]
     async fn solo_changes_backend_by_starting_a_new_session() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
-            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true);
+            let mut reg = Registry::defaults();
+            crate::provider_key::add_backend_with(&mut reg, crate::provider_key::Backend::Codex, true).unwrap();
+            let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
             app.start_solo();
             let first = app.solo.expect("Solo is up");
             assert_eq!(app.agents[&first].backend, crate::config::ProviderKind::Bija, "Solo defaults to bija");
-            assert_eq!(app.set_model(first, "sol"), Ok(()));
+            assert_eq!(app.set_model(first, "sol-codex"), Ok(()));
             let second = app.solo.expect("a new Solo");
             assert_ne!(first, second);
             assert_eq!(app.agents[&second].backend, crate::config::ProviderKind::Codex);
-            assert_eq!(app.settings.default_model, "sol");
-            assert_eq!(app.set_model(second, "luna-api"), Ok(()), "and back");
+            assert_eq!(app.settings.default_model, "sol-codex");
+            assert_eq!(app.set_model(second, "luna-api"), Ok(()), "and back, through a 0.7 spelling");
             assert_eq!(app.agents[&app.solo.expect("Solo")].backend, crate::config::ProviderKind::Bija);
+            assert_eq!(app.settings.default_model, "luna", "saved under the alias it resolved to");
+        });
+    }
+
+    /// A settings change goes through one door: validated, applied live where it can be, refused
+    /// whole when the model or pattern it names does not exist.
+    #[tokio::test]
+    async fn settings_are_set_validated_and_applied_through_one_door() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.start_solo();
+            let solo = app.solo.expect("Solo is up");
+            assert_eq!(app.set_setting("approval_mode", "never"), Ok(""));
+            assert_eq!((app.settings.approval_mode.as_str(), app.agents[&solo].approval.as_str()), ("never", "never"), "Solo's thread follows at once");
+            assert_eq!(app.set_setting("default_model", "luna"), Ok("Solo's next session (/new) uses it"));
+            assert_eq!(app.settings.default_model, "luna");
+            assert!(app.set_setting("default_model", "nope").unwrap_err().contains("not in /models"));
+            assert_eq!(app.settings.default_model, "luna", "a refusal changes nothing");
+            assert!(app.set_setting("default_pattern", "no-such-pattern").unwrap_err().contains("not found"));
+            assert_eq!(app.set_setting("default_pattern", "mantra-lean"), Ok(""));
+            assert_eq!(app.pattern_name, "mantra-lean", "new runs use it");
+            let panel = app.side_panel;
+            assert_eq!(app.set_setting("side_panel", if panel { "off" } else { "on" }), Ok(""));
+            assert_eq!(app.side_panel, !panel);
+            assert!(app.set_setting("fps", "1000").is_err());
         });
     }
 
@@ -3222,7 +3807,7 @@ mod tests {
         let pattern = vec!["~/.cargo".to_string(), "~/pattern-root".to_string(), "~/not-there".to_string()];
         let (cargo_s, extra_s, pattern_s) = (cargo.to_string_lossy().into_owned(), extra.to_string_lossy().into_owned(), pattern_root.to_string_lossy().into_owned());
 
-        let args = sandbox_overrides("workspace-write", true, &[extra.clone()], &pattern, &[cargo.clone()], Some(&home));
+        let args = sandbox_overrides("workspace-write", true, std::slice::from_ref(&extra), &pattern, std::slice::from_ref(&cargo), Some(&home));
         assert!(args.contains(&"sandbox_workspace_write.network_access=true".to_string()), "{args:?}");
         let lists: Vec<&String> = args.iter().filter(|a| a.starts_with("sandbox_workspace_write.writable_roots=")).collect();
         assert_eq!(lists.len(), 1, "one list, however many sources feed it: {args:?}");
@@ -3231,7 +3816,7 @@ mod tests {
         assert!(list.contains(&pattern_s) && list.contains(&extra_s), "{list}");
         assert!(!list.contains("not-there"), "a pattern root that does not exist is left out: {list}");
 
-        let read_only = sandbox_overrides("read-only", true, &[extra.clone()], &pattern, &[cargo.clone()], Some(&home));
+        let read_only = sandbox_overrides("read-only", true, std::slice::from_ref(&extra), &pattern, std::slice::from_ref(&cargo), Some(&home));
         assert!(!read_only.iter().any(|a| a.contains("network_access")), "{read_only:?}");
         assert!(read_only.iter().any(|a| a.contains(&extra_s)), "the spawn's own roots still go in: {read_only:?}");
         assert!(!read_only.iter().any(|a| a.contains(&cargo_s)), "toolchain and pattern roots are for workspace-write only: {read_only:?}");
@@ -3604,10 +4189,10 @@ mod tests {
     }
 
     /// Solo starts with `solo_mcp`'s servers — on the real spawn path, read back from the argv a
-    /// stand-in Codex was started with — and `/mcp` says which; `/mcp solo` changes it on disk for
-    /// the next Solo, refusing a server that is not configured.
+    /// stand-in Codex was started with — and `/settings` lists them; its MCP servers field changes
+    /// `solo_mcp` on disk for the next Solo, refusing a server that is not configured.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn solo_gets_its_mcp_servers_and_slash_mcp_switches_them() {
+    async fn solo_gets_its_mcp_servers_and_settings_switch_them() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let dir = crate::config::home().join("solo-mcp");
             std::fs::create_dir_all(&dir).unwrap();
@@ -3617,12 +4202,14 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let hub = Hub::new(vec!["sh".into(), "-c".into(), script, "sh".into()], vec![], vec![], ev_tx, false);
-            let mut settings = Settings { default_model: "sol".into(), ..Settings::default() };
+            let mut settings = Settings { default_model: "sol-codex".into(), ..Settings::default() };
             settings.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
             settings.mcp_servers.insert("off".into(), mcp_server("x", &[], false));
             // on disk too, as outside the demo they always are: the app reads them back from there
             settings.save().unwrap();
-            let mut app = App::new(settings, Registry::defaults(), dir.clone(), hub, tx, false);
+            let mut reg = Registry::defaults();
+            crate::provider_key::add_backend_with(&mut reg, crate::provider_key::Backend::Codex, true).unwrap();
+            let mut app = App::new(settings, reg, dir.clone(), hub, tx, false);
             let read = |n: u32| {
                 for _ in 0..200 {
                     if let Ok(t) = std::fs::read_to_string(argv(n)) {
@@ -3640,30 +4227,31 @@ mod tests {
             assert!(first.lines().any(|l| l == "mcp_servers.blender.command=\"uvx\""), "{first}");
             assert!(!first.contains("mcp_servers.off."), "{first}");
 
-            app.command("/mcp");
-            let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-            assert!(toast.contains("blender, off (off)") && toast.contains("Solo has: blender"), "{toast}");
-            app.command("/mcp solo nope");
-            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("no MCP server named nope")));
+            app.open_settings();
+            let listed: Vec<(String, bool)> = crate::ui::settings::rows(&app).into_iter().filter_map(|(_, r)| match r { crate::ui::settings::Row::Mcp { name, enabled, .. } => Some((name, enabled)), _ => None }).collect();
+            assert_eq!(listed, vec![("blender".to_string(), true), ("off".to_string(), false)]);
+            let e = app.set_setting("solo_mcp", "nope").unwrap_err();
+            assert!(e.contains("no MCP server named nope"), "{e}");
             assert_eq!(app.settings.solo_mcp, vec!["*".to_string()], "refused, unchanged");
-            app.command("/mcp solo none");
-            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("Solo MCP: none") && t.0.contains("/new")));
+            assert_eq!(app.set_setting("solo_mcp", "none"), Ok("Solo's next session (/new) uses it"));
             assert!(Settings::load_on_disk().unwrap().solo_mcp.is_empty(), "saved");
             assert_eq!(app.solo_mcp, vec!["blender".to_string()], "the running Solo keeps what it started with");
             app.command("/new");
             assert!(app.solo_mcp.is_empty());
             assert!(!read(2).contains("mcp_servers.blender"), "the next Solo has none");
-            app.command("/mcp solo blender, off");
+            app.set_setting("solo_mcp", "blender, off").unwrap();
             assert_eq!(app.settings.solo_mcp, vec!["blender".to_string(), "off".to_string()]);
+            app.command("/mcp solo none");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("MCP servers are in /settings"));
+            assert_eq!(app.settings.solo_mcp, vec!["blender".to_string(), "off".to_string()], "the old command changes nothing");
             let _ = app.shutdown();
         });
-        assert_eq!(mcp_summary(&Settings::default(), &[]), "no MCP servers — add one with `mantra mcp add <name> -- <command> [args…]`");
     }
 
     /// A server added with `mantra mcp add` while the app is open (written to settings.toml behind
     /// its back here) survives the app's next settings save — a model pick — instead of being
-    /// written over with the table the app started with, and `/mcp solo` takes it; one removed on
-    /// disk is gone from `/mcp` too.
+    /// written over with the table the app started with, and Solo's MCP servers field takes it;
+    /// `/settings` lists it, and one removed on disk is gone from there too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn servers_changed_on_disk_while_the_app_runs_are_seen_and_kept() {
         crate::web::snapshot::tests::with_mantra_home(|| {
@@ -3672,7 +4260,7 @@ mod tests {
             let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
             Settings::default().save().unwrap();
             let mut app = App::new(Settings::load_on_disk().unwrap(), Registry::defaults(), PathBuf::from("."), hub, tx, false);
-            let toast = |app: &App| app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+            let listed = |app: &App| crate::ui::settings::rows(app).into_iter().filter_map(|(_, r)| match r { crate::ui::settings::Row::Mcp { name, .. } => Some(name), _ => None }).collect::<Vec<_>>();
             // another terminal: mantra mcp add blender -- uvx blender-mcp
             let mut disk = Settings::load_on_disk().unwrap();
             disk.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
@@ -3682,16 +4270,17 @@ mod tests {
             let saved = Settings::load_on_disk().unwrap();
             assert_eq!(saved.default_model, "luna", "the app's own change is saved");
             assert!(saved.mcp_servers.contains_key("blender"), "and the server added meanwhile kept");
-            app.command("/mcp solo blender");
-            assert!(toast(&app).contains("Solo MCP: blender"), "{}", toast(&app));
-            app.command("/mcp");
-            assert!(toast(&app).contains("MCP: blender"), "{}", toast(&app));
+            app.set_setting("solo_mcp", "blender").expect("the server added meanwhile is known");
+            assert_eq!(app.settings.solo_mcp, vec!["blender".to_string()]);
+            app.open_settings();
+            assert_eq!(listed(&app), vec!["blender".to_string()]);
             // mantra mcp remove blender
             let mut disk = Settings::load_on_disk().unwrap();
             disk.mcp_servers.clear();
             disk.save().unwrap();
-            app.command("/mcp");
-            assert!(toast(&app).starts_with("no MCP servers"), "{}", toast(&app));
+            app.leave_screen();
+            app.open_settings();
+            assert!(listed(&app).is_empty());
             let _ = app.shutdown();
         });
     }

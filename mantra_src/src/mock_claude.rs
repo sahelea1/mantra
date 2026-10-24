@@ -11,7 +11,7 @@
 //! shortcut around it.
 //!
 //! Role behaviour mirrors `mock.rs`'s scripts (`planner`/`orchestrator`/`worker`/`gate`), scoped
-//! down to the paths WP10.6's demo pattern (`mantra-default-claude`) actually exercises: submitting
+//! down to the paths a demo pattern with its roles on Claude Code actually exercises: submitting
 //! the plan, spawning a phase, one file edit per worker, and a passing gate report. It shares the
 //! plan JSON and task-info/name-casing helpers with `mock.rs` directly (`pub(crate)`) rather than
 //! duplicating them.
@@ -238,13 +238,14 @@ impl Mock {
 
 async fn planner_turn(m: &mut Mock, text: &str) {
     if text.contains("[mantra:plan]") {
-        let (_, r) = m.tool_use("mantra_submit_plan", crate::mock::mock_plan(true)).await;
+        let swarm = crate::mock::wants_swarm(text);
+        let (_, r) = m.tool_use("mantra_submit_plan", crate::mock::mock_plan(true, swarm)).await;
         if r.starts_with("REJECTED") {
-            // mock_plan(true) deliberately gives two Foundations tasks the same scope, exercising
-            // the same reject → fix → resubmit path `mock.rs`'s planner takes.
-            let _ = m.tool_use("mantra_submit_plan", crate::mock::mock_plan(false)).await;
+            // mock_plan(true, …) deliberately gives two Foundations tasks the same scope,
+            // exercising the same reject → fix → resubmit path `mock.rs`'s planner takes.
+            let _ = m.tool_use("mantra_submit_plan", crate::mock::mock_plan(false, swarm)).await;
         }
-        m.say("Plan submitted: 3 phases, 7 tasks — foundations, then parallel features, then integration.").await;
+        m.say(&crate::mock::mock_plan_said(swarm)).await;
     } else if text.contains("[mantra:reprompt]") {
         let _ = m.tool_use("mantra_status", json!({})).await;
         m.say("Reviewed status — no plan change needed.").await;

@@ -263,6 +263,7 @@ pub fn stage_label(stage: &Stage) -> String {
         }
         Stage::Finale { idx } => format!("finale {}", idx + 1),
         Stage::Done => "done".into(),
+        Stage::Failed(why) if why == super::run::STOPPED_BY_USER => "stopped".into(),
         Stage::Failed(_) => "failed".into(),
     }
 }
@@ -511,6 +512,7 @@ pub(crate) mod tests {
         assert_eq!(stage_label(&Stage::Phase { idx: 1, step: PhaseStep::Fix { round: 2 } }), "phase 2 · fix r2");
         assert_eq!(stage_label(&Stage::Finale { idx: 2 }), "finale 3");
         assert_eq!(stage_label(&Stage::Failed("boom".into())), "failed");
+        assert_eq!(stage_label(&Stage::Failed(super::super::run::STOPPED_BY_USER.into())), "stopped", "the user's own stop is not a failure");
     }
 
     #[test]

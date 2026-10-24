@@ -182,7 +182,7 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(format!("     project {}{}", home_rel(&app.project), if app.branch.is_empty() { String::new() } else { format!("  {} {}", theme::g("⎇", "@"), app.branch) }), theme::faint())),
         Line::default(),
         key("just type", "ask or instruct the agent · type while it works to steer"),
-        key("/", "commands  (/model /effort /compact /diff /run …)"),
+        key("/", "commands  (/model /run /models /settings …)"),
         key("ctrl+o", "Mandala: planner → orchestrator → parallel workers → gates"),
         key("ctrl+k · alt+↑↓", "switch model · change reasoning effort"),
         key("?", "all keys"),

@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# End-to-end check of the swarm pattern and Akasha: a whole `mantra-swarm` run on the real `bija`
-# binary against the in-process mock model server that `mantra --demo` starts
-# (src/mock_openai.rs), with Akasha on (the demo switches it on in memory). No API calls, no key,
-# no cost. A sibling of bija-e2e.sh, which checks the plain bija run.
+# End-to-end check of the swarm worker class (and Akasha): a whole `mantra run --parallel 8` in
+# `--demo`, on the default pattern, with a goal that asks for a swarm — so the demo planner
+# (src/mock.rs, src/mock_openai.rs) cuts a phase of ten `worker-swarm` tasks, a test per module —
+# and Akasha on (the demo switches it on in memory). No API calls, no key, no cost. A sibling of
+# bija-e2e.sh, which checks the plain run on the real bija binary.
 #
 #   docs/tools/swarm-e2e.sh                     # release build, then the run, then PASS/FAIL
 #   SWARM_E2E_SPEED=2 docs/tools/swarm-e2e.sh   # slower mock (the default is 8× demo speed)
 #   SWARM_E2E_KEEP=1 docs/tools/swarm-e2e.sh    # keep the temp dir (MANTRA_HOME, demo repo) to look at
 #
 # What it proves, and how:
-#   - the swarm run reaches Done              `"stage": "Done"` in the run's state.json
-#   - it ran the swarm pattern                 the run's own pattern.toml is mantra-swarm, with its
-#                                              `builders` group
-#   - a worker shared a note through bija      a bija transcript holds a mantra_akasha_note call
-#   - the note reached the group's block       state.json's `akasha` blocks hold at least one note
-#                                              by an agent (not only Mantra's own lines)
-#   - the Conductor journaled it               journal.jsonl has an `akasha · … noted #…` line
-#   - nothing crashed                          no panic, no snapshot timeout
+#   - the run reaches Done                    `"stage": "Done"` in the run's state.json
+#   - --parallel 8 set every class            the run's own pattern.toml is mantra-default with
+#                                             max_parallel = 8 and worker-swarm's parallel = 8, and
+#                                             its `builders` group
+#   - the planner used the class              plan.json has a phase of ≥ 8 worker-swarm tasks
+#   - more than 4 ran at once                 the journal's `spawned … (worker-swarm · N/8 at once)`
+#                                             lines reach N > 4, every one against the run's cap of 8
+#   - a worker shared a note                  state.json's `akasha` blocks hold a note by an agent,
+#                                             and the journal has an `akasha · … noted #` line
+#   - nothing crashed                         no panic, no snapshot timeout
 set -euo pipefail
 cd "$(dirname "$0")/../../mantra_src"
 
@@ -27,7 +30,7 @@ bin="$target/release/mantra"
 for b in mantra bija; do
   [ -x "$target/release/$b" ] || { echo "FAIL: $target/release/$b was not built"; exit 1; }
 done
-command -v python3 >/dev/null || { echo "FAIL: python3 is needed to read state.json"; exit 1; }
+command -v python3 >/dev/null || { echo "FAIL: python3 is needed to read the run's files"; exit 1; }
 
 # One temp dir holds everything: MANTRA_HOME, and — through TMPDIR, which the demo repo is
 # created under — the demo project, so the script can find it afterwards.
@@ -40,10 +43,10 @@ fi
 export MANTRA_HOME="$tmp/home" TMPDIR="$tmp" MANTRA_MOCK_SPEED="${SWARM_E2E_SPEED:-8}" LANG="${LANG:-en_US.UTF-8}"
 mkdir -p "$MANTRA_HOME"
 
-echo "running a swarm on bija (mantra-swarm, Akasha on)…"
+echo "running a swarm (mantra-default, --parallel 8, Akasha on)…"
 script="wait:0.5;until:plan review@120;key:a;until:run complete@600;snap:done"
 set +e
-out="$("$bin" --demo --pattern mantra-swarm --snapshot "$script" run "build a tiny todo CLI" 2>&1)"
+out="$("$bin" --demo --snapshot "$script" run "build a tiny todo CLI, its tests written by a swarm" --parallel 8 2>&1)"
 code=$?
 set -e
 
@@ -67,37 +70,50 @@ else
   else
     fail "the run did not reach Done: $(grep -m1 '"stage"' "$state" || echo 'no stage')"
   fi
-  if grep -q '^name = "mantra-swarm"' "$run_dir/pattern.toml" 2>/dev/null && grep -q '^\[\[groups\]\]' "$run_dir/pattern.toml"; then
-    pass "the run's pattern is mantra-swarm, with its group"
-  else
-    fail "the run's pattern.toml is not mantra-swarm with [[groups]]"
-  fi
-  # `akasha` in state.json is group name → block {group, cap, next_id, entries: [{id, author, at,
-  # text, urgent}]}; Mantra's own lines are by `mantra`, the agents' by their names.
-  notes="$(python3 -I - "$state" <<'PY'
-import json, sys
-st = json.load(open(sys.argv[1]))
-blocks = (st.get("akasha") or {}).values()
-entries = [e for b in blocks for e in b.get("entries", [])]
-print(len([e for e in entries if e.get("author") != "mantra"]), len(entries))
-PY
-)" || notes="0 0"
-  read -r by_agents total <<<"$notes"
-  if [ "${by_agents:-0}" -ge 1 ]; then
-    pass "$by_agents note(s) by agents in the run's shared notes ($total in all)"
-  else
-    fail "no note by an agent in state.json's akasha blocks ($total in all)"
-  fi
-  if grep -q 'akasha · .* noted #' "$run_dir/journal.jsonl" 2>/dev/null; then
-    pass "the journal records the notes"
-  else
-    fail "no 'akasha · … noted #' line in $run_dir/journal.jsonl"
-  fi
-fi
+  # Every check below reads one of the run's own files; each prints `PASS: …` or `FAIL: …` lines.
+  checks="$(python3 -I - "$run_dir" <<'PY'
+import json, re, sys, tomllib
+run = sys.argv[1]
+def say(ok, what):
+    print(("PASS: " if ok else "FAIL: ") + what)
 
-sessions="$MANTRA_HOME/bija/sessions"
-if grep -lq '"mantra_akasha_note"' "$sessions"/*/transcript.jsonl 2>/dev/null; then pass "a worker shared a note through bija"; else fail "no bija transcript holds a mantra_akasha_note call"; fi
-if grep -lq '"write_file"' "$sessions"/*/transcript.jsonl 2>/dev/null; then pass "workers wrote files through bija"; else fail "no bija transcript holds a write_file call"; fi
+try:
+    p = tomllib.load(open(f"{run}/pattern.toml", "rb"))
+    swarm = p.get("roles", {}).get("worker-swarm", {})
+    groups = [g.get("name") for g in p.get("groups", [])]
+    say(p.get("name") == "mantra-default" and p.get("settings", {}).get("max_parallel") == 8 and swarm.get("parallel") == 8 and "builders" in groups,
+        f"the run's pattern is mantra-default with every class at 8 (max_parallel {p.get('settings', {}).get('max_parallel')}, worker-swarm {swarm.get('parallel')}, groups {groups})")
+except Exception as e:
+    say(False, f"the run's pattern.toml does not read: {e}")
+
+try:
+    plan = json.load(open(f"{run}/plan.json"))
+    widest = max((sum(1 for t in ph.get("tasks", []) if t.get("role") == "worker-swarm") for ph in plan.get("phases", [])), default=0)
+    say(widest >= 8, f"the plan has a phase of {widest} worker-swarm tasks (≥ 8)")
+except Exception as e:
+    say(False, f"plan.json does not read: {e}")
+
+spawned = []
+for line in open(f"{run}/journal.jsonl"):
+    m = re.search(r"spawned \S+ \(worker-swarm · (\d+)/(\d+) at once\)", json.loads(line).get("text", ""))
+    if m:
+        spawned.append((int(m.group(1)), int(m.group(2))))
+peak = max((n for n, _ in spawned), default=0)
+caps = sorted({cap for _, cap in spawned})
+say(peak > 4, f"{len(spawned)} swarm workers spawned, at most {peak} at once (> 4)")
+say(caps == [8], f"every swarm spawn counted against the run's cap of 8 (caps seen: {caps})")
+
+st = json.load(open(f"{run}/state.json"))
+entries = [e for b in (st.get("akasha") or {}).values() for e in b.get("entries", [])]
+by_agents = [e for e in entries if e.get("author") != "mantra"]
+say(len(by_agents) >= 1, f"{len(by_agents)} note(s) by agents in the run's shared notes ({len(entries)} in all)")
+noted = any(re.search(r"akasha · .* noted #", json.loads(l).get("text", "")) for l in open(f"{run}/journal.jsonl"))
+say(noted, "the journal records the notes")
+PY
+)" || checks="FAIL: the run's files could not be checked"
+  echo "$checks"
+  fails=$((fails + $(grep -c '^FAIL' <<<"$checks" || true)))
+fi
 
 if [ "$fails" -ne 0 ]; then
   tail -60 <<<"$out"

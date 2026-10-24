@@ -2,6 +2,177 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.8.0 — 2026-10-24
+
+Mantra got cluttered: twenty-six commands, a letter key for every row action, a popup for every
+edit, a swarm that was a pattern of its own with a flag of its own, and a Codex login assumed on
+every machine. This release keeps every feature and takes the clutter out. Everything runs on
+`bija`, the built-in harness; Codex and Claude Code stay, as backends you add; a provider is a
+pasted API key; the swarm is a worker class the planner uses where it fits; the commands that
+were settings live on one `/settings` screen; and the web UI can do what the terminal can.
+
+- **Nothing needs Codex.** A fresh install has one provider, `bija` (the OpenAI API, key from
+  `$OPENAI_API_KEY` or pasted in `/models`), and four models on it under the plain aliases
+  `astra`, `sol`, `terra` and `luna`; Solo starts on `sol`, and every built-in pattern names those
+  four, so a whole Mandala runs on bija alone. Codex (a ChatGPT login) and Claude Code are
+  *add-on backends*: `/models` → `ctrl+n` offers both, and each imports its default models only
+  then. The special case that gave a fresh install with a signed-in Codex a different default is
+  gone, and so is the demo fallback when neither CLI was found. Startup no longer mentions Codex
+  at all; a missing `bija` — when the default model's provider is bija — is a plain error on
+  stderr (reinstall, or `$MANTRA_BIJA`) and exit 1. `mantra doctor` grades `bija` as required and
+  lists `codex` and `claude` as *optional backends*, found or not, graded only when a model in
+  `/models` runs on them.
+- **A provider from just its API key.** `/models` → `ctrl+n` → *Provider from an API key*: paste
+  the key and Mantra reads the API from its prefix (`sk-ant-` is the Messages API at
+  `api.anthropic.com`; `sk-or-` is `openrouter.ai`, `gsk_` `api.groq.com`, `xai-` `api.x.ai`,
+  `AIza` `generativelanguage.googleapis.com`, `csk-` `api.cerebras.ai`, `fw_`
+  `api.fireworks.ai`, `sk-` and `sk-proj-` `api.openai.com`), prefills the base URL for you to
+  confirm — or asks for it when the prefix names nothing — lists `{base}/models`, and offers what
+  it found in the Discover picker (all selected when there are twelve or fewer, none when there
+  are more). The provider's id and name come from the URL's host (`api.groq.com` → `groq`, made
+  unique with `-2`), the key is stored in `api_key` (`models.toml` stays `0600`), and a `sk-` key
+  for the URL the `bija` row already has completes that row instead of making a second one. A
+  refused key says so (401/403), a URL with no model list says to add models by hand (404), and
+  either way the provider is kept. The Messages API's own `/v1/models` listing (`data[]` with `id`
+  and `display_name`) is read too.
+- **The swarm is a worker class.** Every built-in pattern has a **`worker-swarm`** role next to
+  `worker-small` and `worker-big`: `∴`, amber, `luna`, effort `auto` (which resolves to `low`),
+  and a new role field, `parallel = 16` — how many agents of that role may run at once, counted
+  apart from the shared `max_parallel` pool (1–128; the Studio edits it, *none* shares the pool).
+  The planner is told to use it only when a phase is many (6+) small, independent, same-shaped
+  tasks — per-file migrations, a test per module — and the run brief lists each worker role with
+  its cap (*worker-swarm — up to 16 at once*). A phase that uses a class of its own may hold up
+  to twice that cap in tasks (32 for the swarm, so a swarm phase validates with default
+  settings), and the scheduler admits each queued task against its own role's cap: a swarm task
+  queued behind a blocked big one still starts. Journal and pulse lines name the class cap.
+- **Three patterns, not six.** `mantra-default`, `mantra-lean` and `mantra-thorough` are the
+  built-ins; `mantra-swarm`, `mantra-default-bija` and `mantra-default-claude` are retired (the
+  built-ins are on bija themselves now, and the swarm is a class). Each built-in carries an
+  Akasha `builders` group of all three worker roles — inert until Akasha is switched on, so
+  *enable akasha* just works. `mantra run "<goal>" --parallel N` is the one number for a run:
+  `max_parallel` and every role with a `parallel` of its own become N, in the run's own copy of
+  the pattern, and a phase may hold N tasks. `--swarm` and `/swarm` are gone.
+- **Stop a run.** `/stop` in the terminal, *Stop run* in the web UI: it interrupts and shuts down
+  every agent of the run, cancels the workers still queued, and ends the run as *stopped* —
+  saved, journaled, and openable read-only from `/runs` to land or delete, like any run that did
+  not finish. A new `/run` can start right away.
+- **Nineteen commands, from twenty-six, and none needs a parameter typed.** `/run`, `/runs`,
+  `/pattern`, `/studio`, `/models`, `/settings`, `/model`, `/new`, `/plan`, `/diff`, `/akasha`,
+  `/inbox`, `/pause`, `/stop`, `/respawn`, `/compact`, `/land`, `/help`, `/quit`. A missing
+  parameter opens a selector or tab-completes: `/run` with no goal opens the new-run overlay (the
+  pattern list with its tags and descriptions above a goal field; `e` edits the highlighted
+  pattern in the Studio); `/pattern` is the same list without the goal; `/akasha` with several
+  groups opens a group selector, `/respawn` with no focused agent an agent selector; tab
+  completes `@names`, group names and agent names. `/swarm`, `/experimental`, `/mcp`, `/web`,
+  `/remote`, `/effort`, `/approvals`, `/verbose` and `/mandala` are gone from the list; typed by
+  hand, each says where it went, for this release.
+- **`/settings`, one screen for what used to be five commands.** A form with an *about this
+  setting* panel beside it, in six sections: *Solo* (model, approvals, sandbox, which MCP servers
+  Solo gets), *Runs* (default pattern, notifications), *Features* (Akasha), *MCP servers* (one row
+  each: add, test, remove, enable), *Web & remote* (listen address, password, TLS, push, the URLs,
+  and the link, QR, code and password that `/remote` showed) and *Appearance* (glyphs, colours,
+  reduce motion, mouse, frames a second, side panel). The fields and their validation are one
+  piece of code (`Settings::fields` / `set_field`) that the web UI renders from too, so the two
+  cannot disagree about what a setting accepts.
+- **Type to edit, Enter saves, no popups.** On `/settings`, `/models` and `/studio` a printable
+  key on a text field starts editing it in place with that key as the new content (`⏎` edits the
+  existing value; `esc` brings the old one back); `⏎` commits and saves the file, `↑↓` commit and
+  move. Because letters type now, row actions moved to chords: `ctrl+n` add (the add menu on
+  `/models`, a role in the Studio, a server in Settings), `Delete` pressed twice removes,
+  `ctrl+t` tests a model or an MCP server, `ctrl+d` discovers a provider's models; `ctrl+s` still
+  saves, but nothing needs it. The Studio's pattern name is its first text field (a new name
+  saves a copy and switches to it — what `r` did). The selected row is highlighted across the
+  whole width on the models grid, the providers grid, the Studio lists and the settings form, so
+  the right-hand columns visibly belong to it. `ctrl+t` (side panel) and `ctrl+d` (diff) only
+  mean that on the chat screens, which is what lets the config screens reuse them.
+- **Fewer duplicate keys.** The stage loses `d` (it is `ctrl+d`), `i` (`ctrl+g`) and `s`
+  (`/studio`); the help overlay is regrouped into *everywhere*, *chat*, *stage* and *config
+  screens*, with the editing model said once; each screen's footer lists only what works there,
+  eight items at most.
+- **The web UI does what the terminal does.** The start-run card has a pattern select and an
+  optional *workers at once*; every place a run is shown offers *Stop run* and *Delete run* (and,
+  after a stop, *Start a new run*); Settings becomes sections — Solo, Runs, Features, MCP
+  servers, Models & providers, Patterns, Web & remote, Appearance, Notifications, About. The
+  Models & providers page edits aliases and providers cell by cell, tests a model, adds a
+  provider from a pasted key (paste → URL → probe → a checklist of models → add) and adds Codex
+  or Claude Code; the Patterns page lists the patterns with their tags and edits roles,
+  settings, flow and groups, with save, save as a copy, delete (yours only) and *use for new
+  runs*; the MCP page adds, tests, toggles and removes servers; the command palette has entries
+  for all of it. The new commands (`run_stop`, `patterns_list`, `pattern_get`/`_save`/`_delete`,
+  `settings_get`/`_set`, `mcp_set`/`_remove`/`_test`, `models_get`, `model_set`/`_add`/`_delete`/
+  `_test`, `provider_set`/`_delete`/`_from_key`, `models_import`, `add_backend`) are additive to
+  protocol 1 and go through the same App methods the terminal uses, with no validation of their
+  own. No reply ever carries a key: the web password reads *set* or *not set*, and a provider's
+  `api_key` is masked down to its last four characters.
+- **Patterns as a list.** Name, tag (*default*, *built-in*, *edited* — a file shadows a
+  built-in — or *yours*), description, each role with its model and cap, or the reason a broken
+  file does not load; copying a pattern under a new name and deleting a file of yours report
+  every reason they refuse. The new-run overlay and the web's Patterns page are built on it.
+- **The demo shows the class.** `mantra --demo` runs the Mandala on the real `bija` against the
+  scripted mock API under the plain aliases, and a goal that says "swarm" gets a phase of ten
+  `worker-swarm` tasks from the demo planner. `docs/tools/swarm-e2e.sh` drives `mantra run
+  --parallel 8` on the default pattern and checks that more than four swarm tasks ran at once.
+  The demo keeps its in-memory Codex and Claude Code mocks for the mixed-backend checks, and
+  Solo's scripted agent plays Codex there, so its command approvals stay showable.
+- **A broken config file is never saved over.** When a hand edit leaves `settings.toml` or
+  `models.toml` unparseable, the session runs on defaults as before, but no save writes those
+  defaults over the file any more — a pasted key in it survives. The refusal says what to fix. A
+  `models.toml` with providers and no models keeps its providers.
+- **A plan sent as broken text is told how to send it.** A planner that packs its whole plan into
+  one string and breaks the escaping in a gate command now gets "pass `plan` as a JSON object"
+  back, instead of a parser column it kept fiddling with.
+
+**Upgrading from 0.7**
+
+- **Plain aliases, and `-api` still works.** After an exact alias and an exact model id,
+  `Registry::get` answers to `x` for `x-api` and to `x-api` for `x`, and logs the fallback once
+  per name. A 0.7 `models.toml` (Codex's `sol` beside bija's `sol-api`), a 0.7 pattern file
+  naming `sol-api`, and `default_model = "sol-api"` in `settings.toml` all keep working whichever
+  of the two you delete.
+- **A 0.7 file on a host without Codex** (the common case: there `sol` is Codex's and cannot
+  start). When `codex` is not on `PATH` and the file has a model `x` on Codex's account *and*
+  `x-api` on a bija provider, the Codex entries go and each `x-api` is renamed `x` (its *— with
+  an API key* note dropped). Logged once and saved once, together with the other migrations on
+  load. With Codex installed nothing is renamed, and the fallback covers the two spellings;
+  delete the Codex models when you want to, in one go: the providers grid shows a first row,
+  `openai · Codex (ChatGPT login)`, whenever any model is on Codex's account — read-only, and
+  `Delete` on it (twice) removes every model on the account.
+- **A models.toml from before bija** gets the `bija` provider and the default models through it,
+  once, on load — under the plain aliases where those are free, else under their `-api` twins.
+- **Codex and Claude Code are added, not detected.** `/models` → `ctrl+n` → *Codex (ChatGPT
+  login)* needs `codex` on `PATH`; → *Claude Code* needs `claude`. Each adds its default models
+  under their own aliases, or `<alias>-codex` / `<alias>-claude` where another model already
+  holds the name (`sol` is bija's on a fresh install); adding twice adds nothing twice. A
+  `claude` provider already in your file is untouched, and `claude` on `PATH` no longer adds one
+  by itself.
+- **The retired patterns.** A `default_pattern` of `mantra-default-bija` or `mantra-swarm` in
+  `settings.toml` reads as `mantra-default`; so does `--pattern mantra-swarm`, and so does a run
+  whose state names a removed pattern, with one line in the log. A *file* with one of those names
+  in `~/.mantra/patterns/` (or a repo's `.mantra/patterns/`) still loads as your own pattern.
+  `mantra-default-claude` had the planner, manager and orchestrator on `fable51` and the workers
+  on `sonnet5`: add Claude Code, then point those roles at the `claude` aliases in the Studio (or
+  ask the architect to). A pattern file written before 0.8 has no `worker-swarm` and loads as it
+  is; `parallel` is the only new role key and is left out of the file when unset.
+- **`--swarm N "<goal>"` is gone**: `mantra run "<goal>" --parallel N` (the old flag says so, for
+  this release). N is still 1–128, kept in the run's own copy of the pattern and never in the
+  saved one.
+- **Where the commands went.** `/effort` → `alt+↑↓`, or `←→` in the model picker (`ctrl+k`);
+  `/approvals` → `shift+tab`, or *Approvals* in `/settings`; `/verbose` → `ctrl+e`; `/mandala` →
+  `ctrl+o`; `/experimental` → *Features* in `/settings` (the `mantra experimental` subcommand
+  stays); `/mcp` → *MCP servers* in `/settings` (`mantra mcp …` stays for scripts); `/web` and
+  `/remote` → *Web & remote* in `/settings`; `/swarm` → the worker class. `/solo`, `/stage`,
+  `/exit`, `/q` and `/clear` still work as silent aliases.
+- **Keys that moved.** `/models`: `n` → `ctrl+n`, `x` → `Delete` twice, `t` → `ctrl+t`, `D` →
+  `ctrl+d`; the Studio: `r` (rename) → the pattern's name field, `n` and `x` likewise; the stage:
+  `d`, `i`, `s` → `ctrl+d`, `ctrl+g`, `/studio`. `settings.toml` and your pattern files need no
+  change.
+- **A self-hosted relay's UI must be rebuilt.** The web app a relay serves is the bundle built
+  from this repository's tag: rebuild the relay's `remote-ui` image at `v0.8.0` (`MANTRA_REF`) to
+  get the new screens. Nothing breaks if you do not — the wire protocol is still version 1, the
+  new commands are additive, and an older bundle keeps working with the commands it knows — it
+  just does not have the new pages. The hosted `remote.mantra.codes` is its operator's to
+  rebuild.
+
 ## v0.7.0 — 2026-10-21
 
 Mantra gets a harness of its own. Until now every agent was a vendor CLI, so a machine without

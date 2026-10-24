@@ -187,7 +187,7 @@ mod tests {
             for l in &lines {
                 assert!(l.width() <= w.max(3), "width {w}: {:?}", l);
             }
-            let joined: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect::<String>().replace(' ', "").replace('•', "");
+            let joined: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect::<String>().replace([' ', '•'], "");
             assert_eq!(joined, text.replace(' ', ""), "no text lost at width {w}");
         }
     }

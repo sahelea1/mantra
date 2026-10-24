@@ -37,10 +37,10 @@ fi
 export MANTRA_HOME="$tmp/home" TMPDIR="$tmp" MANTRA_MOCK_SPEED="${BIJA_E2E_SPEED:-8}" LANG="${LANG:-en_US.UTF-8}"
 mkdir -p "$MANTRA_HOME"
 
-echo "running a Mandala on bija (mantra-default-bija)…"
+echo "running a Mandala on bija (mantra-default)…"
 script="wait:0.5;until:plan review@120;key:a;until:run complete@600;snap:done"
 set +e
-out="$("$bin" --demo --pattern mantra-default-bija --snapshot "$script" run "build a tiny todo CLI" 2>&1)"
+out="$("$bin" --demo --pattern mantra-default --snapshot "$script" run "build a tiny todo CLI" 2>&1)"
 code=$?
 set -e
 

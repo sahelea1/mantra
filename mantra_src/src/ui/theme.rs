@@ -1,7 +1,7 @@
 //! Colours and glyphs with graceful fallback (truecolor → 256 → 16, Unicode → ASCII).
 
 use ratatui::style::{Color, Modifier, Style};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Depth {
@@ -10,6 +10,7 @@ pub enum Depth {
     C16,
 }
 
+#[derive(Clone, Copy)]
 struct T {
     depth: Depth,
     ascii: bool,
@@ -17,8 +18,12 @@ struct T {
     italic: bool,
 }
 
-static TH: OnceLock<T> = OnceLock::new();
+/// Read on every style made, written by `init` — at startup and again when `/settings` changes
+/// glyphs, colours or motion, so those apply without a restart.
+static TH: RwLock<T> = RwLock::new(T { depth: Depth::C256, ascii: false, motion: true, italic: true });
 
+/// Works out the terminal's colours and glyphs from the settings and the environment. Called
+/// again after a change in `/settings`; the next frame is drawn with the new ones.
 pub fn init(s: &crate::config::Settings) {
     let term = std::env::var("TERM").unwrap_or_default();
     let colorterm = std::env::var("COLORTERM").unwrap_or_default().to_lowercase();
@@ -46,11 +51,15 @@ pub fn init(s: &crate::config::Settings) {
         _ => term == "linux" || (!lang.is_empty() && !lang.contains("utf")),
     };
     let italic = !(term.starts_with("screen") || term == "linux");
-    let _ = TH.set(T { depth, ascii, motion: !s.reduce_motion, italic });
+    let t = T { depth, ascii, motion: !s.reduce_motion, italic };
+    match TH.write() {
+        Ok(mut th) => *th = t,
+        Err(poisoned) => *poisoned.into_inner() = t,
+    }
 }
 
-fn th() -> &'static T {
-    TH.get_or_init(|| T { depth: Depth::C256, ascii: false, motion: true, italic: true })
+fn th() -> T {
+    *TH.read().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn depth() -> Depth {
@@ -164,6 +173,19 @@ pub const TEXT: (u8, u8, u8) = (226, 230, 236);
 pub const MUTED: (u8, u8, u8) = (160, 166, 178);
 pub const DIM: (u8, u8, u8) = (96, 102, 116);
 pub const FAINT: (u8, u8, u8) = (62, 66, 78);
+/// The selected row's background in the config screens' lists and grids: dark enough for every
+/// text colour to read on it, light enough to see on a dark terminal.
+pub const BAND: (u8, u8, u8) = (40, 40, 62);
+
+/// The selected-row band (`ui::form::band`). Sixteen colours have no shade dark enough to keep
+/// faint text readable on, so there it is reverse video instead.
+pub fn row_sel() -> Style {
+    if depth() == Depth::C16 {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().bg(c(BAND))
+    }
+}
 
 pub fn c(t: (u8, u8, u8)) -> Color {
     rgb(t.0, t.1, t.2)

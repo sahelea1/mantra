@@ -52,9 +52,10 @@ pub enum JobOut {
     Vision(Vec<Value>, bool),
 }
 
-/// The aliases of `reg` whose model takes images — what `Run::set_vision_models` is handed.
+/// The aliases of `reg` whose model takes images — what `Run::set_vision_models` is handed —
+/// in both spellings `Registry::get` answers to.
 pub fn vision_aliases(reg: &crate::config::Registry) -> HashSet<String> {
-    reg.models.iter().filter(|m| m.vision).map(|m| m.alias.clone()).collect()
+    reg.vision_names()
 }
 
 /// What every halt for a dead model gateway ends with: what to do (nothing but wait and resume)
@@ -196,6 +197,10 @@ pub enum Pending {
     },
 }
 
+/// Why a run the user stopped (`Run::stop`) is `Failed` — `state::stage_label` shows exactly this
+/// one as "stopped" rather than "failed".
+pub const STOPPED_BY_USER: &str = "stopped by you";
+
 /// What `respawn` reports when it went ahead, and when the pause boundary deferred it.
 pub const RESPAWNED: &str = "respawned with a fresh thread";
 pub const RESPAWN_DEFERRED: &str = "respawn deferred — a fresh thread starts when the run resumes";
@@ -221,6 +226,12 @@ pub enum WState {
     Done,
     Failed(String),
     Cancelled,
+}
+
+/// Whether a worker holds one of its class's slots: preparing its worktree, running, or waiting
+/// out a retry delay — what the per-class caps count (`Run::slots_taken`).
+fn holds_slot(w: &Worker) -> bool {
+    matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))
 }
 
 /// Stable name of a worker state — the saved `state.json` and the web protocol both use it.
@@ -861,9 +872,6 @@ impl Run {
         if let Some(m) = self.slot_models.get(slot) {
             role.model = m.clone();
         }
-        // `{max_parallel}` (the swarm's planner and orchestrator) is this run's number, not the
-        // pattern file's: `--swarm 24` lives only in the run's own copy of the pattern.
-        role.instructions = super::pattern::with_max_parallel(&role.instructions, self.pattern.settings.max_parallel);
         role
     }
 
@@ -1740,11 +1748,29 @@ Then summarize in 2-4 lines.",
 
     pub(super) fn planning_prompt(&self) -> String {
         let s = &self.pattern.settings;
+        let workers = self.pattern.worker_roles();
+        // Each role with how many of it run at once — its own class, or the pool it shares — so
+        // the planner cuts a phase to the width it will actually run at.
+        let pool: Vec<&str> = workers.iter().map(String::as_str).filter(|n| !self.pattern.has_own_cap(n)).collect();
         let mut roles = String::new();
-        for n in self.pattern.worker_roles() {
-            let r = self.role(&n);
-            roles.push_str(&format!("- {n}: {} (model {}, effort {})\n", r.description, r.model, r.effort));
+        for n in &workers {
+            let r = self.role(n);
+            let cap = match r.parallel {
+                Some(c) => format!("up to {c} at once"),
+                None => match pool.iter().filter(|o| *o != n).copied().collect::<Vec<_>>() {
+                    others if others.is_empty() => format!("up to {} at once", s.max_parallel),
+                    others => format!("up to {} at once, shared with {}", s.max_parallel, others.join(", ")),
+                },
+            };
+            roles.push_str(&format!("- {n} — {cap}: {} (model {}, effort {})\n", r.description, r.model, r.effort));
         }
+        let wide: Vec<String> = workers
+            .iter()
+            .map(|n| (n, self.pattern.phase_task_limit([n.as_str()])))
+            .filter(|(_, limit)| *limit > s.max_tasks_per_phase)
+            .map(|(n, limit)| format!("{limit} in a phase that uses {n}"))
+            .collect();
+        let per_phase = if wide.is_empty() { format!("at most {} tasks per phase", s.max_tasks_per_phase) } else { format!("at most {} tasks per phase ({})", s.max_tasks_per_phase, wide.join(", ")) };
         // A resumed/respawned planner calls this same function, so an empty project skips the
         // "explore first" line for it too — nothing new appears after a respawn to explore.
         let explore = if project_is_empty(&self.workspace_dir()) {
@@ -1753,11 +1779,9 @@ Then summarize in 2-4 lines.",
             "Explore the project, then call mantra_submit_plan."
         };
         format!(
-            "[mantra:plan]\nUSER REQUEST:\n{}\n\nProject directory: {}\nWorker roles you can assign:\n{roles}\nConstraints: at most {} tasks per phase; up to {} run at once; tasks in one phase run in parallel on isolated copies and must use disjoint scopes; each phase ends with gate checks (shell commands) + a QA agent.\n\n{explore}",
+            "[mantra:plan]\nUSER REQUEST:\n{}\n\nProject directory: {}\nWorker roles you can assign:\n{roles}\nConstraints: {per_phase}; tasks in one phase run in parallel on isolated copies and must use disjoint scopes; each phase ends with gate checks (shell commands) + a QA agent.\n\n{explore}",
             self.brief,
             self.workspace_dir().display(),
-            s.max_tasks_per_phase,
-            s.max_parallel
         )
     }
 
@@ -1838,7 +1862,6 @@ Then summarize in 2-4 lines.",
             // happily re-runs a phase the user or the planner is still sorting out.
             return format!("REFUSED: the run is halted ({}) — it must be resumed first (planner: mantra_resume_run; user: space)", trunc(&h.message, 80));
         }
-        let running = self.workers.iter().filter(|w| matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))).count();
         let prompt = prompt.filter(|p| !p.trim().is_empty()).unwrap_or_else(|| task.prompt.clone());
         let attempt = self.workers.iter().filter(|w| w.task.id == task.id).map(|w| w.attempt).max().unwrap_or(0) + 1;
         let cap = self.max_attempts();
@@ -1855,8 +1878,9 @@ Then summarize in 2-4 lines.",
             self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, None, msg.clone(), full, failure.as_deref());
             return format!("REFUSED: {msg}");
         }
-        let queued = running >= self.pattern.settings.max_parallel;
+        let queued = self.slots_taken(&task.role) >= self.pattern.cap_of(&task.role);
         let tid = task.id.clone();
+        let role = task.role.clone();
         let adhoc = task.id.starts_with("fix-");
         // A halved context from an earlier attempt of the same task carries forward, and so does
         // the model the user switched that attempt to: a retry or a respawn is the same task.
@@ -1886,11 +1910,29 @@ Then summarize in 2-4 lines.",
             model,
         });
         if queued {
-            self.log("…", "gray", format!("{tid} queued (max_parallel = {})", self.pattern.settings.max_parallel));
+            self.log("…", "gray", format!("{tid} queued ({})", self.class_cap_text(&role)));
             return format!("{tid} queued — it starts when a slot frees up");
         }
         self.prepare_worker(ctx, &tid, attempt, adhoc);
         format!("{tid} starting (attempt {attempt})")
+    }
+
+    /// The slots of `role`'s class taken right now. A role with a cap of its own
+    /// (`Role::parallel`, the swarm) counts only its own workers; every other role — and a name
+    /// the pattern does not have — counts the whole shared pool against `max_parallel`.
+    fn slots_taken(&self, role: &str) -> usize {
+        let own = self.pattern.has_own_cap(role);
+        self.workers.iter().filter(|w| holds_slot(w) && if own { w.task.role == role } else { !self.pattern.has_own_cap(&w.task.role) }).count()
+    }
+
+    /// How a journal line names `role`'s cap: `worker-swarm: 16 at once` for a class of its own,
+    /// `max_parallel = 4` for the shared pool.
+    fn class_cap_text(&self, role: &str) -> String {
+        if self.pattern.has_own_cap(role) {
+            format!("{role}: {} at once", self.pattern.cap_of(role))
+        } else {
+            format!("max_parallel = {}", self.pattern.settings.max_parallel)
+        }
     }
 
     /// Total attempts per task across every retry path (auto-retry, orchestrator, user).
@@ -1970,7 +2012,9 @@ Then summarize in 2-4 lines.",
         let tid = w.task.id.clone();
         self.mark_edge(id);
         ctx.prompt(id, self.with_akasha(id, prompt));
-        self.log(&glyph, "violet", format!("{} {tid} ({rname})", if resumed { "re-attached" } else { "spawned" }));
+        // how full its class is now, this one included: the width a run actually reaches
+        let (taken, cap) = (self.slots_taken(&rname), self.pattern.cap_of(&rname));
+        self.log(&glyph, "violet", format!("{} {tid} ({rname} · {taken}/{cap} at once)", if resumed { "re-attached" } else { "spawned" }));
         self.save_state();
     }
 
@@ -1978,10 +2022,21 @@ Then summarize in 2-4 lines.",
         if self.halted() {
             return;
         }
-        let running = self.workers.iter().filter(|w| matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))).count();
-        let free = self.pattern.settings.max_parallel.saturating_sub(running);
-        let queued: Vec<(String, u32, bool)> = self.workers.iter().filter(|w| w.state == WState::Queued).take(free).map(|w| (w.task.id.clone(), w.attempt, w.adhoc)).collect();
-        for (t, a, adhoc) in queued {
+        // The whole queue in order, each task against its own class's cap: a queued swarm task
+        // behind a big one that has to wait still starts. Class key: the role for a class of its
+        // own, `None` for the shared pool.
+        let mut taken: HashMap<Option<&str>, usize> = HashMap::new();
+        let mut start: Vec<(String, u32, bool)> = vec![];
+        for w in self.workers.iter().filter(|w| w.state == WState::Queued) {
+            let role = w.task.role.as_str();
+            let class = self.pattern.has_own_cap(role).then_some(role);
+            let n = taken.entry(class).or_insert_with(|| self.slots_taken(role));
+            if *n < self.pattern.cap_of(role) {
+                *n += 1;
+                start.push((w.task.id.clone(), w.attempt, w.adhoc));
+            }
+        }
+        for (t, a, adhoc) in start {
             if let Some(w) = self.workers.iter_mut().find(|w| w.task.id == t && w.attempt == a) {
                 w.state = WState::Preparing;
             }
@@ -2450,6 +2505,40 @@ Then summarize in 2-4 lines.",
         self.log("✗", "red", format!("run stopped: {why}"));
         self.alerts.push(why.clone());
         ctx.notify(&format!("Mantra: {why}"));
+        self.end_failed(why);
+    }
+
+    /// Stop the run for good, by the user's hand (`/stop`, the web's Stop run): interrupt what is
+    /// busy and shut down every agent of the run, cancel the workers still queued or in flight,
+    /// and end it as `Failed(STOPPED_BY_USER)` — shown as "stopped", saved and journaled, and no
+    /// longer active, so a new run can start straight away. Its branch and worktrees stay: like
+    /// any failed run it reopens read-only from `/runs`, to land or delete. No notification —
+    /// the user pressed the key.
+    pub fn stop(&mut self, ctx: &mut dyn Ctx) {
+        if !self.is_active() {
+            return;
+        }
+        for a in self.all_agents() {
+            if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
+                ctx.interrupt(a);
+            }
+            // not archived: the threads stay readable from the stopped run
+            ctx.stop(a, false);
+        }
+        for w in self.workers.iter_mut().filter(|w| matches!(w.state, WState::Queued | WState::Preparing | WState::Running | WState::Retrying(_))) {
+            w.state = WState::Cancelled;
+        }
+        // a halt the user stopped instead of resuming is over, and nothing is waiting on anyone
+        self.halt = None;
+        self.paused_agents.clear();
+        self.alerts.clear();
+        self.log("■", "amber", "run stopped by you");
+        self.end_failed(STOPPED_BY_USER.into());
+    }
+
+    /// Where every failed run ends: the stage, the time it ended, nothing left pending, the clock
+    /// stopped, the state saved (which releases the run's owner file too).
+    fn end_failed(&mut self, why: String) {
         self.stage = Stage::Failed(why);
         self.finished_unix = Some(crate::util::unix_secs());
         self.drop_pending("the run stopped");
@@ -2466,6 +2555,12 @@ Then summarize in 2-4 lines.",
     // ───────────────────────────── inputs ─────────────────────────────
 
     pub fn on_job(&mut self, ctx: &mut dyn Ctx, tag: JobTag, out: JobOut) {
+        // A failed or stopped run starts nothing more: a setup, merge or checks job still in
+        // flight when it ended would spawn a planner or a gate into it. `/land` on it still works,
+        // and a vision call is answered (to an agent that is shut down anyway).
+        if matches!(self.stage, Stage::Failed(_)) && !matches!(tag, JobTag::Land | JobTag::Vision { .. }) {
+            return;
+        }
         match (tag, out) {
             (JobTag::Setup, JobOut::Setup(r)) => match r {
                 Ok(ws) => {
@@ -3856,9 +3951,9 @@ Then summarize in 2-4 lines.",
             None => "Plan: not written yet.\n".into(),
         };
         format!(
-            "[mantra:manage] {lead}\nGoal:\n{}\n\n{plan}\nRun settings: up to {} tasks in parallel; each task gets {} attempts in total; a gate gets {} rounds; the watchdog nudges an idle agent after {}s and escalates after {}s; you get a health digest every {}.\n\nNothing needs you yet: call mantra_wait. Mantra wakes you when something does.",
+            "[mantra:manage] {lead}\nGoal:\n{}\n\n{plan}\nRun settings: tasks in parallel: {}; each task gets {} attempts in total; a gate gets {} rounds; the watchdog nudges an idle agent after {}s and escalates after {}s; you get a health digest every {}.\n\nNothing needs you yet: call mantra_wait. Mantra wakes you when something does.",
             self.brief,
-            s.max_parallel,
+            self.pattern.parallel_summary(),
             self.max_attempts(),
             s.gate_max_rounds,
             s.watchdog_seconds,
@@ -5102,6 +5197,11 @@ mod halt_tests {
             p
         }
 
+        /// A pattern without groups (the built-ins have `builders`; a file from before groups has none).
+        fn ungrouped() -> Pattern {
+            Pattern { groups: vec![], ..Pattern::builtin() }
+        }
+
         /// A run of `pattern` in its first phase, Akasha `on`, writing into a scratch dir of its own.
         fn run_of(pattern: Pattern, on: bool, tag: &str) -> Run {
             let mut run = Run::new(PathBuf::from("."), pattern, "build it".into());
@@ -5166,7 +5266,7 @@ mod halt_tests {
             run.enable_akasha(false);
             assert_eq!(run.group_of(w), None, "off, nobody is in a group");
             assert_eq!(run.akasha["builders"].entries.len(), 1, "but the notes are kept for when it is back on");
-            assert!(run_of(Pattern::builtin(), true, "table-plain").akasha.is_empty(), "no groups, no blocks");
+            assert!(run_of(ungrouped(), true, "table-plain").akasha.is_empty(), "no groups, no blocks");
             let _ = std::fs::remove_dir_all(&run.dir);
         }
 
@@ -5186,7 +5286,7 @@ mod halt_tests {
             let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "x"}));
             assert!(!ok && r.contains("not in a group"), "{r}");
             // on, or without groups, the start says nothing about it
-            for (pattern, on, tag) in [(grouped("urgent", true, 4096), true, "off-on"), (Pattern::builtin(), false, "off-plain")] {
+            for (pattern, on, tag) in [(grouped("urgent", true, 4096), true, "off-on"), (ungrouped(), false, "off-plain")] {
                 let mut other = run_of(pattern, on, tag);
                 other.stage = Stage::Setup;
                 other.start(&mut TestCtx::new());
@@ -5890,25 +5990,193 @@ mod halt_tests {
         assert!(prompt.contains("mantra_read_phase"), "{prompt}");
     }
 
-    /// The swarm's planner and orchestrator are told the run's own number: the pattern's 8, or
-    /// the 24 a `--swarm 24` run carries in its copy of the pattern — never the placeholder.
-    #[test]
-    fn the_swarm_planner_and_orchestrator_are_briefed_with_the_runs_max_parallel() {
-        for (n, want) in [(None, "up to 8"), (Some(24), "up to 24")] {
-            let mut pattern = Pattern::builtin_swarm();
-            if let Some(n) = n {
-                pattern.settings.max_parallel = n;
-            }
-            let mut ctx = TestCtx::new();
-            let mut run = Run::new(PathBuf::from("."), pattern, "test".into());
-            run.plan = Some(one_task_phase());
-            let planner = run.spawn_planner(&mut ctx);
-            let orchestrator = run.spawn_orchestrator(&mut ctx);
-            for a in [planner, orchestrator] {
-                let i = ctx.spawned_instructions.iter().find(|(id, _)| *id == a).map(|(_, i)| i.clone()).expect("instructions captured");
-                assert!(i.contains(want) && !i.contains("{max_parallel}"), "{want}: {i}");
-            }
+    // Worker classes ------------------------------------------------------------------------------
+
+    /// One phase of `big` worker-big tasks, then `swarm` worker-swarm tasks, disjoint scopes.
+    fn class_phase(big: usize, swarm: usize) -> Plan {
+        let task = |id: String, role: &str| Task { scope: vec![format!("src/{id}/**")], id, role: role.into(), prompt: "do one small thing well".into(), ..Default::default() };
+        let mut tasks: Vec<Task> = (0..big).map(|i| task(format!("b{i}"), "worker-big")).collect();
+        tasks.extend((0..swarm).map(|i| task(format!("s{i}"), "worker-swarm")));
+        Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks, ..Default::default() }], ..Default::default() }
+    }
+
+    /// A run in phase 1 of `plan` with every task of it spawned, in plan order; its directory is
+    /// a scratch one of its own (`tag`).
+    fn spawned_phase(ctx: &mut TestCtx, plan: Plan, tag: &str) -> Run {
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        run.dir = scratch_dir(tag);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        for t in plan.phases[0].tasks.clone() {
+            run.spawn_task(ctx, t, None, None);
         }
+        run.plan = Some(plan);
+        run
+    }
+
+    fn holding(run: &Run, role: &str) -> usize {
+        run.workers.iter().filter(|w| w.task.role == role && holds_slot(w)).count()
+    }
+
+    fn queued(run: &Run) -> Vec<&str> {
+        run.workers.iter().filter(|w| w.state == WState::Queued).map(|w| w.task.id.as_str()).collect()
+    }
+
+    /// Each class fills its own slots: under `max_parallel` = 4 and worker-swarm's own 16, the big
+    /// workers take the shared pool (all 3 of them, or 4 of 6) and 16 swarm tasks run beside them;
+    /// what is left queues in its own class, and the journal names that class's cap.
+    #[test]
+    fn each_worker_class_fills_its_own_slots() {
+        for (big, running_big, queued_big) in [(3, 3, 0), (6, 4, 2)] {
+            let mut ctx = TestCtx::new();
+            let run = spawned_phase(&mut ctx, class_phase(big, 20), &format!("classes-fill-{big}"));
+            assert_eq!((run.pattern.settings.max_parallel, run.pattern.cap_of("worker-swarm")), (4, 16));
+            assert_eq!((holding(&run, "worker-big"), holding(&run, "worker-swarm")), (running_big, 16), "{big} big tasks: {running_big} + 16 at once");
+            let q = queued(&run);
+            assert_eq!(q.iter().filter(|t| t.starts_with('b')).count(), queued_big);
+            assert_eq!(q.iter().filter(|t| t.starts_with('s')).copied().collect::<Vec<_>>(), vec!["s16", "s17", "s18", "s19"]);
+            let said: Vec<&str> = run.pulse.iter().map(|p| p.text.as_str()).collect();
+            assert!(said.contains(&"s16 queued (worker-swarm: 16 at once)"), "{said:?}");
+            if queued_big > 0 {
+                assert!(said.contains(&"b4 queued (max_parallel = 4)"), "{said:?}");
+            }
+            let _ = std::fs::remove_dir_all(&run.dir);
+        }
+    }
+
+    /// `fill_slots` walks the whole queue in order and admits each task against its own class:
+    /// a queued swarm task behind a big one that has to wait still starts when a swarm slot frees,
+    /// and the big one starts when a slot of the pool does — never the other way round.
+    #[test]
+    fn a_queued_swarm_task_behind_a_waiting_big_one_starts() {
+        let mut ctx = TestCtx::new();
+        let mut run = spawned_phase(&mut ctx, class_phase(5, 17), "classes-queue");
+        assert_eq!(queued(&run), vec!["b4", "s16"], "the big task queued first");
+        let done = |run: &mut Run, id: &str| run.workers.iter_mut().find(|w| w.task.id == id).unwrap().state = WState::Done;
+        done(&mut run, "s0");
+        run.fill_slots(&mut ctx);
+        assert_eq!(queued(&run), vec!["b4"], "the swarm task went past the waiting big one");
+        assert_eq!((holding(&run, "worker-big"), holding(&run, "worker-swarm")), (4, 16));
+        done(&mut run, "s1");
+        run.fill_slots(&mut ctx);
+        assert_eq!(queued(&run), vec!["b4"], "a free swarm slot is not the pool's");
+        done(&mut run, "b0");
+        run.fill_slots(&mut ctx);
+        assert!(queued(&run).is_empty());
+        assert_eq!((holding(&run, "worker-big"), holding(&run, "worker-swarm")), (4, 15));
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// A fix worker (`fix-…`, a big or small worker) and a task naming a role the pattern does
+    /// not have count in the shared pool; `--parallel N` widens every class to N.
+    #[test]
+    fn the_shared_pool_takes_fix_workers_and_unknown_roles_and_parallel_widens_every_class() {
+        let mut ctx = TestCtx::new();
+        let mut run = spawned_phase(&mut ctx, class_phase(3, 0), "classes-pool");
+        run.spawn_task(&mut ctx, Task { id: "fix-1".into(), role: "worker-small".into(), prompt: "fix it".into(), ..Default::default() }, None, None);
+        run.spawn_task(&mut ctx, Task { id: "odd".into(), role: "worker-gone".into(), prompt: "do it".into(), ..Default::default() }, None, None);
+        assert_eq!(queued(&run), vec!["odd"], "3 big + the fix worker fill the pool of 4");
+        assert_eq!(run.slots_taken("worker-gone"), 4);
+        let mut ctx = TestCtx::new();
+        let mut p = Pattern::builtin();
+        p.set_parallel(8);
+        let mut run = Run::new(PathBuf::from("."), p, "test".into());
+        run.dir = scratch_dir("classes-wide");
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        for t in class_phase(10, 10).phases[0].tasks.clone() {
+            run.spawn_task(&mut ctx, t, None, None);
+        }
+        assert_eq!((holding(&run, "worker-big"), holding(&run, "worker-swarm")), (8, 8), "--parallel 8: 8 in every class");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// The spawn line says how full the worker's class is, this one included — the width a run
+    /// actually reached, which the swarm e2e reads back from the journal.
+    #[test]
+    fn the_spawn_line_says_how_full_the_class_is() {
+        let mut ctx = TestCtx::new();
+        let mut run = spawned_phase(&mut ctx, class_phase(2, 3), "classes-spawn-line");
+        for (i, id) in ["b0", "s0", "s1"].iter().enumerate() {
+            run.on_job(&mut ctx, JobTag::WorkerWt { task: id.to_string(), attempt: 1 }, JobOut::Wt(Ok((PathBuf::from("."), format!("br{i}")))));
+        }
+        let said: Vec<&str> = run.pulse.iter().map(|p| p.text.as_str()).collect();
+        for want in ["spawned b0 (worker-big · 2/4 at once)", "spawned s0 (worker-swarm · 3/16 at once)", "spawned s1 (worker-swarm · 3/16 at once)"] {
+            assert!(said.contains(&want), "{want}: {said:?}");
+        }
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    /// The run brief lists each worker role with how many of it run at once — the swarm its own
+    /// 16, the others the pool they share — and the wider task limit of a swarm phase.
+    #[test]
+    fn the_run_brief_lists_each_worker_role_with_its_cap() {
+        let run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let brief = run.planning_prompt();
+        for want in ["- worker-swarm — up to 16 at once: Many tiny, independent tasks at once (model luna, effort auto)", "- worker-big — up to 4 at once, shared with worker-small: ", "- worker-small — up to 4 at once, shared with worker-big: ", "Constraints: at most 8 tasks per phase (32 in a phase that uses worker-swarm); "] {
+            assert!(brief.contains(want), "{want}\n{brief}");
+        }
+        assert!(!brief.contains("run at once;"), "the old single number is gone: {brief}");
+        let mut p = Pattern::builtin();
+        p.roles.retain(|n, _| n != "worker-swarm" && n != "worker-small");
+        p.groups.clear();
+        let brief = Run::new(PathBuf::from("."), p, "test".into()).planning_prompt();
+        assert!(brief.contains("- worker-big — up to 4 at once: ") && brief.contains("Constraints: at most 8 tasks per phase; "), "{brief}");
+        let manager = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into()).manager_brief("lead");
+        assert!(manager.contains("tasks in parallel: 4 at once · worker-swarm 16;"), "{manager}");
+    }
+
+    // Stopping a run -------------------------------------------------------------------------------
+
+    /// `stop` ends the run for good: busy agents interrupted, every agent shut down, the workers
+    /// still queued or running cancelled, a halt and its alerts gone, `Failed(STOPPED_BY_USER)`
+    /// saved — "stopped" on disk — without a notification; a job still in flight starts nothing,
+    /// and the stopped run reopens read-only, spawning nothing.
+    #[test]
+    fn stop_shuts_down_every_agent_and_ends_the_run_stopped() {
+        let mut ctx = TestCtx::new();
+        let mut run = spawned_phase(&mut ctx, class_phase(5, 0), "stop");
+        let (orch, idle_worker, busy_worker) = (ctx.add_busy(), ctx.add_idle(), ctx.add_busy());
+        run.orchestrator = Some(orch);
+        run.workers[0].agent = Some(idle_worker);
+        run.workers[0].state = WState::Running;
+        run.workers[1].agent = Some(busy_worker);
+        run.workers[1].state = WState::Running;
+        run.workers[2].state = WState::Done;
+        run.halt(&mut ctx, HaltReason::AgentTurnFailed, Some(busy_worker), "the gateway is down".into());
+        // the halt interrupted them; busy again, as an agent mid-turn when the user stops looks
+        for a in [orch, busy_worker] {
+            ctx.agents.get_mut(&a).unwrap().turn_active = true;
+        }
+        ctx.interrupted.clear();
+        ctx.notified.clear();
+        let spawns = ctx.spawns.len();
+        run.stop(&mut ctx);
+        assert_eq!(ctx.interrupted, vec![orch, busy_worker], "the busy ones are interrupted");
+        let mut stopped = ctx.stopped.clone();
+        stopped.sort();
+        assert_eq!(stopped, vec![orch, idle_worker, busy_worker], "every agent of the run is shut down");
+        let states: Vec<&str> = run.workers.iter().map(|w| worker_state_str(&w.state)).collect();
+        assert_eq!(states, vec!["cancelled", "cancelled", "done", "cancelled", "cancelled"], "b3 and b4 were queued or preparing");
+        assert!(!run.halted() && run.alerts.is_empty() && !run.is_active());
+        assert_eq!(run.stage, Stage::Failed(STOPPED_BY_USER.into()));
+        assert!(run.pulse.iter().any(|p| p.text == "run stopped by you"));
+        assert!(ctx.notified.is_empty(), "no notification for the user's own key: {:?}", ctx.notified);
+        let st = RunState::load(&run.dir).expect("saved");
+        assert_eq!((st.stage_label(), st.finished(), st.halted.is_none()), ("stopped".to_string(), true, true));
+        assert!(st.finished_unix.is_some());
+        // a merge that was in flight does not start a gate in the stopped run
+        run.on_job(&mut ctx, JobTag::Merge { phase: 0 }, JobOut::Merge(git::MergeResult { merged: vec!["b2".into()], conflicts: vec![], log: String::new() }));
+        assert_eq!((ctx.spawns.len(), &run.stage), (spawns, &Stage::Failed(STOPPED_BY_USER.into())));
+        // stopping twice changes nothing
+        let lines = run.pulse.len();
+        run.stop(&mut ctx);
+        assert_eq!(run.pulse.len(), lines);
+        // reopened from `/runs`: read-only, nothing spawned
+        let mut ctx2 = TestCtx::new();
+        let mut again = Run::from_state(&st, Pattern::builtin(), run.plan.clone(), run.dir.clone());
+        again.resume_boot(&mut ctx2, &st);
+        assert!(ctx2.spawns.is_empty() && !again.is_active());
+        assert!(again.pulse.iter().any(|p| p.text.starts_with("you stopped this run — opened read-only")), "{:?}", again.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&run.dir);
     }
 
     /// Review fix: the built-in default pattern's last finale step reuses `self.planner` as the
@@ -6624,7 +6892,7 @@ mod halt_tests {
         assert_ne!(new_planner, planner, "a fresh agent is briefed, not the one whose session is gone");
         assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:plan]")), "the planner is re-briefed with its planning prompt: {:?}", ctx.prompts);
         assert!(run.continue_queue.is_empty(), "no [mantra:retry] continuation — the old thread has nothing to continue");
-        assert!(run.retry_counts.get(&planner).is_none(), "not a retry");
+        assert!(!run.retry_counts.contains_key(&planner), "not a retry");
     }
 
     #[test]
@@ -8247,7 +8515,7 @@ mod halt_tests {
         }
         assert!(!run.halted());
         assert_eq!(run.workers[0].attempt, 1);
-        assert!(run.retry_counts.get(&w).is_none(), "the counted ladder was never touched");
+        assert!(!run.retry_counts.contains_key(&w), "the counted ladder was never touched");
         assert_eq!(run.continue_queue.len() as u32, run.pattern.settings.worker_retries + 5);
         assert!(run.continue_queue.iter().all(|(a, _, m)| *a == w && m.contains("not your fault")));
     }
@@ -8431,7 +8699,7 @@ mod halt_tests {
 
     /// Phase 1 at gate round 1's fix: a planner that is idle, a fix worker `fix-1` on the
     /// integration copy `integ`, and a pattern with a manager that has not been spawned yet.
-    fn run_in_fix_round(ctx: &mut TestCtx, integ: &PathBuf) -> (Run, AgentId, AgentId) {
+    fn run_in_fix_round(ctx: &mut TestCtx, integ: &Path) -> (Run, AgentId, AgentId) {
         let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
         run.dir = scratch_dir("fix-outage");
         let planner = ctx.add_idle();
@@ -8439,11 +8707,11 @@ mod halt_tests {
         run.planner = Some(planner);
         run.plan = Some(one_task_phase());
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
-        run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.clone(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+        run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.to_path_buf(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
         let w = ctx.add_idle();
         let mut fix = mk_worker("fix-1", "worker-small", w, WState::Running);
         fix.adhoc = true;
-        fix.wt = Some(integ.clone());
+        fix.wt = Some(integ.to_path_buf());
         run.workers.push(fix);
         (run, planner, w)
     }
