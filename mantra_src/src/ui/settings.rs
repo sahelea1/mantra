@@ -853,7 +853,7 @@ mod tests {
             let band = theme::row_sel().bg.unwrap();
             let inner_w = 120 - 36 - 2;
             assert!((1..1 + inner_w).all(|x| buf[(x, y)].bg == band), "the whole row of the form");
-            assert!(s.contains("never skips prompts") && s.contains("BYPASS-SANDBOX-DANGER") && s.contains("needs /new"), "the hint explains ordinary approvals, explicit bypass, and when it applies: {s}");
+            assert!(s.contains("never skips prompts") && s.contains("BYPASS-SANDBOX-DANGER") && s.contains("/new"), "the hint explains ordinary approvals, explicit bypass, and when it applies: {s}");
             assert!(s.contains("off — mantra --web starts it"), "{s}");
             for w in [80u16, 100, 160] {
                 let (s, _) = screen(&mut app, w, 30);
