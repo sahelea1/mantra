@@ -719,6 +719,9 @@ async fn run_process(
                     Some(Cmd::Turn { text }) => {
                         let p = turn_params(&tid, &text, effort, model, approval);
                         *last_turn = Some(text.clone());
+                        // A previous start may have failed without a turn/completed event. An
+                        // interrupt for that failed start must not stop this new turn.
+                        interrupt_on_start = false;
                         awaiting_turn_start = true;
                         fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
                     }
@@ -733,6 +736,7 @@ async fn run_process(
                         } else {
                             // The turn ended just before this steer: start a new one, with the *current* policy.
                             let p = turn_params(&tid, &text, effort, model, approval);
+                            interrupt_on_start = false;
                             awaiting_turn_start = true;
                             fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
                         }
@@ -1441,6 +1445,57 @@ done"#;
             while !log.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
         }).await.unwrap();
         assert!(std::fs::read_to_string(&log).unwrap().contains("\"turnId\":\"t1\""));
+        ctl.send(Cmd::Shutdown).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_codex_start_does_not_carry_an_interrupt_to_the_next_turn() {
+        let dir = std::env::temp_dir().join(format!("mantra-hub-rejected-start-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("interrupts.log");
+        let script = r#"turns=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id";;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr"}}}\n' "$id";;
+    *'"method":"turn/start"'*)
+      turns=$((turns + 1))
+      if [ "$turns" -eq 1 ]; then printf '{"id":%s,"error":{"code":-1,"message":"rejected"}}\n' "$id"
+      else printf '{"id":%s,"result":{}}\n' "$id"; printf '{"method":"turn/started","params":{"turn":{"id":"t2"}}}\n'; fi;;
+    *'"method":"turn/interrupt"'*) printf '%s\n' "$line" >> "$INTERRUPTS_LOG"; printf '{"id":%s,"result":{}}\n' "$id";;
+  esac
+done"#;
+        let spec = SpawnSpec {
+            cwd: dir.clone(), model: "m".into(), provider: "openai".into(), effort: String::new(),
+            approval: "never".into(), sandbox: "read-only".into(), developer_instructions: String::new(),
+            dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
+            thread_name: None, backend: Backend::Codex,
+            envs: vec![("INTERRUPTS_LOG".into(), log.to_string_lossy().into_owned())],
+            claude: None, bija: None, mcp: vec![],
+        };
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        tokio::spawn(agent_task(92, spec, ["sh", "-c", script].map(str::to_string).to_vec(), ev, cmds, Duration::ZERO));
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap(), Some(HubEvent::Ready { .. })));
+        ctl.send(Cmd::Turn { text: "rejected".into() }).unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap(), Some(HubEvent::CmdFailed { what: "turn", .. })));
+        ctl.send(Cmd::Interrupt).unwrap();
+        ctl.send(Cmd::Turn { text: "accepted".into() }).unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap() {
+                Some(HubEvent::Notif { method, .. }) if method == "turn/started" => break,
+                Some(HubEvent::CmdFailed { error, .. }) => panic!("{error}"),
+                Some(HubEvent::Crashed { reason, .. }) => panic!("{reason}"),
+                _ => {}
+            }
+        }
+        // fire sends the interrupt asynchronously; let the fake receive anything dispatched by
+        // turn/started before checking its log.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!log.exists(), "a rejected turn's interrupt must not stop the next turn");
         ctl.send(Cmd::Shutdown).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
