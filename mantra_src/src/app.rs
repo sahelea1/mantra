@@ -59,6 +59,7 @@ impl ChatDraft {
         match screen {
             Screen::Solo => Some(Self::Solo(solo)),
             Screen::Stage => Some(Self::Stage),
+            Screen::Zoom(id) if Some(id) == solo => Some(Self::Solo(Some(id))),
             Screen::Zoom(id) => Some(Self::Zoom(id)),
             Screen::Studio | Screen::Models | Screen::Settings => None,
         }
@@ -1263,6 +1264,11 @@ impl App {
             self.input = new_draft.and_then(|key| self.drafts.remove(&key)).unwrap_or_default();
             self.suggest = 0;
         }
+        self.drafts.retain(|key, _| match key {
+            ChatDraft::Solo(Some(id)) => Some(*id) == self.solo,
+            ChatDraft::Zoom(id) => self.agents.contains_key(id),
+            _ => true,
+        });
         let jump = matches!((self.screen, s), (Screen::Stage, Screen::Zoom(_)) | (Screen::Zoom(_), Screen::Stage));
         if jump && crate::ui::theme::motion() {
             self.flash_screen = Some(Instant::now());
@@ -4633,6 +4639,7 @@ done"#;
     fn chat_drafts_follow_their_conversation_across_switches_and_zoom_escape() {
         let mut app = screen_app();
         app.solo = Some(1);
+        for id in [1, 10, 11] { app.agents.insert(id, Agent::new(id, "draft test", "worker", PathBuf::new())); }
         app.input.set("solo draft");
         app.input.cur = 4;
         app.set_screen(Screen::Stage);
@@ -4654,6 +4661,13 @@ done"#;
         app.set_screen(Screen::Solo);
         assert_eq!(app.input.text(), "solo draft");
         assert_eq!(app.input.cur, 4, "the cursor stays with the draft");
+        app.set_screen(Screen::Zoom(1));
+        assert_eq!(app.input.text(), "solo draft", "zooming Solo is the same conversation");
+        app.set_screen(Screen::Solo);
+        app.agents.remove(&10);
+        app.set_screen(Screen::Stage);
+        assert!(!app.drafts.contains_key(&ChatDraft::Zoom(10)), "removed agents release their drafts");
+        app.set_screen(Screen::Solo);
         app.enter_screen(Screen::Settings);
         assert!(app.input.is_empty());
         app.leave_screen();

@@ -452,8 +452,15 @@ async function main() {
 
     if (MODE === 'main') {
         await step('main', driver, 'drafts survive navigation, Escape, palette, and a delayed failed send', async () => {
-            const ids = await driver.evaluate(() => [...window.Mantra.store.S.agents.keys()].slice(0, 2));
-            if (ids.length !== 2) throw new Error('need two retained agents');
+            const ids = await driver.evaluate(() => {
+                const store = window.Mantra.store;
+                const solo = [...store.S.agents.values()].find(a => a.role_kind === 'solo');
+                if (!solo) throw new Error('missing Solo');
+                // A UI-only idle peer keeps this navigation test independent of run timing.
+                // No command is sent to the fixture agent.
+                store.S.agents.set(90001, { ...solo, id: 90001, name: 'Draft fixture', items: [] });
+                return [solo.id, 90001];
+            });
             const box = '.composer textarea';
             await nav(driver, '/agent/' + ids[0]);
             await driver.fill(box, 'draft for first agent');
@@ -484,6 +491,8 @@ async function main() {
             }
             await nav(driver, '/agent/' + ids[1]);
             if (await driver.inputValue(box) !== 'draft for second agent') throw new Error('failed send affected another agent');
+            await nav(driver, '/agent/' + ids[0]);
+            await driver.evaluate(() => window.Mantra.store.S.agents.delete(90001));
         });
         await step('main', driver, 'confirmation keeps keyboard focus and submits once', async () => {
             await driver.evaluate(() => {

@@ -46,10 +46,12 @@ jobs:
           name: browser-screenshots
           path: ${{ runner.temp }}/mantra-shots
           if-no-files-found: ignore
-      - name: Keep tested binaries
+      - name: Keep debug binaries
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tested-linux-binaries
+          if-no-files-found: ignore
           path: |
             mantra_src/target/debug/mantra
             mantra_src/target/debug/bija
