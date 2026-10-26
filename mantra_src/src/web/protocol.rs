@@ -354,6 +354,8 @@ impl Command {
         "plan_approve",
         "pause_resume",
         "interrupt",
+        "agent_stop",
+        "app_shutdown",
         "respawn",
         "compact",
         "set_model",

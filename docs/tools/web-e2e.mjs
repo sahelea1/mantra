@@ -89,6 +89,17 @@ async function loadPlaywright() {
     }
 }
 
+// Poll from the test process: page.waitForFunction injects eval under older
+// Playwright versions, which the application's strict CSP correctly rejects.
+async function waitForState(page, predicate, arg, options = {}) {
+    const deadline = Date.now() + (options.timeout ?? 30000);
+    while (Date.now() < deadline) {
+        if (await page.evaluate(predicate, arg)) return;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('Timed out waiting for browser state: ' + predicate.toString());
+}
+
 async function main() {
     const { chromium, devices } = await loadPlaywright();
     const server = BIN ? await startServer() : null;
@@ -133,7 +144,7 @@ async function main() {
             console.log(`PASS [${tag}] ${name} (${Date.now() - t} ms)`);
         } catch (e) {
             fails++;
-            console.log(`FAIL [${tag}] ${name}: ${e.message.split('\n')[0]}`);
+            console.log(`FAIL [${tag}] ${name}: ${e.message}`);
             await page.screenshot({ path: failShot(tag, name) }).catch(() => {});
         }
     }
@@ -161,13 +172,13 @@ async function main() {
             await driver.selectOption('.start-row select', 'e2e-on-codex');
             await driver.fill('textarea.goal', 'Add a REST API with auth and a small web UI');
             await driver.click('button:has-text("Start run")');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
         });
         await step('ask', driver, 'approve plan → workers', async () => {
             await nav(driver, '/run');
             await driver.waitForSelector('button:has-text("Approve plan")', { timeout: 5000 });
             await driver.click('button:has-text("Approve plan")');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && (r.workers || []).length > 0; }, null, { timeout: 60000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && (r.workers || []).length > 0; }, null, { timeout: 60000 });
             await nav(driver, '/');
         });
         await step('ask', driver, 'question band appears (MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1)', async () => {
@@ -184,15 +195,15 @@ async function main() {
             // answers one event a turn — an answer that reaches it inside another turn (as the
             // result of the mantra_wait it is in) is not relayed. Answer once p2-ui is done and
             // the orchestrator is between turns, so the answer starts a turn of its own.
-            await driver.waitForFunction(() => {
+            await waitForState(driver, () => {
                 const s = window.Mantra.store.S;
                 const orch = [...s.agents.values()].find((a) => a.role_kind === 'orchestrator' && a.in_run);
                 return (s.run.workers || []).some((w) => w.task_id === 'p2-ui' && w.state === 'done') && orch && !orch.busy;
             }, null, { timeout: 30000 });
             await driver.fill('.band.question input, .band.question textarea', 'cursor pagination, page size 50');
             await driver.click('.band.question button[type=submit]');
-            await driver.waitForFunction(() => !window.Mantra.store.S.run.question, null, { timeout: 15000 });
-            await driver.waitForFunction(() => /The user decided/.test(JSON.stringify([...window.Mantra.store.S.agents.values()].map((a) => (a.items || []).map((i) => i.text)))), null, { timeout: 30000 });
+            await waitForState(driver, () => !window.Mantra.store.S.run.question, null, { timeout: 15000 });
+            await waitForState(driver, () => /The user decided/.test(JSON.stringify([...window.Mantra.store.S.agents.values()].map((a) => (a.items || []).map((i) => i.text)))), null, { timeout: 30000 });
         });
     } else {
         // "Approval" pass: a direct message to the Solo agent triggers a command-approval card
@@ -204,7 +215,7 @@ async function main() {
             await driver.click('.composer button.send');
             await driver.waitForSelector('.approval', { timeout: 20000 });
             await driver.click('.approval .btn.primary');
-            await driver.waitForFunction(() => { const tx = document.querySelector('.tx'); return tx && /approved: \$ cargo test/.test(tx.textContent); }, null, { timeout: 20000 });
+            await waitForState(driver, () => { const tx = document.querySelector('.tx'); return tx && /approved: \$ cargo test/.test(tx.textContent); }, null, { timeout: 20000 });
             if (await driver.locator('.approval').count()) throw new Error('approval card still shown after approving');
         });
         await step('main', driver, 'solo: diff', async () => {
@@ -217,13 +228,13 @@ async function main() {
             await nav(driver, '/');
             await driver.fill('textarea.goal', 'Add a REST API with auth and a small web UI');
             await driver.click('button:has-text("Start run")');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
         });
         await step('main', driver, 'run screen → approve plan → workers appear', async () => {
             await nav(driver, '/run');
             await driver.waitForSelector('button:has-text("Approve plan")', { timeout: 5000 });
             await driver.click('button:has-text("Approve plan")');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && (r.workers || []).length > 0; }, null, { timeout: 60000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && (r.workers || []).length > 0; }, null, { timeout: 60000 });
             await nav(driver, '/');
             await driver.waitForTimeout(1500); // let the roster settle into its busy/phase look
         });
@@ -235,14 +246,14 @@ async function main() {
         });
         let worker = null;
         await step('main', driver, 'open a running worker + send a message', async () => {
-            await driver.waitForFunction(() => { const s = window.Mantra.store.S; return [...s.agents.values()].some((a) => a.role_kind === 'worker' && a.busy); }, null, { timeout: 30000 });
+            await waitForState(driver, () => { const s = window.Mantra.store.S; return [...s.agents.values()].some((a) => a.role_kind === 'worker' && a.busy); }, null, { timeout: 30000 });
             worker = await driver.evaluate(() => { const s = window.Mantra.store.S; const w = [...s.agents.values()].find((a) => a.role_kind === 'worker' && a.busy); return w && w.id; });
             if (!worker) throw new Error('no busy worker found in the roster');
             await nav(driver, '/agent/' + worker);
             await driver.waitForSelector('.composer textarea');
             await driver.fill('.composer textarea', 'please keep the handlers small');
             await driver.click('.composer button.send');
-            await driver.waitForFunction(() => /please keep the handlers small/.test(document.body.textContent), null, { timeout: 10000 });
+            await waitForState(driver, () => /please keep the handlers small/.test(document.body.textContent), null, { timeout: 10000 });
         });
         await step('main', phone, 'screenshot: worker agent screen', async () => {
             await nav(phone, '/agent/' + worker);
@@ -262,7 +273,7 @@ async function main() {
         });
         await step('main', driver, 'pulse', async () => {
             await nav(driver, '/pulse');
-            await driver.waitForFunction(() => document.querySelectorAll('.pulse-row, .pulse li, .pl-row').length > 0 || /spawn|phase/i.test(document.body.textContent), null, { timeout: 8000 });
+            await waitForState(driver, () => document.querySelectorAll('.pulse-row, .pulse li, .pl-row').length > 0 || /spawn|phase/i.test(document.body.textContent), null, { timeout: 8000 });
         });
         await step('main', driver, 'runs list shows the open run', async () => {
             await nav(driver, '/runs');
@@ -285,7 +296,7 @@ async function main() {
             // through the page: the Solo section, its Approvals select, the one saving indicator
             await nav(driver, '/settings/solo');
             await driver.selectOption('#fld-approval_mode', to);
-            await driver.waitForFunction((v) => { const c = window.Mantra.store.S.ui.cfg; return c && c.settings && c.settings.fields.find((f) => f.key === 'approval_mode').value === v; }, to, { timeout: 8000 });
+            await waitForState(driver, (v) => { const c = window.Mantra.store.S.ui.cfg; return c && c.settings && c.settings.fields.find((f) => f.key === 'approval_mode').value === v; }, to, { timeout: 8000 });
             if (field(await must(driver, 'settings_get'), 'approval_mode').value !== to) throw new Error('approval_mode did not change');
             const bypass = await must(driver, 'settings_set', { key: 'approval_mode', value: 'BYPASS-SANDBOX-DANGER' });
             if (field(bypass.settings, 'approval_mode').value !== 'BYPASS-SANDBOX-DANGER') throw new Error('bypass permission not saved');
@@ -310,7 +321,7 @@ async function main() {
             await row.locator('button[aria-label^="Note:"]').click();
             await row.locator('input.cell-input').fill('set from the web e2e');
             await row.locator('input.cell-input').press('Enter');
-            await driver.waitForFunction(() => { const c = window.Mantra.store.S.ui.cfg; return c.models.models.find((x) => x.alias === 'luna').note === 'set from the web e2e'; }, null, { timeout: 8000 });
+            await waitForState(driver, () => { const c = window.Mantra.store.S.ui.cfg; return c.models.models.find((x) => x.alias === 'luna').note === 'set from the web e2e'; }, null, { timeout: 8000 });
             const back = await must(driver, 'model_set', { alias: 'luna', field: 'note', value: luna.note });
             if (back.registry.models.find((x) => x.alias === 'luna').note !== luna.note) throw new Error('the note did not go back');
             await refused(driver, 'model_set', { alias: 'luna', field: 'context', value: 'lots' }, '200k');
@@ -334,7 +345,7 @@ async function main() {
             // new: the whole flow, through the Add-provider sheet.
             const local = url.replace('127.0.0.1', 'localhost');
             await nav(driver, '/settings/models');
-            await driver.click('button:has-text("Add provider")');
+            await driver.click('button:has-text("Add API provider")');
             await driver.fill('#ap-key', 'e2e-unknown-prefix-key');
             await driver.waitForSelector('#ap-url', { timeout: 5000 });
             await driver.waitForSelector('.sheet .fld-hint:has-text("names no provider")', { timeout: 5000 });
@@ -343,17 +354,17 @@ async function main() {
             await driver.waitForSelector('.sheet .check-row', { timeout: 60000 });
             await driver.click('.sheet button:has-text("None")');
             // the list is redrawn on the next frame: wait for it, or check() finds the box still ticked
-            await driver.waitForFunction(() => !document.querySelector('.sheet .check-row:not(.done) input:checked'), null, { timeout: 5000 });
+            await waitForState(driver, () => !document.querySelector('.sheet .check-row:not(.done) input:checked'), null, { timeout: 5000 });
             const pick = await driver.locator('.sheet .check-row:not(.done) .mono').first().textContent();
             await driver.locator('.sheet .check-row:not(.done) input').first().check();
             await driver.click('.sheet button:has-text("Add 1 model")');
-            await driver.waitForFunction((model) => { const c = window.Mantra.store.S.ui.cfg; return !window.Mantra.store.S.ui.sheet && c.models.models.some((x) => x.provider === 'local' && x.model === model); }, pick, { timeout: 10000 });
+            await waitForState(driver, (model) => { const c = window.Mantra.store.S.ui.cfg; return !window.Mantra.store.S.ui.sheet && c.models.models.some((x) => x.provider === 'local' && x.model === model); }, pick, { timeout: 10000 });
             const added = (await must(driver, 'models_get')).models.find((x) => x.provider === 'local' && x.model === pick);
             if (!added) throw new Error('the imported model is not in models_get');
             // delete it in the table (behind its confirm sheet), then the provider
             await driver.locator('.mt.models [data-alias="' + added.alias + '"] button[aria-label^="Delete "]').click();
             await driver.click('.sheet button:has-text("Delete")');
-            await driver.waitForFunction((a) => !window.Mantra.store.S.ui.cfg.models.models.some((x) => x.alias === a), added.alias, { timeout: 8000 });
+            await waitForState(driver, (a) => !window.Mantra.store.S.ui.cfg.models.models.some((x) => x.alias === a), added.alias, { timeout: 8000 });
             const gone = await must(driver, 'provider_delete', { id: 'local' });
             if (gone.registry.providers.some((p) => p.id === 'local')) throw new Error('the provider is still there');
         });
@@ -367,7 +378,7 @@ async function main() {
             await driver.click('button:has-text("Save as copy")');
             await driver.fill('.sheet input[aria-label="Name of the copy"]', 'e2e-pattern');
             await driver.click('.sheet button:has-text("Save copy")');
-            await driver.waitForFunction(() => location.pathname.endsWith('/patterns/e2e-pattern'), null, { timeout: 8000 });
+            await waitForState(driver, () => location.pathname.endsWith('/patterns/e2e-pattern'), null, { timeout: 8000 });
             await driver.waitForSelector('.pe-titles .tag.t-yours', { timeout: 8000 });
             const list = await must(driver, 'patterns_list');
             const mine = list.patterns.find((x) => x.name === 'e2e-pattern');
@@ -386,7 +397,7 @@ async function main() {
             await driver.waitForSelector('.pe-errors:has-text("parallel must be from 1 to 128")', { timeout: 8000 });
             await driver.click('.pe-acts button:has-text("Delete")');
             await driver.click('.sheet button:has-text("Delete")');
-            await driver.waitForFunction(() => location.pathname.endsWith('/settings/patterns'), null, { timeout: 8000 });
+            await waitForState(driver, () => location.pathname.endsWith('/settings/patterns'), null, { timeout: 8000 });
             if ((await must(driver, 'patterns_list')).patterns.some((x) => x.name === 'e2e-pattern')) throw new Error('e2e-pattern is still listed');
         });
 
@@ -414,17 +425,17 @@ async function main() {
                 if (pattern) await driver.selectOption('.start-row select', pattern);
                 if (width) await driver.fill('.par-wrap input', String(width));
                 await driver.click('.start-row button:has-text("Start run")');
-                await driver.waitForFunction(([o, pt]) => { const r = window.Mantra.store.S.run; return r && r.id !== o && r.active && (!pt || r.pattern === pt); }, [before, pattern], { timeout: 20000 });
+                await waitForState(driver, ([o, pt]) => { const r = window.Mantra.store.S.run; return r && r.id !== o && r.active && (!pt || r.pattern === pt); }, [before, pattern], { timeout: 20000 });
                 return driver.evaluate(() => window.Mantra.store.S.run.id);
             };
             await nav(driver, '/run');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && !r.active; }, null, { timeout: 60000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && !r.active; }, null, { timeout: 60000 });
             await driver.waitForSelector('.run-hero button:has-text("Delete")', { timeout: 5000 });
             const first = await startFromCard('Add a changelog page', 'mantra-lean', 2);
             await nav(driver, '/run');
             await driver.click('.run-hero button:has-text("Stop")');
             await driver.click('.sheet button:has-text("Stop run")');
-            await driver.waitForFunction(() => { const r = window.Mantra.store.S.run; return r && !r.active && r.stage.stopped; }, null, { timeout: 20000 });
+            await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && !r.active && r.stage.stopped; }, null, { timeout: 20000 });
             await driver.waitForSelector('.run-stopped', { timeout: 5000 });
             await refused(driver, 'run_stop', {}, 'no active run to stop');
             // the start card is right there again
@@ -433,7 +444,7 @@ async function main() {
             await driver.waitForSelector('.run-hero button:has-text("Delete")', { timeout: 10000 });
             await driver.click('.run-hero button:has-text("Delete")');
             await driver.click('.sheet button:has-text("Delete")');
-            await driver.waitForFunction(() => !window.Mantra.store.S.run, null, { timeout: 20000 });
+            await waitForState(driver, () => !window.Mantra.store.S.run, null, { timeout: 20000 });
             const runs = await must(driver, 'runs_list');
             if (!runs.runs.some((x) => x.id === first && x.stage === 'stopped')) throw new Error('the stopped run is not in the runs list: ' + JSON.stringify(runs.runs.map((x) => [x.id, x.stage])));
         });
@@ -450,11 +461,11 @@ async function main() {
             if (!stillLive) throw new Error('cancelling stopped the agent');
             await driver.click('.agent-actions button:has-text("Stop agent")');
             await driver.click('.sheet button:has-text("Stop agent")');
-            await driver.waitForFunction((id) => window.Mantra.store.agent(id)?.status === 'stopped', fresh.agent, { timeout: 10000 });
+            await waitForState(driver, (id) => window.Mantra.store.agent(id)?.status === 'stopped', fresh.agent, { timeout: 10000 });
             await driver.waitForSelector('.agent-trouble button:has-text("New Solo session")');
             await refused(driver, 'send', { agent: fresh.agent, text: 'must not restart' }, 'process has ended');
             await driver.click('.agent-trouble button:has-text("New Solo session")');
-            await driver.waitForFunction((old) => location.pathname.startsWith('/agent/') && !location.pathname.endsWith('/' + old), fresh.agent);
+            await waitForState(driver, (old) => location.pathname.startsWith('/agent/') && !location.pathname.endsWith('/' + old), fresh.agent);
         });
         // Only close a server this test itself launched, never a caller-owned remote instance.
         if (server) await step('main', driver, 'host shutdown: cancel keeps it alive → confirm exits cleanly', async () => {
