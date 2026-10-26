@@ -77,6 +77,11 @@
         if (d === 'relaunching' || d.startsWith('restarting (')) return d;
         return 'retrying' + (d ? ' — ' + F.trunc(d, max) : '');
     }
+    function completedAgent(a) {
+        const run = S().run;
+        return !!(a && a.status === 'stopped' && !a.stopped_by_user && (!a.worker || a.worker.state !== 'failed') &&
+            ((a.worker && a.worker.state === 'done') || (a.in_run && run && run.stage && run.stage.kind === 'done')));
+    }
     // → {text, tone} where tone ∈ busy | wait | bad | idle | dim | done | review
     function status(a, now) {
         now = now || Date.now();
@@ -89,7 +94,9 @@
             case 'retrying': return { text: retryingText(a, 60), tone: 'wait' };
             case 'failed': return { text: 'failed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
             case 'crashed': return { text: 'crashed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
-            case 'stopped': return { text: a.stopped_by_user ? 'stopped by you' : 'stopped', tone: 'wait' };
+            case 'stopped': return completedAgent(a) ? { text: 'completed', tone: 'done' }
+                : a.stopped_by_user ? { text: 'stopped by you', tone: 'wait' }
+                    : w && w.state === 'failed' ? { text: 'failed', tone: 'bad' } : { text: 'stopped', tone: 'wait' };
             case 'waiting': return { text: a.status_detail || 'waiting', tone: 'wait' };
         }
         if (a.swarm_waiting) return { text: 'waiting for Akasha swarm', tone: 'wait' };
@@ -474,7 +481,7 @@
     }
 
     M.parts = {
-        glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, retryingText, statusPill, wstate, groups, roleLabel,
+        glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, retryingText, completedAgent, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
         haltBand, haltPrimary, haltResumeLabel, stageWhere, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };

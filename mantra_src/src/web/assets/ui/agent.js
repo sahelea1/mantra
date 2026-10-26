@@ -211,6 +211,7 @@
         st.el = el;
         if (!st.stick && st.top !== undefined) st.restore = true;
         el.addEventListener('scroll', () => {
+            if (st.el !== el || !el.isConnected || st.restore) return; // ignore detached and initial-layout events
             st.top = el.scrollTop;
             const near = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
             if (near !== st.stick && st.endOrd == null) { st.stick = near; M.act.changed(); }
@@ -312,7 +313,8 @@
             const st = scroll[id];
             if (!st.el) continue;
             if (!st.el.isConnected) {
-                st.top = st.el.scrollTop;
+                // The last connected scroll event already recorded top. A detached element can
+                // report zero even though the person was reading an older page.
                 st.el = null; // the prior agent's mounted transcript can now be collected
                 continue;
             }
@@ -449,7 +451,9 @@
     }
 
     function composer(a) {
-        if (a.status === 'stopped') return h('div', { class: 'composer-note', key: 'stopped-composer' }, a.in_run ? 'This process has ended. Respawn it to continue.' : 'This process has ended. Start a new Solo session to continue.');
+        if (a.status === 'stopped') return P.completedAgent(a)
+            ? h('div', { class: 'composer-note completed', key: 'stopped-composer' }, 'This agent’s work is complete.')
+            : h('div', { class: 'composer-note', key: 'stopped-composer' }, a.in_run ? 'This process has ended. Respawn it to continue.' : 'This process has ended. Start a new Solo session to continue.');
         const s = S();
         const key = 'c' + a.id;
         const text = s.ui.drafts[key] || '';
@@ -531,10 +535,10 @@
 
     // A failed or crashed agent gets its fixes right above the composer.
     function troubleCard(a) {
-        if (a.status !== 'failed' && a.status !== 'crashed' && a.status !== 'stopped') return null;
+        if (P.completedAgent(a) || (a.status !== 'failed' && a.status !== 'crashed' && a.status !== 'stopped')) return null;
         const canRespawn = a.in_run || a.status === 'crashed';
         return h('div', { class: 'agent-trouble', key: 'trouble', role: 'alert' },
-            h('div', null, h('b', null, a.status === 'stopped' ? a.name + ' is stopped' : a.status === 'crashed' ? a.name + ' crashed' : a.name + '’s last turn failed')),
+            h('div', null, h('b', null, a.status === 'stopped' ? a.worker && a.worker.state === 'failed' && !a.stopped_by_user ? a.name + '’s task failed' : a.name + ' is stopped' : a.status === 'crashed' ? a.name + ' crashed' : a.name + '’s last turn failed')),
             a.status_detail ? h('div', { class: 'band-msg' }, F.trunc(a.status_detail, 300)) : null,
             h('div', { class: 'band-actions' },
                 P.btn('Switch model', () => M.act.sheet({ kind: 'model', agent: a.id }), { sm: true, icon: 'model', key: 'm' }),

@@ -654,6 +654,7 @@ button.item-head:hover { background: var(--bg-hover); }
 .composer .stop { width: 38px; height: 38px; border-radius: 50%; color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
 .composer .force { min-height: 34px; border-radius: 17px; color: var(--accent); }
 .composer-note { font-size: var(--fs-xs); color: var(--amber); padding: 4px 14px 0; }
+.composer-note.completed { color: var(--dim); }
 .suggest { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); max-height: 280px; overflow-y: auto; background: var(--bg-card); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: var(--shadow-lg); padding: 4px; z-index: 10; animation: rise 120ms both; }
 .sug { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 42px; padding: 0 10px; border-radius: 8px; font-size: var(--fs-sm); }
 .sug b { font-family: var(--mono); font-weight: 600; flex: none; }

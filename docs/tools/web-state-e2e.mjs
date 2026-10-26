@@ -136,7 +136,47 @@ try {
         return document.querySelectorAll('.tx-inner > .msg').length;
     });
     assert.equal(reused, 200, 'a reused id starts with a fresh transcript window');
-    console.log('web-state-e2e: transcript window, scroll, streaming, waiting, long response, removal passed');
+
+    // A completed run stops its processes. The worker page must not describe that as a failure.
+    await page.evaluate(() => { window.testParts = window.Mantra.parts; });
+    await page.addScriptTag({ path: path.join(ui, 'parts.js') });
+    const finished = await page.evaluate(() => {
+        const M = window.Mantra, oldParts = window.testParts;
+        // agent.js captured the small test stub at load time; fill that object with the real
+        // shared components used by the complete agent screen.
+        Object.assign(oldParts, M.parts);
+        M.parts = oldParts;
+        const a = { id: 7, name: 'Worker 7', role_kind: 'worker', status: 'stopped', stopped_by_user: false,
+            in_run: true, busy: false, worker: { task_id: 'p2-ui', state: 'done', attempt: 1 },
+            items: [], items_first: 0, items_total: 0, created_at: Date.now(), model_alias: 'luna' };
+        M.store.S.agents.set(7, a);
+        M.store.S.run = { stage: { kind: 'done' } };
+        const inspect = () => {
+            M.patch(document.getElementById('root'), M.agentView.agentScreen(7));
+            return { status: M.parts.status(a), trouble: !!document.querySelector('.agent-trouble'),
+                composer: document.querySelector('.composer-note')?.textContent || '',
+                composerClass: document.querySelector('.composer-note')?.className || '' };
+        };
+        const completed = inspect();
+        a.stopped_by_user = true;
+        const manuallyStopped = inspect();
+        a.worker.state = 'failed'; a.stopped_by_user = false;
+        const stoppedFailedWorker = inspect();
+        a.status = 'failed';
+        const failed = inspect();
+        return { completed, manuallyStopped, stoppedFailedWorker, failed };
+    });
+    assert.deepEqual(finished.completed.status, { text: 'completed', tone: 'done' });
+    assert.equal(finished.completed.trouble, false);
+    assert.match(finished.completed.composer, /work is complete/);
+    assert.match(finished.completed.composerClass, /completed/);
+    assert.equal(finished.manuallyStopped.status.text, 'stopped by you');
+    assert.equal(finished.manuallyStopped.trouble, true);
+    assert.equal(finished.stoppedFailedWorker.status.tone, 'bad');
+    assert.equal(finished.stoppedFailedWorker.trouble, true);
+    assert.equal(finished.failed.status.tone, 'bad');
+    assert.equal(finished.failed.trouble, true);
+    console.log('web-state-e2e: transcript window, scroll, streaming, waiting, long response, removal, completed worker passed');
 } finally {
     await browser.close();
 }

@@ -2,6 +2,26 @@
 
 All notable changes to Mantra are recorded here.
 
+## Unreleased
+
+- **Consistent activity states.** Approval, question, swarm, and retry waits are distinct from
+  active work. Blocked agents do not show working animations or silence warnings; the live
+  Mandala remains intact. Compact terminal approvals keep their actions visible at 40×12.
+- **Draft and focus continuity.** Solo, the run prompt, and each zoomed agent keep separate
+  terminal drafts and cursor positions. Remote drafts survive navigation, reconnects, and late
+  send failures. Escape preserves drafts; dialogs restore focus and confirmations submit once.
+- **Responsive long conversations.** Remote transcripts mount at most 400 items while browsing
+  history. Large messages use a bounded preview with full text available. Streaming updates no
+  longer copy the whole loaded history; removed agents release their cached views and drafts.
+- **Backend reliability.** An idle Codex interrupt cannot cancel the next turn. Claude model and
+  effort changes share a restart while preserving queued messages. Closed RPC connections clear
+  pending requests. The UI explains which approvals apply to native tools versus Mantra requests.
+- **Approval isolation.** Automatic approval uses each requesting agent's active policy and cannot
+  approve another agent's pending command or question.
+- **Less protocol duplication.** Remote command variants and accepted wire names now share one
+  definition, with compatibility tests. Browser regressions cover long histories, waits, draft
+  races, palette focus, confirmations, and cache cleanup alongside the existing integration suite.
+
 ## v0.8.2 — 2026-10-26
 
 - **Akasha delegation from Solo and Studio roles.** Solo can start bounded swarms with shared

@@ -144,13 +144,15 @@ Most changes apply at once; a few say when they will (the toast tells you): the 
 
 <img src="docs/img/solo-approval.png" alt="An approval card for a shell command" width="820">
 
-`shift+tab` (or *Approvals* in `/settings`) cycles **untrusted → on-request → never ask** for the Solo agent. These three ordinary modes apply to the live session immediately, even while a card is on screen.
+`shift+tab` (or *Approvals* in `/settings`) cycles **untrusted → on-request → never ask** for the Solo agent. These three ordinary modes apply to the live session immediately, even while a card is on screen. Codex applies them to its native tools. Bija and Claude Code run native tools unattended; for those backends these modes govern Mantra requests and questions. Their sandbox setting still applies.
 
 - **untrusted** asks before anything that is not known-safe.
 - **on-request** asks when the agent wants to leave its sandbox.
 - **never ask** never prompts; anything that would have asked is auto-approved and written to the log (`✓ auto-approved (never ask): $ cargo test`). The sandbox still applies.
 
 **BYPASS-SANDBOX-DANGER** is a separate choice in *Approvals*, not part of the quick cycle: no approval prompts and no backend sandbox. Entering or leaving this mode takes effect with `/new`; the current session keeps its existing permission, as shown in its footer. Codex receives `danger-full-access` and `never`; Bija uses `full`; Claude Code explicitly disables its sandbox. This does not change what the ordinary **never ask** choice means.
+
+Automatic approval follows the requesting agent’s policy; it never grants another agent’s pending request.
 
 Team roles have their own `permission` field in the Studio, `never` by default, so a run does not stop to ask. A role set to ask sends its questions to the inbox (`ctrl+g`). Claude Code agents always run with `--dangerously-skip-permissions` — a pipe cannot answer Claude's own prompts — so their containment is the worktree and the role's sandbox instead.
 
@@ -324,6 +326,8 @@ An alias maps to a model **and the runtime it goes through**, and every picker s
 In Solo, the agent can list configured model aliases and start a separate subagent on any usable alias, including one on a different backend. It can message, inspect, await, and stop each subagent through its tools. Each child is a separate process in the same project; starting a new Solo session shuts down that session's children.
 
 Use the **Codex** backend for a ChatGPT subscription and **Claude Code** for its CLI login. **Bija** uses configured API endpoints and keys; it does not reuse a ChatGPT subscription.
+
+Drafts stay with each conversation while the terminal or browser page remains open. Navigation, overlay dismissal, and browser reconnects preserve them; a full browser reload starts fresh. Long remote transcripts use a bounded visible window, with earlier history and full message text available on demand.
 
 **Akasha swarms.** Solo can start a small group of independent agents with a shared notebook. For a team role, enable **Can spawn swarm** in `/studio` (or the remote pattern editor); it is off by default for roles. Each group has up to eight members, with at most sixteen live swarm members across the app. Members use configured model aliases, can mix backends, and inherit the parent’s active permission and working directory. They cannot spawn more swarms. Split work by file or responsibility: members share the parent’s workspace rather than getting separate worktrees.
 
