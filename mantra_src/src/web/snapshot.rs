@@ -229,6 +229,9 @@ pub struct AgentView {
     pub compacting: bool,
     pub compact_pending: bool,
     pub stopped_by_user: bool,
+    /// A worker finished successfully before its phase retired it from the current worker list.
+    #[serde(default)]
+    pub completed_work: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_at: Option<u64>,
     pub last_event_at: u64,
@@ -846,6 +849,7 @@ struct RunFacts {
     members: HashSet<AgentId>,
     expected: HashSet<AgentId>,
     workers: HashMap<AgentId, WorkerView>,
+    completed: HashSet<AgentId>,
 }
 
 fn run_facts(app: &App) -> RunFacts {
@@ -854,8 +858,9 @@ fn run_facts(app: &App) -> RunFacts {
             members: r.all_agents().into_iter().collect(),
             expected: r.expected_active().into_iter().map(|(a, _)| a).collect(),
             workers: worker_views(r).into_iter().filter_map(|w| Some((w.agent?, w))).collect(),
+            completed: r.completed_agents.clone(),
         },
-        None => RunFacts { members: HashSet::new(), expected: HashSet::new(), workers: HashMap::new() },
+        None => RunFacts { members: HashSet::new(), expected: HashSet::new(), workers: HashMap::new(), completed: HashSet::new() },
     }
 }
 
@@ -890,6 +895,7 @@ fn agent_view_with(app: &App, a: &Agent, facts: &RunFacts) -> AgentView {
         compacting: a.compacting,
         compact_pending: a.compact_pending,
         stopped_by_user: a.stopped_by_user,
+        completed_work: facts.completed.contains(&a.id) && !a.stopped_by_user && matches!(&a.status, Status::Stopped),
         turn_started_at: a.turn_started.map(ms),
         last_event_at: ms(a.last_event),
         created_at: ms(a.created),
@@ -1632,6 +1638,25 @@ pub(crate) mod tests {
         assert_eq!(d.seq, 2);
         assert_eq!(d.agents.as_ref().unwrap()[0].id, 1);
         assert_eq!(d.agents_removed, Some(vec![2]));
+    }
+
+    #[test]
+    fn retired_successful_worker_keeps_exact_completion_after_worker_list_clears() {
+        let mut app = test_app();
+        add_agent(&mut app, 1, "p2-ui");
+        add_agent(&mut app, 2, "p2-ui"); // an earlier failed attempt of the same task
+        for a in app.agents.values_mut() { a.status = Status::Stopped; }
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        run.stage = Stage::Done;
+        run.completed_agents.insert(1);
+        app.run = Some(run);
+        let facts = run_facts(&app);
+        let done = agent_view_with(&app, &app.agents[&1], &facts);
+        let failed_attempt = agent_view_with(&app, &app.agents[&2], &facts);
+        assert!(done.worker.is_none() && !done.in_run && done.completed_work);
+        assert!(failed_attempt.worker.is_none() && !failed_attempt.in_run && !failed_attempt.completed_work);
+        app.agents.get_mut(&1).unwrap().stopped_by_user = true;
+        assert!(!agent_view_with(&app, &app.agents[&1], &run_facts(&app)).completed_work);
     }
 
     #[test]

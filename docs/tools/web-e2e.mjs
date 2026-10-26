@@ -415,6 +415,23 @@ async function main() {
             if (!/^ok/.test(t.status)) throw new Error('model_test: ' + JSON.stringify(t));
         });
 
+        await step('main', phone, 'completed worker stays calm after its phase retires', async () => {
+            await waitForState(phone, (id) => {
+                const s = window.Mantra.store.S, a = s.agents.get(id);
+                return s.run?.stage?.kind === 'done' && a?.status === 'stopped' && a.completed_work;
+            }, worker, { timeout: 60000 });
+            const retired = await phone.evaluate((id) => {
+                const a = window.Mantra.store.agent(id);
+                return { worker: a.worker, in_run: a.in_run, completed: a.completed_work };
+            }, worker);
+            if (retired.worker || retired.in_run || !retired.completed) throw new Error('retired worker lost precise completion: ' + JSON.stringify(retired));
+            await nav(phone, '/agent/' + worker);
+            await phone.waitForSelector('.agent-head .pill.tone-done:has-text("completed")');
+            if (await phone.locator('.agent-trouble').count()) throw new Error('completed worker has a trouble card');
+            await phone.waitForSelector('.composer-note.completed:has-text("work is complete")');
+            await shot(phone, 'web-agent-completed-phone.png');
+        });
+
         await step('main', driver, 'run: start one from the Run screen → Stop (confirm) → start the next → delete', async () => {
             // The demo's run is over by now (Land / Delete, and the start card under it); a run
             // that is over hands its screen to the next one.

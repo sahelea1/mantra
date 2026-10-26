@@ -80,7 +80,7 @@
     function completedAgent(a) {
         const run = S().run;
         return !!(a && a.status === 'stopped' && !a.stopped_by_user && (!a.worker || a.worker.state !== 'failed') &&
-            ((a.worker && a.worker.state === 'done') || (a.in_run && run && run.stage && run.stage.kind === 'done')));
+            (a.completed_work || (a.worker && a.worker.state === 'done') || (a.in_run && run && run.stage && run.stage.kind === 'done')));
     }
     // → {text, tone} where tone ∈ busy | wait | bad | idle | dim | done | review
     function status(a, now) {

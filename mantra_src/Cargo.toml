@@ -1,6 +1,6 @@
 [package]
 name = "mantra"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 description = "Mantra: a terminal UI that runs and orchestrates coding agents — Codex, Claude Code or its own Bija harness (Solo + Mandala modes)"
 license = "MIT"

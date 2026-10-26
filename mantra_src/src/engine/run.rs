@@ -430,6 +430,9 @@ pub struct Run {
     pub gate_agent: Option<AgentId>,
     pub finale_agent: Option<AgentId>,
     pub workers: Vec<Worker>,
+    /// Successful worker processes retained in the app after their phase's worker list is cleared.
+    /// Keyed by agent id so a failed earlier attempt of the same task is never called complete.
+    pub completed_agents: HashSet<AgentId>,
     pub history: Vec<PhaseRecord>,
     pub checks: Vec<CheckResult>,
     pub conflicts: Vec<String>,
@@ -599,6 +602,7 @@ impl Run {
             gate_agent: None,
             finale_agent: None,
             workers: vec![],
+            completed_agents: HashSet::new(),
             history: vec![],
             checks: vec![],
             conflicts: vec![],
@@ -2335,6 +2339,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
         self.log("✓", "green", "gate passed — archiving workers, writing handoff");
         // archive workers + gate agent
+        self.completed_agents.extend(self.workers.iter().filter(|w| w.state == WState::Done).filter_map(|w| w.agent));
         let agents: Vec<AgentId> = self.workers.iter().filter_map(|w| w.agent).chain(self.gate_agent).collect();
         for a in agents {
             self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
@@ -6203,6 +6208,27 @@ mod halt_tests {
         again.resume_boot(&mut ctx2, &st);
         assert!(ctx2.spawns.is_empty() && !again.is_active());
         assert!(again.pulse.iter().any(|p| p.text.starts_with("you stopped this run — opened read-only")), "{:?}", again.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn successful_handoff_remembers_the_done_agent_not_an_earlier_failed_attempt() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "completion".into());
+        run.dir = scratch_dir("retired-worker-completion");
+        run.plan = Some(class_phase(1, 0));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 0 } };
+        let failed = ctx.add_idle();
+        let done = ctx.add_idle();
+        run.workers.push(mk_worker("b0", "worker-big", failed, WState::Failed("previous attempt".into())));
+        let mut latest = mk_worker("b0", "worker-big", done, WState::Done);
+        latest.attempt = 2;
+        run.workers.push(latest);
+        run.begin_handoff(&mut ctx, 0);
+        assert!(run.completed_agents.contains(&done));
+        assert!(!run.completed_agents.contains(&failed));
+        run.workers.clear();
+        assert!(run.completed_agents.contains(&done), "the completion survives the next phase clearing its worker list");
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
