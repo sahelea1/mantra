@@ -13,15 +13,35 @@ pub fn ms() -> u128 {
 }
 
 pub fn spinner() -> &'static str {
+    if !theme::motion() {
+        return theme::g("⠿", "*");
+    }
     if theme::ascii() {
         const F: [&str; 4] = ["|", "/", "-", "\\"];
         return F[(ms() / 120) as usize % 4];
     }
     const F: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    if !theme::motion() {
-        return "⠿";
-    }
     F[(ms() / 80) as usize % 10]
+}
+
+/// A small travelling spark, with a fading trail. Always five columns, so a busy label stays
+/// anchored as it moves; reduced motion leaves a single still star in the same footprint.
+pub fn spark(color: (u8, u8, u8)) -> Vec<Span<'static>> {
+    let moving = theme::motion();
+    let head = if moving { (ms() / 180) as usize % 5 } else { 2 };
+    (0..5)
+        .map(|i| {
+            let age = (head + 5 - i) % 5;
+            let (glyph, intensity) = match age {
+                0 => (theme::g("✦", "*"), 1.0),
+                1 if moving => (theme::g("·", "."), 0.6),
+                2 if moving => (theme::g("·", "."), 0.3),
+                _ => (" ", 0.0),
+            };
+            let style = Style::default().fg(mix(theme::FAINT, color, intensity));
+            Span::styled(glyph, if age == 0 { style.add_modifier(Modifier::BOLD) } else { style })
+        })
+        .collect()
 }
 
 /// 0..1..0 over `period` ms.

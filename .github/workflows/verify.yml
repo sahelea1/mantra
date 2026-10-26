@@ -1,0 +1,46 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/mantra-polish-akasha
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Test workspace
+        working-directory: mantra_src
+        run: cargo test --locked --workspace --no-fail-fast -- --test-threads=1
+      - name: Build both backends
+        working-directory: mantra_src
+        run: cargo build --locked
+      - name: Install browser test tools
+        run: |
+          npm install --prefix /tmp/mantra-browser-tools playwright@1.51.1
+          node /tmp/mantra-browser-tools/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Browser integration — desktop and phone
+        env:
+          MANTRA_BIN: ${{ github.workspace }}/mantra_src/target/debug/mantra
+          MANTRA_E2E_PW_MODULES: /tmp/mantra-browser-tools/node_modules
+          MANTRA_E2E_OUT: ${{ runner.temp }}/mantra-shots
+        run: |
+          node docs/tools/web-e2e.mjs main
+          node docs/tools/web-e2e.mjs ask
+      - name: Terminal integration
+        run: bash mantra_src/scripts/stress.sh
+      - name: Keep browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-screenshots
+          path: ${{ runner.temp }}/mantra-shots
+          if-no-files-found: ignore

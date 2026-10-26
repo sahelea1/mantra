@@ -288,7 +288,7 @@ pub fn busy_line(a: &Agent) -> Option<Line<'static>> {
             Span::styled(trunc(m, 60), theme::fg(theme::AMBER)),
             Span::styled(format!("  {}", a.retry_note.clone().map(|n| trunc(&n, 60)).unwrap_or_default()), theme::faint()),
         ])),
-        Status::Starting => Some(Line::from(vec![Span::styled(format!("{} ", anim::spinner()), theme::dim()), Span::styled("starting codex…", theme::dim())])),
+        Status::Starting => Some(Line::from(vec![Span::styled(format!("{} ", anim::spinner()), theme::dim()), Span::styled("starting agent…", theme::dim())])),
         _ if a.busy() || a.compacting => {
             let b = anim::breath(1600);
             let col = theme::named(&a.color);

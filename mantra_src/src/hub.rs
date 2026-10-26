@@ -132,6 +132,7 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(3);
 pub struct Hub {
     ev: mpsc::UnboundedSender<HubEvent>,
     agents: HashMap<AgentId, mpsc::UnboundedSender<Cmd>>,
+    tasks: HashMap<AgentId, tokio::task::AbortHandle>,
     next: AgentId,
     pub codex_cmd: Vec<String>,
     /// Command used to launch one `claude` process per Claude Code agent (WP10.3).
@@ -168,7 +169,7 @@ impl Hub {
             None => (None, None),
         };
         let (alive, gone) = mpsc::channel(1);
-        Hub { ev, agents: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bridge_problem, bija_alive: Some(alive), bija_gone: Some(gone) }
+        Hub { ev, agents: HashMap::new(), tasks: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bridge_problem, bija_alive: Some(alive), bija_gone: Some(gone) }
     }
 
     /// Why Claude Code agents have no bridge to Mantra's tools, if the socket was wanted and could
@@ -209,11 +210,12 @@ impl Hub {
         };
         let alive = if spec.backend == Backend::Bija { self.bija_alive.clone() } else { None };
         let task = agent_task(id, spec, cmd, ev, rx, delay);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Held for as long as the task runs: see `Stopping`.
             let _alive = alive;
             task.await
         });
+        self.tasks.insert(id, task.abort_handle());
     }
 
     /// Whether an agent process is registered under this id (the web API validates ids with it).
@@ -231,14 +233,23 @@ impl Hub {
         if let Some(tx) = self.agents.remove(&id) {
             let _ = tx.send(Cmd::Shutdown);
         }
+        if let Some(task) = self.tasks.remove(&id) {
+            // A backend can be stuck in startup/handshake before it reads the command channel.
+            // Let the normal cleanup run first, then bound the stop even in that state. All
+            // backend children use kill_on_drop, so aborting also ends the actual process.
+            tokio::spawn(async move {
+                tokio::time::sleep(QUIT_GRACE).await;
+                task.abort();
+            });
+        }
     }
 
     /// Tells every agent to shut down. The returned `Stopping` is what the quit path awaits before
     /// the runtime goes: its teardown kills every child still running, and a bija agent needs a
     /// moment first to end its running command and background jobs and close its transcript.
     pub fn shutdown_all(&mut self) -> Stopping {
-        for (_, tx) in self.agents.drain() {
-            let _ = tx.send(Cmd::Shutdown);
+        for id in self.agents.keys().copied().collect::<Vec<_>>() {
+            self.shutdown(id);
         }
         // "removed at exit" (§10.4) — best-effort; a leaked file under `run/` is harmless (pid-scoped
         // name, next process's bind removes any stale one anyway) but tidying up is cheap.
@@ -266,6 +277,27 @@ impl Stopping {
             // `recv` answers `None` once the last sender is gone, i.e. the last bija task ended.
             Some(mut gone) => tokio::time::timeout(limit, gone.recv()).await.is_ok(),
             None => true,
+        }
+    }
+}
+
+/// A backend's private process group. Kept beside its Child across every await, so normal
+/// cleanup runs first and cancellation still reaps npm wrappers and attached tool processes.
+/// Bija's deliberately detached background jobs retain its existing graceful cleanup path.
+pub(super) struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    pub(super) fn new(pid: Option<u32>) -> Self {
+        Self(pid.filter(|pid| *pid > 1 && *pid <= i32::MAX as u32))
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            // The spawn used process_group(0), so this is the child's group, never Mantra's.
+            unsafe { libc::killpg(pid as i32, libc::SIGKILL); }
         }
     }
 }
@@ -423,6 +455,12 @@ async fn agent_task(
     let mut turn_cut = false;
 
     'outer: loop {
+        // Hub::shutdown removes the sole sender. Do not launch a process after a stop
+        // requested during the Codex stagger delay or between two relaunch attempts.
+        if cmds.is_closed() {
+            let _ = ev.send(HubEvent::Exited { agent: id });
+            return;
+        }
         let started = match spec.backend {
             Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
             Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
@@ -562,6 +600,7 @@ async fn run_process(
         Ok(x) => x,
         Err(e) => return Exit::LaunchFailed(e.to_string()),
     };
+    let _group = ProcessGroup::new(child.id());
     if let Err(e) = rpc::handshake(&conn).await {
         // Codex says why it died on stderr (`/proc/self/exe` missing, a config it rejects, …);
         // that line is what the user needs, "codex process exited (-1)" is not.
@@ -574,7 +613,7 @@ async fn run_process(
     let mut params = json!({
         "model": model.clone(),
         "cwd": spec.cwd.to_string_lossy(),
-        "approvalPolicy": approval.clone(),
+        "approvalPolicy": crate::config::approval_policy(approval),
         "sandbox": spec.sandbox,
         "serviceName": "mantra",
     });
@@ -689,7 +728,7 @@ async fn run_process(
                     Some(Cmd::SetName(n)) => fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": n}), "name", None),
                     Some(Cmd::SetApproval(a)) => {
                         // Apply to the live thread now (not just the next turn/start we send).
-                        fire(&conn, ev, id, "thread/settings/update", json!({"threadId": tid, "approvalPolicy": a}), "settings", None);
+                        fire(&conn, ev, id, "thread/settings/update", json!({"threadId": tid, "approvalPolicy": crate::config::approval_policy(&a)}), "settings", None);
                         *approval = a;
                     }
                     Some(Cmd::Restart) => {
@@ -769,13 +808,21 @@ fn last_significant_stderr_line(tail: &str) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+#[test]
+fn codex_turn_permission_uses_wire_policy_not_ui_label() {
+    let p = turn_params("thread", "hello", "", "model", crate::config::BYPASS_SANDBOX_DANGER);
+    assert_eq!(p["approvalPolicy"], "never");
+    assert_eq!(turn_params("thread", "hello", "", "model", "on-request")["approvalPolicy"], "on-request");
+}
+
 /// `turn/start` params. Models without a reasoning-effort setting get no `effort` at all.
 fn turn_params(tid: &str, text: &str, effort: &str, model: &str, approval: &str) -> Value {
     let mut p = json!({
         "threadId": tid,
         "input": [{ "type": "text", "text": text, "text_elements": [] }],
         "model": model,
-        "approvalPolicy": approval,
+        "approvalPolicy": crate::config::approval_policy(approval),
     });
     if !effort.is_empty() {
         p["effort"] = json!(effort);
@@ -1133,6 +1180,69 @@ mod tests {
         prepare_relaunch(true, &mut thread_id2, &None, &mut replay2);
         assert_eq!(thread_id2, None);
         assert!(replay2.is_empty(), "no last turn yet: nothing to replay");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn backend_process_group_cleanup_ends_a_wrappers_child() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let group = ProcessGroup::new(child.id());
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let worker = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+        let worker: u32 = worker.trim().parse().unwrap();
+        drop(group);
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // An orphaned zombie is already dead and merely awaiting the host's reaper.
+                let dead = std::fs::read_to_string(format!("/proc/{worker}/stat")).map(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')).unwrap_or(false)).unwrap_or(true);
+                if dead { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the wrapper's worker process must not survive");
+    }
+
+    /// An unresponsive app-server never reaches the command loop. Remote stop must still
+    /// terminate its process within the grace period and must never enter crash/restart logic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_during_codex_handshake_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("mantra-stop-handshake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let spec = SpawnSpec {
+            cwd: dir.clone(), model: "m".into(), provider: "openai".into(), effort: String::new(),
+            approval: "never".into(), sandbox: "read-only".into(), developer_instructions: String::new(),
+            dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
+            thread_name: None, backend: Backend::Codex, envs: vec![], claude: None, bija: None, mcp: vec![],
+        };
+        let cmd = vec!["sh".into(), "-c".into(), "echo $$ > pid; exec sleep 60".into()];
+        let (ev, mut rx) = mpsc::unbounded_channel();
+        let mut hub = Hub::new(cmd, vec![], vec![], ev, false);
+        hub.spawn(1, spec);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pid_file.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+        }).await.expect("mock process starts");
+        let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let task = hub.tasks[&1].clone();
+        hub.shutdown(1);
+        assert!(!hub.has_agent(1));
+        tokio::time::timeout(QUIT_GRACE + Duration::from_secs(2), async {
+            while !task.is_finished() { tokio::time::sleep(Duration::from_millis(20)).await; }
+        }).await.expect("startup is cancellable within the grace period");
+        // kill_on_drop is reaped asynchronously by Tokio; allow the reaper a moment as well.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !std::process::Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success() { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the app-server process was killed");
+        assert!(!matches!(rx.try_recv(), Ok(HubEvent::Crashed { .. })), "shutdown must not restart");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The wiring behind `restart_backoff`: a process that exits before the handshake (Codex

@@ -20,7 +20,7 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "parallel", "max_tokens", "mcp", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
 const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap"];
@@ -60,6 +60,7 @@ fn field_kind(entry: &str, field: &str) -> Kind {
         _ => match field {
             "instructions" => Kind::Lines,
             "description" | "mcp" => Kind::Text,
+            "swarm" => Kind::Toggle,
             "glyph" | "parallel" | "max_tokens" => Kind::Step,
             _ => Kind::Choice,
         },
@@ -201,6 +202,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "fallback" => r.fallback.clone().unwrap_or_else(|| "none".into()),
                 "sandbox" => r.sandbox.clone(),
                 "permission" => r.permission.clone(),
+                "swarm" => if r.can_spawn_swarm { "on".into() } else { "off".into() },
                 "parallel" => r.parallel.map(|n| n.to_string()).unwrap_or_else(|| "none".into()),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
                 "mcp" => if r.mcp.is_empty() { "none".into() } else { r.mcp.join(", ") },
@@ -298,6 +300,7 @@ fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
         role => {
             let Some(r) = p.roles.get_mut(role) else { return };
             match field {
+                "swarm" => r.can_spawn_swarm = !r.can_spawn_swarm,
                 "kind" => r.kind = v.into(),
                 "color" => r.color = v.into(),
                 "model" => {
@@ -371,6 +374,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
             let Some(r) = p.roles.get_mut(role) else { return };
             match field {
                 "glyph" => r.glyph = form::cycle(GLYPHS, &r.glyph, d),
+                "swarm" => r.can_spawn_swarm = !r.can_spawn_swarm,
                 // none (shares max_parallel) sits below 1, and 128 is the top
                 "parallel" => {
                     let next = r.parallel.unwrap_or(0) as i64 + d as i64;
@@ -933,7 +937,8 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small and swarm workers, high for finale steps.",
         "parallel" => "How many workers of this role run at once, counted apart from the rest (1-128; worker-swarm has 16). none = it shares the pattern's max_parallel with the other roles without one.",
         "fallback" => "The model that takes over when this role's model twice produces nothing within first_token_minutes. none = the manager is asked instead.",
-        "permission" => "never = the agent never asks (the default). on-request / untrusted: you approve by hand; requests land in the inbox (ctrl+g).",
+        "permission" => "never keeps the sandbox and skips prompts. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox. on-request / untrusted asks you (ctrl+g).",
+        "swarm" => "Lets this role start a temporary swarm in Solo. Swarm children cannot spawn another swarm.",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",
@@ -1254,6 +1259,12 @@ mod tests {
             typed(&mut app, "u");
             assert_eq!(app.studio.pattern.roles["worker-big"].permission, "untrusted");
             assert!(app.edit.is_none());
+            on_field(&mut app, "worker-big", "swarm");
+            assert_eq!(get_value(&app, "worker-big", "swarm"), "off");
+            press(&mut app, KeyCode::Right);
+            assert!(app.studio.pattern.roles["worker-big"].can_spawn_swarm);
+            assert_eq!(get_value(&app, "worker-big", "swarm"), "on");
+            assert!(field_hint("swarm").is_some());
         });
     }
 

@@ -470,8 +470,8 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
     Some(max)
 }
 
-/// The run's shared notes, one section per group, each the block exactly as its agents read it
-/// (`Block::render`): what the overlay shows is what they were told, only styled.
+/// Shared notes, one section per run or scoped swarm group. Notes are the block exactly as its
+/// agents read it (`Block::render`); a swarm adds its parent and children's current status.
 fn akasha(f: &mut Frame, area: Rect, app: &App, group: Option<&str>, scroll: usize) -> usize {
     let r = Rect { x: area.x + 3, y: area.y + 1, width: area.width.saturating_sub(6), height: area.height.saturating_sub(2) };
     clear(f, area, r);
@@ -480,11 +480,25 @@ fn akasha(f: &mut Frame, area: Rect, app: &App, group: Option<&str>, scroll: usi
     f.render_widget(blk, r);
     let width = inner.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
-    for b in app.run.iter().flat_map(|r| r.akasha.values()).filter(|b| group.map(|g| g == b.group).unwrap_or(true)) {
+    for b in app.run.iter().flat_map(|r| r.akasha.values()).filter(|b| group.map(|g| g == App::akasha_run_key(&b.group)).unwrap_or(true)) {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
         lines.extend(akasha_lines(&b.render(), width));
+    }
+    let mut swarms: Vec<_> = app.swarms.values().filter(|s| group.map(|g| g == format!("swarm:{}", s.owner)).unwrap_or(true)).collect();
+    swarms.sort_by_key(|s| s.owner);
+    for s in swarms {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(trunc(&format!("swarm · {} · {} agents", s.name, s.children.len()), width), theme::bold(theme::fg(theme::VIOLET)))));
+        lines.push(swarm_member_line(app, s.owner, "owner", width));
+        for &child in &s.children {
+            lines.push(swarm_member_line(app, child, "  ↳", width));
+        }
+        lines.push(Line::default());
+        lines.extend(akasha_lines(&s.notes.render(), width));
     }
     // the run can be closed while this is open: say so instead of drawing an empty box
     if lines.is_empty() {
@@ -499,6 +513,26 @@ fn akasha(f: &mut Frame, area: Rect, app: &App, group: Option<&str>, scroll: usi
     max
 }
 
+fn swarm_member_line(app: &App, id: crate::hub::AgentId, role: &str, width: usize) -> Line<'static> {
+    let Some(a) = app.agents.get(&id) else {
+        return Line::from(Span::styled(trunc(&format!("{role} #{id} · closed"), width), theme::faint()));
+    };
+    let (status, color) = if a.stopped_by_user {
+        ("stopped by you".to_string(), theme::AMBER)
+    } else {
+        match &a.status {
+            Status::Failed(why) | Status::Crashed(why) => (format!("failed: {why}"), theme::RED),
+            Status::Retrying(why) => (Status::retrying_text(why, 40), theme::AMBER),
+            Status::Waiting => ("waiting for approval".to_string(), theme::AMBER),
+            Status::Starting => ("starting".to_string(), theme::MUTED),
+            Status::Stopped => ("stopped".to_string(), theme::MUTED),
+            _ if a.busy() => (if a.activity.is_empty() { "working".to_string() } else { a.activity.clone() }, theme::TEAL),
+            _ => ("idle".to_string(), theme::MUTED),
+        }
+    };
+    Line::from(Span::styled(trunc(&format!("{role} {} · {status}", a.name), width), theme::fg(color)))
+}
+
 /// A rendered block, styled by what each line is: the `## akasha · …` header, a note's
 /// `[7 · w2 · 14:02]` head (amber after a `!` when urgent), and the indented lines a note's text
 /// continues on. A long line wraps under the note's text, not under its head.
@@ -506,7 +540,7 @@ fn akasha_lines(rendered: &str, width: usize) -> Vec<Line<'static>> {
     let mut out = vec![];
     for line in rendered.lines() {
         if let Some(head) = line.strip_prefix("## ") {
-            out.push(Line::from(Span::styled(head.to_string(), theme::bold(theme::fg(theme::VIOLET)))));
+            out.push(Line::from(Span::styled(trunc(head, width), theme::bold(theme::fg(theme::VIOLET)))));
             continue;
         }
         let (urgent, rest) = match line.strip_prefix('!') {
@@ -1224,6 +1258,46 @@ mod tests {
         let screen = screen_of(&mut app, 100, 30);
         assert!(screen.contains("no akasha groups in this run") && screen.contains("akasha"), "{screen}");
         assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { scroll: 0, .. })), "clamped");
+    }
+
+    #[test]
+    fn scoped_swarm_notes_open_without_a_run_and_show_member_status() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let owner = 101;
+        let child = 102;
+        let mut parent = crate::agent::Agent::new(owner, "solo", "solo", std::path::PathBuf::from("."));
+        parent.status = Status::Idle;
+        let mut member = crate::agent::Agent::new(child, "scout", "swarm", std::path::PathBuf::from("."));
+        member.status = Status::Busy;
+        member.turn_active = true;
+        member.activity = "reading config".into();
+        app.agents.insert(owner, parent);
+        app.agents.insert(child, member);
+        let mut notes = crate::engine::akasha::Block::new("research", 8_192);
+        notes.note("scout", "Reuse the existing config parser", false, 0).unwrap();
+        app.swarms.insert(owner, crate::app::swarm::SwarmGroup { owner, name: "research".into(), notes, children: vec![child] });
+
+        app.input.set("/akasha sw");
+        assert_eq!(app.suggestions().iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["/akasha swarm:101"]);
+        app.input.clear();
+        app.command("/akasha");
+        assert!(matches!(app.overlays.last(), Some(Overlay::Akasha { group: Some(name), .. }) if name == "swarm:101"));
+        let screen = screen_of(&mut app, 100, 30);
+        assert!(screen.contains("owner solo · idle"), "{screen}");
+        assert!(screen.contains("scout · reading config"), "{screen}");
+        assert!(screen.contains("Reuse the existing config parser"), "{screen}");
+        assert!(swarm_member_line(&app, child, "member", 20).width() <= 20);
+
+        app.overlays.clear();
+        let mut run = crate::engine::run::Run::new(std::path::PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.akasha.insert("research".into(), crate::engine::akasha::Block::new("research", 8_192));
+        app.run = Some(run);
+        app.command("/akasha");
+        let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("run and swarm groups need a selector") };
+        assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["research", "swarm:101"]);
+        app.run.as_mut().unwrap().akasha.insert("swarm:101".into(), crate::engine::akasha::Block::new("swarm:101", 8_192));
+        let keys: Vec<_> = app.akasha_choices().into_iter().map(|c| c.key).collect();
+        assert!(keys.contains(&"run:swarm:101".to_string()) && keys.contains(&"swarm:101".to_string()));
     }
 
     /// `/run` without a goal opens the new-run overlay: the patterns, the one for new runs

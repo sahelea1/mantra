@@ -98,10 +98,13 @@ pub(super) async fn run_claude_process(
     apply_env(&mut command, spec, &cs);
 
     crate::mlog!("claude {id}: spawn {} {}", prog, logged_args(&args).join(" "));
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Exit::LaunchFailed(format!("failed to start `{}`: {e}", claude_cmd.join(" "))),
     };
+    let _group = super::ProcessGroup::new(child.id());
     crate::mlog!("claude {id}: spawned pid={:?}", child.id());
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill().await;
@@ -390,6 +393,10 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
     a.extend(["-p".into(), "--input-format".into(), "stream-json".into(), "--output-format".into(), "stream-json".into(), "--verbose".into()]);
     // Only "never" is modeled until Role.permission (WP3) lands: every Claude agent is unattended.
     a.push("--dangerously-skip-permissions".into());
+    if spec.approval == crate::config::BYPASS_SANDBOX_DANGER {
+        // Permission bypass alone does not disable a sandbox enabled in the user's Claude settings.
+        a.extend(["--settings".into(), r#"{"sandbox":{"enabled":false}}"#.into()]);
+    }
     a.push(if resume { "--resume".into() } else { "--session-id".into() });
     a.push(session_id.to_string());
     a.push("--model".into());
@@ -1063,6 +1070,14 @@ mod tests {
         assert!(args.contains(&"--bare".to_string()));
         assert!(args.windows(2).any(|w| w == ["--tools".to_string(), "Read,Glob,Grep,WebFetch".to_string()]));
         assert!(!args.contains(&"--mcp-config".to_string()), "no bridge socket configured (mcp_sock: None) — must never add --mcp-config to a socket nothing listens on");
+        assert!(!args.contains(&"--settings".to_string()), "ordinary permissions preserve Claude's settings");
+        let mut bypass = spec.clone();
+        bypass.approval = crate::config::BYPASS_SANDBOX_DANGER.into();
+        bypass.sandbox = "danger-full-access".into();
+        let args = build_args(1, &bypass, &cs, "sonnet5", "high", "abc-123", true, &[]);
+        assert!(args.windows(2).any(|w| w == ["--settings", r#"{"sandbox":{"enabled":false}}"#]));
+        assert!(args.windows(2).any(|w| w == ["--add-dir", "/"]));
+        assert!(!args.contains(&"--disallowedTools".to_string()));
     }
 
     #[test]

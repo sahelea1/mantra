@@ -182,6 +182,17 @@ impl App {
                 self.agent_ok(agent)?;
                 Ok(json!({"interrupted": self.interrupt_by_user(agent)}))
             }
+            Command::AgentStop { agent } => {
+                self.agent_ok(agent)?;
+                Ok(json!({"stopped": self.stop_agent_by_user(agent)}))
+            }
+            Command::AppShutdown => {
+                if let Some(run) = &self.run {
+                    run.save_state();
+                }
+                self.quit = true;
+                ok()
+            }
             Command::Respawn { agent } => {
                 self.agent_ok(agent)?;
                 let crashed = self.agents.get(&agent).map(|a| matches!(a.status, crate::agent::Status::Crashed(_))).unwrap_or(false);
@@ -338,11 +349,11 @@ impl App {
                 ok()
             }
             Command::ApprovalMode { mode } => {
-                if !["untrusted", "on-request", "never"].contains(&mode.as_str()) {
-                    return Err("mode is untrusted, on-request or never".into());
+                if !crate::settings_ops::APPROVAL_MODES.contains(&mode.as_str()) {
+                    return Err(format!("mode is {}", crate::settings_ops::APPROVAL_MODES.join(", ")));
                 }
-                self.set_approval_mode(&mode);
-                ok()
+                let note = self.set_setting("approval_mode", &mode)?;
+                Ok(json!({"note": note}))
             }
             Command::DiscardQueue { agent } => {
                 self.agent_ok(agent)?;
@@ -564,6 +575,47 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Cmd::Steer { text }) if text == "later\n\nnow"));
         let r = run(&mut app, &mut h, 3, Command::Send { agent: 99, text: "x".into(), force: None });
         assert!(matches!(r, ServerMsg::Result(ref x) if !x.ok && x.error.as_deref() == Some("no such agent")));
+    }
+
+    #[test]
+    fn remote_stop_ends_process_and_ignores_late_restart_events() {
+        let (mut app, mut h, mut rx) = wired();
+        let a = app.agents.get_mut(&1).unwrap();
+        a.turn_active = true;
+        a.status = crate::agent::Status::Busy;
+        a.queued.push("do more".into());
+        let r = run(&mut app, &mut h, 1, Command::AgentStop { agent: 1 });
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.ok));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Shutdown)));
+        assert!(!app.hub.has_agent(1));
+        assert!(app.agents[&1].stopped_by_user);
+        assert!(app.agents[&1].queued.is_empty());
+        assert!(!app.agents[&1].busy());
+        for e in [
+            crate::hub::HubEvent::Crashed { agent: 1, reason: "late crash".into(), restarting: true, attempt: 1 },
+            crate::hub::HubEvent::Ready { agent: 1, thread_id: "late".into(), model: "m".into(), resumed: true },
+            crate::hub::HubEvent::Notif { agent: 1, method: "turn/started".into(), params: json!({"turn": {"id": "late"}}) },
+        ] {
+            app.on_event(crate::app::AppEvent::Hub(e));
+            assert_eq!(app.agents[&1].status, crate::agent::Status::Stopped);
+        }
+        prompt_agent(&app.hub, &mut app.agents, 1, "late engine prompt".into(), true, Send::Auto);
+        assert!(app.agents[&1].stopped_by_user, "a dead process cannot be resumed by messaging");
+        let r = run(&mut app, &mut h, 2, Command::Send { agent: 1, text: "hi".into(), force: None });
+        assert!(matches!(r, ServerMsg::Result(ref x) if !x.ok));
+        assert!(matches!(run(&mut app, &mut h, 3, Command::AgentStop { agent: 999 }), ServerMsg::Result(ref x) if !x.ok));
+        assert!(matches!(run(&mut app, &mut h, 4, Command::AgentStop { agent: 1 }), ServerMsg::Result(ref x) if x.ok));
+    }
+
+    #[test]
+    fn remote_shutdown_acknowledges_then_uses_the_normal_quit_path() {
+        let (mut app, mut h, mut rx) = wired();
+        let r = run(&mut app, &mut h, 7, Command::AppShutdown);
+        assert!(matches!(r, ServerMsg::Result(ref x) if x.ok && x.req == 7));
+        assert!(app.quit);
+        assert!(rx.try_recv().is_err(), "the event loop owns orderly shutdown after the reply");
+        app.shutdown();
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Shutdown)));
     }
 
     #[test]

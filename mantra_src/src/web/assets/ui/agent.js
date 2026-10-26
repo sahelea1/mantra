@@ -266,12 +266,14 @@
         } catch (e) { M.act.flash(e.message, 'error'); }
     }
 
-    // Web-safe slash commands (spec §6; no quit/studio/models editing).
+    // Slash commands use the same actions and confirmations as the visible controls.
     function slashCommands(a) {
         const s = S();
         const run = s.run;
         const list = [
             { n: '/compact', d: 'compact ' + a.name + '\'s context', f: () => M.act.cmd('compact', { agent: a.id }, { ok: 'Compacting' }) },
+            { n: '/stop-agent', d: 'end this agent process', f: () => stopAgent(a) },
+            { n: '/quit', d: 'close Mantra on the host', f: () => M.screens.closeMantra() },
             { n: '/interrupt', d: 'stop the current turn', f: () => M.act.cmd('interrupt', { agent: a.id }, { ok: 'Interrupted' }) },
             { n: '/model', d: 'switch model', f: () => M.act.sheet({ kind: 'model', agent: a.id }) },
             { n: '/effort', d: 'change reasoning effort', f: () => M.act.sheet({ kind: 'effort', agent: a.id }) },
@@ -355,6 +357,7 @@
     }
 
     function composer(a) {
+        if (a.status === 'stopped') return h('div', { class: 'composer-note', key: 'stopped-composer' }, a.in_run ? 'This process has ended. Respawn it to continue.' : 'This process has ended. Start a new Solo session to continue.');
         const s = S();
         const key = 'c' + a.id;
         const text = s.ui.drafts[key] || '';
@@ -391,13 +394,22 @@
     }
 
     // ── header, actions ──────────────────────────────────────────────────────────────────────────
+    function stopAgent(a) {
+        M.act.sheet({
+            kind: 'confirm', danger: true, title: 'Stop ' + a.name + '?', confirm: 'Stop agent',
+            body: 'Ends this agent process and its Solo subagents. Its transcript stays here. ' + (a.in_run ? 'Use Respawn to continue its task.' : 'Start a new Solo session to continue.'),
+            run: () => M.act.cmd('agent_stop', { agent: a.id }, { ok: 'Agent stopped' }),
+        });
+    }
+
     function actionList(a) {
         const A = M.act;
         const files = (a.files || []).length;
         const planN = (a.plan || []).length;
         return [
+            a.status !== 'stopped' ? { id: 'stop-agent', icon: 'stop', label: 'Stop agent', run: () => stopAgent(a) } : null,
             a.busy ? { id: 'interrupt', icon: 'stop', label: 'Interrupt', run: () => A.cmd('interrupt', { agent: a.id }, { ok: 'Interrupted' }) } : null,
-            { id: 'compact', icon: 'compact', label: a.compact_pending ? 'Compact (queued)' : 'Compact', run: () => A.cmd('compact', { agent: a.id }, { ok: 'Compacting' }), disabled: a.compacting },
+            a.status !== 'stopped' ? { id: 'compact', icon: 'compact', label: a.compact_pending ? 'Compact (queued)' : 'Compact', run: () => A.cmd('compact', { agent: a.id }, { ok: 'Compacting' }), disabled: a.compacting } : null,
             a.in_run || a.status === 'crashed' ? { id: 'respawn', icon: 'respawn', label: 'Respawn', run: () => A.cmd('respawn', { agent: a.id }, { ok: 'Respawning ' + a.name }) } : null,
             { id: 'model', icon: 'model', label: 'Model', run: () => A.sheet({ kind: 'model', agent: a.id }) },
             a.efforts && a.efforts.length ? { id: 'effort', icon: 'spark', label: 'Effort', run: () => A.sheet({ kind: 'effort', agent: a.id }) } : null,
@@ -427,15 +439,37 @@
 
     // A failed or crashed agent gets its fixes right above the composer.
     function troubleCard(a) {
-        if (a.status !== 'failed' && a.status !== 'crashed') return null;
+        if (a.status !== 'failed' && a.status !== 'crashed' && a.status !== 'stopped') return null;
         const canRespawn = a.in_run || a.status === 'crashed';
         return h('div', { class: 'agent-trouble', key: 'trouble', role: 'alert' },
-            h('div', null, h('b', null, a.status === 'crashed' ? a.name + ' crashed' : a.name + '’s last turn failed')),
+            h('div', null, h('b', null, a.status === 'stopped' ? a.name + ' is stopped' : a.status === 'crashed' ? a.name + ' crashed' : a.name + '’s last turn failed')),
             a.status_detail ? h('div', { class: 'band-msg' }, F.trunc(a.status_detail, 300)) : null,
             h('div', { class: 'band-actions' },
                 P.btn('Switch model', () => M.act.sheet({ kind: 'model', agent: a.id }), { sm: true, icon: 'model', key: 'm' }),
                 canRespawn ? P.btn('Respawn', () => M.act.cmd('respawn', { agent: a.id }, { busyKey: 'respawn' + a.id, ok: 'Respawning ' + a.name }), { sm: true, icon: 'respawn', busyKey: 'respawn' + a.id, key: 'r' }) : null,
-                !canRespawn ? h('span', { class: 'dim sm' }, 'Send a message to try again.') : null));
+                !canRespawn && a.status === 'stopped' ? P.btn('New Solo session', () => M.act.cmd('new_solo', {}).then((d) => d && M.act.nav('/agent/' + d.agent)), { sm: true, icon: 'plus' }) : !canRespawn ? h('span', { class: 'dim sm' }, 'Send a message to try again.') : null));
+    }
+
+    function swarmCard(a) {
+        const g = a.swarm;
+        if (!g) return null;
+        const go = (id) => M.act.nav('/agent/' + id);
+        const isOwner = g.owner === a.id;
+        const chars = (n) => n < 1000 ? String(n) : (n / 1024).toFixed(n < 10 * 1024 ? 1 : 0).replace(/\.0$/, '') + 'k';
+        const notes = g.notes || [];
+        return h('section', { class: 'swarm-card', key: 'swarm', 'aria-label': 'Akasha swarm ' + g.name },
+            h('div', { class: 'swarm-head' },
+                h('b', null, 'Akasha swarm · ', g.name),
+                isOwner ? h('span', { class: 'dim sm' }, 'Owner') : h('button', { type: 'button', class: 'link sm', onclick: () => go(g.owner) }, 'Parent: ', g.owner_name)),
+            h('div', { class: 'swarm-members' },
+                (g.children || []).map((child) => h('button', { type: 'button', class: 'swarm-member', key: child.id, onclick: () => go(child.id) },
+                    h('span', null, child.name), h('span', { class: 'dim sm' }, child.status))),
+                isOwner && h('span', { class: 'dim sm swarm-stop-hint' }, 'Stopping the owner ends this swarm.')),
+            h('details', { class: 'swarm-notes' },
+                h('summary', null, 'Shared notes · ', F.plural(notes.length, 'note'), ' · ', chars(g.notes_used || 0), '/', chars(g.notes_cap || 0)),
+                notes.length ? h('ol', { class: 'notes' }, notes.map((note, i) => h('li', { class: 'note' + (note.urgent ? ' urgent' : ''), key: i },
+                    h('div', { class: 'note-meta' }, note.urgent ? h('span', { class: 'mini-chip warn' }, 'urgent') : null, h('span', null, note.author)),
+                    h('div', { class: 'note-x' }, F.inline(note.text))))) : h('p', { class: 'sec-sub' }, 'No notes yet.')));
     }
 
     function agentScreen(id) {
@@ -451,6 +485,7 @@
         const trouble = troubleCard(a);
         return h('div', { class: 'agent-screen', key: 'agent' + a.id },
             header(a),
+            swarmCard(a),
             transcript(a),
             h('div', { class: 'agent-foot', key: 'foot' },
                 q || trouble || aps.length || (a.queued || []).length ? h('div', { class: 'foot-stack', key: 'stack' },

@@ -9,10 +9,12 @@ use crate::hub::{AgentId, Cmd, Hub, HubEvent, SpawnSpec};
 use crate::ui::input::{Act, Input};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+
+pub(crate) mod swarm;
 
 pub enum AppEvent {
     Term(Event),
@@ -96,7 +98,7 @@ pub enum Overlay {
     Runs { sel: usize, list: Vec<crate::engine::state::RunSummary>, confirm: bool, others: usize },
     /// The remote link's QR code, as large as the terminal allows (⏎ on the link in `/settings`).
     Qr,
-    /// `/akasha [group]`: the run's shared notes, every group's block or the one named.
+    /// `/akasha [group]`: shared run or scoped swarm notes, all groups or the one named.
     Akasha { scroll: usize, group: Option<String> },
 }
 
@@ -266,7 +268,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "show the run's plan"),
     ("/land", "merge the finished run into your branch"),
     ("/respawn", "respawn a run agent in place: /respawn [agent]"),
-    ("/akasha", "the run's shared notes: /akasha [group]"),
+    ("/akasha", "shared run / swarm notes: /akasha [group]"),
     ("/inbox", "approvals & alerts"),
     ("/pattern", "choose the pattern for new runs"),
     ("/studio", "pattern studio: roles, flow, architect"),
@@ -328,6 +330,10 @@ pub struct App {
     solo_children: HashMap<AgentId, AgentId>,
     /// Tool calls awaiting completion of a Solo subagent.
     solo_waiters: HashMap<AgentId, Vec<(AgentId, Value)>>,
+    pub(crate) swarms: HashMap<AgentId, swarm::SwarmGroup>,
+    swarm_owners: HashMap<AgentId, AgentId>,
+    swarm_waiters: HashMap<AgentId, Vec<Value>>,
+    swarm_deferred: HashSet<AgentId>,
     pub run: Option<Run>,
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
@@ -599,7 +605,7 @@ fn bija_writable_roots(sandbox: &str, extra: &[PathBuf], pattern: &[String], hom
 fn claude_strict_mcp(o: &AgentOpts) -> bool {
     !o.mcp.is_empty() || o.tools.iter().any(|t| {
         !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| {
-            tools::VISION_TOOLS.contains(&n) || n.starts_with("mantra_subagent_")
+            tools::VISION_TOOLS.contains(&n) || n.starts_with("mantra_subagent_") || n.starts_with("mantra_swarm_") || n.starts_with("mantra_akasha_")
         })
     })
 }
@@ -627,7 +633,12 @@ fn bija_spawn(reg: &Registry, m: &crate::config::ModelEntry, o: &AgentOpts, cw: 
     (spawn, key.into_iter().collect())
 }
 
-pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, o: AgentOpts) -> AgentId {
+pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, mut o: AgentOpts) -> AgentId {
+    // Resolve once, before building any backend's sandbox configuration. The original permission
+    // stays on the agent/spec so the UI and Claude's explicit sandbox opt-out remain accurate.
+    if o.approval == crate::config::BYPASS_SANDBOX_DANGER {
+        o.sandbox = "danger-full-access".into();
+    }
     let id = hub.alloc_id();
     let m = reg.resolve(&o.model_alias);
     let wanted = o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort).to_string();
@@ -719,6 +730,7 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.effort = effort.clone();
     a.ctx_window = Some(cw);
     a.approval = o.approval.clone();
+    a.sandbox = o.sandbox.clone();
     if lowered {
         // The clamp is right (the model has no such setting) — but say so once, or a role
         // configured for max quietly runs at high.
@@ -741,6 +753,12 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
 ///   an idle agent it behaves exactly like `Auto`/Enter.
 pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentId, text: String, echo: bool, mode: Send) {
     let Some(a) = agents.get_mut(&id) else { return };
+    // A process explicitly ended by the user cannot accept messages. Preserve its stop latch,
+    // including when a late orchestrator message arrives after the process was removed.
+    if matches!(a.status, Status::Stopped) {
+        a.notice(Level::Warn, "agent is stopped — respawn it or start a new Solo session");
+        return;
+    }
     // Any message — from the user, the orchestrator or the engine — ends a hand stop: talking to
     // an agent *is* telling it to carry on. Every send funnels through here, so this one line is
     // the whole lifecycle of the flag.
@@ -750,10 +768,6 @@ pub fn prompt_agent(hub: &Hub, agents: &mut BTreeMap<AgentId, Agent>, id: AgentI
     }
     a.follow = true;
     a.scroll = 0;
-    if matches!(a.status, Status::Stopped) {
-        a.notice(Level::Warn, "agent is stopped");
-        return;
-    }
     if mode == Send::Force && a.turn_active {
         let mut joined = std::mem::take(&mut a.queued);
         if !text.trim().is_empty() {
@@ -981,6 +995,10 @@ impl App {
             solo_mcp: vec![],
             solo_children: HashMap::new(),
             solo_waiters: HashMap::new(),
+            swarms: HashMap::new(),
+            swarm_owners: HashMap::new(),
+            swarm_waiters: HashMap::new(),
+            swarm_deferred: HashSet::new(),
             run: None,
             approvals: vec![],
             toast: None,
@@ -1061,6 +1079,7 @@ impl App {
 
     pub fn start_solo(&mut self) {
         if let Some(old) = self.solo.take() {
+            self.stop_swarm_children(old);
             self.stop_solo_children(old);
             self.hub.shutdown(old);
             self.agents.remove(&old);
@@ -1101,10 +1120,12 @@ impl App {
                 cwd: self.project.clone(),
                 approval: self.settings.approval_mode.clone(),
                 sandbox,
-                instructions: String::new(),
+                instructions: tools::SWARM_OWNER_PROTOCOL.into(),
                 // the vision tools when Solo's model takes images (`on_request` runs them)
                 tools: {
                     let mut t = tools::solo_tools();
+                    t.extend(tools::swarm_tools());
+                    t.extend(tools::akasha_tools());
                     if self.registry.vision(&chosen) { t.extend(tools::vision_tools()); }
                     t
                 },
@@ -1602,6 +1623,8 @@ impl App {
             self.toast("no active run to stop", Level::Info);
             return false;
         }
+        let owners = self.run.as_ref().map(|r| r.all_agents()).unwrap_or_default();
+        for owner in owners { self.stop_swarm_children(owner); }
         self.with_run(|r, c| r.stop(c));
         self.toast("run stopped — /run starts a new one; /runs still has this one", Level::Ok);
         true
@@ -1885,6 +1908,11 @@ impl App {
         self.settings.approval_mode = mode.to_string();
         self.save_settings();
         if let Some(s) = self.solo {
+            let live = self.agents.get(&s).map(|a| a.approval.as_str()).unwrap_or("");
+            if (mode == crate::config::BYPASS_SANDBOX_DANGER) != (live == crate::config::BYPASS_SANDBOX_DANGER) {
+                self.toast(format!("permission saved: {mode} · /new applies the sandbox change; this session keeps {live}"), Level::Warn);
+                return;
+            }
             self.hub.send(s, Cmd::SetApproval(mode.to_string()));
             if let Some(a) = self.agents.get_mut(&s) {
                 a.approval = mode.to_string();
@@ -1892,11 +1920,12 @@ impl App {
         }
         let label = match mode {
             "never" => "never ask",
+            crate::config::BYPASS_SANDBOX_DANGER => "BYPASS-SANDBOX-DANGER · no sandbox, never ask",
             "untrusted" => "ask for anything untrusted",
             _ => "ask when needed",
         };
         let pending = self.approvals.len();
-        if mode == "never" && pending > 0 {
+        if crate::config::approval_policy(mode) == "never" && pending > 0 {
             self.auto_approve_pending();
             self.toast(format!("approvals: {label} — {pending} waiting request(s) approved"), Level::Info);
         } else {
@@ -1923,6 +1952,9 @@ impl App {
         let mut s = self.settings.clone();
         s.set_field(key, value)?;
         self.apply_settings(s)?;
+        if key == "approval_mode" && self.solo.and_then(|id| self.agents.get(&id)).is_some_and(|a| a.approval != self.settings.approval_mode) {
+            return Ok("Solo's next session (/new) uses it; this session keeps its current permission");
+        }
         Ok(if applied_live(key) { "" } else { crate::settings_ops::takes_effect(key) })
     }
 
@@ -2192,6 +2224,17 @@ impl App {
     }
 
     fn on_hub(&mut self, ev: HubEvent) {
+        let id = match &ev {
+            HubEvent::Ready { agent, .. } | HubEvent::Notif { agent, .. }
+            | HubEvent::Request { agent, .. } | HubEvent::CmdFailed { agent, .. }
+            | HubEvent::Crashed { agent, .. } | HubEvent::Exited { agent }
+            | HubEvent::BridgeConn { agent, .. } => *agent,
+        };
+        // Shutdown races messages already in the event queue. They must not turn a deliberately
+        // ended process back into a busy/restarting card or execute a late tool request.
+        if !self.hub.has_agent(id) && self.agents.get(&id).is_some_and(|a| a.stopped_by_user && a.status == Status::Stopped) {
+            return;
+        }
         match ev {
             HubEvent::Ready { agent, thread_id, model, resumed } => {
                 let mut was_busy = false;
@@ -2298,6 +2341,8 @@ impl App {
                     }
                     if self.solo_children.contains_key(&agent) {
                         self.on_turn_done(agent, "failed", Some(error), Some(crate::agent::ErrKind::Transient));
+                    } else if self.swarm_owners.contains_key(&agent) {
+                        self.swarm_child_ended(agent, "failed", Some(&error));
                     }
                 }
                 "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
@@ -2343,6 +2388,9 @@ impl App {
                 if self.solo_children.contains_key(&agent) && !(restarting && attempt == 0) {
                     self.fail_solo_waiters(agent, &format!("Subagent {agent} crashed: {reason}"));
                 }
+                if self.swarm_owners.contains_key(&agent) && !restarting {
+                    self.swarm_child_ended(agent, "crashed", Some(&reason));
+                }
                 if Some(agent) == self.solo && !restarting {
                     self.toast(format!("Solo agent is down: {} — /new to retry (full error in the log)", crate::util::trunc(&reason, 160)), Level::Error);
                 }
@@ -2354,6 +2402,9 @@ impl App {
                 }
                 if self.solo_children.contains_key(&agent) {
                     self.fail_solo_waiters(agent, &format!("Subagent {agent} exited."));
+                }
+                if self.swarm_owners.contains_key(&agent) {
+                    self.swarm_child_ended(agent, "exited", None);
                 }
             }
             HubEvent::BridgeConn { agent, stream } => {
@@ -2380,9 +2431,23 @@ impl App {
             return;
         }
         if self.in_run(agent) {
+            // A worker's workspace can be merged immediately after its final turn. Hold that
+            // completion while delegated members write; wake the owner to review all results.
+            let short_lived = self.run.as_ref().and_then(|r| r.role_name_of(agent).and_then(|n| r.pattern.role(&n).map(|role| role.kind == "worker" || role.kind == "gate"))).unwrap_or(false);
+            if short_lived && status == "completed" && self.swarm_pending(agent) {
+                self.swarm_deferred.insert(agent);
+                if let Some(a) = self.agents.get_mut(&agent) { a.swarm_waiting = true; a.activity = "waiting for Akasha swarm".into(); }
+                return;
+            }
+            if short_lived && self.swarms.contains_key(&agent) { self.stop_swarm_children(agent); }
             let st = status.to_string();
             self.with_run(|r, c| r.on_turn_done(c, agent, &st, error.clone(), kind));
+            if self.run.as_ref().is_some_and(|r| !r.is_active()) {
+                let owners = self.run.as_ref().map(|r| r.all_agents()).unwrap_or_default();
+                for owner in owners { self.stop_swarm_children(owner); }
+            }
         }
+        self.swarm_child_ended(agent, status, error.as_deref());
         if self.solo_children.contains_key(&agent) {
             if let Some(waiters) = self.solo_waiters.remove(&agent) {
                 let answer = self.solo_child_answer(agent, status, error.as_deref());
@@ -2458,10 +2523,11 @@ impl App {
                     let model = self.registry.resolve(alias);
                     let backend = self.registry.backend_of(&model);
                     let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
+                    let approval = self.agents.get(&parent).map(|a| a.approval.clone()).unwrap_or_else(|| self.settings.approval_mode.clone());
                     let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
                         name: format!("solo subagent · {alias}"), role: "solo-subagent".into(), glyph: "◇".into(), color: "blue".into(),
                         model_alias: alias.to_string(), effort: args.get("effort").and_then(Value::as_str).map(str::to_string), cwd: self.project.clone(),
-                        approval: self.settings.approval_mode.clone(), sandbox: role_sandbox(&self.settings.sandbox, backend),
+                        approval, sandbox: role_sandbox(&self.settings.sandbox, backend),
                         instructions: "You are an independent subagent working for a Solo session. Complete the assigned task, keep changes within the user's project, and return a concise result.".into(),
                         tools: if model.vision { tools::vision_tools() } else { vec![] }, extra_writable: vec![], network: true, writable_roots: vec![],
                         context_override: None, resume_thread: None, thread_name: None, mcp,
@@ -2529,7 +2595,11 @@ impl App {
             "item/tool/call" => {
                 let tool = params.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                if Some(agent) == self.solo && self.solo_tool_call(agent, id.clone(), &tool, &args) {
+                if tool == "mantra_gate_report" && self.swarm_pending(agent) {
+                    self.respond_tool_text(agent, id, "Wait for all Akasha swarm members with mantra_swarm_wait, review their work, then report the gate verdict.", false);
+                } else if self.swarm_tool_call(agent, id.clone(), &tool, &args) {
+                    // A group tool is always checked against its owner, including stale calls.
+                } else if Some(agent) == self.solo && self.solo_tool_call(agent, id.clone(), &tool, &args) {
                     // `mantra_subagent_wait` may keep this request open until the child finishes.
                 } else if Some(agent) == self.studio.architect {
                     let (text, ok) = self.architect_tool(&tool, &args);
@@ -2587,7 +2657,7 @@ impl App {
                 // mode can still ask — honour the *agent's own* approval policy here (not the
                 // global Solo mode), so a Mandala role set to "never" auto-resolves even while
                 // Solo's mode is something else, and vice versa.
-                if self.agents.get(&agent).map(|a| a.approval == "never").unwrap_or(false) {
+                if self.agents.get(&agent).map(|a| crate::config::approval_policy(&a.approval) == "never").unwrap_or(false) {
                     self.auto_approve_pending();
                     self.toast = self.toast.take().filter(|t| !t.0.contains("needs approval"));
                     self.notes.retain(|n| !n.contains("needs approval"));
@@ -3105,17 +3175,29 @@ impl App {
         options.into_iter().filter(|(o, _)| o.starts_with(arg) && o != arg).map(|(o, about)| Suggestion { text: format!("{cmd} {o}"), label: o, about }).collect()
     }
 
-    /// The run's Akasha groups: name, then how many notes and who shares them.
+    /// Reserve the swarm key namespace without taking an existing run group's notes away.
+    pub(crate) fn akasha_run_key(name: &str) -> String {
+        if name.starts_with("swarm:") || name.starts_with("run:") { format!("run:{name}") } else { name.to_string() }
+    }
+
+    /// Run groups keep ordinary names; scoped swarms use a key distinct from their friendly name.
     pub fn akasha_choices(&self) -> Vec<Choice> {
-        let Some(r) = &self.run else { return vec![] };
-        r.akasha
-            .values()
-            .map(|b| {
+        let mut choices: Vec<Choice> = self.run.iter().flat_map(|r| {
+            r.akasha.values().map(|b| {
                 let roles = r.pattern.groups.iter().find(|g| g.name == b.group).map(|g| g.roles.join(", ")).unwrap_or_default();
                 let n = b.entries.len();
-                Choice { key: b.group.clone(), label: b.group.clone(), detail: format!("{n} note{} · {roles}", if n == 1 { "" } else { "s" }), on: false }
+                let key = Self::akasha_run_key(&b.group);
+                Choice { key: key.clone(), label: key, detail: format!("{n} note{} · {roles}", if n == 1 { "" } else { "s" }), on: false }
             })
-            .collect()
+        }).collect();
+        let mut swarms: Vec<_> = self.swarms.values().collect();
+        swarms.sort_by_key(|s| s.owner);
+        choices.extend(swarms.into_iter().map(|s| {
+            let key = format!("swarm:{}", s.owner);
+            let owner = self.agents.get(&s.owner).map(|a| a.name.as_str()).unwrap_or("closed owner");
+            Choice { key: key.clone(), label: key, detail: format!("{} · {owner} · {} agents · {} notes", s.name, s.children.len(), s.notes.entries.len()), on: false }
+        }));
+        choices
     }
 
     /// The run's agents as the stage shows them (card order): name, then role and model.
@@ -3199,6 +3281,44 @@ impl App {
         ag.queued.clear();
         ag.notice(Level::Warn, "stopped by you — type to continue, or r to respawn");
         self.hub.send(a, Cmd::Interrupt);
+        true
+    }
+
+    /// End the actual process, not just its current turn. Keep the transcript and make the
+    /// user-stop latch outlive late notifications and queued engine retries.
+    pub(crate) fn stop_agent_by_user(&mut self, id: AgentId) -> bool {
+        if !self.hub.has_agent(id) {
+            return false;
+        }
+        self.stop_swarm_children(id);
+        let children: Vec<_> = self.solo_children.iter().filter_map(|(child, parent)| (*parent == id).then_some(*child)).collect();
+        for child in children {
+            self.stop_agent_by_user(child);
+        }
+        self.fail_solo_waiters(id, &format!("Subagent {id} was stopped by you."));
+        self.approvals.retain(|a| a.agent != id);
+        self.hub.shutdown(id);
+        if let Some(a) = self.agents.get_mut(&id) {
+            a.stopped_by_user = true;
+            a.queued.clear();
+            a.status = Status::Stopped;
+            a.turn_active = false;
+            a.awaiting_start = false;
+            a.turn_wait_since = None;
+            a.compacting = false;
+            a.compact_pending = false;
+            a.finished.get_or_insert(Instant::now());
+            a.activity = "stopped by you".into();
+            a.notice(Level::Warn, "process stopped by you — respawn it or start a new Solo session");
+        }
+        if self.in_run(id) {
+            if let Some(run) = self.run.as_mut() {
+                run.agent_stopped_by_user(id);
+            }
+        }
+        if self.swarm_owners.contains_key(&id) {
+            self.swarm_child_ended(id, "stopped", None);
+        }
         true
     }
 
@@ -3419,15 +3539,21 @@ impl App {
     }
 
     /// `/akasha [group]`: the notes of the group named; with none, the only group straight away,
-    /// or a selector of the groups there are — and a toast when there is nothing to show (no run,
-    /// a run without groups: Akasha off or a pattern with none, a group it does not have).
+    /// or a selector of run and scoped swarm groups — and a toast when there is nothing to show.
     pub fn open_akasha(&mut self, group: &str) {
         let groups = self.akasha_choices();
+        // Older run groups with a reserved-looking name still open by that name when it is
+        // unambiguous; selectors and completions always use their explicit key.
+        let run_alias = (!groups.iter().any(|g| g.key == group))
+            .then(|| self.run.as_ref().and_then(|r| r.akasha.get(group)).map(|b| Self::akasha_run_key(&b.group)))
+            .flatten();
+        let group = run_alias.as_deref().unwrap_or(group);
         if groups.is_empty() {
             self.toast("no akasha groups in this run", Level::Info);
         } else if !group.is_empty() && !groups.iter().any(|g| g.key == group) {
             let have: Vec<String> = groups.into_iter().map(|g| g.key).collect();
-            self.toast(format!("no akasha group '{group}' in this run (it has: {})", have.join(", ")), Level::Info);
+            let scope = if self.swarms.is_empty() { "this run" } else { "this session" };
+            self.toast(format!("no akasha group '{group}' in {scope} (it has: {})", have.join(", ")), Level::Info);
         } else if !group.is_empty() || groups.len() == 1 {
             let group = if group.is_empty() { groups[0].key.clone() } else { group.to_string() };
             self.overlays.push(Overlay::Akasha { scroll: 0, group: Some(group) });
@@ -3886,6 +4012,78 @@ mod tests {
             }
             other => panic!("expected child result response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn bypass_permission_requires_a_new_session_and_children_inherit_the_live_permission() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.start_solo();
+            let first = app.solo.unwrap();
+            let original = app.agents[&first].approval.clone();
+            let note = app.set_setting("approval_mode", crate::config::BYPASS_SANDBOX_DANGER).unwrap();
+            assert!(note.contains("/new"));
+            assert_eq!(app.agents[&first].approval, original, "saving a setting cannot unsandbox a running process");
+            app.start_solo();
+            let parent = app.solo.unwrap();
+            assert_eq!(app.agents[&parent].approval, crate::config::BYPASS_SANDBOX_DANGER);
+            assert!(app.set_setting("approval_mode", "on-request").unwrap().contains("/new"));
+            assert_eq!(app.agents[&parent].approval, crate::config::BYPASS_SANDBOX_DANGER, "leaving bypass also requires a fresh sandbox");
+            let alias = app.settings.default_model.clone();
+            assert!(app.solo_tool_call(parent, json!("spawn"), "mantra_subagent_start", &json!({"task": "check", "model": alias})));
+            let child = *app.solo_children.keys().next().unwrap();
+            assert_eq!(app.agents[&child].approval, crate::config::BYPASS_SANDBOX_DANGER, "a child inherits the running parent's choice, not a pending /new change");
+            app.start_solo();
+            assert_eq!(app.agents[&app.solo.unwrap()].approval, "on-request");
+            assert!(app.solo_children.is_empty());
+        });
+    }
+
+    /// Exercise the actual Codex JSON-RPC wire, including a resumed pattern agent. Never-ask
+    /// alone keeps its sandbox; the explicit bypass changes both settings before thread creation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_bypass_reaches_start_and_resume_without_changing_ordinary_never() {
+        let dir = std::env::temp_dir().join(format!("mantra-bypass-wire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("requests.jsonl");
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id";;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' "$line" > "$1"; printf '{"id":%s,"result":{"thread":{"id":"test-thread"},"model":"test"}}\n' "$id";;
+  esac
+done"#;
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hub = Hub::new(vec!["sh".into(), "-c".into(), script.into(), "test".into(), log.to_string_lossy().into_owned()], vec![], vec![], ev_tx, false);
+        let mut agents = BTreeMap::new();
+        let mut reg = Registry::defaults();
+        reg.add_codex_model("test-codex", "test").unwrap();
+        for (permission, resume) in [("never", false), (crate::config::BYPASS_SANDBOX_DANGER, false), (crate::config::BYPASS_SANDBOX_DANGER, true)] {
+            let id = spawn_agent(&mut hub, &mut agents, &reg, AgentOpts {
+                name: "test".into(), role: "worker".into(), glyph: "◇".into(), color: "teal".into(),
+                model_alias: "test-codex".into(), effort: None, cwd: dir.clone(),
+                approval: permission.into(), sandbox: "read-only".into(), instructions: String::new(), tools: vec![],
+                extra_writable: vec![], context_override: None, resume_thread: resume.then(|| "test-thread".into()),
+                thread_name: None, network: false, writable_roots: vec![], mcp: vec![],
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match ev_rx.recv().await.expect("hub alive") {
+                        HubEvent::Ready { agent, .. } if agent == id => break,
+                        HubEvent::Crashed { agent, reason, .. } if agent == id => panic!("Codex wire mock failed: {reason}"),
+                        _ => {}
+                    }
+                }
+            }).await.expect("Codex handshake completes");
+            let req: Value = serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+            assert_eq!(req["method"], if resume { "thread/resume" } else { "thread/start" });
+            assert_eq!(req["params"]["approvalPolicy"], "never");
+            assert_eq!(req["params"]["sandbox"], if permission == "never" { "read-only" } else { "danger-full-access" });
+            assert_eq!(agents[&id].approval, permission);
+            hub.shutdown(id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The agent list shows what an agent really runs at: an `auto` effort that reaches the spawn is

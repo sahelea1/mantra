@@ -23,7 +23,8 @@ pub struct Role {
     /// read-only | workspace-write
     pub sandbox: String,
     /// Codex approval policy for agents of this role: "never" (default — never asks; requests
-    /// land in the inbox only if a tool forces the question), "on-request", or "untrusted".
+    /// land in the inbox only if a tool forces the question), "on-request", "untrusted", or
+    /// "BYPASS-SANDBOX-DANGER" (never asks AND overrides this role's sandbox).
     pub permission: String,
     pub description: String,
     pub instructions: String,
@@ -43,6 +44,9 @@ pub struct Role {
     /// crowding the big and small workers out of their slots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel: Option<usize>,
+    /// Whether this role may spawn a temporary Akasha swarm in Solo. Disabled by default.
+    #[serde(default)]
+    pub can_spawn_swarm: bool,
 }
 
 impl Default for Role {
@@ -61,6 +65,7 @@ impl Default for Role {
             max_tokens: None,
             fallback: None,
             parallel: None,
+            can_spawn_swarm: false,
         }
     }
 }
@@ -84,7 +89,7 @@ pub fn auto_effort(kind: &str, role_name: &str, finale: bool) -> &'static str {
 }
 
 /// Values `Role.permission` may take.
-pub const PERMISSIONS: &[&str] = &["never", "on-request", "untrusted"];
+pub const PERMISSIONS: &[&str] = &["never", "on-request", "untrusted", crate::config::BYPASS_SANDBOX_DANGER];
 
 /// Values `Group.push` may take: which new notes reach a group's busy members mid-turn.
 pub const PUSH_MODES: &[&str] = &["none", "urgent", "all"];
@@ -1143,6 +1148,11 @@ mod tests {
         }
         let mut bad = Pattern::builtin();
         let name = bad.worker_roles()[0].clone();
+        bad.roles.get_mut(&name).unwrap().permission = crate::config::BYPASS_SANDBOX_DANGER.into();
+        assert!(bad.validate().is_ok());
+        let restored = Pattern::from_toml(&bad.to_toml()).unwrap();
+        assert_eq!(restored.roles[&name].permission, crate::config::BYPASS_SANDBOX_DANGER);
+        assert_eq!(restored.roles[&name].sandbox, bad.roles[&name].sandbox, "permission is separate from the sandbox field");
         bad.roles.get_mut(&name).unwrap().permission = "sometimes".into();
         let errs = bad.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("permission") && e.contains("sometimes")), "{errs:?}");

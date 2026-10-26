@@ -111,6 +111,9 @@ pub fn spawn(cmd: &[String], extra_args: &[String], cwd: &std::path::Path, envs:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Each backend owns a group; the hub can end wrapper/tool descendants on shutdown too.
+    #[cfg(unix)]
+    c.process_group(0);
     let mut child = c.spawn().map_err(|e| anyhow!("failed to start `{}`: {e}", cmd.join(" ")))?;
     let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;

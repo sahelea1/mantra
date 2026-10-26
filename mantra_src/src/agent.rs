@@ -162,6 +162,10 @@ pub struct Agent {
     /// Codex approval policy this agent was spawned with ("never" | "on-request" | "untrusted").
     /// Drives auto-approval independently of the global Solo mode (`Settings.approval_mode`).
     pub approval: String,
+    /// Effective sandbox selected when this process was spawned; delegation inherits it.
+    pub sandbox: String,
+    /// A Mantra swarm member is doing work for this agent; idle time here is intentional.
+    pub swarm_waiting: bool,
     pub thread_id: Option<String>,
     pub status: Status,
     pub items: Vec<Item>,
@@ -236,6 +240,8 @@ impl Agent {
             effort: "medium".into(),
             cwd,
             approval: "never".into(),
+            sandbox: "workspace-write".into(),
+            swarm_waiting: false,
             thread_id: None,
             status: Status::Starting,
             items: vec![],
@@ -292,7 +298,7 @@ impl Agent {
     /// activity) — `None` when there is no such turn, or when silence is expected: a hand stop,
     /// an approval being waited on, a compaction.
     pub fn first_token_wait(&self) -> Option<Duration> {
-        if !self.busy() || self.stopped_by_user || self.compacting || self.status == Status::Waiting {
+        if !self.busy() || self.stopped_by_user || self.compacting || self.status == Status::Waiting || self.swarm_waiting {
             return None;
         }
         self.turn_wait_since.map(|t| t.elapsed())

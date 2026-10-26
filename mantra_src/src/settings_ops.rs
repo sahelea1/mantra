@@ -11,7 +11,7 @@ pub const SECTION_FEATURES: &str = "Features";
 pub const SECTION_WEB: &str = "Web & remote";
 pub const SECTION_APPEARANCE: &str = "Appearance";
 
-pub const APPROVAL_MODES: &[&str] = &["untrusted", "on-request", "never"];
+pub const APPROVAL_MODES: &[&str] = &["untrusted", "on-request", "never", crate::config::BYPASS_SANDBOX_DANGER];
 pub const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
 const GLYPHS: &[&str] = &["auto", "unicode", "ascii"];
 const COLORS: &[&str] = &["auto", "truecolor", "256", "16"];
@@ -93,7 +93,7 @@ impl Settings {
         };
         let mut out = vec![
             f(SECTION_SOLO, "default_model", "Model", aliases, self.default_model.clone(), "The model a new Solo session starts on (ctrl+k switches the live one)."),
-            f(SECTION_SOLO, "approval_mode", "Approvals", options(APPROVAL_MODES), self.approval_mode.clone(), "When Solo asks before a command or an edit: untrusted asks most, never not at all (shift+tab cycles)."),
+            f(SECTION_SOLO, "approval_mode", "Approvals", options(APPROVAL_MODES), self.approval_mode.clone(), "never skips prompts but keeps the Sandbox setting. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox; entering or leaving it needs /new. Shift+tab cycles the ordinary approval modes."),
             f(SECTION_SOLO, "sandbox", "Sandbox", options(SANDBOXES), self.sandbox.clone(), "What Solo's commands may touch: read-only, the project (workspace-write), or everything."),
             f(SECTION_SOLO, "solo_mcp", "MCP servers", FieldKind::Enum(servers), solo_mcp, "Which MCP servers Solo agents get: all enabled ones, none, or the ones named."),
             f(SECTION_RUNS, "default_pattern", "Pattern", FieldKind::Enum(patterns.to_vec()), self.default_pattern.clone(), "The pattern new runs use: its roles, models and flow (/studio edits them)."),

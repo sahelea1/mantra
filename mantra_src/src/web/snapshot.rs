@@ -106,6 +106,9 @@ pub struct PatternRoleView {
     /// "codex" | "claude-code"
     pub backend: String,
     pub sandbox: String,
+    /// Whether this role may spawn a temporary Akasha swarm in Solo.
+    #[serde(default)]
+    pub can_spawn_swarm: bool,
     /// Model alias used when this role's model gives no first token in time (`Role.fallback`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
@@ -274,6 +277,35 @@ pub struct AgentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub cwd: String,
+    /// The temporary Akasha swarm this agent owns or belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm: Option<SwarmView>,
+}
+
+/// Live Solo swarm metadata and its bounded shared Akasha notebook.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SwarmView {
+    pub owner: u32,
+    pub owner_name: String,
+    pub name: String,
+    pub children: Vec<SwarmChildView>,
+    pub notes: Vec<SwarmNoteView>,
+    pub notes_used: usize,
+    pub notes_cap: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SwarmChildView {
+    pub id: u32,
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SwarmNoteView {
+    pub author: String,
+    pub text: String,
+    pub urgent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -889,7 +921,29 @@ fn agent_view_with(app: &App, a: &Agent, facts: &RunFacts) -> AgentView {
         items_total: a.items_total_ord(),
         thread_id: a.thread_id.clone(),
         cwd: a.cwd.to_string_lossy().to_string(),
+        swarm: swarm_view(app, a.id),
     }
+}
+
+fn swarm_view(app: &App, agent_id: crate::hub::AgentId) -> Option<SwarmView> {
+    let group = app.swarms.get(&agent_id).or_else(|| app.swarms.values().find(|g| g.children.contains(&agent_id)))?;
+    let children = group.children.iter().filter_map(|id| app.agents.get(id).map(|child| {
+        let (status, _) = status_str(&child.status);
+        SwarmChildView { id: *id, name: child.name.clone(), status: status.into() }
+    })).collect();
+    let notes = group.notes.entries.iter().map(|entry| SwarmNoteView {
+        author: entry.author.clone(), text: entry.text.clone(), urgent: entry.urgent,
+    }).collect();
+    let owner_name = app.agents.get(&group.owner).map(|owner| owner.name.clone()).unwrap_or_else(|| format!("Agent {}", group.owner));
+    Some(SwarmView {
+        owner: group.owner,
+        owner_name,
+        name: group.name.clone(),
+        children,
+        notes,
+        notes_used: group.notes.chars(),
+        notes_cap: group.notes.cap,
+    })
 }
 
 fn stage_view(s: &Stage) -> StageView {
@@ -1165,6 +1219,7 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 model_alias: role.model,
                 effort: role.effort,
                 sandbox: role.sandbox,
+                can_spawn_swarm: role.can_spawn_swarm,
                 fallback: role.fallback,
             })
             .collect(),
@@ -1742,6 +1797,7 @@ pub(crate) mod tests {
         app.pattern_name = "my-split".into();
         app.project = dir.clone();
         own.roles.get_mut("planner").unwrap().fallback = Some("backup".into());
+        own.roles.get_mut("planner").unwrap().can_spawn_swarm = true;
         std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
         let info = app_info(&app, &Env::default(), &pattern_list(&dir));
         assert_eq!(info.patterns.len(), info.pattern_list.len());
@@ -1749,7 +1805,9 @@ pub(crate) mod tests {
         let roles = json["pattern_roles"].as_array().unwrap();
         let planner = roles.iter().find(|r| r["name"] == "planner").unwrap();
         assert_eq!(planner["fallback"], "backup");
+        assert_eq!(planner["can_spawn_swarm"], true);
         assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r.get("fallback").is_none()));
+        assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r["can_spawn_swarm"] == false), "the default role snapshot opts out");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

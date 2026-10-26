@@ -130,6 +130,12 @@ pub enum Command {
     Interrupt {
         agent: u32,
     },
+    /// End the agent process (and Solo children), retaining its transcript.
+    AgentStop {
+        agent: u32,
+    },
+    /// Close this Mantra instance through the normal, graceful quit path.
+    AppShutdown,
     Respawn {
         agent: u32,
     },
@@ -575,6 +581,8 @@ mod tests {
             Command::PlanApprove,
             Command::PauseResume,
             Command::Interrupt { agent: 2 },
+            Command::AgentStop { agent: 2 },
+            Command::AppShutdown,
             Command::Respawn { agent: 2 },
             Command::Compact { agent: 2 },
             Command::SetModel { agent: 2, alias: "sol".into() },

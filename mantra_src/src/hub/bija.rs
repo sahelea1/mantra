@@ -142,10 +142,13 @@ pub(super) async fn run_bija_process(
         command.env(k, v);
     }
     crate::mlog!("bija {id}: spawn {prog} {}", args.join(" "));
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Exit::LaunchFailed(format!("failed to start `{}`: {e}", bija_cmd.join(" "))),
     };
+    let _group = super::ProcessGroup::new(child.id());
     let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill().await;
         return Exit::LaunchFailed("bija: missing stdio pipes".into());

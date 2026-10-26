@@ -75,6 +75,14 @@ pub fn log_path() -> PathBuf {
     home().join("logs").join("mantra.log")
 }
 
+/// Explicit opt-in: bypass both approval prompts and the backend's sandbox.
+/// This is a permission, separate from the existing sandbox/full-access setting.
+pub const BYPASS_SANDBOX_DANGER: &str = "BYPASS-SANDBOX-DANGER";
+
+pub fn approval_policy(permission: &str) -> &str {
+    if permission == BYPASS_SANDBOX_DANGER { "never" } else { permission }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -89,7 +97,7 @@ pub struct Settings {
     pub bija_command: Vec<String>,
     /// Model alias used by Solo mode.
     pub default_model: String,
-    /// Approval mode for Solo: "untrusted" | "on-request" | "never".
+    /// Approval mode for Solo: "untrusted" | "on-request" | "never" | "BYPASS-SANDBOX-DANGER".
     pub approval_mode: String,
     /// Sandbox for Solo: "read-only" | "workspace-write" | "danger-full-access".
     pub sandbox: String,

@@ -71,7 +71,8 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     if empty && zoom.is_none() {
         welcome(f, body[1], app);
     } else if let Some(a) = id.and_then(|a| app.agents.get_mut(&a)) {
-        let footer: Vec<Line<'static>> = solo_busy_line(a).into_iter().collect();
+        let status = if zoom.is_some() { busy_line(a) } else { solo_busy_line(a, body[1].width.saturating_sub(4) as usize) };
+        let footer: Vec<Line<'static>> = status.into_iter().collect();
         convo::draw(f, body[1], a, verbose, footer);
     }
     if show_side {
@@ -100,8 +101,9 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let hints: Vec<(&str, &str)> = if zoom.is_some() {
         vec![("⏎", "queue"), ("ctrl+f", "send now"), ("ctrl+c", "interrupt"), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("esc", "▸ overview")]
     } else {
-        let mode = app.settings.approval_mode.clone();
-        let m: &'static str = match mode.as_str() {
+        let mode = id.and_then(|a| app.agents.get(&a)).map(|a| a.approval.as_str()).unwrap_or(&app.settings.approval_mode);
+        let m: &'static str = match mode {
+            "BYPASS-SANDBOX-DANGER" => "BYPASS-SANDBOX-DANGER",
             "never" => "approvals: never ask",
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
@@ -111,20 +113,14 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     footer(f, rows[5], &hints);
 }
 
-/// Solo's thinking indicator uses a slow, low contrast pulse and a stable label. The shared
-/// shimmer is useful in dense run views, but this quieter rhythm reads better below a one-agent
-/// conversation and avoids making every character appear to animate.
-fn solo_busy_line(a: &Agent) -> Option<Line<'static>> {
-    if !(a.busy() || a.compacting) {
+/// Keep the text still while a small spark moves beside it. Actual activity and silence warnings
+/// take priority over bookkeeping on narrow terminals; the stage/zoom keep their own animation.
+fn solo_busy_line(a: &Agent, width: usize) -> Option<Line<'static>> {
+    if matches!(a.status, Status::Retrying(_) | Status::Starting) || !(a.busy() || a.compacting) {
         return busy_line(a);
     }
     let elapsed = a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default();
     let col = theme::named(&a.color);
-    let pulse = anim::breath(2600);
-    let icon = Span::styled(
-        format!("{} ", theme::g("✦", "*")),
-        Style::default().fg(theme::mix(theme::FAINT, col, 0.25 + 0.55 * pulse)).add_modifier(Modifier::BOLD),
-    );
     let label = if a.compacting {
         "Compacting context…"
     } else {
@@ -132,15 +128,75 @@ fn solo_busy_line(a: &Agent) -> Option<Line<'static>> {
             "thinking" => "Thinking…",
             "writing" => "Writing…",
             "starting turn" => "Starting…",
-            _ => "Working…",
+            "" => "Working…",
+            other => other,
         }
     };
-    let mut spans = vec![icon, Span::styled(label, theme::text())];
-    spans.push(Span::styled(format!("  {elapsed} · {} tok · {} · ctrl+c to interrupt", fmt_tokens(a.tokens_total), a.effort), theme::faint()));
-    if let Some(q) = super::quiet_for(a) {
-        spans.push(Span::styled(format!(" · quiet {}", fmt_dur(q)), theme::fg(theme::AMBER)));
-    }
+    let quiet = super::quiet_for(a).map(|q| format!(" · quiet {}", fmt_dur(q))).unwrap_or_default();
+    let icon_width = if width >= 32 { 6 } else { 2 };
+    let available = width.saturating_sub(icon_width + w_of(&quiet));
+    let details = [
+        format!("  {elapsed} · {} tok · {} · ctrl+c to interrupt", fmt_tokens(a.tokens_total), a.effort),
+        format!("  {elapsed} · {} tok", fmt_tokens(a.tokens_total)),
+        format!("  {elapsed}"),
+        String::new(),
+    ]
+    .into_iter()
+    .find(|s| w_of(s) + w_of(label).min(24) <= available)
+    .unwrap_or_default();
+    let label = trunc(label, available.saturating_sub(w_of(&details)));
+    let mut spans = if icon_width == 6 { anim::spark(col) } else { vec![Span::styled(theme::g("✦", "*"), theme::fg(col))] };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(label, theme::text()));
+    spans.push(Span::styled(details, theme::faint()));
+    spans.push(Span::styled(trunc(&quiet, width.saturating_sub(icon_width)), theme::fg(theme::AMBER)));
     Some(Line::from(spans))
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn working() -> Agent {
+        let mut a = Agent::new(1, "solo", "solo", PathBuf::from("."));
+        a.status = Status::Busy;
+        a.turn_active = true;
+        a.turn_started = Some(Instant::now());
+        a
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn solo_preserves_live_reasoning_and_tool_activity() {
+        let mut a = working();
+        for activity in ["thinking · 9.4k", "$ cargo test", "editing src/main.rs"] {
+            a.activity = activity.into();
+            assert!(text(&solo_busy_line(&a, 100).unwrap()).contains(activity));
+        }
+        a.status = Status::Retrying("rate limited".into());
+        assert!(text(&solo_busy_line(&a, 100).unwrap()).contains("rate limited"));
+        a.status = Status::Starting;
+        assert!(text(&solo_busy_line(&a, 100).unwrap()).contains("starting agent"));
+    }
+
+    #[test]
+    fn narrow_solo_keeps_silence_visible_without_overflow() {
+        let mut a = working();
+        a.activity = "$ a command whose very long name would otherwise hide the silence warning".into();
+        a.last_event = Instant::now() - Duration::from_secs(90);
+        for width in [20, 32, 48, 80, 120] {
+            let line = solo_busy_line(&a, width).unwrap();
+            assert!(line.width() <= width, "status overflows {width}: {}", text(&line));
+            assert!(text(&line).contains("quiet"), "silence warning lost at {width}");
+        }
+        a.compacting = true;
+        assert!(text(&solo_busy_line(&a, 100).unwrap()).contains("Compacting context"));
+    }
 }
 
 /// Zoomed-in header: a solid band tinted with the agent's role colour so the two views — overview
@@ -222,7 +278,7 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(m.alias.clone(), theme::bold(theme::text())),
             Span::styled(format!(" ({}) ", m.model), theme::dim()),
             Span::styled(eff.clone(), theme::fg(effort_color(&eff))),
-            Span::styled(format!("   approvals  {}", app.settings.approval_mode), theme::faint()),
+            Span::styled(format!("   approvals  {}", app.solo.and_then(|id| app.agents.get(&id)).map(|a| a.approval.as_str()).unwrap_or(&app.settings.approval_mode)), theme::faint()),
         ]),
         Line::from(Span::styled(format!("     project {}{}", home_rel(&app.project), if app.branch.is_empty() { String::new() } else { format!("  {} {}", theme::g("⎇", "@"), app.branch) }), theme::faint())),
         Line::default(),

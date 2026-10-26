@@ -56,6 +56,35 @@ pub fn solo_tools() -> Vec<Value> {
     ]
 }
 
+/// Bounded Akasha delegation for Solo and roles explicitly enabled in a pattern.
+pub fn swarm_tools() -> Vec<Value> {
+    vec![
+        tool("mantra_swarm_start", "Start up to eight independent agents sharing one Akasha notebook. Validate all tasks before starting. Models are configured /models aliases; omit model to use your own. Each task needs a concrete, independent goal.", json!({
+            "tasks": {"type": "array", "items": {"type": "object", "properties": {
+                "task": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}
+            }, "required": ["task"]}},
+            "shared_chars": {"type": "integer", "description": "Akasha notebook capacity, 1024..16384 characters (default 8192)"}
+        }), &["tasks"]),
+        tool("mantra_swarm_status", "List your swarm members, their progress and shared Akasha notes. Completed members remain visible until stopped.", json!({}), &[]),
+        tool("mantra_swarm_wait", "Wait until every member of your swarm finishes, then review their answers and shared notes. A worker or gate should wait before reporting its own completion.", json!({}), &[]),
+        tool("mantra_swarm_note", "Share a short note with your Akasha swarm members. They read it through mantra_akasha_read.", json!({"text": {"type": "string"}, "urgent": {"type": "boolean"}}), &["text"]),
+        tool("mantra_swarm_message", "Send a follow-up to one of your swarm members by its id.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        tool("mantra_swarm_stop", "Stop one member by id, or omit agent to stop your whole swarm.", json!({"agent": {"type": "string"}}), &[]),
+    ]
+}
+
+pub const SWARM_OWNER_PROTOCOL: &str = "\n## Akasha delegation\nYour swarm is bounded to eight members. Give each member an independent task. Use mantra_swarm_note to share context, mantra_swarm_status to review progress and notes, and mantra_swarm_wait before reporting completion. Verify members' work yourself. A gate must wait and review before mantra_gate_report. Stop a group when finished.\n";
+
+/// Same notebook operations as a run group, but swarm notes are read at milestones and on a
+/// follow-up prompt; unlike run groups they do not push into a busy member's turn.
+pub fn swarm_member_note_tools() -> Vec<Value> {
+    let mut v = akasha_tools();
+    if let Some(note) = v.iter_mut().find(|x| x["name"] == "mantra_akasha_note") {
+        note["inputSchema"]["properties"]["urgent"]["description"] = json!("mark this note as a priority; other members see it when they next read shared notes");
+    }
+    v
+}
+
 pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
     let mut v = vec![
         tool(

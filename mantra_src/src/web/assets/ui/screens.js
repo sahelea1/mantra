@@ -67,6 +67,13 @@
             run: () => M.act.cmd('run_stop', {}),
         });
     }
+    function closeMantra() {
+        M.act.sheet({
+            kind: 'confirm', danger: true, title: 'Close Mantra on the host?', confirm: 'Close Mantra',
+            body: 'Stops all agent processes and closes this Mantra instance, including remote access. Saved runs and files remain. You will need to start Mantra on the host to reconnect.',
+            run: () => M.act.cmd('app_shutdown', {}, { ok: 'Closing Mantra…' }),
+        });
+    }
     function deleteRun(id, title, after) {
         M.act.sheet({
             kind: 'confirm', danger: true, title: 'Delete run ' + (title || id) + '?', confirm: 'Delete',
@@ -397,6 +404,7 @@
             h('span', { class: 'row-main' },
                 h('span', { class: 'row-title' }, r.name),
                 h('span', { class: 'row-sub' }, r.kind),
+                r.can_spawn_swarm ? h('span', { class: 'row-sub' }, 'Can start an Akasha swarm in Solo') : null,
                 r.fallback ? h('span', { class: 'row-sub role-fallback', title: 'Used when ' + r.model_alias + ' gives no first token in time' }, '↪ falls back to ', h('b', null, r.fallback)) : null),
             h('span', { class: 'chip model' }, h('b', null, r.model_alias), r.effort ? [h('span', { class: 'sep' }, '·'),
                 r.effort === 'auto' ? h('span', { class: 'effort-auto', title: 'Auto effort: Mantra picks it for each spawn' }, 'auto') : h('span', null, r.effort)] : null),
@@ -491,7 +499,8 @@
             app.headless ? ['Terminal', 'headless (no TUI)'] : null,
             ['Log', '~/.mantra/logs/mantra.log'],
         ].filter((x) => x && x[1]);
-        return card('About', h('dl', { class: 'kv' }, rows.map(([k, v]) => [h('dt', { key: 'k' + k }, k), h('dd', { key: 'v' + k, class: k === 'Project' || k === 'Log' ? 'mono' : null }, v)])), { key: 'about', icon: 'info' });
+        return card('About', [h('dl', { class: 'kv' }, rows.map(([k, v]) => [h('dt', { key: 'k' + k }, k), h('dd', { key: 'v' + k, class: k === 'Project' || k === 'Log' ? 'mono' : null }, v)])),
+            P.btn('Close Mantra', closeMantra, { sm: true, icon: 'stop', kind: 'danger-ghost', disabled: s.conn.state !== 'open' })], { key: 'about', icon: 'info' });
     }
 
     function sessionCard() {
@@ -598,6 +607,6 @@
 
     M.screens = {
         teamScreen, runScreen, pulseScreen, pulseList, inboxScreen, runsScreen, loadRuns, moreScreen, loginScreen, connectScreen, page, card,
-        startRunCard, stopRun, deleteRun, notificationsCard, appearanceCard, rolesCard, remoteCard, certCard, sessionCard, aboutCard,
+        startRunCard, stopRun, closeMantra, deleteRun, notificationsCard, appearanceCard, rolesCard, remoteCard, certCard, sessionCard, aboutCard,
     };
 })(window.Mantra = window.Mantra || {});

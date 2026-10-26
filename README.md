@@ -144,11 +144,13 @@ Most changes apply at once; a few say when they will (the toast tells you): the 
 
 <img src="docs/img/solo-approval.png" alt="An approval card for a shell command" width="820">
 
-`shift+tab` (or *Approvals* in `/settings`) cycles **untrusted → on-request → never ask** for the Solo agent. The change applies to the live session immediately, even while a card is on screen.
+`shift+tab` (or *Approvals* in `/settings`) cycles **untrusted → on-request → never ask** for the Solo agent. These three ordinary modes apply to the live session immediately, even while a card is on screen.
 
 - **untrusted** asks before anything that is not known-safe.
 - **on-request** asks when the agent wants to leave its sandbox.
 - **never ask** never prompts; anything that would have asked is auto-approved and written to the log (`✓ auto-approved (never ask): $ cargo test`). The sandbox still applies.
+
+**BYPASS-SANDBOX-DANGER** is a separate choice in *Approvals*, not part of the quick cycle: no approval prompts and no backend sandbox. Entering or leaving this mode takes effect with `/new`; the current session keeps its existing permission, as shown in its footer. Codex receives `danger-full-access` and `never`; Bija uses `full`; Claude Code explicitly disables its sandbox. This does not change what the ordinary **never ask** choice means.
 
 Team roles have their own `permission` field in the Studio, `never` by default, so a run does not stop to ask. A role set to ask sends its questions to the inbox (`ctrl+g`). Claude Code agents always run with `--dangerously-skip-permissions` — a pipe cannot answer Claude's own prompts — so their containment is the worktree and the role's sandbox instead.
 
@@ -320,6 +322,12 @@ The Studio shows a pattern's groups in its overview, read-only; they are edited 
 An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI API • bija`, `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
 
 In Solo, the agent can list configured model aliases and start a separate subagent on any usable alias, including one on a different backend. It can message, inspect, await, and stop each subagent through its tools. Each child is a separate process in the same project; starting a new Solo session shuts down that session's children.
+
+Use the **Codex** backend for a ChatGPT subscription and **Claude Code** for its CLI login. **Bija** uses configured API endpoints and keys; it does not reuse a ChatGPT subscription.
+
+**Akasha swarms.** Solo can start a small group of independent agents with a shared notebook. For a team role, enable **Can spawn swarm** in `/studio` (or the remote pattern editor); it is off by default for roles. Each group has up to eight members, with at most sixteen live swarm members across the app. Members use configured model aliases, can mix backends, and inherit the parent’s active permission and working directory. They cannot spawn more swarms. Split work by file or responsibility: members share the parent’s workspace rather than getting separate worktrees.
+
+The parent uses `mantra_swarm_start`, `mantra_swarm_status`, `mantra_swarm_wait`, `mantra_swarm_message`, `mantra_swarm_note`, and `mantra_swarm_stop`. Members coordinate through the Akasha note tools. `/akasha` shows their notes in the terminal; remote agent pages show the group, member links and folded shared notes. Ending the parent or replacing a Solo session ends its members too. Delegated groups are session-local; normal run Akasha groups retain their existing persistence.
 
 To add an API provider, press `ctrl+n` in `/models` and pick a known API (OpenAI, Anthropic, OpenRouter, Groq, xAI, Gemini, Cerebras or Fireworks), or *Local / custom API*. The choice fills in the endpoint; you can edit it before saving. Paste its key, or leave the key empty for a local server. Mantra then lists the provider's models for you to select. The key is stored in `models.toml` (`0600`). A refused key or a URL without a model list keeps the provider so you can add models by hand. Key prefixes can still suggest an endpoint in the custom flow.
 
@@ -572,6 +580,9 @@ Or describe what you want and let the **architect agent** edit the pattern while
 ---
 
 ## Anywhere: the web UI and remote access
+
+Remote agent actions distinguish **Interrupt** (the current turn), **Stop agent** (the process and its delegated children), and **Stop run**. **Close Mantra** in Settings/About or the command palette ends the host instance after confirmation; saved runs and files remain, and reconnecting requires starting Mantra again on the host.
+
 
 ```bash
 mantra --web                                          # this machine only — http://127.0.0.1:7777

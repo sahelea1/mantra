@@ -287,6 +287,8 @@ async function main() {
             await driver.selectOption('#fld-approval_mode', to);
             await driver.waitForFunction((v) => { const c = window.Mantra.store.S.ui.cfg; return c && c.settings && c.settings.fields.find((f) => f.key === 'approval_mode').value === v; }, to, { timeout: 8000 });
             if (field(await must(driver, 'settings_get'), 'approval_mode').value !== to) throw new Error('approval_mode did not change');
+            const bypass = await must(driver, 'settings_set', { key: 'approval_mode', value: 'BYPASS-SANDBOX-DANGER' });
+            if (field(bypass.settings, 'approval_mode').value !== 'BYPASS-SANDBOX-DANGER') throw new Error('bypass permission not saved');
             const back = await must(driver, 'settings_set', { key: 'approval_mode', value: was });
             if (field(back.settings, 'approval_mode').value !== was) throw new Error('approval_mode did not go back');
             await refused(driver, 'settings_set', { key: 'fps', value: '1000' }, 'from 4 to 60');
@@ -370,6 +372,11 @@ async function main() {
             const list = await must(driver, 'patterns_list');
             const mine = list.patterns.find((x) => x.name === 'e2e-pattern');
             if (!mine || mine.tag !== 'yours' || mine.description !== 'my e2e take on the default') throw new Error('patterns_list: ' + JSON.stringify(mine));
+            await driver.check('input[aria-label="Allow worker-small to start an Akasha swarm"]');
+            await driver.locator('.pe-acts button:has-text("Save")').first().click();
+            await driver.waitForTimeout(400);
+            const swarmPattern = await must(driver, 'pattern_get', { name: 'e2e-pattern' });
+            if (!swarmPattern.pattern.roles['worker-small'].can_spawn_swarm) throw new Error('swarm role toggle did not persist');
             // invalid: refused with every reason, in the editor too
             const bad = JSON.parse(JSON.stringify((await must(driver, 'pattern_get', { name: 'e2e-pattern' })).pattern));
             bad.roles.planner.kind = 'boss';
@@ -429,6 +436,39 @@ async function main() {
             await driver.waitForFunction(() => !window.Mantra.store.S.run, null, { timeout: 20000 });
             const runs = await must(driver, 'runs_list');
             if (!runs.runs.some((x) => x.id === first && x.stage === 'stopped')) throw new Error('the stopped run is not in the runs list: ' + JSON.stringify(runs.runs.map((x) => [x.id, x.stage])));
+        });
+    }
+
+    if (MODE === 'main') {
+        await step('main', driver, 'agent process: cancel stop → stop → transcript stays → new Solo', async () => {
+            const fresh = await must(driver, 'new_solo');
+            await nav(driver, '/agent/' + fresh.agent);
+            await driver.waitForSelector('.agent-actions button:has-text("Stop agent")', { timeout: 10000 });
+            await driver.click('.agent-actions button:has-text("Stop agent")');
+            await driver.click('.sheet button:has-text("Cancel")');
+            const stillLive = await driver.evaluate((id) => window.Mantra.store.agent(id).status !== 'stopped', fresh.agent);
+            if (!stillLive) throw new Error('cancelling stopped the agent');
+            await driver.click('.agent-actions button:has-text("Stop agent")');
+            await driver.click('.sheet button:has-text("Stop agent")');
+            await driver.waitForFunction((id) => window.Mantra.store.agent(id)?.status === 'stopped', fresh.agent, { timeout: 10000 });
+            await driver.waitForSelector('.agent-trouble button:has-text("New Solo session")');
+            await refused(driver, 'send', { agent: fresh.agent, text: 'must not restart' }, 'process has ended');
+            await driver.click('.agent-trouble button:has-text("New Solo session")');
+            await driver.waitForFunction((old) => location.pathname.startsWith('/agent/') && !location.pathname.endsWith('/' + old), fresh.agent);
+        });
+        // Only close a server this test itself launched, never a caller-owned remote instance.
+        if (server) await step('main', driver, 'host shutdown: cancel keeps it alive → confirm exits cleanly', async () => {
+            await nav(driver, '/settings/about');
+            await driver.click('button:has-text("Close Mantra")');
+            await driver.click('.sheet button:has-text("Cancel")');
+            await must(driver, 'settings_get');
+            await driver.click('button:has-text("Close Mantra")');
+            await driver.click('.sheet button:has-text("Close Mantra")');
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('Mantra did not exit after shutdown')), 10000);
+                if (server.exitCode !== null) { clearTimeout(timer); return server.exitCode === 0 ? resolve() : reject(new Error('exit ' + server.exitCode)); }
+                server.once('exit', (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error('exit ' + code)); });
+            });
         });
     }
 

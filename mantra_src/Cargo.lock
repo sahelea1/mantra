@@ -948,6 +948,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "hmac",
+ "libc",
  "p256",
  "pbkdf2",
  "qrcode",

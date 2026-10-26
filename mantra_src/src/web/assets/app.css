@@ -524,6 +524,17 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--b
 .shell.desk .agent-head { padding: 14px 24px 10px; }
 .shell.desk .agent-head h1 { font-size: var(--fs-lg); }
 .shell.desk.with-panel .agent-head, .shell.desk .main-body.fill { }
+.swarm-card { flex: none; padding: 8px calc(12px + var(--sar)); border-bottom: 1px solid var(--line); background: var(--bg-card); font-size: var(--fs-sm); }
+.shell.desk .swarm-card { padding: 8px 24px; }
+.swarm-head { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+.swarm-head .link { margin-left: auto; }
+.swarm-members { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.swarm-member { display: inline-flex; align-items: center; gap: 7px; min-height: 28px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 7px; }
+.swarm-member:hover { background: var(--bg-hover); }
+.swarm-stop-hint { margin-left: auto; }
+.swarm-notes { margin-top: 6px; color: var(--muted); }
+.swarm-notes summary { cursor: pointer; min-height: 24px; }
+.swarm-notes .notes { max-height: 180px; overflow: auto; }
 
 .ctx { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ctx-track { position: relative; width: 46px; height: 5px; border-radius: 3px; background: var(--faint); overflow: visible; }

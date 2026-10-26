@@ -786,6 +786,7 @@
                 pf('Effort', sel(role.effort, efforts, set('effort'), 'Effort of ' + name), role.effort === 'auto' ? 'Mantra picks it per spawn from the role’s job' : null),
                 pf('Sandbox', sel(role.sandbox, O.sandboxes || [], set('sandbox'), 'Sandbox of ' + name)),
                 pf('Approvals', sel(role.permission, O.permissions || [], set('permission'), 'Approvals of ' + name)),
+                pf('Akasha swarm', toggleCtl(role.can_spawn_swarm, set('can_spawn_swarm'), 'Allow ' + name + ' to start an Akasha swarm'), 'May delegate to a temporary Akasha swarm; members cannot spawn another swarm'),
                 worker ? pf('Workers at once', txt(role.parallel, (v) => { role.parallel = String(v).trim() === '' ? null : nums(v); touch(); }, { num: true, min: O.parallel[0], max: O.parallel[1], placeholder: 'shares the pool', label: 'Workers at once of ' + name }), 'A class of its own; empty shares the pattern’s pool') : null,
                 pf('Fallback', sel(role.fallback || '', [['', 'none — the manager is asked']].concat(models.filter((x) => x.alias !== role.model).map((x) => x.alias)), (v) => { role.fallback = v || null; touch(); }, 'Fallback of ' + name), 'Takes over when the model gives no first token in time'),
                 pf('MCP servers', txt((role.mcp || []).join(', '), (v) => { role.mcp = v.split(/[\s,]+/).filter(Boolean); touch(); }, { placeholder: O.mcp && O.mcp.length ? 'none · * for all · ' + O.mcp.join(', ') : 'none (Settings › MCP servers)', label: 'MCP servers of ' + name, mono: true })),

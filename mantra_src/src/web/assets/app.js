@@ -627,6 +627,7 @@
         }
         if (run && run.landable) items.push({ key: 'land', label: 'Land run', icon: 'land', run: () => sheet({ kind: 'confirm', title: 'Land this run?', body: 'Merges ' + run.branch + ' into your current branch.', confirm: 'Land', run: () => cmd('land', {}, { ok: 'Landing…' }) }) });
         items.push({ key: 'solo', label: 'New Solo session', icon: 'plus', run: () => cmd('new_solo', {}, { ok: 'New session' }).then((d) => d && nav('/agent/' + d.agent)) });
+        items.push({ key: 'quit', label: 'Close Mantra on the host', icon: 'stop', run: () => SC.closeMantra() });
         items.push({ key: 'theme', label: 'Toggle dark / light', icon: 'sun', run: () => { const dark = S.ui.theme === 'dark' || (S.ui.theme === 'system' && mqDark.matches); M.store.setPref('theme', dark ? 'light' : 'dark'); applyPrefs(); } });
         items.push({ key: 'verbose', label: (S.ui.verbose ? 'Hide' : 'Show') + ' full reasoning & output', icon: 'eye', run: () => M.store.setPref('verbose', !S.ui.verbose) });
         if (mqWide.matches) items.push({ key: 'panel', label: (S.ui.panelOpen ? 'Hide' : 'Show') + ' side panel', icon: 'panel', run: () => M.store.setPref('panelOpen', !S.ui.panelOpen) });

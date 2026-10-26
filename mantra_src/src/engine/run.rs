@@ -726,7 +726,7 @@ impl Run {
     /// KB rewritten atomically at every transition. The owner file goes with it — refreshed while
     /// the run is live, released once it is over — and so does the run's `pattern.toml` when a
     /// role-level model change made it differ from the copy on disk.
-    pub(super) fn save_state(&self) {
+    pub(crate) fn save_state(&self) {
         let slot_of = |a: AgentId| self.slot_of(a);
         if self.is_active() {
             self.owner.write(&self.dir);
@@ -824,6 +824,10 @@ impl Run {
     pub(super) fn role_req(&self, req: SpawnReq) -> SpawnReq {
         let mut req = self.akasha_req(req);
         req.mcp = req.role.mcp.clone();
+        if req.role.can_spawn_swarm {
+            req.tools.extend(tools::swarm_tools());
+            req.instructions.push_str(tools::SWARM_OWNER_PROTOCOL);
+        }
         if self.sees(&req.role.model) {
             req.tools.extend(tools::vision_tools());
         }
@@ -3382,6 +3386,14 @@ Then summarize in 2-4 lines.",
         self.wake_orch(ctx);
     }
 
+    /// A remote process stop also cancels retries already scheduled before the stop arrived.
+    pub fn agent_stopped_by_user(&mut self, a: AgentId) {
+        self.continue_queue.retain(|(id, _, _)| *id != a);
+        self.retry_counts.remove(&a);
+        self.last_status.remove(&a);
+        self.log("■", "amber", format!("{} process stopped by you — respawn to continue", self.name_of(a)));
+    }
+
     pub fn tick(&mut self, ctx: &mut dyn Ctx) {
         if self.last_tick.elapsed() < Duration::from_millis(900) {
             return;
@@ -3417,7 +3429,7 @@ Then summarize in 2-4 lines.",
         let mut events = vec![];
         for w in &mut self.workers {
             let Some(a) = w.agent.and_then(|a| ctx.agent(a)) else { continue };
-            if w.state == WState::Running && a.busy() && a.last_event.elapsed() > stall && !w.stall_flagged {
+            if w.state == WState::Running && a.busy() && !a.swarm_waiting && a.last_event.elapsed() > stall && !w.stall_flagged {
                 w.stall_flagged = true;
                 events.push(format!("TRIPWIRE: {} has shown no activity for {} minutes (last: {}).", w.task.id, stall.as_secs() / 60, a.activity));
             }
@@ -3552,7 +3564,7 @@ Then summarize in 2-4 lines.",
             // A deliberate stop is not idleness: an agent the user stopped by hand is waiting for
             // them, so it is never nudged, respawned or escalated on. Its ladder is dropped too —
             // when the stop is lifted it starts again from the bottom rung.
-            if agent.busy() || agent.stopped_by_user {
+            if agent.busy() || agent.stopped_by_user || agent.swarm_waiting {
                 self.watch.remove(&a);
                 continue;
             }
@@ -5814,6 +5826,21 @@ mod halt_tests {
         assert!(ctx.prompts.is_empty(), "an orchestrator asleep in mantra_wait while a worker runs must not be nudged: {:?}", ctx.prompts);
     }
 
+    #[test]
+    fn watchdog_does_not_nudge_an_idle_worker_waiting_for_its_swarm() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let worker = ctx.add_idle();
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        run.workers.push(mk_worker("t1", "worker-small", worker, WState::Running));
+        ctx.set_idle_secs(worker, 500);
+        ctx.agents.get_mut(&worker).unwrap().swarm_waiting = true;
+        run.watchdog_tick(&mut ctx);
+        assert!(ctx.prompts.iter().all(|(a, _)| *a != worker));
+        assert!(run.watchdog_idle(worker).is_none());
+    }
+
     /// The case the ladder structurally cannot see: a planner that is *busy* — connected, turn
     /// live — but has emitted nothing for minutes. From the outside that is indistinguishable
     /// from a crash, so it earns one pulse line and nothing else: no nudge, no respawn, no halt.
@@ -6893,6 +6920,24 @@ mod halt_tests {
         assert!(ctx.prompts.iter().any(|(a, t)| *a == new_planner && t.contains("[mantra:plan]")), "the planner is re-briefed with its planning prompt: {:?}", ctx.prompts);
         assert!(run.continue_queue.is_empty(), "no [mantra:retry] continuation — the old thread has nothing to continue");
         assert!(!run.retry_counts.contains_key(&planner), "not a retry");
+    }
+
+    #[test]
+    fn process_stop_cancels_a_previously_scheduled_retry_only_for_that_agent() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+        let planner = ctx.add_idle();
+        let other = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
+        run.continue_queue.push((planner, Instant::now(), "retry stopped planner".into()));
+        run.continue_queue.push((other, Instant::now(), "retry other agent".into()));
+        run.retry_counts.insert(planner, 2);
+        run.agent_stopped_by_user(planner);
+        assert!(!run.retry_counts.contains_key(&planner));
+        assert_eq!(run.continue_queue.len(), 1);
+        assert_eq!(run.continue_queue[0].0, other);
+        assert!(run.is_active(), "an individual stop keeps the rest of the run");
     }
 
     #[test]
