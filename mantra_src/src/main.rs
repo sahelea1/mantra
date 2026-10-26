@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const HELP: &str = "mantra — one terminal for coding agents, all on bija, its built-in harness
+const HELP: &str = "mantra — one terminal for coding agents on configured Bija, Codex or Claude Code models
 
   Solo and every built-in pattern start on `sol` and its siblings through the OpenAI API (the key
   in $OPENAI_API_KEY, or pasted in /models). /models adds any other provider from just its API key
@@ -539,11 +539,10 @@ fn demo_project() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The alias Codex's own account has the default model `plain` under — `sol-codex` beside bija's
-/// `sol` — once the Codex models are in the registry.
+/// Find a configured Codex alias by its familiar demo name, when the demo has seeded both
+/// Bija and Codex variants. Production model IDs come entirely from models.toml.
 fn codex_alias_of(reg: &config::Registry, plain: &str) -> Option<String> {
-    let id = config::codex_default_models().into_iter().find(|m| m.alias == plain)?.model;
-    reg.models.iter().find(|m| !m.is_custom_provider() && m.model == id).map(|m| m.alias.clone())
+    reg.models.iter().find(|m| !m.is_custom_provider() && (m.alias == plain || m.alias == format!("{plain}-codex"))).map(|m| m.alias.clone())
 }
 
 /// Why this session cannot start, or `None`: bija is the harness, so a missing one is fatal when
@@ -551,7 +550,9 @@ fn codex_alias_of(reg: &config::Registry, plain: &str) -> Option<String> {
 /// error later. A missing Codex or Claude Code is never said at startup: it matters only to an
 /// agent on one of their models (the hub says so then) and to `doctor`.
 fn startup_problem(found: config::BijaFound, settings: &config::Settings, reg: &config::Registry) -> Option<String> {
-    let on_bija = reg.backend_of(&reg.resolve(&settings.default_model)) == config::ProviderKind::Bija;
+    // An unconfigured install opens `/models` without starting an agent. Do not treat the
+    // unresolved default alias as a Bija model and require its binary at this point.
+    let on_bija = reg.get(&settings.default_model).is_some_and(|m| reg.backend_of(m) == config::ProviderKind::Bija);
     (found == config::BijaFound::Missing && on_bija).then(|| {
         format!("bija, the harness `{}` runs on, is not installed: `{}` is not on PATH and not beside mantra.\n        Reinstall mantra (bija ships beside it), or point $MANTRA_BIJA at the binary.", settings.default_model, settings.bija_command.join(" "))
     })
@@ -633,9 +634,14 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
         // saved) whatever is installed — the mixed-backend runs need no real `codex` or `claude`:
         // the demo's whole point is zero external dependencies. After bija's, so the plain
         // aliases stay bija's.
-        for backend in [provider_key::Backend::Codex, provider_key::Backend::ClaudeCode] {
-            let _ = provider_key::add_backend_with(&mut registry, backend, true);
+        // Demo fixtures are local mock ids, never a source of models for a real account.
+        for m in config::codex_default_models() {
+            if !registry.models.iter().any(|x| !x.is_custom_provider() && x.model == m.model) {
+                let alias = if registry.get(&m.alias).is_some() { format!("{}-codex", m.alias) } else { m.alias.clone() };
+                registry.models.push(config::ModelEntry { alias, ..m });
+            }
         }
+        let _ = provider_key::add_backend_with(&mut registry, provider_key::Backend::ClaudeCode, true);
         // The demo shows what there is to see, the experiments included — in memory, like the
         // mocks: settings.toml is not touched.
         if !settings.experimental_on(config::EXPERIMENTAL_AKASHA) {
@@ -651,7 +657,7 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
         }
         // Solo stays on the Codex mock: its scripted command approvals are what the snapshot and
         // web e2e scripts drive in the demo's Solo.
-        if registry.backend_of(&registry.resolve(&settings.default_model)) == config::ProviderKind::Bija {
+        if registry.get(&settings.default_model).is_some_and(|m| registry.backend_of(m) == config::ProviderKind::Bija) {
             if let Some(sol) = codex_alias_of(&registry, "sol") {
                 settings.default_model = sol;
             }
@@ -1194,10 +1200,11 @@ fn doctor() {
     let s = config::Settings::load();
     let r = config::Registry::load();
     println!("mantra {} doctor\n", env!("CARGO_PKG_VERSION"));
-    // bija is the harness every default model runs on: required.
+    // Bija is required only when a configured model uses it.
     let (bija_cmd, found) = config::resolve_bija_command(&s.bija_command);
     let (good, text) = probe_cli(bija_cmd.first().map(String::as_str).unwrap_or("bija"), " — it ships beside mantra: reinstall, or set bija_command / $MANTRA_BIJA");
-    println!("{} bija: {text} · {} ({})", ok(good), bija_cmd.join(" "), found.describe());
+    let bija_used = r.models.iter().any(|m| r.backend_of(m) == config::ProviderKind::Bija);
+    println!("{} bija: {text} · {} ({})", if bija_used { ok(good) } else { " " }, bija_cmd.join(" "), found.describe());
     let (verdict, text) = provider_row(&s, &r);
     println!("{} provider: {text}", verdict.map(ok).unwrap_or(" "));
     // Codex and Claude Code are optional backends: found or not, graded only when a model in
@@ -1443,7 +1450,9 @@ fn sandbox_helper_probe(cmd0: &str, cwd: &std::path::Path) -> Result<String, Str
 /// is `None` when there is nothing Mantra can check (Codex's own account, a subscription login).
 fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, String) {
     let alias = &s.default_model;
-    let m = r.resolve(alias);
+    let Some(m) = r.get(alias) else {
+        return (None, format!("no default model configured — add a provider and model in /models, then choose it in /settings"));
+    };
     if !m.is_custom_provider() {
         return (None, format!("`{alias}` runs on Codex's own account — see the login row"));
     }
@@ -1696,15 +1705,18 @@ mod doctor_tests {
     /// — and is no reason to stop when Solo's model is on another backend; Codex is never asked for.
     #[test]
     fn a_missing_bija_stops_the_start_only_when_solo_needs_it() {
-        let reg = config::Registry::defaults();
+        let mut reg = config::Registry::defaults();
         let s = config::Settings::default();
+        assert_eq!(startup_problem(config::BijaFound::Missing, &s, &reg), None, "setup without models does not require Bija");
+        reg.providers.push(config::bija_default_provider());
+        reg.models.push(config::bija_default_model_entries("bija").into_iter().find(|m| m.alias == "sol").unwrap());
         let why = startup_problem(config::BijaFound::Missing, &s, &reg).expect("Solo is on bija");
         assert!(why.contains("bija") && why.contains("$MANTRA_BIJA") && why.contains("Reinstall"), "{why}");
         for found in [config::BijaFound::Configured, config::BijaFound::BesideMantra, config::BijaFound::Env] {
             assert_eq!(startup_problem(found, &s, &reg), None, "{found:?}");
         }
         let mut with_codex = reg.clone();
-        provider_key::add_backend_with(&mut with_codex, provider_key::Backend::Codex, true).unwrap();
+        with_codex.add_codex_model("sol-codex", "account-model").unwrap();
         let on_codex = config::Settings { default_model: "sol-codex".into(), ..Default::default() };
         assert_eq!(startup_problem(config::BijaFound::Missing, &on_codex, &with_codex), None);
     }
@@ -1718,7 +1730,8 @@ mod doctor_tests {
             let mut reg = config::Registry::defaults();
             let s = config::Settings::default();
             assert!(codex_account_needed(&s, &reg).is_empty(), "{:?}", codex_account_needed(&s, &reg));
-            provider_key::add_backend_with(&mut reg, provider_key::Backend::Codex, true).unwrap();
+            reg.add_codex_model("sol-codex", "account-model").unwrap();
+            reg.add_codex_model("astra-codex", "another-account-model").unwrap();
             assert!(codex_account_needed(&s, &reg).is_empty(), "added, but nothing uses it");
             let on_codex = config::Settings { default_model: "sol-codex".into(), ..Default::default() };
             assert_eq!(codex_account_needed(&on_codex, &reg), vec!["the default model `sol-codex`".to_string()]);
@@ -1757,9 +1770,10 @@ mod doctor_tests {
     #[test]
     fn doctor_refuses_a_bija_provider_with_an_unknown_wire_before_any_request() {
         let mut r = config::Registry::defaults();
-        if let Some(p) = r.providers.iter_mut().find(|p| p.id == "bija") {
-            p.wire = "grpc".into();
-        }
+        let mut p = config::bija_default_provider();
+        p.wire = "grpc".into();
+        r.providers.push(p);
+        r.models.push(config::bija_default_model_entries("bija").into_iter().find(|m| m.alias == "sol").unwrap());
         let (ok, row) = provider_row(&config::Settings::default(), &r);
         assert_eq!(ok, Some(false));
         assert!(row.contains("wire 'grpc'") && row.contains("/models to fix"), "{row}");

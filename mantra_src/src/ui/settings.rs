@@ -690,7 +690,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = crate::hub::Hub::new(vec![], vec![], vec![], ev_tx, false);
-        let mut app = App::new(crate::config::Settings::default(), crate::config::Registry::defaults(), std::path::PathBuf::from("/nonexistent"), hub, tx, false);
+        // These UI tests exercise settings against the established model fixture. A fresh
+        // production registry is intentionally empty.
+        let mut registry = crate::config::Registry::defaults();
+        registry.providers.push(crate::config::bija_default_provider());
+        registry.models.extend(crate::config::bija_default_model_entries("bija"));
+        let mut app = App::new(crate::config::Settings::default(), registry, std::path::PathBuf::from("/nonexistent"), hub, tx, false);
         app.open_settings();
         app
     }

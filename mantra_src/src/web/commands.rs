@@ -1065,11 +1065,12 @@ mod tests {
     fn models_get_masks_keys_and_shows_the_codex_account() {
         let (mut app, mut h, _rx) = wired();
         app.registry.providers[0].api_key = Some("sk-proj-abcdefgh1234".into());
-        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
+        // Codex has no guessed catalogue; the account row only lists models the user added.
+        app.registry.add_codex_model("personal", "my-codex-model").unwrap();
         let got = ask(&mut app, &mut h, Command::ModelsGet).unwrap();
         assert!(!got.to_string().contains("abcdefgh"), "{got}");
         let providers = got["providers"].as_array().unwrap();
-        assert_eq!((providers[0]["id"].as_str(), providers[0]["account"].as_bool(), providers[0]["models"].as_u64()), (Some("openai"), Some(true), Some(4)));
+        assert_eq!((providers[0]["id"].as_str(), providers[0]["account"].as_bool(), providers[0]["models"].as_u64()), (Some("openai"), Some(true), Some(1)));
         let bija = providers.iter().find(|p| p["id"] == "bija").unwrap();
         assert_eq!((bija["api_key"].as_str(), bija["key_set"].as_bool(), bija["wire"].as_str()), (Some("••••1234"), Some(true), Some("openai")));
         let sol = got["models"].as_array().unwrap().iter().find(|m| m["alias"] == "sol").unwrap();
@@ -1097,9 +1098,9 @@ mod tests {
         });
     }
 
-    /// Models added and deleted: the last one and Solo's default stay.
-    #[test]
-    fn model_add_and_delete_keep_the_default() {
+    /// Models added and deleted: Solo follows a valid selection and an empty registry is allowed.
+    #[tokio::test]
+    async fn model_add_and_delete_keep_the_default() {
         let (mut app, mut h, _rx) = wired();
         let got = ask(&mut app, &mut h, Command::ModelAdd { provider: "bija".into(), model: Some("mx-5.2".into()), alias: None }).unwrap();
         assert_eq!(got["alias"], "mx-5.2");
@@ -1107,9 +1108,14 @@ mod tests {
         assert!(ask(&mut app, &mut h, Command::ModelAdd { provider: "nowhere".into(), model: None, alias: None }).unwrap_err().contains("no provider named nowhere"));
         assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "mx-5.2".into() }).is_ok());
         assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "mx-5.2".into() }).unwrap_err().contains("no model named"));
-        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "sol".into() }).unwrap_err().contains("Solo's default model"));
-        app.registry.models.retain(|m| m.alias == "sol");
-        assert!(ask(&mut app, &mut h, Command::ModelDelete { alias: "sol".into() }).unwrap_err().contains("last model"));
+        ask(&mut app, &mut h, Command::ModelDelete { alias: "sol".into() }).unwrap();
+        assert_ne!(app.settings.default_model, "sol", "Solo's selection moves off a deleted model");
+        let remaining: Vec<String> = app.registry.models.iter().map(|m| m.alias.clone()).collect();
+        for alias in remaining {
+            ask(&mut app, &mut h, Command::ModelDelete { alias }).unwrap();
+        }
+        assert!(app.registry.models.is_empty());
+        assert!(app.settings.default_model.is_empty(), "an empty registry has no selected model");
     }
 
     /// A provider cell from the web lands in models.toml — a pasted key as well, which no reply
@@ -1139,18 +1145,20 @@ mod tests {
     }
 
     /// A provider goes with its models; the Codex row with the whole account; never Solo's default.
-    #[test]
-    fn provider_delete_takes_its_models_and_keeps_the_default() {
+    #[tokio::test]
+    async fn provider_delete_takes_its_models_and_keeps_the_default() {
         let (mut app, mut h, _rx) = wired();
         let gw = crate::provider_key::add_provider(&mut app.registry, &crate::provider_key::provider_from_key("k", Some("https://inference.test-gateway.dev/v1"))).unwrap();
         app.registry.models.push(crate::config::ModelEntry { alias: "fast".into(), provider: gw.clone(), model: "fast-1".into(), ..Default::default() });
         assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: gw }).unwrap()["models"], 1);
         assert!(app.registry.get("fast").is_none());
-        assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "bija".into() }).unwrap_err().contains("Solo's default model"));
         assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "openai".into() }).unwrap_err().contains("no Codex models"));
-        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
-        assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: "openai".into() }).unwrap()["models"], 4);
+        app.registry.add_codex_model("personal", "my-codex-model").unwrap();
+        assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: "openai".into() }).unwrap()["models"], 1);
         assert!(app.registry.codex_account_models().is_empty());
+        assert_eq!(ask(&mut app, &mut h, Command::ProviderDelete { id: "bija".into() }).unwrap()["models"], 4);
+        assert!(app.registry.models.is_empty());
+        assert!(app.settings.default_model.is_empty(), "removing the last provider leaves no default model");
         assert!(ask(&mut app, &mut h, Command::ProviderDelete { id: "nope".into() }).unwrap_err().contains("no provider named nope"));
     }
 
@@ -1227,8 +1235,7 @@ mod tests {
     #[test]
     fn add_backend_adds_once_and_knows_its_kinds() {
         let (mut app, mut h, _rx) = wired();
-        assert_eq!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap()["added"], 4);
-        assert_eq!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap()["added"], 0);
+        assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap_err().contains("no preset models"));
         assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "claude-code".into() }).unwrap()["added"].as_u64().unwrap() > 0);
         assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "vim".into() }).unwrap_err().contains("codex or claude-code"));
     }

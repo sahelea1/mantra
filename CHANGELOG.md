@@ -2,6 +2,24 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.8.1 — 2026-10-26
+
+- **Solo controls and delegation.** `ctrl+c` interrupts a running Solo turn, including before
+  Codex has reported its turn ID, without discarding a drafted message. `ctrl+f` sends a draft
+  into the current turn. Solo can list configured models and start, message, inspect, wait for,
+  and stop independent subagents on any usable Bija, Codex, or Claude Code model alias. Its busy
+  footer now shows an animated activity indicator and the current work.
+- **Explicit model configuration.** A fresh install has no implicit Bija endpoint, provider, or
+  model. Bija becomes available after adding a provider and model. Codex model IDs are entered in
+  `/models` and can be added, edited, or removed, including the final Codex model; an empty
+  registry returns Solo to setup. Existing saved providers and models stay intact.
+- **Built-in runs with a new model.** Missing aliases in unchanged built-in patterns bind to the
+  configured default model in the run's own pattern copy; customized patterns retain explicit
+  assignments and preflight validation.
+- **Simpler provider setup.** The terminal and web UIs offer named API endpoints, plus a custom
+  or local endpoint. Claude Code offers separate subscription and API key choices. The key flow
+  can discover models after adding a provider and does not save a preset until submitted.
+
 ## v0.8.0 — 2026-10-24
 
 Mantra got cluttered: twenty-six commands, a letter key for every row action, a popup for every

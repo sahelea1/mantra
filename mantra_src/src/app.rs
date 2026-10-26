@@ -124,6 +124,8 @@ pub struct Choice {
 pub enum SelectThen {
     /// `/models` ctrl+n: a provider from its key, a model, Codex, Claude Code.
     AddMenu,
+    /// Choose a known API endpoint, or a custom/local URL, before entering a key.
+    ProviderPreset,
     /// "A model on an existing provider": the provider it goes on.
     AddModelOn,
     /// `/akasha` with several groups: the one to show.
@@ -139,6 +141,7 @@ pub const ADD_KEY: &str = "key";
 pub const ADD_MODEL: &str = "model";
 pub const ADD_CODEX: &str = "codex";
 pub const ADD_CLAUDE: &str = "claude";
+pub const ADD_CLAUDE_KEY: &str = "claude-api-key";
 
 /// One row of the new-run overlay's pattern list.
 pub struct PatternChoice {
@@ -320,6 +323,11 @@ pub struct App {
     pub solo: Option<AgentId>,
     /// The MCP servers the current Solo agent was started with (`/settings` says which).
     pub solo_mcp: Vec<String>,
+    /// Standalone Solo subagents, keyed by child id; only the Solo session that started them may
+    /// message, inspect, or wait for them.
+    solo_children: HashMap<AgentId, AgentId>,
+    /// Tool calls awaiting completion of a Solo subagent.
+    solo_waiters: HashMap<AgentId, Vec<(AgentId, Value)>>,
     pub run: Option<Run>,
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
@@ -337,8 +345,8 @@ pub struct App {
     pub pulse_panel: bool,
     pub quit: bool,
     /// When ctrl+c was last pressed and how many times in a row (within 2s of each other):
-    /// the first press does the contextual thing (close an overlay, clear the input, interrupt
-    /// the focused agent's turn), the third always quits.
+    /// the first press does the contextual thing (close an overlay, interrupt a busy Solo turn,
+    /// clear the input, or interrupt another focused agent), the third always quits.
     ctrl_c: Option<Instant>,
     ctrl_c_count: u8,
     pub tx: UnboundedSender<AppEvent>,
@@ -586,11 +594,14 @@ fn bija_writable_roots(sandbox: &str, extra: &[PathBuf], pattern: &[String], hom
 }
 
 /// Whether a Claude Code agent runs under `--strict-mcp-config` (`ClaudeSpawn::strict_mcp`): one
-/// with a toolset of Mantra's beyond the vision tools (a run's agents, the architect) or with
-/// servers of Mantra's. Solo, with at most the vision tools, keeps the user's own `claude mcp`
-/// servers as it always had them.
+/// with a toolset of Mantra's beyond Solo's delegation and vision tools (a run's agents, the
+/// architect) or with servers of Mantra's. Solo keeps the user's own `claude mcp` servers.
 fn claude_strict_mcp(o: &AgentOpts) -> bool {
-    !o.mcp.is_empty() || o.tools.iter().any(|t| !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| tools::VISION_TOOLS.contains(&n)))
+    !o.mcp.is_empty() || o.tools.iter().any(|t| {
+        !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| {
+            tools::VISION_TOOLS.contains(&n) || n.starts_with("mantra_subagent_")
+        })
+    })
 }
 
 /// A Bija agent's spawn config and child environment. Like the Claude arm of `spawn_agent`,
@@ -968,6 +979,8 @@ impl App {
             confirm: None,
             solo: None,
             solo_mcp: vec![],
+            solo_children: HashMap::new(),
+            solo_waiters: HashMap::new(),
             run: None,
             approvals: vec![],
             toast: None,
@@ -1048,11 +1061,29 @@ impl App {
 
     pub fn start_solo(&mut self) {
         if let Some(old) = self.solo.take() {
+            self.stop_solo_children(old);
             self.hub.shutdown(old);
             self.agents.remove(&old);
         }
+        // A removed/stale default must never be resolved into a phantom raw model id. Use the
+        // configured default when it is runnable, otherwise the first runnable registry entry.
+        let usable = self.registry.models.iter().filter(|m| self.demo || self.registry.alias_problem(&m.alias).is_none()).map(|m| m.alias.clone()).collect::<Vec<_>>();
+        let chosen = if self.demo || self.registry.alias_problem(&self.settings.default_model).is_none() {
+            self.registry.get(&self.settings.default_model).map(|m| m.alias.clone())
+        } else {
+            None
+        }.or_else(|| usable.first().cloned());
+        let Some(chosen) = chosen else {
+            self.toast("No usable model is configured. Add or fix a model in /models, then start Solo again.", Level::Warn);
+            return;
+        };
+        if chosen != self.settings.default_model {
+            self.settings.default_model = chosen.clone();
+            self.save_settings();
+            self.toast(format!("Solo default updated to {chosen} because the previous model is unavailable"), Level::Info);
+        }
         self.refresh_mcp_servers();
-        let backend = self.registry.backend_of(&self.registry.resolve(&self.settings.default_model));
+        let backend = self.registry.backend_of(&self.registry.resolve(&chosen));
         let sandbox = role_sandbox(&self.settings.sandbox, backend);
         let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
         let mcp_names: Vec<String> = mcp.iter().map(|(name, _)| name.clone()).collect();
@@ -1065,14 +1096,18 @@ impl App {
                 role: "solo".into(),
                 glyph: "●".into(),
                 color: "saffron".into(),
-                model_alias: self.settings.default_model.clone(),
+                model_alias: chosen.clone(),
                 effort: None,
                 cwd: self.project.clone(),
                 approval: self.settings.approval_mode.clone(),
                 sandbox,
                 instructions: String::new(),
                 // the vision tools when Solo's model takes images (`on_request` runs them)
-                tools: if self.registry.vision(&self.settings.default_model) { tools::vision_tools() } else { vec![] },
+                tools: {
+                    let mut t = tools::solo_tools();
+                    if self.registry.vision(&chosen) { t.extend(tools::vision_tools()); }
+                    t
+                },
                 extra_writable: vec![],
                 network: true,
                 writable_roots: vec![],
@@ -1087,7 +1122,7 @@ impl App {
         if let Some(t) = mcp_refused_toast(&self.settings) {
             self.toast(t, Level::Warn);
         }
-        if let Some(why) = self.model_problem(&self.settings.default_model) {
+        if let Some(why) = self.model_problem(&chosen) {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, &why);
             }
@@ -1474,6 +1509,28 @@ impl App {
                 return;
             }
         };
+        // The shipped patterns keep their familiar role aliases for existing installations.
+        // A new installation has no model presets, so bind only missing built-in aliases to
+        // the user's chosen model in this run's saved pattern copy. User-edited patterns retain
+        // exact role names and still get a clear preflight error for a typo.
+        let mut rebound_roles = 0;
+        if !self.demo && matches!(pattern.tag(), "default" | "built-in") {
+            let usable = self.registry.models.iter()
+                .find(|m| m.alias == self.settings.default_model && self.registry.alias_problem(&m.alias).is_none())
+                .or_else(|| self.registry.models.iter().find(|m| self.registry.alias_problem(&m.alias).is_none()))
+                .map(|m| m.alias.clone());
+            if let Some(alias) = usable {
+                for role in pattern.roles.values_mut() {
+                    if self.registry.get(&role.model).is_none() {
+                        role.model = alias.clone();
+                        rebound_roles += 1;
+                    }
+                    if role.fallback.as_deref().is_some_and(|f| !f.is_empty() && self.registry.get(f).is_none()) {
+                        role.fallback = Some(alias.clone());
+                    }
+                }
+            }
+        }
         // what the journal says about an override: only when it changes a number
         let mut width_note = None;
         if let Some(n) = max_parallel {
@@ -1504,6 +1561,9 @@ impl App {
             return;
         }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
+        if rebound_roles > 0 {
+            run.log("⚙", "blue", format!("{rebound_roles} built-in roles use configured models; see this run's pattern copy"));
+        }
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
@@ -2234,7 +2294,10 @@ impl App {
                         a.notice(Level::Error, format!("couldn't start the turn: {error}"));
                     }
                     if self.in_run(agent) {
-                        self.with_run(|r, c| r.on_turn_done(c, agent, "failed", Some(error), Some(crate::agent::ErrKind::Transient)));
+                        self.with_run(|r, c| r.on_turn_done(c, agent, "failed", Some(error.clone()), Some(crate::agent::ErrKind::Transient)));
+                    }
+                    if self.solo_children.contains_key(&agent) {
+                        self.on_turn_done(agent, "failed", Some(error), Some(crate::agent::ErrKind::Transient));
                     }
                 }
                 "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
@@ -2277,6 +2340,9 @@ impl App {
                 if self.in_run(agent) {
                     self.with_run(|r, c| r.on_crash(c, agent, &reason, restarting));
                 }
+                if self.solo_children.contains_key(&agent) && !(restarting && attempt == 0) {
+                    self.fail_solo_waiters(agent, &format!("Subagent {agent} crashed: {reason}"));
+                }
                 if Some(agent) == self.solo && !restarting {
                     self.toast(format!("Solo agent is down: {} — /new to retry (full error in the log)", crate::util::trunc(&reason, 160)), Level::Error);
                 }
@@ -2285,6 +2351,9 @@ impl App {
                 if let Some(a) = self.agents.get_mut(&agent) {
                     a.status = Status::Stopped;
                     a.turn_active = false;
+                }
+                if self.solo_children.contains_key(&agent) {
+                    self.fail_solo_waiters(agent, &format!("Subagent {agent} exited."));
                 }
             }
             HubEvent::BridgeConn { agent, stream } => {
@@ -2312,7 +2381,15 @@ impl App {
         }
         if self.in_run(agent) {
             let st = status.to_string();
-            self.with_run(|r, c| r.on_turn_done(c, agent, &st, error, kind));
+            self.with_run(|r, c| r.on_turn_done(c, agent, &st, error.clone(), kind));
+        }
+        if self.solo_children.contains_key(&agent) {
+            if let Some(waiters) = self.solo_waiters.remove(&agent) {
+                let answer = self.solo_child_answer(agent, status, error.as_deref());
+                for (parent, request) in waiters {
+                    self.respond_tool_text(parent, request, &answer, status == "completed");
+                }
+            }
         }
         if Some(agent) == self.solo {
             let long = self.agents.get(&agent).and_then(|a| a.turn_started).map(|t| t.elapsed() > Duration::from_secs(30)).unwrap_or(false);
@@ -2322,12 +2399,139 @@ impl App {
         }
     }
 
+    fn respond_tool_text(&self, agent: AgentId, id: Value, text: &str, success: bool) {
+        self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": success}) });
+    }
+
+    fn fail_solo_waiters(&mut self, child: AgentId, reason: &str) {
+        if let Some(waiters) = self.solo_waiters.remove(&child) {
+            for (parent, request) in waiters {
+                self.respond_tool_text(parent, request, reason, false);
+            }
+        }
+    }
+
+    fn solo_child_answer(&self, child: AgentId, status: &str, error: Option<&str>) -> String {
+        let answer = self.agents.get(&child).and_then(|a| a.final_message.as_deref()).unwrap_or("").trim();
+        if status == "completed" {
+            if answer.is_empty() { format!("Subagent {child} completed without a final text answer.") } else { answer.to_string() }
+        } else if let Some(error) = error {
+            format!("Subagent {child} {status}: {error}")
+        } else {
+            format!("Subagent {child} {status}.")
+        }
+    }
+
+    fn stop_solo_children(&mut self, parent: AgentId) {
+        let children = self.solo_children.iter().filter_map(|(child, owner)| (*owner == parent).then_some(*child)).collect::<Vec<_>>();
+        for child in children {
+            self.hub.shutdown(child);
+            self.agents.remove(&child);
+            self.solo_waiters.remove(&child);
+            self.solo_children.remove(&child);
+        }
+    }
+
+    /// Handle the Solo-only subagent API. `false` means the tool name is not one of ours.
+    fn solo_tool_call(&mut self, parent: AgentId, request: Value, name: &str, args: &Value) -> bool {
+        if !matches!(name, "mantra_subagent_models" | "mantra_subagent_start" | "mantra_subagent_message" | "mantra_subagent_wait" | "mantra_subagent_inspect" | "mantra_subagent_stop") {
+            return false;
+        }
+        let text_arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("").trim();
+        let result = match name {
+            "mantra_subagent_models" => {
+                let models = self.registry.models.iter().map(|m| {
+                    let backend = self.registry.backend_of(m);
+                    let problem = if self.demo { None } else { self.registry.alias_problem(&m.alias) };
+                    format!("{} ({backend:?}){}", m.alias, problem.map(|p| format!(": unavailable — {p}")).unwrap_or_default())
+                }).collect::<Vec<_>>();
+                Some((if models.is_empty() { "No models configured. Add one in /models.".into() } else { models.join("\n") }, true))
+            }
+            "mantra_subagent_start" => {
+                let task = text_arg("task");
+                let alias = text_arg("model");
+                if task.is_empty() || alias.is_empty() {
+                    Some(("mantra_subagent_start requires a task and a configured model alias.".to_string(), false))
+                } else if self.registry.get(alias).is_none() || (!self.demo && self.registry.alias_problem(alias).is_some()) {
+                    Some((format!("Model '{alias}' is not usable. Choose a configured alias from /models."), false))
+                } else {
+                    let model = self.registry.resolve(alias);
+                    let backend = self.registry.backend_of(&model);
+                    let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
+                    let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
+                        name: format!("solo subagent · {alias}"), role: "solo-subagent".into(), glyph: "◇".into(), color: "blue".into(),
+                        model_alias: alias.to_string(), effort: args.get("effort").and_then(Value::as_str).map(str::to_string), cwd: self.project.clone(),
+                        approval: self.settings.approval_mode.clone(), sandbox: role_sandbox(&self.settings.sandbox, backend),
+                        instructions: "You are an independent subagent working for a Solo session. Complete the assigned task, keep changes within the user's project, and return a concise result.".into(),
+                        tools: if model.vision { tools::vision_tools() } else { vec![] }, extra_writable: vec![], network: true, writable_roots: vec![],
+                        context_override: None, resume_thread: None, thread_name: None, mcp,
+                    });
+                    self.solo_children.insert(child, parent);
+                    prompt_agent(&self.hub, &mut self.agents, child, task.to_string(), true, Send::Auto);
+                    Some((format!("Started subagent {child} on model alias '{alias}'. Use mantra_subagent_wait, mantra_subagent_message, or mantra_subagent_inspect with agent='{child}'."), true))
+                }
+            }
+            "mantra_subagent_message" | "mantra_subagent_wait" | "mantra_subagent_inspect" | "mantra_subagent_stop" => {
+                let child = text_arg("agent").parse::<AgentId>().ok().filter(|child| self.solo_children.get(child) == Some(&parent));
+                if let Some(child) = child {
+                    match name {
+                        "mantra_subagent_message" => {
+                            let message = text_arg("message");
+                            if message.is_empty() { Some(("mantra_subagent_message requires a message.".into(), false)) }
+                            else {
+                                prompt_agent(&self.hub, &mut self.agents, child, message.to_string(), true, Send::Auto);
+                                Some((format!("Message sent to subagent {child}."), true))
+                            }
+                        }
+                        "mantra_subagent_wait" => {
+                            let busy = self.agents.get(&child).is_some_and(Agent::busy);
+                            if busy {
+                                self.solo_waiters.entry(child).or_default().push((parent, request));
+                                return true;
+                            }
+                            let (status, error) = match self.agents.get(&child).map(|a| &a.status) {
+                                Some(Status::Failed(e)) | Some(Status::Crashed(e)) => ("failed", Some(e.as_str())),
+                                Some(Status::Stopped) => ("stopped", None),
+                                _ => ("completed", None),
+                            };
+                            Some((self.solo_child_answer(child, status, error), status == "completed"))
+                        }
+                        "mantra_subagent_stop" => {
+                            self.fail_solo_waiters(child, &format!("Subagent {child} was stopped."));
+                            self.hub.shutdown(child);
+                            self.agents.remove(&child);
+                            self.solo_children.remove(&child);
+                            Some((format!("Stopped subagent {child}."), true))
+                        }
+                        _ => {
+                            if let Some(a) = self.agents.get(&child) {
+                                let status = match &a.status { Status::Failed(e) => format!("failed: {e}"), Status::Crashed(e) => format!("crashed: {e}"), s => format!("{s:?}") };
+                                let n = args.get("lines").and_then(Value::as_u64).unwrap_or(8).clamp(1, 20) as usize;
+                                let tail = a.items.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().map(|i| i.text.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
+                                Some((format!("Subagent {child} · {} · model {} · {status}\n{}", a.name, a.model_alias, tail), true))
+                            } else { None }
+                        }
+                    }
+                } else {
+                    Some(("Unknown subagent id. Use an id returned by mantra_subagent_start in this Solo session.".into(), false))
+                }
+            }
+            _ => None,
+        };
+        if let Some((text, success)) = result {
+            self.respond_tool_text(parent, request, &text, success);
+        }
+        true
+    }
+
     fn on_request(&mut self, agent: AgentId, id: Value, method: &str, params: Value) {
         match method {
             "item/tool/call" => {
                 let tool = params.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                if Some(agent) == self.studio.architect {
+                if Some(agent) == self.solo && self.solo_tool_call(agent, id.clone(), &tool, &args) {
+                    // `mantra_subagent_wait` may keep this request open until the child finishes.
+                } else if Some(agent) == self.studio.architect {
                     let (text, ok) = self.architect_tool(&tool, &args);
                     self.hub.send(agent, Cmd::Respond { id, result: json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}) });
                 } else if self.in_run(agent) {
@@ -2957,6 +3161,16 @@ impl App {
             self.edit = None;
             return;
         }
+        // In Solo, ctrl+c means stop the live model turn even when the user has already started
+        // drafting the next message; preserve that draft for after the interruption.
+        if self.screen == Screen::Solo {
+            if let Some(a) = self.focus_agent() {
+                if self.interrupt_by_user(a) {
+                    self.toast(format!("stopping… it stays stopped ({more})"), Level::Warn);
+                    return;
+                }
+            }
+        }
         if !self.input.is_empty() {
             self.input.clear();
             return;
@@ -3255,6 +3469,32 @@ impl App {
 mod tests {
     use super::*;
 
+    fn configured_fixture() -> Registry {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::bija_default_provider());
+        reg.models.extend(crate::config::bija_default_model_entries("bija"));
+        reg
+    }
+
+    #[tokio::test]
+    async fn built_in_run_binds_missing_role_aliases_to_one_configured_model() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("one-model-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut reg = Registry::defaults();
+            reg.add_codex_model("my-codex", "model-chosen-by-user").unwrap();
+            let settings = Settings { default_model: "my-codex".into(), ..Settings::default() };
+            let mut app = App::new(settings, reg, project, Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            app.start_run("check the repository");
+            let run = app.run.as_ref().expect("one configured model suffices for a built-in run");
+            assert!(run.pattern.roles.values().all(|role| role.model == "my-codex"));
+            assert!(run.pulse.iter().any(|line| line.text.contains("built-in roles use configured models")));
+            app.shutdown();
+        });
+    }
+
     /// `/pattern` lists the built-ins first, `mantra-default` leading and marked as the default,
     /// each with the one-line description the picker shows.
     #[test]
@@ -3362,7 +3602,7 @@ mod tests {
                 let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
                 let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
                 let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
-                App::new(Settings { default_pattern: default_pattern.into(), ..Settings::default() }, Registry::defaults(), project.clone(), hub, tx, true)
+                App::new(Settings { default_pattern: default_pattern.into(), ..Settings::default() }, configured_fixture(), project.clone(), hub, tx, true)
             };
             for old in RETIRED {
                 let app = app_with(old);
@@ -3435,7 +3675,7 @@ mod tests {
             assert!(!crate::config::home().join("settings.toml").exists(), "the demo saves nothing");
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
             app.set_setting("experimental.akasha", "on").unwrap();
             assert!(app.settings.experimental_on("akasha") && Settings::load().experimental_on("akasha"));
             app.set_setting("experimental.akasha", "off").unwrap();
@@ -3499,7 +3739,7 @@ mod tests {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("/nonexistent"), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("/nonexistent"), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
             assert_eq!(app.set_setting("default_model", "luna"), Ok("Solo's next session (/new) uses it"));
             assert_eq!(app.set_setting("approval_mode", "never"), Ok(""));
             assert_eq!(app.set_setting("default_pattern", "mantra-lean"), Ok(""));
@@ -3573,6 +3813,79 @@ mod tests {
             other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    #[test]
+    fn solo_ctrl_c_interrupts_a_live_turn_without_discarding_a_draft() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let id = 41;
+        app.solo = Some(id);
+        let mut agent = Agent::new(id, "solo", "solo", PathBuf::new());
+        agent.status = Status::Busy;
+        agent.turn_active = true;
+        app.agents.insert(id, agent);
+        let mut rx = app.hub.test_register(id);
+        app.input.set("next question");
+        app.ctrl_c_press();
+        assert_eq!(app.input.text(), "next question");
+        assert!(app.agents[&id].stopped_by_user);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Interrupt)));
+    }
+
+    #[test]
+    fn solo_ctrl_f_sends_the_draft_into_the_live_turn_now() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let id = 42;
+        app.solo = Some(id);
+        let mut agent = Agent::new(id, "solo", "solo", PathBuf::new());
+        agent.status = Status::Busy;
+        agent.turn_active = true;
+        app.agents.insert(id, agent);
+        let mut rx = app.hub.test_register(id);
+        app.input.set("please check this now");
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Steer { text }) if text == "please check this now"));
+    }
+
+    #[test]
+    fn solo_without_a_usable_model_does_not_spawn_a_phantom_default() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry = Registry::defaults();
+        app.settings.default_model = "sol".into();
+        app.start_solo();
+        assert!(app.solo.is_none());
+        assert!(app.agents.is_empty());
+        assert!(app.toast.as_ref().is_some_and(|(t, _, _)| t.contains("/models")));
+    }
+
+    #[test]
+    fn solo_subagent_wait_returns_the_childs_final_answer_to_the_parent_tool_call() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.solo = Some(1);
+        let mut parent = Agent::new(1, "solo", "solo", PathBuf::new());
+        parent.status = Status::Busy;
+        parent.turn_active = true;
+        let mut child = Agent::new(2, "subagent", "solo-subagent", PathBuf::new());
+        child.status = Status::Busy;
+        child.turn_active = true;
+        child.final_message = Some("found the fix".into());
+        app.agents.insert(1, parent);
+        app.agents.insert(2, child);
+        app.solo_children.insert(2, 1);
+        let mut parent_rx = app.hub.test_register(1);
+        let _child_rx = app.hub.test_register(2);
+        assert!(app.solo_tool_call(1, json!("wait-1"), "mantra_subagent_wait", &json!({"agent": "2"})));
+        assert!(parent_rx.try_recv().is_err(), "wait remains open while child is busy");
+        app.on_turn_done(2, "completed", None, None);
+        match parent_rx.try_recv() {
+            Ok(Cmd::Respond { id, result }) => {
+                assert_eq!(id, json!("wait-1"));
+                assert_eq!(result.pointer("/contentItems/0/text").and_then(Value::as_str), Some("found the fix"));
+                assert_eq!(result["success"], true);
+            }
+            other => panic!("expected child result response, got {other:?}"),
+        }
     }
 
     /// The agent list shows what an agent really runs at: an `auto` effort that reaches the spawn is
@@ -3682,7 +3995,9 @@ mod tests {
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
             let mut reg = Registry::defaults();
-            crate::provider_key::add_backend_with(&mut reg, crate::provider_key::Backend::Codex, true).unwrap();
+            reg.providers.push(crate::config::bija_default_provider());
+            reg.models.extend(crate::config::bija_default_model_entries("bija"));
+            reg.add_codex_model("sol-codex", "account-sol").unwrap();
             let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
             app.start_solo();
             let first = app.solo.expect("Solo is up");
@@ -4208,7 +4523,7 @@ mod tests {
             // on disk too, as outside the demo they always are: the app reads them back from there
             settings.save().unwrap();
             let mut reg = Registry::defaults();
-            crate::provider_key::add_backend_with(&mut reg, crate::provider_key::Backend::Codex, true).unwrap();
+            reg.add_codex_model("sol-codex", "account-sol").unwrap();
             let mut app = App::new(settings, reg, dir.clone(), hub, tx, false);
             let read = |n: u32| {
                 for _ in 0..200 {
@@ -4259,7 +4574,7 @@ mod tests {
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
             let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
             Settings::default().save().unwrap();
-            let mut app = App::new(Settings::load_on_disk().unwrap(), Registry::defaults(), PathBuf::from("."), hub, tx, false);
+            let mut app = App::new(Settings::load_on_disk().unwrap(), configured_fixture(), PathBuf::from("."), hub, tx, false);
             let listed = |app: &App| crate::ui::settings::rows(app).into_iter().filter_map(|(_, r)| match r { crate::ui::settings::Row::Mcp { name, .. } => Some(name), _ => None }).collect::<Vec<_>>();
             // another terminal: mantra mcp add blender -- uvx blender-mcp
             let mut disk = Settings::load_on_disk().unwrap();
@@ -4295,8 +4610,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
-        let reg = Registry::defaults();
-        let eye = reg.models.iter().find(|m| m.vision).map(|m| m.alias.clone()).expect("a built-in alias that sees");
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::bija_default_provider());
+        reg.models.extend(crate::config::bija_default_model_entries("bija"));
+        let eye = reg.models.iter().find(|m| m.vision).map(|m| m.alias.clone()).expect("a configured alias that sees");
         let mut app = App::new(Settings::default(), reg, dir.clone(), hub, tx, true);
         let mut a = Agent::new(7, "solo", "solo", dir.clone());
         a.model_alias = eye;
@@ -4345,6 +4662,7 @@ mod tests {
         };
         assert!(!claude_strict_mcp(&o(vec![], vec![])), "nothing of Mantra's at all");
         assert!(!claude_strict_mcp(&o(tools::vision_tools(), vec![])), "Solo with the vision tools");
+        assert!(!claude_strict_mcp(&o(tools::solo_tools(), vec![])), "Solo's delegation tools keep the user's own Claude MCP servers");
         assert!(claude_strict_mcp(&o(tools::vision_tools(), vec![("blender".into(), mcp_server("uvx", &["blender-mcp"], true))])), "servers of Mantra's");
         let mut run_tools = tools::vision_tools();
         run_tools.extend(tools::worker_tools());

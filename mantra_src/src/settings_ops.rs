@@ -280,7 +280,9 @@ mod tests {
     /// rely on), and the list covers the sections the screen shows, each key once.
     #[test]
     fn every_field_takes_back_its_own_value() {
-        let reg = Registry::defaults();
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::bija_default_provider());
+        reg.models.extend(crate::config::bija_default_model_entries("bija"));
         let patterns = vec!["mantra-default".to_string(), "mantra-lean".to_string()];
         let s = Settings::default();
         let fields = s.fields(&reg, &patterns);

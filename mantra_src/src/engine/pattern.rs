@@ -1001,8 +1001,10 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_role_uses_a_default_registry_model_and_a_usable_effort() {
-        let reg = crate::config::Registry::defaults();
+    fn every_builtin_role_uses_a_supported_alias_when_explicitly_configured() {
+        let mut reg = crate::config::Registry::defaults();
+        reg.providers.push(crate::config::bija_default_provider());
+        reg.models.extend(crate::config::bija_default_model_entries("bija"));
         for p in all_builtins() {
             for (n, r) in &p.roles {
                 assert!(reg.get(&r.model).is_some(), "{}: role '{n}' uses unknown model alias '{}'", p.name, r.model);

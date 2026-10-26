@@ -1490,7 +1490,12 @@ pub(crate) mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
-        App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true)
+        // Tests of the existing demo flows need explicit fixture models. Production defaults
+        // remain empty, so fresh installs never inherit a Bija provider or model catalogue.
+        let mut registry = Registry::defaults();
+        registry.providers.push(crate::config::bija_default_provider());
+        registry.models.extend(crate::config::bija_default_model_entries("bija"));
+        App::new(Settings::default(), registry, PathBuf::from("."), hub, tx, true)
     }
 
     /// A worker record for one attempt at `task` (role `worker-small`), as the engine leaves it.

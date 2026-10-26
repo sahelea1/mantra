@@ -379,7 +379,8 @@
         const c = C();
         const k = (f) => 'm:' + m.alias + ':' + f;
         const more = !!c.open['m:' + m.alias];
-        const provs = R.providers.map((p) => p.id);
+        // Codex's login is an account rather than a provider row until its first model is added.
+        const provs = ['openai', ...R.providers.filter((p) => p.id !== 'openai').map((p) => p.id)];
         if (!provs.includes(m.provider)) provs.unshift(m.provider);
         const select = (field, val, opts, label) => h('select', { class: 'select cell-select', value: val, 'aria-label': label + ' of ' + m.alias, onchange: (e) => modelSet(m.alias, field)(e.target.value) },
             opts.map((o) => h('option', { value: o, key: o, selected: o === val }, o)));
@@ -440,7 +441,7 @@
         const del = () => M.act.sheet({
             kind: 'confirm', danger: true,
             title: p.account ? 'Remove the Codex account?' : 'Delete ' + p.id + '?',
-            body: p.account ? 'Removes its ' + F.plural(p.models, 'model') + ' from models.toml. “Add Codex” brings them back.' : 'Deletes ' + p.id + (p.models ? ' and its ' + F.plural(p.models, 'model') : '') + ' from models.toml, its key with it.',
+            body: p.account ? 'Removes its ' + F.plural(p.models, 'model') + ' from models.toml. You can add Codex models again by id.' : 'Deletes ' + p.id + (p.models ? ' and its ' + F.plural(p.models, 'model') : '') + ' from models.toml, its key with it.',
             confirm: p.account ? 'Remove' : 'Delete', run: () => reg('provider_delete', { id: p.id }, k('delete'), (d) => (p.account ? 'Codex account removed' : 'Deleted ' + p.id) + (d.models ? ' · ' + F.plural(d.models, 'model') : '')),
         });
         if (p.account) {
@@ -484,22 +485,53 @@
         const c = C(), R = c.models;
         if (!R) return null;
         const B = R.backends || {};
-        const backend = (kind, label, b) => P.btn(b && b.added ? label + ' ✓' : 'Add ' + label, () => reg('add_backend', { kind }, 'backend', (d) => d.added ? label + ': ' + F.plural(d.added, 'model') + ' added' : label + ' models are there already'),
-            { icon: 'plus', key: kind, disabled: !(b && b.installed), title: b && b.installed ? (b.added ? 'Added — adds any of its models that are missing' : 'Adds its default models') : '`' + (kind === 'codex' ? 'codex' : 'claude') + '` is not on PATH on this machine' });
-        const open = () => M.act.sheet({ kind: 'add-provider', step: 'key', key: '', url: '', urlTouched: false, draft: null, error: null, result: null, sel: {}, filter: '' });
+        const addClaude = async (auth) => {
+            const added = await reg('add_backend', { kind: 'claude-code' }, 'backend');
+            if (!added) return;
+            const p = C().models.providers.find((x) => x.kind === 'claude-code');
+            if (!p) return;
+            if (!await reg('provider_set', { id: p.id, field: 'auth', value: auth }, 'backend')) return;
+            if (auth === 'api_key') {
+                await reg('provider_set', { id: p.id, field: 'env_key', value: 'ANTHROPIC_API_KEY' }, 'backend');
+                M.act.flash('Claude Code: paste an API key in its row, or set $ANTHROPIC_API_KEY', 'ok');
+            } else {
+                M.act.flash('Claude Code uses your subscription login', 'ok');
+            }
+        };
+        const addCodex = () => {
+            c.addModel.provider = 'openai';
+            changed();
+            requestAnimationFrame(() => document.querySelector('input[aria-label="Model id"]')?.focus());
+        };
+        const open = () => M.act.sheet({ kind: 'add-provider', step: 'key', choice: '', key: '', url: '', urlTouched: false, draft: null, error: null, result: null, sel: {}, filter: '' });
         return SC.card('Providers', [
             h('p', { class: 'sec-sub', key: 'sub' }, 'Where the models run. Keys are stored in ~/.mantra/models.toml, readable by you only, and never shown again.'),
             h('div', { class: 'mt providers', role: 'table', 'aria-label': 'Providers', key: 'table' },
                 h('div', { class: 'mt-head', role: 'row' }, ['Id', 'Name', 'Base URL', 'Key', 'Kind', 'Wire / auth', ''].map((x, i) => h('span', { key: i, role: 'columnheader' }, x))),
                 R.providers.map(providerRow)),
             h('div', { class: 'form-row start', key: 'acts' },
-                P.btn('Add provider', open, { kind: 'primary', icon: 'plus', key: 'add' }),
-                backend('codex', 'Codex', B.codex), backend('claude-code', 'Claude Code', B.claude)),
+                P.btn('Add API provider', open, { kind: 'primary', icon: 'plus', key: 'add' }),
+                !R.providers.some((p) => p.kind === 'bija') ? P.btn('Bija · inactive', open, { key: 'bija-status', disabled: true, title: 'Choose Add API provider to configure Bija' }) : null,
+                P.btn('Add Codex model', addCodex, { icon: 'plus', key: 'codex', disabled: !(B.codex && B.codex.installed), title: 'Enter a Codex model id above; no model list is built into Mantra' }),
+                P.btn('Claude Code subscription', () => addClaude('subscription'), { icon: 'plus', key: 'claude-code', disabled: !(B.claude && B.claude.installed), title: 'Uses your Claude Code login' }),
+                P.btn('Claude Code API key', () => addClaude('api_key'), { icon: 'plus', key: 'claude-key', disabled: !(B.claude && B.claude.installed), title: 'Paste a key or set $ANTHROPIC_API_KEY' })),
             errLine('backend'),
         ], { key: 'providers', icon: 'globe' });
     }
 
-    // ── the Add-provider sheet: key → URL → probe → checklist → add ──────────────────────────────
+    // ── the Add-provider sheet: choose an API → key → probe → checklist ────────────────────────
+    // Choices fill only this form. No Bija provider or model is added until the user submits it.
+    const API_CHOICES = [
+        ['openai', 'OpenAI API', 'https://api.openai.com/v1'],
+        ['anthropic', 'Anthropic API', 'https://api.anthropic.com/v1'],
+        ['openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1'],
+        ['groq', 'Groq', 'https://api.groq.com/openai/v1'],
+        ['xai', 'xAI', 'https://api.x.ai/v1'],
+        ['gemini', 'Gemini API', 'https://generativelanguage.googleapis.com/v1beta/openai'],
+        ['cerebras', 'Cerebras', 'https://api.cerebras.ai/v1'],
+        ['fireworks', 'Fireworks', 'https://api.fireworks.ai/inference/v1'],
+        ['local', 'Local / custom OpenAI-compatible', ''],
+    ];
     let draftTimer = null;
     function askDraft(sh) {
         clearTimeout(draftTimer);
@@ -553,7 +585,18 @@
         const go = (e) => { if (e) e.preventDefault(); if (!busy && (sh.key.trim() || sh.url.trim())) probe(sh); };
         const body = h('form', { class: 'ap-form', key: 'f', onsubmit: go },
             sh.existing ? h('p', { class: 'sheet-text' }, 'Asks ', h('b', null, sh.existing), ' for its model list. Paste a key to replace its own, or leave it empty.')
-                : h('p', { class: 'sheet-text' }, 'Paste the API key — Mantra works out the provider from it, asks for its models, and you pick the ones you want. A local server takes no key: leave it empty and give its URL.'),
+                : h('p', { class: 'sheet-text' }, 'Choose an API, then enter its key. For a local server, enter its URL and leave the key empty. This adds a Bija backend only when you submit.'),
+            !sh.existing ? [
+                h('label', { class: 'select-label', for: 'ap-choice', key: 'cl' }, 'API provider'),
+                h('select', { id: 'ap-choice', class: 'select', key: 'cs', value: sh.choice || '', onchange: (e) => {
+                    sh.choice = e.target.value;
+                    const choice = API_CHOICES.find((x) => x[0] === sh.choice);
+                    sh.url = choice ? choice[2] : '';
+                    sh.urlTouched = !!choice;
+                    sh.error = null;
+                    askDraft(sh); changed();
+                } }, [h('option', { value: '', key: 'none' }, 'Select an API or paste a key'), ...API_CHOICES.map((x) => h('option', { value: x[0], key: x[0] }, x[1]))]),
+            ] : null,
             h('label', { class: 'select-label', for: 'ap-key' }, 'API key'),
             h('input', { id: 'ap-key', class: 'input mono', type: 'password', autocomplete: 'off', value: sh.key, placeholder: 'the key, as the provider gave it to you', disabled: busy || null, oninput: (e) => { sh.key = e.target.value; sh.error = null; askDraft(sh); changed(); } }),
             sh.key.trim() || sh.url || sh.existing ? [

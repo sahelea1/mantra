@@ -39,6 +39,23 @@ pub fn worker_tools() -> Vec<Value> {
     vec![ask_tool("orchestrator")]
 }
 
+/// Standalone Solo orchestration tools. These deliberately accept a registry alias per child so
+/// Solo can delegate to a different configured model/provider when the task calls for it.
+pub fn solo_tools() -> Vec<Value> {
+    vec![
+        tool("mantra_subagent_models", "List the configured model aliases available to Solo subagents, with their backend. Use an alias from this list in mantra_subagent_start.", json!({}), &[]),
+        tool("mantra_subagent_start", "Start an independent subagent process in the current project. Choose any configured /models alias; the child can use a different provider/model from you.", json!({
+            "task": {"type": "string"},
+            "model": {"type": "string", "description": "configured alias from /models"},
+            "effort": {"type": "string", "description": "optional reasoning effort"}
+        }), &["task", "model"]),
+        tool("mantra_subagent_message", "Send a follow-up message to one of your subagents. Use its id returned by mantra_subagent_start.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        tool("mantra_subagent_wait", "Wait for one subagent to finish and return its final answer. Use its id returned by mantra_subagent_start.", json!({"agent": {"type": "string"}}), &["agent"]),
+        tool("mantra_subagent_inspect", "Inspect one subagent's current state and recent activity.", json!({"agent": {"type": "string"}, "lines": {"type": "integer"}}), &["agent"]),
+        tool("mantra_subagent_stop", "Stop one of your subagents and release its process. Its final answer stays available only while it is running, so inspect it first if needed.", json!({"agent": {"type": "string"}}), &["agent"]),
+    ]
+}
+
 pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
     let mut v = vec![
         tool(

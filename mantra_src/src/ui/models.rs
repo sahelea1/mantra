@@ -1,10 +1,10 @@
 //! `/models`: the registry as two grids — models and providers — edited in place (`ui::form`):
-//! type into a cell and ⏎ saves models.toml. ctrl+n adds (a provider from nothing but its API key,
-//! a model, Codex, Claude Code), Delete twice removes, ctrl+t tests a model, ctrl+d asks a
-//! provider for its models.
+//! type into a cell and ⏎ saves models.toml. ctrl+n adds an API-key provider, a model, a Codex
+//! account model by ID, or a Claude Code subscription; Delete twice removes, ctrl+t tests a model,
+//! ctrl+d discovers provider models.
 
 use super::{theme, *};
-use crate::app::{App, Choice, EditTarget, KeyFlow, Overlay, Select, SelectThen, ADD_CLAUDE, ADD_CODEX, ADD_KEY, ADD_MODEL};
+use crate::app::{App, Choice, EditTarget, KeyFlow, Overlay, Select, SelectThen, ADD_CLAUDE, ADD_CLAUDE_KEY, ADD_CODEX, ADD_KEY, ADD_MODEL};
 use crate::config::{ModelEntry, ProviderEntry, ProviderKind, Registry};
 use crate::ui::form::{self, Edit, Outcome, Start};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -78,8 +78,9 @@ fn model_kind(col: usize) -> Kind {
 fn prov_kind(row: ProvRow, col: usize) -> Kind {
     match (row, col) {
         (ProvRow::Codex, _) => Kind::Fixed,
+        (ProvRow::Entry(_), PROV_KIND_COL) => Kind::Choice,
         (_, PROV_KEY_COL) => Kind::Secret,
-        (_, PROV_KIND_COL | PROV_AUTH_COL | PROV_WIRE_COL) => Kind::Choice,
+        (_, PROV_AUTH_COL | PROV_WIRE_COL) => Kind::Choice,
         _ => Kind::Text,
     }
 }
@@ -229,10 +230,24 @@ fn set_model_cell(reg: &mut Registry, row: usize, col: usize, text: &str) -> Res
         }
     }
     let m = reg.models.get_mut(row).ok_or("that model is gone")?;
+    if col == MODEL_COL && m.provider == "openai" && t.is_empty() {
+        return Err("a Codex model needs a model ID".into());
+    }
     match col {
         ALIAS_COL => m.alias = crate::util::slug(t),
-        PROVIDER_COL => m.provider = t.to_string(),
-        MODEL_COL => m.model = t.to_string(),
+        PROVIDER_COL => {
+            if t == "openai" && m.model.is_empty() {
+                return Err("a Codex model needs a model ID".into());
+            }
+            m.provider = t.to_string();
+        }
+        MODEL_COL => {
+            let was_empty = m.model.is_empty();
+            m.model = t.to_string();
+            if m.provider == "openai" && was_empty && !t.is_empty() {
+                m.vision = crate::config::takes_images(t);
+            }
+        }
         CONTEXT_COL => {
             let n = parse_tokens(t);
             if n.is_none() && !t.is_empty() && !["none", "default"].contains(&t.to_ascii_lowercase().as_str()) {
@@ -284,7 +299,13 @@ fn set_prov_cell(reg: &mut Registry, idx: usize, col: usize, text: &str) -> Resu
         PROV_URL_COL => p.base_url = t,
         PROV_ENV_COL => p.env_key = t,
         PROV_KEY_COL => p.api_key = if t.is_empty() { None } else { Some(t) },
-        PROV_KIND_COL => p.kind = parse_kind(&t),
+        PROV_KIND_COL => {
+            let normalized = t.to_ascii_lowercase().replace(['_', '-', ' '], "");
+            if !matches!(normalized.as_str(), "codex" | "claude" | "claudecode" | "bija" | "seed") {
+                return Err("provider kind: Codex, ClaudeCode or Bija".into());
+            }
+            p.kind = parse_kind(&t)
+        }
         PROV_AUTH_COL => p.auth = parse_auth(&t),
         PROV_WIRE_COL => p.wire = parse_wire(&t),
         _ => {}
@@ -294,11 +315,8 @@ fn set_prov_cell(reg: &mut Registry, idx: usize, col: usize, text: &str) -> Resu
 
 /// The provider ids a model can be put on: Codex's account while it has models (or this one is
 /// on it), then every configured provider.
-fn provider_choices(reg: &Registry, cur: &str) -> Vec<String> {
-    let mut v = vec![];
-    if !reg.codex_account_models().is_empty() || cur.is_empty() || cur == "openai" {
-        v.push("openai".to_string());
-    }
+fn provider_choices(reg: &Registry) -> Vec<String> {
+    let mut v = vec!["openai".to_string()];
     v.extend(reg.providers.iter().map(|p| p.id.clone()));
     v
 }
@@ -321,7 +339,7 @@ fn step(app: &mut App, d: i32) -> bool {
         }
         return true;
     }
-    let providers = app.registry.models.get(row).map(|m| provider_choices(&app.registry, &m.provider)).unwrap_or_default();
+    let providers = app.registry.models.get(row).map(|_| provider_choices(&app.registry)).unwrap_or_default();
     let Some(m) = app.registry.models.get_mut(row) else { return false };
     match col {
         PROVIDER_COL => m.provider = form::cycle(&providers, &m.provider, d),
@@ -363,7 +381,7 @@ fn jump(app: &mut App, c: char) -> bool {
         }
         return true;
     }
-    let providers = app.registry.models.get(row).map(|m| provider_choices(&app.registry, &m.provider)).unwrap_or_default();
+    let providers = app.registry.models.get(row).map(|_| provider_choices(&app.registry)).unwrap_or_default();
     let Some(m) = app.registry.models.get_mut(row) else { return false };
     let (list, cur) = match col {
         PROVIDER_COL => (providers, m.provider.clone()),
@@ -383,6 +401,11 @@ fn jump(app: &mut App, c: char) -> bool {
 fn save(app: &mut App) {
     if let Err(e) = app.save_registry() {
         app.toast(e, crate::agent::Level::Error);
+    } else if app.registry.alias_problem(&app.settings.default_model).is_some() {
+        if let Some(alias) = app.registry.models.iter().find(|m| app.demo || app.registry.alias_problem(&m.alias).is_none()).map(|m| m.alias.clone()) {
+            app.settings.default_model = alias;
+            app.save_settings();
+        }
     }
 }
 
@@ -425,10 +448,11 @@ pub fn add_menu(app: &App) -> Select {
     Select {
         title: "add".into(),
         items: vec![
-            row(ADD_KEY, "Provider from an API key", "paste the key: Mantra finds the API and lists its models".into()),
-            row(ADD_MODEL, "A model on an existing provider", "a new row to fill in".into()),
-            row(ADD_CODEX, "Codex (ChatGPT login)", format!("its models, on your codex login{codex}")),
-            row(ADD_CLAUDE, "Claude Code", format!("its models, on your claude login{claude}")),
+            row(ADD_KEY, "API key provider", "paste a key and API URL; Mantra can discover its models".into()),
+            row(ADD_MODEL, "Add a model", "enter an alias, provider and model ID".into()),
+            row(ADD_CODEX, "Codex account model", format!("add a model ID for your ChatGPT login{codex}")),
+            row(ADD_CLAUDE, "Claude Code subscription", format!("connect its subscription login{claude}")),
+            row(ADD_CLAUDE_KEY, "Claude Code API key", format!("paste an API key or use $ANTHROPIC_API_KEY{claude}")),
         ],
         sel: 0,
         multi: false,
@@ -441,15 +465,22 @@ pub fn add_chosen(app: &mut App, key: &str) {
     use crate::provider_key::Backend;
     match key {
         ADD_KEY => {
-            app.models_ui.providers = true;
-            app.models_ui.keyflow = Some(KeyFlow::default());
-            app.edit = Some(Edit::new(EditTarget::KeyFlowKey, "", Start::Clear).secret());
+            let items = [
+                ("openai", "OpenAI API", "https://api.openai.com/v1"),
+                ("anthropic", "Anthropic API", "https://api.anthropic.com/v1"),
+                ("openrouter", "OpenRouter", "https://openrouter.ai/api/v1"),
+                ("groq", "Groq", "https://api.groq.com/openai/v1"),
+                ("xai", "xAI", "https://api.x.ai/v1"),
+                ("gemini", "Gemini API", "https://generativelanguage.googleapis.com/v1beta/openai"),
+                ("cerebras", "Cerebras", "https://api.cerebras.ai/v1"),
+                ("fireworks", "Fireworks", "https://api.fireworks.ai/inference/v1"),
+                ("custom", "Local / custom API", "enter its base URL; a local server can use no key"),
+            ].into_iter().map(|(key, label, detail)| Choice { key: key.into(), label: label.into(), detail: detail.into(), on: false }).collect();
+            app.overlays.push(Overlay::Select(Select { title: "choose an API provider".into(), items, sel: 0, multi: false, then: SelectThen::ProviderPreset }));
         }
         ADD_MODEL => {
             let mut items: Vec<Choice> = vec![];
-            if !app.registry.codex_account_models().is_empty() {
-                items.push(Choice { key: "openai".into(), label: "openai".into(), detail: app.registry.provider_name("openai"), on: false });
-            }
+            items.push(Choice { key: "openai".into(), label: "openai".into(), detail: "Codex account (ChatGPT login)".into(), on: false });
             items.extend(app.registry.providers.iter().map(|p| Choice { key: p.id.clone(), label: p.id.clone(), detail: app.registry.provider_name(&p.id), on: false }));
             match items.len() {
                 0 => app.toast("add a provider first — from its API key", crate::agent::Level::Info),
@@ -457,16 +488,59 @@ pub fn add_chosen(app: &mut App, key: &str) {
                 _ => app.overlays.push(Overlay::Select(Select { title: "a model on which provider".into(), items, sel: 0, multi: false, then: SelectThen::AddModelOn })),
             }
         }
-        ADD_CODEX | ADD_CLAUDE => {
-            let (backend, name) = if key == ADD_CODEX { (Backend::Codex, "Codex") } else { (Backend::ClaudeCode, "Claude Code") };
-            match app.add_backend(backend) {
-                Ok(0) => app.toast(format!("{name}'s models are here already"), crate::agent::Level::Info),
-                Ok(n) => app.toast(format!("{name}: {n} model{} added", if n == 1 { "" } else { "s" }), crate::agent::Level::Ok),
-                Err(e) => app.toast(e, crate::agent::Level::Warn),
+        ADD_CODEX | ADD_CLAUDE | ADD_CLAUDE_KEY => {
+            if key == ADD_CODEX {
+                if !app.demo && !crate::config::codex_available() {
+                    app.toast("codex is not on PATH", crate::agent::Level::Warn);
+                } else {
+                    add_model_on(app, "openai");
+                }
+            } else {
+                match app.add_backend(Backend::ClaudeCode) {
+                    Ok(n) if key == ADD_CLAUDE_KEY => {
+                        if let Some((idx, p)) = app.registry.providers.iter_mut().enumerate().find(|(_, p)| p.kind == ProviderKind::ClaudeCode) {
+                            p.auth = "api_key".into();
+                            p.env_key = "ANTHROPIC_API_KEY".into();
+                            save(app);
+                            app.models_ui.providers = true;
+                            app.models_ui.row = prov_row_of(&app.registry, &app.registry.providers[idx].id).unwrap_or(0);
+                            app.models_ui.col = PROV_KEY_COL;
+                            app.edit = Some(Edit::new(EditTarget::ProviderCell(idx, PROV_KEY_COL), "", Start::Clear).secret());
+                            app.toast(format!("Claude Code: {n} model(s). Paste an API key, or press esc to use $ANTHROPIC_API_KEY"), crate::agent::Level::Info);
+                        }
+                    }
+                    Ok(n) => {
+                        if let Some(p) = app.registry.providers.iter_mut().find(|p| p.kind == ProviderKind::ClaudeCode) {
+                            p.auth = "subscription".into();
+                            save(app);
+                        }
+                        app.toast(format!("Claude Code subscription: {n} model{} added", if n == 1 { "" } else { "s" }), crate::agent::Level::Info);
+                    }
+                    Err(e) => app.toast(e, crate::agent::Level::Warn),
+                }
             }
         }
         _ => {}
     }
+}
+
+/// A choice prefills only the next form; nothing is written until the URL is confirmed.
+pub fn provider_preset_chosen(app: &mut App, key: &str) {
+    let url = match key {
+        "openai" => "https://api.openai.com/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "groq" => "https://api.groq.com/openai/v1",
+        "xai" => "https://api.x.ai/v1",
+        "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        "cerebras" => "https://api.cerebras.ai/v1",
+        "fireworks" => "https://api.fireworks.ai/inference/v1",
+        "custom" => "",
+        _ => return,
+    };
+    app.models_ui.providers = true;
+    app.models_ui.keyflow = Some(KeyFlow { guess: url.into(), ..Default::default() });
+    app.edit = Some(Edit::new(EditTarget::KeyFlowKey, "", Start::Clear).secret());
 }
 
 /// A new model row on `provider`, saved, its model id cell open for typing.
@@ -474,7 +548,9 @@ pub fn add_model_on(app: &mut App, provider: &str) {
     let n = app.registry.models.len();
     let alias = (n + 1..).map(|i| format!("model{i}")).find(|a| app.registry.get(a).is_none()).unwrap_or_default();
     app.registry.models.push(ModelEntry { alias, provider: provider.to_string(), ..Default::default() });
-    save(app);
+    if provider != "openai" {
+        save(app);
+    }
     edit_model_cell(app, n, MODEL_COL);
     app.edit = Some(Edit::new(EditTarget::ModelCell(n, MODEL_COL), "", Start::Clear));
 }
@@ -488,6 +564,12 @@ fn edit_key(app: &mut App, k: KeyEvent) {
         Outcome::Editing => {}
         Outcome::Revert => {
             app.edit = None;
+            if let EditTarget::ModelCell(row, MODEL_COL) = &target {
+                if app.registry.models.get(*row).is_some_and(|m| m.provider == "openai" && m.model.is_empty()) {
+                    app.registry.models.remove(*row);
+                    fix_rows(app);
+                }
+            }
             if matches!(target, EditTarget::KeyFlowKey | EditTarget::KeyFlowUrl) {
                 app.models_ui.keyflow = None;
             }
@@ -500,7 +582,9 @@ fn edit_key(app: &mut App, k: KeyEvent) {
         }
         Outcome::Commit | Outcome::CommitMove(_) => {
             let Some(e) = app.edit.take() else { return };
-            if e.changed() {
+            let incomplete_codex_model = matches!(&e.target, EditTarget::ModelCell(row, MODEL_COL)
+                if app.registry.models.get(*row).is_some_and(|m| m.provider == "openai" && m.model.is_empty()));
+            if e.changed() || incomplete_codex_model {
                 let text = e.text();
                 let done = match &e.target {
                     EditTarget::ModelCell(row, col) => set_model_cell(&mut app.registry, *row, *col, &text),
@@ -531,7 +615,8 @@ fn keyflow_next(app: &mut App) {
     let text = e.text().trim().to_string();
     match e.target {
         EditTarget::KeyFlowKey => {
-            let guess = crate::provider_key::provider_from_key(&text, None).base_url;
+            let preset = app.models_ui.keyflow.as_ref().map(|k| k.guess.clone()).unwrap_or_default();
+            let guess = if preset.is_empty() { crate::provider_key::provider_from_key(&text, None).base_url } else { preset };
             if let Some(k) = app.models_ui.keyflow.as_mut() {
                 k.key = text;
                 k.guess = guess.clone();
@@ -566,18 +651,16 @@ fn keyflow_next(app: &mut App) {
 
 /// Delete on the selected row: the first press arms, the second deletes and saves. A provider
 /// takes its models with it (they could not run without it), Codex's row every model on its
-/// account; the last model stays.
+/// account. Removing the last model returns Solo to its setup state.
 fn delete(app: &mut App) {
     let row = app.models_ui.row;
     if !app.models_ui.providers {
         let Some(alias) = app.registry.models.get(row).map(|m| m.alias.clone()) else { return };
-        if app.registry.models.len() == 1 {
-            return app.toast("the last model stays — Mantra needs one", crate::agent::Level::Info);
-        }
         if form::confirm(&mut app.confirm, &alias) {
             app.registry.models.remove(row);
             app.models_ui.row = row.min(app.registry.models.len().saturating_sub(1));
             save(app);
+            reconcile_default_model(app);
             app.toast(format!("deleted {alias}"), crate::agent::Level::Ok);
         }
         return;
@@ -585,23 +668,18 @@ fn delete(app: &mut App) {
     match prov_rows(&app.registry).get(row).copied() {
         Some(ProvRow::Codex) => {
             let n = app.registry.codex_account_models().len();
-            if n == app.registry.models.len() {
-                return app.toast("every model is on the Codex account — add another first", crate::agent::Level::Info);
-            }
             if form::confirm(&mut app.confirm, &format!("the Codex account and its {n} model{}", if n == 1 { "" } else { "s" })) {
                 match app.remove_codex_account() {
                     Ok(n) => app.toast(format!("removed the Codex account: {n} model{}", if n == 1 { "" } else { "s" }), crate::agent::Level::Ok),
                     Err(e) => app.toast(e, crate::agent::Level::Error),
                 }
+                reconcile_default_model(app);
                 fix_rows(app);
             }
         }
         Some(ProvRow::Entry(i)) => {
             let id = app.registry.providers[i].id.clone();
             let n = app.registry.models.iter().filter(|m| m.provider == id).count();
-            if n > 0 && n == app.registry.models.len() {
-                return app.toast(format!("every model is on {id} — add another first"), crate::agent::Level::Info);
-            }
             let what = if n == 0 { id.clone() } else { format!("{id} and its {n} model{}", if n == 1 { "" } else { "s" }) };
             if form::confirm(&mut app.confirm, &what) {
                 app.registry.providers.remove(i);
@@ -612,6 +690,15 @@ fn delete(app: &mut App) {
             }
         }
         None => {}
+    }
+}
+
+/// Keep Solo's configured model on an entry that still exists after a removal. An empty registry
+/// keeps an empty setting so startup can remain in setup until the user adds a model.
+fn reconcile_default_model(app: &mut App) {
+    if app.registry.alias_problem(&app.settings.default_model).is_some() {
+        app.settings.default_model = app.registry.models.iter().find(|m| app.demo || app.registry.alias_problem(&m.alias).is_none()).map(|m| m.alias.clone()).unwrap_or_default();
+        app.save_settings();
     }
 }
 
@@ -982,6 +1069,9 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
         pband = Some(pl.len());
         pl.push(line);
     }
+    if !app.registry.providers.iter().any(|p| p.kind == ProviderKind::Bija) {
+        pl.push(Line::from(Span::styled(" ○ Bija inactive · ctrl+n adds an API provider", theme::dim())));
+    }
     pl.push(Line::default());
     let hint_rows = (pinner.height as usize).saturating_sub(pl.len());
     for h in provider_hints(pinner.width as usize, ui.providers && ui.col >= PROV_KIND_COL).iter().take(hint_rows) {
@@ -1107,14 +1197,14 @@ fn provider_hints(w: usize, enums: bool) -> [&'static str; 4] {
         return [
             " base_url = the API root: Codex adds /responses, Bija /chat/completions or /messages, ClaudeCode wants it without /v1",
             " env_key = an env var holding the key · api_key = paste one (stored 0600) · either works · ctrl+d discovers …/models",
-            " ctrl+n adds a provider from just its API key (the URL and the models are found for you), Codex or Claude Code",
+            " ctrl+n chooses an API endpoint or local URL, a Codex model, or Claude Code auth",
             " kind = Codex | ClaudeCode | Bija · auth (ClaudeCode) = subscription | api_key · wire (Bija) = openai | anthropic",
         ];
     }
     if enums {
-        [" kind = Codex | ClaudeCode | Bija · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " ctrl+n adds a provider from its API key, Codex or Claude Code"]
+        [" kind = Codex | ClaudeCode | Bija · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " ctrl+n chooses an API, Codex model or Claude Code auth"]
     } else {
-        [" base_url = the API root (Codex …/v1/responses · ClaudeCode: no /v1)", " env_key = an env var holding the key · api_key = paste one (0600)", " ctrl+d discovers …/models · → reaches kind, auth and wire", " ctrl+n adds a provider from its API key, Codex or Claude Code"]
+        [" base_url = the API root (Codex …/v1/responses · Bija …/chat/completions)", " env_key = an env var holding the key · api_key = paste one (0600)", " ctrl+d discovers …/models · → reaches kind, auth and wire", " ctrl+n chooses an API, Codex model or Claude Code auth"]
     }
 }
 
@@ -1287,29 +1377,23 @@ mod tests {
     fn the_codex_row_removes_the_accounts_models() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let mut app = saving_app();
-            assert_eq!(prov_rows(&app.registry), vec![ProvRow::Entry(0)], "no Codex models, no Codex row");
-            crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
-            assert_eq!(prov_rows(&app.registry), vec![ProvRow::Codex, ProvRow::Entry(0)]);
+            app.registry = Registry::defaults();
+            assert!(prov_rows(&app.registry).is_empty(), "an empty registry has no provider rows");
+            app.registry.add_codex_model("my-model", "gpt-custom").unwrap();
+            assert_eq!(prov_rows(&app.registry), vec![ProvRow::Codex]);
             press(&mut app, KeyCode::Tab);
             let (lines, _) = screen(&mut app, 140, 34);
-            assert!(lines.iter().any(|l| l.contains("openai") && l.contains("(ChatGPT login via codex)") && l.contains("4 models")), "{}", lines.join("\n"));
+            assert!(lines.iter().any(|l| l.contains("openai") && l.contains("(ChatGPT login via codex)")), "{}", lines.join("\n"));
             typed(&mut app, "x");
             assert!(app.edit.is_none(), "read-only");
-            // the bija row below it edits its own provider
-            press(&mut app, KeyCode::Down);
-            app.models_ui.col = PROV_NAME_COL;
-            typed(&mut app, "Mine");
-            press(&mut app, KeyCode::Enter);
-            assert_eq!(app.registry.providers[0].name, "Mine");
-            press(&mut app, KeyCode::Up);
             press(&mut app, KeyCode::Delete);
-            assert_eq!(app.registry.codex_account_models().len(), 4, "armed");
+            assert_eq!(app.registry.codex_account_models().len(), 1, "armed");
             press(&mut app, KeyCode::Delete);
             assert!(app.registry.codex_account_models().is_empty());
-            assert_eq!(app.registry.models.len(), 4, "bija's four stay");
+            assert_eq!(app.registry.models.len(), 0, "account disable removes its models");
             assert!(Registry::load().codex_account_models().is_empty(), "saved");
-            assert_eq!(prov_rows(&app.registry), vec![ProvRow::Entry(0)]);
-            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "removed the Codex account: 4 models"), "{:?}", app.toast);
+            assert!(prov_rows(&app.registry).is_empty());
+            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "removed the Codex account: 1 model"), "{:?}", app.toast);
         });
     }
 
@@ -1318,24 +1402,34 @@ mod tests {
     fn ctrl_n_offers_the_add_menu() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let mut app = saving_app();
+            app.registry = Registry::defaults();
             ctrl(&mut app, 'n');
             let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("the add menu") };
-            assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![ADD_KEY, ADD_MODEL, ADD_CODEX, ADD_CLAUDE]);
+            assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![ADD_KEY, ADD_MODEL, ADD_CODEX, ADD_CLAUDE, ADD_CLAUDE_KEY]);
             app.overlays.clear();
             add_chosen(&mut app, ADD_MODEL);
             let n = app.registry.models.len();
-            assert_eq!((app.registry.models[n - 1].provider.as_str(), app.registry.models[n - 1].alias.as_str()), ("bija", "model5"));
+            assert_eq!((app.registry.models[n - 1].provider.as_str(), app.registry.models[n - 1].alias.as_str()), ("openai", "model1"));
             assert!(matches!(&app.edit, Some(e) if e.target == EditTarget::ModelCell(n - 1, MODEL_COL)));
             typed(&mut app, "my-model");
             press(&mut app, KeyCode::Enter);
             assert_eq!(Registry::load().models[n - 1].model, "my-model");
-            // Codex in the demo: the mocks stand in for the CLI (and nothing is written)
             app.demo = true;
             add_chosen(&mut app, ADD_CODEX);
-            assert!(Registry::load().models.iter().all(|m| m.provider != "codex"));
-            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "Codex: 4 models added"), "{:?}", app.toast);
+            assert_eq!(app.registry.models.len(), n + 1, "Codex can be extended after its first model");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.registry.models.len(), n, "cancelling an empty Codex model removes its draft");
+            app.registry.models.clear();
             add_chosen(&mut app, ADD_CODEX);
-            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("here already")));
+            assert!(matches!(&app.edit, Some(e) if matches!(&e.target, EditTarget::ModelCell(_, MODEL_COL))));
+            assert_eq!(app.registry.models.last().map(|m| (m.provider.as_str(), m.model.as_str())), Some(("openai", "")));
+            typed(&mut app, "gpt-custom");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.registry.models.last().map(|m| m.model.as_str()), Some("gpt-custom"));
+            add_chosen(&mut app, ADD_CODEX);
+            assert_eq!(app.registry.models.len(), 2, "the direct Codex action opens another model");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.registry.models.len(), 1);
         });
     }
 
@@ -1347,6 +1441,10 @@ mod tests {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let mut app = saving_app();
             add_chosen(&mut app, ADD_KEY);
+            let Some(Overlay::Select(menu)) = app.overlays.pop() else { panic!("API choices") };
+            assert_eq!(menu.then, SelectThen::ProviderPreset);
+            assert!(menu.items.iter().any(|c| c.key == "groq") && menu.items.iter().any(|c| c.key == "custom"));
+            provider_preset_chosen(&mut app, "custom");
             assert!(app.models_ui.providers && app.models_ui.keyflow.is_some());
             assert!(matches!(&app.edit, Some(e) if e.target == EditTarget::KeyFlowKey && e.secret));
             typed(&mut app, "gsk_live_secret_9f3a");
@@ -1361,6 +1459,8 @@ mod tests {
             press(&mut app, KeyCode::Esc);
             assert!(app.models_ui.keyflow.is_none() && app.edit.is_none(), "esc cancels");
             add_chosen(&mut app, ADD_KEY);
+            app.overlays.pop();
+            provider_preset_chosen(&mut app, "custom");
             typed(&mut app, "zz-unknown-1234");
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.edit.as_ref().map(|e| e.text()), Some(String::new()));
@@ -1389,8 +1489,8 @@ mod tests {
         });
     }
 
-    /// At 80 columns a Bija provider's kind and wire can be seen once the cursor is on them, and
-    /// its status reads whole; the hint under the grid is about the columns being edited.
+    /// At 80 columns an explicitly configured Bija provider's kind and wire remain visible,
+    /// and its discovery/test actions stay available.
     #[test]
     fn the_providers_grid_at_80_columns_shows_kind_and_wire() {
         let mut app = crate::web::snapshot::tests::test_app();
@@ -1400,19 +1500,18 @@ mod tests {
         app.models_ui.col = PROV_WIRE_COL;
         let (lines, _) = screen(&mut app, 80, 24);
         let row = lines.iter().find(|l| l.contains("local")).cloned().unwrap_or_default();
-        assert!(row.contains("Bija") && row.contains("anthropic") && row.contains("no key (optional)"), "{row}");
-        assert!(lines.iter().any(|l| l.contains("wire (Bija only) = openai")), "{}", lines.join("\n"));
+        assert!(row.contains("Bija") && row.contains("anthropic") && !row.contains("unavailable"), "{row}");
+        assert!(lines.iter().any(|l| l.contains("wire (Bija only)")), "{}", lines.join("\n"));
         let foot = lines.last().cloned().unwrap_or_default();
         assert!(foot.contains("+/- change") && foot.contains("ctrl+n add"), "the row keys come first: {foot}");
     }
 
-    /// +/- on the provider grid cycles the column under the cursor — kind, auth or wire — and
-    /// nothing else; a typed wire is stored the way models.toml keeps it.
+    /// An explicitly configured provider may use Bija; cycling kind and auth remains editable.
     #[test]
-    fn provider_kind_auth_and_wire_cycle_in_their_own_columns() {
+    fn provider_kind_and_auth_cycle_with_explicit_bija() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let mut app = crate::web::snapshot::tests::test_app();
-            app.registry.providers = vec![ProviderEntry { id: "gw".into(), base_url: "https://gw.dev/v1".into(), ..Default::default() }];
+            app.registry.providers = vec![ProviderEntry { id: "gw".into(), base_url: "https://gw.dev/v1".into(), kind: ProviderKind::Codex, ..Default::default() }];
             app.models_ui.providers = true;
             app.models_ui.row = 0;
             app.models_ui.col = PROV_KIND_COL;
@@ -1421,15 +1520,10 @@ mod tests {
                 assert_eq!(app.registry.providers[0].kind, want);
             }
             typed(&mut app, "b");
-            assert_eq!(app.registry.providers[0].kind, ProviderKind::Bija, "a letter jumps");
+            assert_eq!(app.registry.providers[0].kind, ProviderKind::Bija);
             app.models_ui.col = PROV_AUTH_COL;
             press(&mut app, KeyCode::Char('+'));
             assert_eq!(app.registry.providers[0].auth, "api_key");
-            app.models_ui.col = PROV_WIRE_COL;
-            press(&mut app, KeyCode::Char('+'));
-            assert_eq!(app.registry.providers[0].wire, "anthropic");
-            press(&mut app, KeyCode::Char('+'));
-            assert_eq!(app.registry.providers[0].wire, "", "Chat Completions is stored as no wire at all");
             app.models_ui.col = PROV_KEY_COL;
             press(&mut app, KeyCode::Char('+'));
             assert!(matches!(&app.edit, Some(e) if e.secret && e.text() == "+"), "the key is typed, not cycled");
@@ -1437,7 +1531,7 @@ mod tests {
 
             let mut reg = app.registry.clone();
             set_prov_cell(&mut reg, 0, PROV_KIND_COL, "seed").unwrap();
-            assert_eq!(reg.providers[0].kind, ProviderKind::Bija);
+            reg.providers[0].kind = ProviderKind::Bija;
             set_prov_cell(&mut reg, 0, PROV_WIRE_COL, " Messages ").unwrap();
             assert_eq!(reg.providers[0].wire, "anthropic");
             set_prov_cell(&mut reg, 0, PROV_WIRE_COL, "grpc").unwrap();

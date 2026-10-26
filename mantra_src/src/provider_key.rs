@@ -214,17 +214,17 @@ pub fn probe_and_import(reg: &mut Registry, draft: &ProviderDraft) -> Result<Vec
     Ok(candidates(reg, &id, &found))
 }
 
-/// The two backends that are added to a registry rather than shipped in it.
+/// The two CLI backends. Codex models are added individually from its live catalogue or by id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// Codex's own account (ChatGPT login): the default models on provider `openai`.
+    /// Codex's own account (ChatGPT login): models on provider `openai`.
     Codex,
     /// The `claude` CLI: the `claude` provider and its default models.
     ClaudeCode,
 }
 
-/// Adds a backend's default models — what "add Codex" / "add Claude Code" in `/models` do — once
-/// its CLI is on PATH. Returns how many models were added: 0 when they are all there already.
+/// Adds the Claude Code backend's known models once its CLI is on PATH. Codex has no built-in
+/// model list: its models are chosen from `model/list` or entered by id in `/models`.
 pub fn add_backend(reg: &mut Registry, backend: Backend) -> Result<usize, String> {
     let installed = match backend {
         Backend::Codex => crate::config::codex_available(),
@@ -234,15 +234,15 @@ pub fn add_backend(reg: &mut Registry, backend: Backend) -> Result<usize, String
 }
 
 /// `add_backend` with the PATH check as a parameter (tests; `--demo`, whose backends are mocks).
-/// Each model goes under its own alias when that is free, else `<alias>-codex` / `<alias>-claude`
-/// (`sol` is bija's on every fresh install); one already on that backend is not added twice.
+/// A Claude model goes under its own alias when free, else `<alias>-claude`; one already on that
+/// backend is not added twice. Codex's catalogue is deliberately never guessed here.
 pub fn add_backend_with(reg: &mut Registry, backend: Backend, installed: bool) -> Result<usize, String> {
     let (models, tag) = match backend {
         Backend::Codex => {
             if !installed {
                 return Err("`codex` is not on PATH — install Codex and run `codex login`, then add it again".into());
             }
-            (crate::config::codex_default_models(), "codex")
+            return Err("Codex has no preset models — choose one from Discover or add its model id in /models".into());
         }
         Backend::ClaudeCode => {
             if !installed {
@@ -285,7 +285,7 @@ fn free_alias(reg: &Registry, alias: &str, tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{bija_default_provider, ModelEntry};
+    use crate::config::ModelEntry;
 
     /// Every prefix of the table lands on its URL and wire; an unknown one guesses nothing, and a
     /// URL the caller gives always wins over the guess.
@@ -344,11 +344,11 @@ mod tests {
         // another URL on the same host's name is a second provider
         let other = provider_from_key("k", Some("https://eu.groq.com/v1"));
         assert_eq!(add_provider(&mut reg, &other).unwrap(), "groq-2");
-        // a fresh install's bija row is at the OpenAI API: an `sk-` key completes it
-        assert_eq!(add_provider(&mut reg, &provider_from_key("sk-proj-k", None)).unwrap(), "bija");
-        let bija = reg.providers.iter().find(|p| p.id == "bija").unwrap();
-        assert_eq!((bija.api_key.as_deref(), bija.env_key.as_str()), (Some("sk-proj-k"), ""), "the pasted key is the one used");
-        // without that row, `openai` is still not free
+        // No Bija provider is preconfigured. The Codex account reserves `openai` as an id.
+        assert_eq!(add_provider(&mut reg, &provider_from_key("sk-proj-k", None)).unwrap(), "openai-2");
+        let openai_api = reg.providers.iter().find(|p| p.id == "openai-2").unwrap();
+        assert_eq!((openai_api.api_key.as_deref(), openai_api.env_key.as_str()), (Some("sk-proj-k"), ""));
+        assert_eq!(add_provider(&mut reg, &provider_from_key("sk-proj-next", None)).unwrap(), "openai-2", "same endpoint updates the explicit provider");
         let mut bare = Registry { models: vec![], providers: vec![] };
         assert_eq!(add_provider(&mut bare, &provider_from_key("sk-k", None)).unwrap(), "openai-2");
         // Messages API: the wire is written; a URL that cannot be used is refused, nothing added
@@ -379,7 +379,8 @@ mod tests {
     /// one already configured is never selected.
     #[test]
     fn candidates_preselect_a_short_list_only() {
-        let reg = Registry::defaults();
+        let mut reg = Registry::defaults();
+        reg.models.push(ModelEntry { alias: "sol".into(), provider: "bija".into(), model: "gpt-5.6-sol".into(), context_window: Some(272_000), vision: true, ..Default::default() });
         let found = |n: usize| (0..n).map(|i| Found { id: format!("m{i}"), context: None, reasoning: None, vision: false }).collect::<Vec<_>>();
         assert!(candidates(&reg, "groq", &found(12)).iter().all(|c| c.selected && c.state == CState::New));
         assert!(candidates(&reg, "groq", &found(13)).iter().all(|c| !c.selected));
@@ -391,24 +392,18 @@ mod tests {
         assert!(c.iter().filter(|c| c.model != "gpt-5.6-sol").all(|c| c.selected));
     }
 
-    /// Codex and Claude Code are added once their CLI is there: under the plain alias when free,
-    /// `-codex` / `-claude` beside bija's, never twice.
+    /// Codex never injects a built-in catalogue; Claude Code adds its known models once.
     #[test]
     fn add_backend_is_refused_without_the_cli_and_idempotent_with_it() {
         let mut reg = Registry::defaults();
         assert!(add_backend_with(&mut reg, Backend::Codex, false).unwrap_err().contains("codex"));
         assert!(add_backend_with(&mut reg, Backend::ClaudeCode, false).unwrap_err().contains("claude"));
-        assert_eq!(reg.models.len(), 4, "nothing added without the CLI");
-        assert_eq!(add_backend_with(&mut reg, Backend::Codex, true), Ok(4));
-        assert_eq!(reg.codex_account_models(), vec!["astra-codex", "sol-codex", "terra-codex", "luna-codex"]);
-        assert_eq!(reg.backend_of(&reg.resolve("sol-codex")), ProviderKind::Codex);
-        assert_eq!(reg.backend_of(&reg.resolve("sol")), ProviderKind::Bija, "bija keeps the plain alias");
-        assert_eq!(add_backend_with(&mut reg, Backend::Codex, true), Ok(0), "idempotent");
-        assert_eq!(reg.remove_codex_account(), 4, "and removed as one");
-        // on a registry without bija's aliases Codex gets the plain ones; a bare-provider entry counts
-        let mut codex_only = Registry { models: vec![ModelEntry { alias: "s".into(), provider: String::new(), model: "gpt-5.6-sol".into(), ..Default::default() }], providers: vec![bija_default_provider()] };
-        assert_eq!(add_backend_with(&mut codex_only, Backend::Codex, true), Ok(3), "sol is there already, under its own alias");
-        assert!(codex_only.get("astra").is_some_and(|m| !m.is_custom_provider()));
+        assert!(reg.models.is_empty(), "nothing added without the CLI");
+        assert!(add_backend_with(&mut reg, Backend::Codex, true).unwrap_err().contains("no preset models"));
+        reg.add_codex_model("personal", "a-model-in-the-account").unwrap();
+        assert_eq!(reg.codex_account_models(), vec!["personal"]);
+        assert_eq!(reg.backend_of(reg.get("personal").unwrap()), ProviderKind::Codex);
+        assert_eq!(reg.remove_codex_account(), 1);
         // Claude Code: the provider and its models, once
         let n = add_backend_with(&mut reg, Backend::ClaudeCode, true).unwrap();
         assert_eq!(n, crate::config::claude_default_model_entries("claude").len());

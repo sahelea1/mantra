@@ -711,6 +711,7 @@ fn chosen(app: &mut App, s: &Select) {
     let key = s.items.get(s.sel).map(|c| c.key.clone()).unwrap_or_default();
     match s.then {
         SelectThen::AddMenu => super::models::add_chosen(app, &key),
+        SelectThen::ProviderPreset => super::models::provider_preset_chosen(app, &key),
         SelectThen::AddModelOn => super::models::add_model_on(app, &key),
         SelectThen::Akasha => app.overlays.push(Overlay::Akasha { scroll: 0, group: Some(key) }),
         SelectThen::Respawn => {
@@ -1349,7 +1350,9 @@ mod tests {
     #[test]
     fn the_picker_fits_an_eleven_character_alias() {
         let mut app = crate::web::snapshot::tests::test_app();
-        crate::provider_key::add_backend_with(&mut app.registry, crate::provider_key::Backend::Codex, true).unwrap();
+        // Codex models are explicit user entries; the backend helper no longer invents a
+        // catalogue on a fresh install.
+        app.registry.add_codex_model("astra-codex", "gpt-custom").unwrap();
         app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
         let s = screen_of(&mut app, 140, 30);
         let row = s.lines().find(|l| l.contains("astra-codex")).expect("its row");

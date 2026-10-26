@@ -24,7 +24,7 @@ You already have a coding agent in your terminal. Mantra is the room you put it 
 | **Solo** | One agent, with everything you actually want on screen: the diff it is writing, its plan, how full its context is, what it is running right now. Type while it works. |
 | **Mandala** | A whole team for one goal: a planner writes a phased plan, an orchestrator runs each phase, workers build **in parallel** in their own git worktrees, a fresh read-only QA agent checks the merged work every round and fix workers repair what it finds, a manager watches the whole run and unsticks whatever stalls, and a finale does one QA pass over the diff and a final verification. |
 
-Every agent is one process of `bija`, the small agent harness that ships beside `mantra` and needs nothing but an API key (a local server needs none): a fresh install runs Solo and every built-in pattern on it, with nothing else installed. If you already work in Codex or Claude Code, add either as a backend from `/models` and Mantra drives the official CLI — `codex app-server`, `claude -p` — one process per agent, so your logins, sandboxes and model access keep working exactly as they do today; you just get a room where several of them can work at once without stepping on each other.
+Each agent is its own process: `bija`, the small harness installed beside `mantra`, `codex app-server`, or `claude -p`. A fresh install asks you to configure a provider and model in `/models`; it does not assume an API key, a Bija endpoint or a Codex model list. Solo can also start individual subagents on any configured model alias, even when the aliases use different backends.
 
 **Why you might want it**
 
@@ -51,30 +51,35 @@ curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh |
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.8.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.8.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80) — one build makes both binaries
 cd mantra_src && cargo build --release && cp target/release/mantra target/release/bija ~/.local/bin/
 ```
 
-The installer puts two binaries side by side — `mantra` and `bija`, its agent harness — verifies a sha256 for each, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and finishes by running `mantra doctor`. Re-running it upgrades in place. If no release binary matches your platform (or its download or checksum fails) it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent; a release without a `bija` asset still installs `mantra` — which then says so, instead of starting, while the default model is on bija — and a source build always brings both.
+The installer puts two binaries side by side — `mantra` and `bija`, its agent harness — verifies a sha256 for each, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and finishes by running `mantra doctor`. Re-running it upgrades in place. If no release binary matches your platform (or its download or checksum fails) it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent; a release without a `bija` asset still installs `mantra` and reports the missing harness when a configured model needs it; a source build always brings both.
 
 </details>
 
-**Agents need a model API.** `bija` is already there: set `OPENAI_API_KEY` and Solo and every built-in pattern run on it — or paste any other provider's key in `/models`, or point it at a local Ollama or vLLM, which needs none. The official CLIs are optional extras, added from `/models` (`ctrl+n`) once they are installed:
+**Agents need a configured model.** In `/models`, choose an API provider, enter its key (or a local endpoint with no key), then choose one or more models. Bija itself ships with Mantra; it becomes usable when you explicitly add a Bija provider and a model on it. Codex and Claude Code are optional backends:
+
+The built-in run patterns use their familiar role aliases on existing installations. When an
+unchanged built-in pattern names an alias that a new installation has not configured, that role
+uses the selected usable model for this run. The saved run pattern records the resulting choice;
+patterns you edit yourself keep their exact assignments.
 
 | backend | install | notes |
 |---|---|---|
-| Bija | ships with Mantra | the default for every role; any compatible API, [below](#models-providers-and-backends) |
-| [Codex](https://github.com/openai/codex) | `npm i -g @openai/codex` then `codex login` | your Codex account and its models — *Codex (ChatGPT login)* in the add menu |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm i -g @anthropic-ai/claude-code` then `claude` once | for Claude models, by subscription or gateway — *Claude Code* in the add menu |
+| Bija | ships with Mantra | add an API provider and model explicitly; any compatible API, [below](#models-providers-and-backends) |
+| [Codex](https://github.com/openai/codex) | `npm i -g @openai/codex` then `codex login` | add model IDs from your account in `/models`; remove the account row to disable it |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm i -g @anthropic-ai/claude-code` then `claude` once | choose subscription login or API key in the add menu |
 
 Plus `git`, for the isolated worktrees. `mantra doctor` checks all of it and tells you exactly what is missing or broken — and when a CLI is there but unusable it names the file and the fix (*is a directory — something else on your PATH shadows the real binary*, *is not executable — chmod +x …*), rather than an errno.
 
 `mantra doctor` probes readiness, not presence — one row and verdict each, the readiness probes capped at 10 s (the `--version` checks at 5 s):
 
-- **bija** — required: which `bija` agents run (`bija_command` as configured — a path, or a name on `PATH` — else the one beside `mantra`, else `$MANTRA_BIJA`) and its version
+- **bija** — checked when configured models use it: `bija_command` as configured, the binary beside `mantra`, or `$MANTRA_BIJA`
 - **provider** — the default model's provider: where its key comes from (`$VAR` set, or stored in `models.toml`) and whether the endpoint accepts it, via `GET /models`; no inference is ever sent, and a placeholder URL such as `example.com` gets no request at all
 - **codex**, **claude** — optional backends, *found* or *not found*; a missing one is a failure only when a model in `/models` runs on it. With Codex in use, its readiness follows: **codex app-server** — launched exactly as an agent launches it (provider args, the default model's key in the environment) and taken through the `initialize` handshake, then shut down cleanly — **sandbox** — one `true` run through the configured sandbox policy on that app-server, the same exec path agent commands take (`codex sandbox -- true` on servers without `command/exec`) — and `codex login status` (only a failure when something actually runs on Codex's own account)
 - **sandbox**, when no model is on Codex — whether unprivileged user namespaces are there for bija's bubblewrap (without them its commands run unsandboxed, said once)
@@ -112,6 +117,7 @@ mantra doctor                                   # what's installed, what's missi
 - **Its plan, live** — the agent's own checklist, ticked as it goes.
 - **Context you can see** — a gauge with the auto-compaction threshold marked, so "it forgot everything" stops being a surprise.
 - **Type while it works** — `⏎` queues your message behind the running turn (shown as a `⏳ queued` chip); `ctrl+f` shoves it into the turn right now.
+- **Stop and delegate** — `ctrl+c` interrupts the active Solo turn while retaining your draft; Solo can start, message, inspect, wait for, and stop separate subagents using any configured model alias across Bija, Codex, and Claude Code.
 - **Model and provider always in the header** — `sol · medium · via OpenAI API · ctx 8%`.
 - **One settings screen** — `/settings` holds what used to be five commands; the *Settings* box below lists it.
 
@@ -313,7 +319,9 @@ The Studio shows a pattern's groups in its overview, read-only; they are edited 
 
 An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI API • bija`, `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
 
-To add a provider, press `ctrl+n` in `/models`, choose *Provider from an API key* and paste the key: Mantra reads the API from its prefix (`sk-ant-`, `sk-or-`, `gsk_`, `xai-` and the other well-known ones each name a host, and `sk-` is the OpenAI API), fills in the base URL for you to confirm — you type it only when the prefix names nothing — and lists the provider's models. Tick the ones you want in the Discover list and they are added, the key stored in `models.toml` (`0600`) and the provider named after its host (`api.groq.com` → `groq`). A refused key, or a URL with no model list, says so and keeps the provider, so you can add models by hand.
+In Solo, the agent can list configured model aliases and start a separate subagent on any usable alias, including one on a different backend. It can message, inspect, await, and stop each subagent through its tools. Each child is a separate process in the same project; starting a new Solo session shuts down that session's children.
+
+To add an API provider, press `ctrl+n` in `/models` and pick a known API (OpenAI, Anthropic, OpenRouter, Groq, xAI, Gemini, Cerebras or Fireworks), or *Local / custom API*. The choice fills in the endpoint; you can edit it before saving. Paste its key, or leave the key empty for a local server. Mantra then lists the provider's models for you to select. The key is stored in `models.toml` (`0600`). A refused key or a URL without a model list keeps the provider so you can add models by hand. Key prefixes can still suggest an endpoint in the custom flow.
 
 <details>
 <summary>Which key prefix goes where</summary>
@@ -330,11 +338,11 @@ To add a provider, press `ctrl+n` in `/models`, choose *Provider from an API key
 | `sk-`, `sk-proj-` | `api.openai.com` | Chat Completions |
 | anything else | no guess — you give the URL | Chat Completions |
 
-A URL you type always wins over the guess (a `sk-` key for another OpenAI-compatible host keeps that host). A key for the URL a provider already has completes that provider instead of adding a second one — a fresh install's `bija` row is at the OpenAI API, so a pasted `sk-` key fills it in.
+A URL you type always wins over the guess (a `sk-` key for another OpenAI-compatible host keeps that host). A key for an endpoint already configured updates that provider instead of adding a second one. No Bija endpoint is preconfigured on a fresh install.
 
 </details>
 
-**Codex** and **Claude Code** are add-on backends: with `codex` or `claude` on your `PATH`, *Codex (ChatGPT login)* or *Claude Code* in the same add menu imports that backend's default models (as `<alias>-codex` / `<alias>-claude` where bija already holds the plain alias, so `sol` stays bija's), and Mantra drives the official CLI for them. Codex's account shows in the providers grid as a first row, `openai · Codex (ChatGPT login)`, and `Delete` on it (twice) removes every Codex model at once — the counterpart of adding it.
+**Codex** uses the model IDs you add to `models.toml` in `/models`; Mantra no longer imports a fixed Codex catalogue. Choose *Codex account model*, type the ID, and edit its alias or capabilities in the grid; the Discover action can ask the running Codex app server for its current catalogue. The `openai · Codex (ChatGPT login)` row appears while at least one Codex model is configured. Delete it twice to remove all its models, including when it is the only backend. **Claude Code** offers separate subscription and API key choices; the latter opens the key field and can also read `$ANTHROPIC_API_KEY`.
 
 Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
 
@@ -345,7 +353,7 @@ A role can also say `effort = "auto"` (the Studio cycles it first): Mantra then 
 
 Bija (*bīja*, a seed — the smallest mantra there is) is Mantra's own agent harness: a small Rust binary, installed beside `mantra`, that turns any OpenAI-compatible Chat Completions API — or an Anthropic-compatible Messages API — into a coding agent: file tools, commands with a timeout or in the background, every retryable API error retried with backoff, every message on disk as it happens. No Node, no login: a key, or none for a local server.
 
-Mantra ships a `bija` provider on the OpenAI API (`OPENAI_API_KEY`, or a key pasted in `/models`) with `astra`, `sol`, `terra` and `luna`, and Solo and every built-in pattern run on them: no Codex, no Claude Code, nothing but bija and a key. A `models.toml` from before Bija gets that provider and those aliases once, when it is loaded. One from 0.7 — Codex's `sol` beside bija's `sol-api` — keeps working: `sol` and `sol-api` answer to each other, and on a machine without Codex the bija models simply take the plain names (the changelog has the details). `mantra --demo` runs the same flow on the real binary against a mock API, no key needed. Anything else is a provider of your own — paste its key, or write it by hand — and any role can use its models:
+Mantra starts without Bija provider or model presets. Add your endpoint and choose its models in `/models`; a local server can use no key. Existing `models.toml` entries are preserved, including older `-api` aliases. `mantra --demo` supplies temporary mock models in memory and does not edit your configuration. Built-in patterns refer to the example aliases `astra`, `sol`, `terra` and `luna`: set those aliases to your chosen models or edit the roles in the Studio before starting a run.
 
 ```toml
 [[provider]]
@@ -529,7 +537,7 @@ A resume never replays what the old process was in the middle of. It restarts at
 
 <img src="docs/img/studio.png" alt="The Studio: roles with model, effort, sandbox and permission, plus the architect agent" width="920">
 
-Three patterns ship in the binary (and load by name, with or without a file of your own in `~/.mantra/patterns/`). All three run on bija — `astra` plans, `sol` manages and builds the big tasks, `terra` gates, `luna` builds the small ones — so none needs Codex or Claude Code:
+Three patterns ship in the binary (and load by name, with or without a file of your own in `~/.mantra/patterns/`). Their example roles use aliases `astra`, `sol`, `terra` and `luna`; assign those aliases to your configured models or change the roles in the Studio. The preflight names any alias that is still missing:
 
 | pattern | for | shape |
 |---|---|---|
@@ -624,7 +632,7 @@ On a phone the settings are a list of sections that open as pages, all of it fro
 - **Code + password** — the same session as a short code (grouped in dashes) typed in at remote.mantra.codes, plus the password. For reading aloud, or typing into a device you didn't get the link on.
 - **Password** — set your own, or let Mantra generate a four-word one the first time `--remote` runs (`amber-kite-river-nine`, from a fixed 256-word list) and show it in *Web & remote* in `/settings`. It also derives the link's key, so changing it — or rotating — invalidates old links and codes.
 - **What the relay can and cannot see.** Your host and the connecting browser derive a shared key from the password (PBKDF2, then a fresh HKDF key per connection) that never reaches the relay, and every message after that is AES-256-GCM end-to-end encrypted. The relay sees your IP, the browser's IP, and encrypted bytes — never the password, the key, or anything your agents say. A wrong password or code fails to decrypt the very first frame ("Wrong password or code") rather than quietly connecting into someone else's session.
-- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.8.0` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
+- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.8.1` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
 - **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `mantra --remote` session per IPv4 address at a time — a second one dialing in from behind the same address (the same office, the same home network) is refused until the first disconnects, and Mantra reports that plainly instead of silently taking over.
 - **Behind a proxy.** The relay is dialed through the usual variables: `https_proxy` / `HTTPS_PROXY` for a `wss://` relay, `http_proxy` / `HTTP_PROXY` for `ws://`, `all_proxy` for either (lowercase is read first), `user:pass@` credentials included. `no_proxy` / `NO_PROXY` exempts hosts (`*`, a host or domain suffix, an IPv4 CIDR); a relay on `localhost` or a loopback address is never proxied, whatever the variables say. Only `http://` proxies work — the relay is reached with HTTP `CONNECT`, TLS still runs end to end through the tunnel and the certificate is checked as usual; a `socks5://` or `https://` proxy URL is refused with a hint (an `http://` proxy, or `no_proxy` for the relay host). Behind a TLS-inspecting proxy, or with a self-hosted relay on a private CA, `SSL_CERT_FILE` adds a PEM bundle to the built-in roots, and an untrusted relay certificate points at it. Proxy failures are reported as the proxy's (*refused the CONNECT (HTTP 403)*, *cannot reach the proxy*), not as a dead relay.
 
@@ -672,7 +680,7 @@ Four groups: what works everywhere, in a chat, on the Mandala stage, and on the 
 | `ctrl+k` | model picker (`←→` effort, `+/-` context) |
 | `ctrl+g` | inbox: approvals and alerts from every agent |
 | `ctrl+e` | verbose log |
-| `ctrl+c` | close an overlay / clear the input / **stop** the focused agent (it stays stopped) · three presses quit |
+| `ctrl+c` | close an overlay / **stop** a busy Solo turn while keeping your draft / clear an idle input · three presses quit |
 | `ctrl+l` | redraw |
 | `/` | the commands — `tab` completes them and their arguments (`@names`, groups, agents) |
 
@@ -865,6 +873,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.8.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.8.1** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

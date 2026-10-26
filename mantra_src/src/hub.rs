@@ -638,6 +638,9 @@ async fn run_process(
     }
 
     let mut current_turn: Option<String> = None;
+    // Ctrl+C may arrive while turn/start is awaiting its turn/started notification. Remember it
+    // and interrupt that exact turn once its id arrives, instead of silently dropping the stop.
+    let mut interrupt_on_start = false;
     loop {
         tokio::select! {
             c = cmds.recv() => {
@@ -671,6 +674,8 @@ async fn run_process(
                     Some(Cmd::Interrupt) => {
                         if let Some(t) = &current_turn {
                             fire(&conn, ev, id, "turn/interrupt", json!({"threadId": tid, "turnId": t}), "interrupt", None);
+                        } else {
+                            interrupt_on_start = true;
                         }
                     }
                     Some(Cmd::Compact) => fire(&conn, ev, id, "thread/compact/start", json!({"threadId": tid}), "compact", None),
@@ -698,8 +703,16 @@ async fn run_process(
                 match i {
                     Some(Incoming::Notification { method, params }) => {
                         match method.as_str() {
-                            "turn/started" => current_turn = params.pointer("/turn/id").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                            "turn/completed" => current_turn = None,
+                            "turn/started" => {
+                                current_turn = params.pointer("/turn/id").and_then(|t| t.as_str()).map(str::to_string);
+                                if interrupt_on_start {
+                                    if let Some(t) = &current_turn {
+                                        fire(&conn, ev, id, "turn/interrupt", json!({"threadId": tid, "turnId": t}), "interrupt", None);
+                                        interrupt_on_start = false;
+                                    }
+                                }
+                            }
+                            "turn/completed" => { current_turn = None; interrupt_on_start = false; }
                             _ => {}
                         }
                         let _ = ev.send(HubEvent::Notif { agent: id, method, params });

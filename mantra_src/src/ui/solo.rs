@@ -4,7 +4,7 @@ use super::{theme, *};
 use crate::app::App;
 use crate::engine::run::{HaltReason, WState};
 use crate::hub::AgentId;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 
 pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let area = f.area();
@@ -71,7 +71,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     if empty && zoom.is_none() {
         welcome(f, body[1], app);
     } else if let Some(a) = id.and_then(|a| app.agents.get_mut(&a)) {
-        let footer: Vec<Line<'static>> = busy_line(a).into_iter().collect();
+        let footer: Vec<Line<'static>> = solo_busy_line(a).into_iter().collect();
         convo::draw(f, body[1], a, verbose, footer);
     }
     if show_side {
@@ -88,7 +88,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let placeholder = match (zoom, id.and_then(|a| app.agents.get(&a))) {
         (Some(_), Some(a)) if busy => format!("message {} {} …  (⏎ queue · ctrl+f send now · esc overview)", theme::role_glyph(&a.glyph), a.role),
         (Some(_), _) => "message this agent…  (esc back to overview)".to_string(),
-        (None, _) if busy => "type to steer the running turn…".to_string(),
+        (None, _) if busy => "type to queue for the running turn…".to_string(),
         (None, _) => "ask anything · / commands · ! shell · ctrl+o mandala".to_string(),
     };
     let color = id.and_then(|a| app.agents.get(&a)).map(|a| theme::named(&a.color)).unwrap_or(theme::SAFFRON);
@@ -106,9 +106,41 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "send"), ("ctrl+c", "interrupt"), ("⇧⇥", m), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+o", "mandala"), ("?", "help")]
+        vec![("⏎", "send / queue"), ("ctrl+f", "send now"), ("ctrl+c", "interrupt"), ("⇧⇥", m), ("alt+↑↓", "effort"), ("ctrl+k", "model"), ("ctrl+d", "diff"), ("ctrl+o", "mandala"), ("?", "help")]
     };
     footer(f, rows[5], &hints);
+}
+
+/// Solo's thinking indicator uses a slow, low contrast pulse and a stable label. The shared
+/// shimmer is useful in dense run views, but this quieter rhythm reads better below a one-agent
+/// conversation and avoids making every character appear to animate.
+fn solo_busy_line(a: &Agent) -> Option<Line<'static>> {
+    if !(a.busy() || a.compacting) {
+        return busy_line(a);
+    }
+    let elapsed = a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default();
+    let col = theme::named(&a.color);
+    let pulse = anim::breath(2600);
+    let icon = Span::styled(
+        format!("{} ", theme::g("✦", "*")),
+        Style::default().fg(theme::mix(theme::FAINT, col, 0.25 + 0.55 * pulse)).add_modifier(Modifier::BOLD),
+    );
+    let label = if a.compacting {
+        "Compacting context…"
+    } else {
+        match a.activity.as_str() {
+            "thinking" => "Thinking…",
+            "writing" => "Writing…",
+            "starting turn" => "Starting…",
+            _ => "Working…",
+        }
+    };
+    let mut spans = vec![icon, Span::styled(label, theme::text())];
+    spans.push(Span::styled(format!("  {elapsed} · {} tok · {} · ctrl+c to interrupt", fmt_tokens(a.tokens_total), a.effort), theme::faint()));
+    if let Some(q) = super::quiet_for(a) {
+        spans.push(Span::styled(format!(" · quiet {}", fmt_dur(q)), theme::fg(theme::AMBER)));
+    }
+    Some(Line::from(spans))
 }
 
 /// Zoomed-in header: a solid band tinted with the agent's role colour so the two views — overview
@@ -163,6 +195,19 @@ fn zoomed_header(f: &mut Frame, area: Rect, app: &App, a: &Agent) {
 }
 
 fn welcome(f: &mut Frame, area: Rect, app: &App) {
+    if app.registry.models.is_empty()
+        || app.registry.get(&app.settings.default_model).is_none()
+        || (!app.demo && app.registry.alias_problem(&app.settings.default_model).is_some())
+    {
+        let lines = vec![
+            Line::from(Span::styled(format!("  {}  M A N T R A", theme::g("✦", "*")), theme::bold(theme::accent()))),
+            Line::default(),
+            Line::from(Span::styled("  No usable model is configured.", theme::text())),
+            Line::from(Span::styled("  Open /models to add or repair a model, then start a new Solo session.", theme::dim())),
+        ];
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(Block::default().borders(Borders::NONE)), area);
+        return;
+    }
     let m = app.registry.resolve(&app.settings.default_model);
     let eff = m.default_effort.clone();
     let b = anim::breath(2600);

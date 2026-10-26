@@ -144,8 +144,7 @@ impl CandidateView {
 }
 
 /// What a key looks like, for the add-provider sheet — never the key itself — and `existing`: the
-/// provider already at that URL, which the key would go into instead of a new one (a fresh
-/// install's `bija` row for a key of the API it points at).
+/// provider already at that URL, which the key would go into instead of a new one.
 fn draft_view(d: &ProviderDraft, reg: &Registry) -> Value {
     let existing = provider_key::provider_at(reg, &d.base_url).map(|p| p.id.clone());
     json!({"base_url": d.base_url, "wire": d.wire, "id": d.id, "name": d.name, "guessed": d.guessed, "needs_url": d.needs_url(), "existing": existing})
@@ -362,6 +361,18 @@ fn field_view(f: settings_ops::Field) -> Value {
 }
 
 impl App {
+    /// Keep Solo's saved selection valid when a web edit adds or removes models. An empty
+    /// registry is a supported setup state; `start_solo` then shows the /models hint.
+    fn web_refresh_model_selection(&mut self) {
+        let valid = self.registry.alias_problem(&self.settings.default_model).is_none();
+        if valid { return; }
+        self.settings.default_model = self.registry.models.iter()
+            .find(|m| self.demo || self.registry.alias_problem(&m.alias).is_none())
+            .map(|m| m.alias.clone()).unwrap_or_default();
+        self.save_settings();
+        self.start_solo();
+    }
+
     /// A pattern was saved or deleted: the next publish reads the pattern list again.
     fn patterns_changed(&self) {
         if let Some(l) = &self.web {
@@ -490,19 +501,15 @@ impl App {
             Command::ModelAdd { provider, model, alias } => {
                 let alias = add_model(&mut self.registry, &provider, model.as_deref(), alias.as_deref())?;
                 self.save_registry()?;
+                self.web_refresh_model_selection();
                 Ok(json!({"alias": alias, "registry": self.registry_view()}))
             }
             Command::ModelDelete { alias } => {
                 let i = self.registry.models.iter().position(|m| m.alias == alias).ok_or_else(|| format!("no model named {alias}"))?;
-                if self.registry.models.len() == 1 {
-                    return Err("the last model stays — add another first".into());
-                }
-                if self.settings.default_model == alias {
-                    return Err(format!("{alias} is Solo's default model — pick another in Settings › Solo first"));
-                }
                 self.registry.models.remove(i);
                 self.models_ui.status.remove(&alias);
                 self.save_registry()?;
+                self.web_refresh_model_selection();
                 Ok(json!({"registry": self.registry_view()}))
             }
             Command::ProviderSet { id, field, value } => {
@@ -519,12 +526,6 @@ impl App {
                 if account && on.is_empty() {
                     return Err("there are no Codex models to remove".into());
                 }
-                if on.contains(&self.settings.default_model) {
-                    return Err(format!("{} is Solo's default model and runs on {id} — pick another in Settings › Solo first", self.settings.default_model));
-                }
-                if on.len() == self.registry.models.len() {
-                    return Err(format!("every model is on {id} — add another provider's first"));
-                }
                 let n = if account {
                     self.registry.remove_codex_account()
                 } else {
@@ -534,6 +535,7 @@ impl App {
                     before - self.registry.models.len()
                 };
                 self.save_registry()?;
+                self.web_refresh_model_selection();
                 Ok(json!({"models": n, "registry": self.registry_view()}))
             }
             Command::ModelsImport { provider, candidates } => {
@@ -552,6 +554,7 @@ impl App {
                     return Err("nothing to add — those models are there already".into());
                 }
                 self.save_registry()?;
+                self.web_refresh_model_selection();
                 Ok(json!({"added": added, "updated": updated, "registry": self.registry_view()}))
             }
             Command::AddBackend { kind } => {
@@ -564,6 +567,7 @@ impl App {
                 let added = if self.demo { provider_key::add_backend_with(&mut self.registry, backend, true) } else { provider_key::add_backend(&mut self.registry, backend) }?;
                 if added > 0 {
                     self.save_registry()?;
+                    self.web_refresh_model_selection();
                 }
                 Ok(json!({"added": added, "registry": self.registry_view()}))
             }
@@ -720,6 +724,13 @@ fn mcp_set(s: &mut Settings, name: &str, command: Option<&str>, args: Option<&Ve
 mod tests {
     use super::*;
 
+    fn configured_registry() -> Registry {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::bija_default_provider());
+        reg.models.extend(crate::config::bija_default_model_entries("bija"));
+        reg
+    }
+
     #[test]
     fn a_key_shows_its_last_four_only_when_that_says_nothing_more() {
         assert_eq!(mask("sk-proj-abcdefgh1234"), "••••1234");
@@ -744,7 +755,7 @@ mod tests {
     /// provider id carry what hangs off them.
     #[test]
     fn model_and_provider_cells_validate_and_carry_their_references() {
-        let mut reg = Registry::defaults();
+        let mut reg = configured_registry();
         let before = format!("{:?}", reg.models);
         for (field, value, words) in [
             ("alias", "  ", "short name"),
@@ -789,7 +800,7 @@ mod tests {
 
     #[test]
     fn a_new_model_gets_a_free_alias() {
-        let mut reg = Registry::defaults();
+        let mut reg = configured_registry();
         assert_eq!(add_model(&mut reg, "bija", None, None), Ok("model5".into()));
         assert_eq!(add_model(&mut reg, "bija", Some("mx-5.2"), None), Ok("mx-5.2".into()));
         assert!(add_model(&mut reg, "bija", Some("x"), Some("luna")).unwrap_err().contains("taken"));
