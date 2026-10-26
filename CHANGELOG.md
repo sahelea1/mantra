@@ -2,6 +2,27 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.8.2 — 2026-10-26
+
+- **Akasha delegation from Solo and Studio roles.** Solo can start bounded swarms with shared
+  notes; pattern roles opt in with **Can spawn swarm**. Members can use different configured
+  Codex, Bija, or Claude Code aliases. Parents can message, inspect, wait for, and stop their
+  members, and workers and gates must review delegated work before completing. Children inherit
+  the parent's active permissions and workspace and cannot recursively spawn more swarms.
+- **Swarm visibility.** The terminal's `/akasha` view includes delegated groups. Remote agent
+  pages show member status links and collapsible shared notes, with layouts checked on desktop
+  and phone. Existing Mandala run groups and their persistence remain available.
+- **Explicit sandbox bypass.** `BYPASS-SANDBOX-DANGER` is separate from ordinary `never ask`.
+  It disables backend sandboxing and approval prompts; entering or leaving it requires a fresh
+  Solo session. The footer shows the current session's permission, and children inherit it.
+- **Remote lifecycle controls.** Stop an agent or close Mantra through confirmed remote actions.
+  Stopping clears queued work and pending approvals, ends children and backend process groups,
+  and keeps the transcript with an action to start a fresh Solo session.
+- **Solo activity polish.** A compact animated activity trail retains detailed work status,
+  respects reduced motion and ASCII mode, and adapts to narrow terminals.
+- **Verification.** Added GitHub workspace, browser, and terminal integration checks; refreshed
+  browser fixtures to preserve the application's strict content security policy.
+
 ## v0.8.1 — 2026-10-26
 
 - **Solo controls and delegation.** `ctrl+c` interrupts a running Solo turn, including before

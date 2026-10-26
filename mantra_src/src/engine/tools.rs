@@ -79,7 +79,11 @@ pub const SWARM_OWNER_PROTOCOL: &str = "\n## Akasha delegation\nYour swarm is bo
 /// follow-up prompt; unlike run groups they do not push into a busy member's turn.
 pub fn swarm_member_note_tools() -> Vec<Value> {
     let mut v = akasha_tools();
+    if let Some(read) = v.iter_mut().find(|x| x["name"] == "mantra_akasha_read") {
+        read["description"] = json!("Read your swarm's shared notes: members' facts and decisions, and Mantra's completion summaries.");
+    }
     if let Some(note) = v.iter_mut().find(|x| x["name"] == "mantra_akasha_note") {
+        note["description"] = json!("Add a short fact, decision, interface, or pitfall to your swarm's shared notebook. An urgent note is marked as priority for the next read; it does not interrupt busy peers.");
         note["inputSchema"]["properties"]["urgent"]["description"] = json!("mark this note as a priority; other members see it when they next read shared notes");
     }
     v

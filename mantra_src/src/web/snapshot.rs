@@ -106,7 +106,7 @@ pub struct PatternRoleView {
     /// "codex" | "claude-code"
     pub backend: String,
     pub sandbox: String,
-    /// Whether this role may spawn a temporary Akasha swarm in Solo.
+    /// Whether this role may spawn a temporary Akasha swarm in Solo or a selected pattern.
     #[serde(default)]
     pub can_spawn_swarm: bool,
     /// Model alias used when this role's model gives no first token in time (`Role.fallback`).
@@ -282,7 +282,7 @@ pub struct AgentView {
     pub swarm: Option<SwarmView>,
 }
 
-/// Live Solo swarm metadata and its bounded shared Akasha notebook.
+/// Live swarm metadata and its bounded shared Akasha notebook.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct SwarmView {
     pub owner: u32,

@@ -132,7 +132,7 @@ impl App {
             prompt_agent(&self.hub, &mut self.agents, child, brief, true, Send::Auto);
             ids.push(format!("{child} ({})", task.model));
         }
-        (format!("Akasha {} started {} member{}: {}. Use mantra_swarm_status to review progress and mantra_akasha_read for shared notes. Parent model: {parent_model}.", self.swarms[&owner].name, ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")), true)
+        (format!("Akasha {} started {} member{}: {}. Use mantra_swarm_status for progress and shared notes, then mantra_swarm_wait before reporting completion. Parent model: {parent_model}.", self.swarms[&owner].name, ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")), true)
     }
 
     fn swarm_status(&self, owner: AgentId) -> (String, bool) {
