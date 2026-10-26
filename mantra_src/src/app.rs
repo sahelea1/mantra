@@ -45,6 +45,26 @@ pub enum Screen {
     Settings,
 }
 
+/// Input belongs to a conversation, while config screens keep their own field editors. Stage
+/// has one run prompt even as its selected card changes; each zoom and Solo session has a draft.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ChatDraft {
+    Solo(Option<AgentId>),
+    Stage,
+    Zoom(AgentId),
+}
+
+impl ChatDraft {
+    fn for_screen(screen: Screen, solo: Option<AgentId>) -> Option<Self> {
+        match screen {
+            Screen::Solo => Some(Self::Solo(solo)),
+            Screen::Stage => Some(Self::Stage),
+            Screen::Zoom(id) => Some(Self::Zoom(id)),
+            Screen::Studio | Screen::Models | Screen::Settings => None,
+        }
+    }
+}
+
 impl Screen {
     /// The screens that edit configuration (`ui::form`'s rules): leaving one returns to where it
     /// was opened from, and ctrl+t / ctrl+d mean the screen's own row actions there.
@@ -317,6 +337,7 @@ pub struct App {
     screen_before: Option<Screen>,
     pub overlays: Vec<Overlay>,
     pub input: Input,
+    drafts: HashMap<ChatDraft, Input>,
     /// The field being edited in place on a config screen (`ui::form`): one at a time, wherever
     /// it is — the screens draw it in their cell and send it the keys.
     pub edit: Option<crate::ui::form::Edit>,
@@ -989,6 +1010,7 @@ impl App {
             screen_before: None,
             overlays: vec![],
             input: Input::default(),
+            drafts: HashMap::new(),
             edit: None,
             confirm: None,
             solo: None,
@@ -1041,7 +1063,7 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
-        self.agents.values().any(|a| a.busy() || matches!(a.status, Status::Starting | Status::Retrying(_)))
+        self.agents.values().any(|a| crate::ui::producing(a) || a.status == Status::Starting)
             || self.toast.as_ref().map(|t| t.1.elapsed().as_millis() < crate::ui::toast_life(&t.0) + 100).unwrap_or(false)
             || self.agents.values().any(|a| a.compacting || a.ctx_anim.map(|(_, t)| t.elapsed().as_millis() < 950).unwrap_or(false))
             || self.run.as_ref().map(|r| (r.is_active() && !r.halted() && r.stage != Stage::Review) || r.pulse.back().map(|p| p.at.elapsed().as_millis() < 1600).unwrap_or(false)).unwrap_or(false)
@@ -1079,6 +1101,11 @@ impl App {
 
     pub fn start_solo(&mut self) {
         if let Some(old) = self.solo.take() {
+            self.drafts.remove(&ChatDraft::Solo(Some(old)));
+            if self.screen == Screen::Solo {
+                self.input = Input::default();
+                self.suggest = 0;
+            }
             self.stop_swarm_children(old);
             self.stop_solo_children(old);
             self.hub.shutdown(old);
@@ -1138,6 +1165,10 @@ impl App {
                 mcp,
             },
         );
+        if self.screen == Screen::Solo && self.solo.is_none() {
+            // The welcome prompt's draft belongs to the newly created Solo conversation.
+            self.drafts.remove(&ChatDraft::Solo(None));
+        }
         self.solo = Some(id);
         self.solo_mcp = mcp_names;
         if let Some(t) = mcp_refused_toast(&self.settings) {
@@ -1223,6 +1254,15 @@ impl App {
     /// Switch screens, flashing the header briefly on a Stage↔Zoom jump (skipped when
     /// `reduce_motion` is on) so the overview/zoom switch never feels silent.
     pub(crate) fn set_screen(&mut self, s: Screen) {
+        let old_draft = ChatDraft::for_screen(self.screen, self.solo);
+        let new_draft = ChatDraft::for_screen(s, self.solo);
+        if old_draft != new_draft {
+            if let Some(key) = old_draft {
+                self.drafts.insert(key, std::mem::take(&mut self.input));
+            }
+            self.input = new_draft.and_then(|key| self.drafts.remove(&key)).unwrap_or_default();
+            self.suggest = 0;
+        }
         let jump = matches!((self.screen, s), (Screen::Stage, Screen::Zoom(_)) | (Screen::Zoom(_), Screen::Stage));
         if jump && crate::ui::theme::motion() {
             self.flash_screen = Some(Instant::now());
@@ -1610,7 +1650,7 @@ impl App {
         self.run = Some(run);
         // The planner isn't spawned yet (workspace setup is an async job) — zoom to it once it
         // exists, in on_event's JobTag::Setup handling below, if the user hasn't navigated away.
-        self.screen = Screen::Stage;
+        self.set_screen(Screen::Stage);
         self.sel = 0;
         self.sel_follow = None;
     }
@@ -1693,7 +1733,7 @@ impl App {
         self.journal_bridge_problem(&mut run);
         self.run = Some(run);
         self.unfinished_runs.retain(|id| *id != r.id);
-        self.screen = Screen::Stage;
+        self.set_screen(Screen::Stage);
         self.sel = 0;
         self.sel_follow = None;
         self.toast(format!("resumed {} at {label}", r.id), Level::Ok);
@@ -1902,8 +1942,8 @@ impl App {
 
     // ─── approvals ───
 
-    /// App-wide approval mode. Solo's thread is updated live; anything that still asks while the
-    /// mode is "never" (e.g. mid-turn, or a run agent) is approved automatically.
+    /// Save the Solo approval preference. Codex applies it to native tools; all backends
+    /// apply it to Mantra requests. Run agents retain their own role permission.
     pub fn set_approval_mode(&mut self, mode: &str) {
         self.settings.approval_mode = mode.to_string();
         self.save_settings();
@@ -1913,7 +1953,9 @@ impl App {
                 self.toast(format!("permission saved: {mode} · /new applies the sandbox change; this session keeps {live}"), Level::Warn);
                 return;
             }
-            self.hub.send(s, Cmd::SetApproval(mode.to_string()));
+            if self.agents.get(&s).is_some_and(|a| a.backend == crate::config::ProviderKind::Codex) {
+                self.hub.send(s, Cmd::SetApproval(mode.to_string()));
+            }
             if let Some(a) = self.agents.get_mut(&s) {
                 a.approval = mode.to_string();
             }
@@ -1924,7 +1966,7 @@ impl App {
             "untrusted" => "ask for anything untrusted",
             _ => "ask when needed",
         };
-        let pending = self.approvals.len();
+        let pending = self.approvals.iter().filter(|p| self.agents.get(&p.agent).is_some_and(|a| crate::config::approval_policy(&a.approval) == "never")).count();
         if crate::config::approval_policy(mode) == "never" && pending > 0 {
             self.auto_approve_pending();
             self.toast(format!("approvals: {label} — {pending} waiting request(s) approved"), Level::Info);
@@ -1934,10 +1976,12 @@ impl App {
     }
 
     fn auto_approve_pending(&mut self) {
-        while !self.approvals.is_empty() {
-            let q = self.approvals[0].method == "item/tool/requestUserInput";
+        // Each request keeps its own agent's policy. One unattended worker must never
+        // grant permissions or answer a question pending for a different agent.
+        while let Some(idx) = self.approvals.iter().position(|p| self.agents.get(&p.agent).is_some_and(|a| crate::config::approval_policy(&a.approval) == "never")) {
+            let q = self.approvals[idx].method == "item/tool/requestUserInput";
             let answer = q.then(|| "No human is available right now (approval mode: never ask). Proceed with your best judgment and state any assumptions.".to_string());
-            self.resolve_approval_ex(0, if q { 0 } else { 1 }, answer, true);
+            self.resolve_approval_ex(idx, if q { 0 } else { 1 }, answer, true);
         }
     }
 
@@ -2988,7 +3032,7 @@ impl App {
         // Interrupting is ctrl+c's job (it used to be both, and the two hints collided).
         if k.code == KeyCode::Esc {
             match self.screen {
-                Screen::Zoom(_) if self.input.is_empty() => {
+                Screen::Zoom(_) => {
                     self.set_screen(Screen::Stage);
                     // back onto a halted run with the keys live: the zoom header's "esc ▸ e
                     // details" and the halt band's e / space / m / r then work on the next key
@@ -3900,6 +3944,45 @@ mod tests {
         assert_eq!(app.studio.pattern.groups, swarm.groups, "the Studio keeps the last good pattern");
     }
 
+    #[tokio::test]
+    async fn automatic_approval_never_grants_another_agents_requests() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let mut ask = Agent::new(1, "ask", "worker", PathBuf::new());
+        ask.approval = "on-request".into();
+        let mut unattended = Agent::new(2, "unattended", "worker", PathBuf::new());
+        unattended.approval = "never".into();
+        app.agents.insert(1, ask);
+        app.agents.insert(2, unattended);
+        let mut ask_rx = app.hub.test_register(1);
+        let mut auto_rx = app.hub.test_register(2);
+        for (agent, method) in [(1, "item/commandExecution/requestApproval"), (2, "item/commandExecution/requestApproval"), (1, "item/tool/requestUserInput")] {
+            app.approvals.push(Approval { agent, id: json!(format!("{agent}-{method}")), method: method.into(), title: "test".into(), detail: "test".into(), params: json!({}), at: Instant::now() });
+        }
+        app.auto_approve_pending();
+        assert_eq!(app.approvals.len(), 2);
+        assert!(app.approvals.iter().all(|p| p.agent == 1));
+        assert!(ask_rx.try_recv().is_err());
+        assert!(matches!(auto_rx.try_recv(), Ok(Cmd::Respond { .. })));
+    }
+
+    #[tokio::test]
+    async fn host_approval_changes_do_not_send_unsupported_backend_commands() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            for backend in [crate::config::ProviderKind::Bija, crate::config::ProviderKind::ClaudeCode, crate::config::ProviderKind::Codex] {
+                let mut app = crate::web::snapshot::tests::test_app();
+                let mut agent = Agent::new(1, "solo", "solo", PathBuf::new());
+                agent.backend = backend;
+                agent.approval = "on-request".into();
+                app.agents.insert(1, agent);
+                app.solo = Some(1);
+                let mut rx = app.hub.test_register(1);
+                app.set_approval_mode("never");
+                assert_eq!(app.agents[&1].approval, "never");
+                assert_eq!(matches!(rx.try_recv(), Ok(Cmd::SetApproval(_))), backend == crate::config::ProviderKind::Codex);
+            }
+        });
+    }
+
     fn busy_agent(turn_active: bool, awaiting_start: bool) -> (BTreeMap<AgentId, Agent>, AgentId) {
         let mut agents = BTreeMap::new();
         let id: AgentId = 1;
@@ -4544,6 +4627,37 @@ done"#;
         app.enter_screen(Screen::Studio);
         app.leave_screen();
         assert_eq!(app.screen, Screen::Zoom(id));
+    }
+
+    #[test]
+    fn chat_drafts_follow_their_conversation_across_switches_and_zoom_escape() {
+        let mut app = screen_app();
+        app.solo = Some(1);
+        app.input.set("solo draft");
+        app.input.cur = 4;
+        app.set_screen(Screen::Stage);
+        assert!(app.input.is_empty(), "the stage must not inherit Solo's prompt");
+        app.input.set("stage draft");
+        app.set_screen(Screen::Zoom(10));
+        assert!(app.input.is_empty(), "a worker must not inherit the run's prompt");
+        app.input.set("worker 10 draft");
+        app.set_screen(Screen::Zoom(11));
+        assert!(app.input.is_empty(), "a different worker must start with its own input");
+        app.input.set("worker 11 draft");
+        app.set_screen(Screen::Zoom(10));
+        assert_eq!(app.input.text(), "worker 10 draft");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Stage);
+        assert_eq!(app.input.text(), "stage draft", "Escape keeps the zoom's draft for its return");
+        app.set_screen(Screen::Zoom(10));
+        assert_eq!(app.input.text(), "worker 10 draft");
+        app.set_screen(Screen::Solo);
+        assert_eq!(app.input.text(), "solo draft");
+        assert_eq!(app.input.cur, 4, "the cursor stays with the draft");
+        app.enter_screen(Screen::Settings);
+        assert!(app.input.is_empty());
+        app.leave_screen();
+        assert_eq!(app.input.text(), "solo draft", "config screens cannot take the chat input");
     }
 
     /// The agent can be gone by the time the Studio is closed (respawned, stopped, run torn

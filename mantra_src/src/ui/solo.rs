@@ -10,9 +10,13 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let area = f.area();
     let id = zoom.or(app.solo);
     let approval = app.approval_for(id);
-    let ap_h = approval.map(|i| approval_height(&app.approvals[i])).unwrap_or(0);
     let chip_h = super::queue_chip_height(app, id);
-    let in_h = input_height(app, area.width).min(area.height.saturating_sub(8).max(3));
+    let min_approval = if approval.is_some() { 3 } else { 0 };
+    let input_room = area.height.saturating_sub(1 + 3 + chip_h + min_approval + 1).max(3);
+    let in_h = input_height(app, area.width).min(input_room);
+    // On a 40×12 split, reserve a log and the input before giving detail lines to an approval.
+    let ap_room = area.height.saturating_sub(1 + 3 + chip_h + in_h + 1);
+    let ap_h = approval.map(|i| approval_height(&app.approvals[i]).min(ap_room)).unwrap_or(0);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(ap_h), Constraint::Length(chip_h), Constraint::Length(in_h), Constraint::Length(1)])
@@ -85,7 +89,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     super::draw_queue_chip(f, rows[3], app, id);
 
     // input
-    let busy = id.and_then(|a| app.agents.get(&a)).map(|a| a.busy()).unwrap_or(false);
+    let busy = id.and_then(|a| app.agents.get(&a)).map(producing).unwrap_or(false);
     let placeholder = match (zoom, id.and_then(|a| app.agents.get(&a))) {
         (Some(_), Some(a)) if busy => format!("message {} {} …  (⏎ queue · ctrl+f send now · esc overview)", theme::role_glyph(&a.glyph), a.role),
         (Some(_), _) => "message this agent…  (esc back to overview)".to_string(),
@@ -116,7 +120,7 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
 /// Keep the text still while a small spark moves beside it. Actual activity and silence warnings
 /// take priority over bookkeeping on narrow terminals; the stage/zoom keep their own animation.
 fn solo_busy_line(a: &Agent, width: usize) -> Option<Line<'static>> {
-    if matches!(a.status, Status::Retrying(_) | Status::Starting) || !(a.busy() || a.compacting) {
+    if matches!(a.status, Status::Waiting | Status::Retrying(_) | Status::Starting) || a.swarm_waiting || !(producing(a) || a.compacting) {
         return busy_line(a);
     }
     let elapsed = a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default();
@@ -196,6 +200,20 @@ mod status_tests {
         }
         a.compacting = true;
         assert!(text(&solo_busy_line(&a, 100).unwrap()).contains("Compacting context"));
+    }
+
+    #[test]
+    fn solo_waits_without_a_working_spark_or_stale_quiet_warning() {
+        let mut a = working();
+        a.activity = "writing".into();
+        a.last_event = Instant::now() - Duration::from_secs(90);
+        a.status = Status::Waiting;
+        let line = text(&solo_busy_line(&a, 40).unwrap());
+        assert!(line.contains("waiting for approval") && !line.contains("Writing") && !line.contains("quiet"), "{line}");
+        a.status = Status::Busy;
+        a.swarm_waiting = true;
+        let line = text(&solo_busy_line(&a, 40).unwrap());
+        assert!(line.contains("waiting for Akasha swarm") && !line.contains("quiet"), "{line}");
     }
 }
 
@@ -375,7 +393,7 @@ fn side_panel(f: &mut Frame, area: Rect, app: &App, id: Option<AgentId>) {
         for (step, st) in &a.plan {
             let (g, col) = match st.as_str() {
                 "completed" => (theme::g("✓", "x"), theme::GREEN),
-                "inProgress" => (if a.busy() { anim::spinner() } else { theme::g("◐", "~") }, theme::SAFFRON),
+                "inProgress" => (if producing(a) { anim::spinner() } else { theme::g("◐", "~") }, theme::SAFFRON),
                 _ => (theme::g("○", "o"), theme::FAINT),
             };
             let tst = if st == "completed" { theme::dim().add_modifier(Modifier::CROSSED_OUT) } else if st == "inProgress" { theme::text() } else { theme::muted() };

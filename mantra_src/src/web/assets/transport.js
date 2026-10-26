@@ -161,6 +161,7 @@
             this.synced = false;
             this.state = 'idle';
             this.attempt = 0;
+            this.connectionEpoch = 0;
             this.stopped = false;
             this.lastRx = 0;
             this.t.onopen = () => this.onOpen();
@@ -190,6 +191,7 @@
         }
         connect() {
             clearTimeout(this.retryTimer);
+            this.connectionEpoch++;
             this.setState(this.attempt === 0 && !this.everOpen ? 'connecting' : 'reconnecting');
             this.t.connect();
         }
@@ -262,9 +264,10 @@
             }
         }
         async onClose(info) {
+            const epoch = this.connectionEpoch;
             clearInterval(this.pingTimer);
             this.synced = false;
-            this.rejectAll('connection lost');
+            this.rejectAll('Connection lost before Mantra confirmed the action. Check its state before retrying.');
             if (this.stopped) return;
             if (info.local === 'badkey') {
                 this.stopped = true;
@@ -298,9 +301,11 @@
             if (this.mode === 'local' && !info.opened && this.checkAuth) {
                 try {
                     const ok = await this.checkAuth();
+                    if (this.stopped || epoch !== this.connectionEpoch) return;
                     if (ok === false) { this.stopped = true; this.setState('auth'); return; }
                 } catch (_) { /* server unreachable → plain reconnect */ }
             }
+            if (this.stopped || epoch !== this.connectionEpoch) return;
             if (this.bye === 'unauthorized') return;
             const slow = this.bye === 'slow';
             this.attempt += 1;
@@ -327,12 +332,12 @@
         // Send a command. Resolves with `data` (or the `items` message for fetch_items).
         request(cmd, args, timeoutMs) {
             return new Promise((resolve, reject) => {
-                if (this.state !== 'open') { reject(new Error('not connected')); return; }
+                if (this.state !== 'open') { reject(new Error('Mantra is disconnected. Wait for it to reconnect, then retry.')); return; }
                 const req = this.req++;
                 const msg = Object.assign({ t: 'cmd', req, cmd }, args || {});
-                const timer = setTimeout(() => { this.pending.delete(req); reject(new Error('no answer from Mantra')); }, timeoutMs || 30000);
+                const timer = setTimeout(() => { this.pending.delete(req); reject(new Error('No answer from Mantra. Check its state before retrying.')); }, timeoutMs || 30000);
                 this.pending.set(req, { resolve, reject, timer });
-                if (!this.t.send(msg)) { clearTimeout(timer); this.pending.delete(req); reject(new Error('not connected')); }
+                if (!this.t.send(msg)) { clearTimeout(timer); this.pending.delete(req); reject(new Error('Mantra is disconnected. Wait for it to reconnect, then retry.')); }
             });
         }
     }

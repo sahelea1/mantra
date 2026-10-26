@@ -276,20 +276,28 @@ const QUIET_AFTER: Duration = Duration::from_secs(20);
 /// have — shown only past a threshold, so a normal turn never gains noise.
 pub(crate) fn quiet_for(a: &Agent) -> Option<Duration> {
     let d = a.last_event.elapsed();
-    (a.busy() && d >= QUIET_AFTER).then_some(d)
+    (producing(a) && d >= QUIET_AFTER).then_some(d)
+}
+
+/// A turn can remain active while its tool approval or swarm children block it. Only a turn
+/// actually producing work gets motion and a silence warning.
+pub(crate) fn producing(a: &Agent) -> bool {
+    a.busy() && !matches!(a.status, Status::Waiting | Status::Retrying(_)) && !a.swarm_waiting && !a.stopped_by_user
 }
 
 /// Animated "thinking" status line shown under the log while an agent works.
 pub fn busy_line(a: &Agent) -> Option<Line<'static>> {
     let elapsed = a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default();
     match &a.status {
+        Status::Waiting => Some(Line::from(Span::styled(format!("{} waiting for approval · ctrl+g to review", theme::g("⚑", "!")), theme::fg(theme::AMBER)))),
         Status::Retrying(m) => Some(Line::from(vec![
-            Span::styled(format!("{} ", anim::spinner()), theme::fg(theme::AMBER)),
-            Span::styled(trunc(m, 60), theme::fg(theme::AMBER)),
+            Span::styled(format!("{} ", theme::g("↻", "r")), theme::fg(theme::AMBER)),
+            Span::styled(Status::retrying_text(m, 60), theme::fg(theme::AMBER)),
             Span::styled(format!("  {}", a.retry_note.clone().map(|n| trunc(&n, 60)).unwrap_or_default()), theme::faint()),
         ])),
         Status::Starting => Some(Line::from(vec![Span::styled(format!("{} ", anim::spinner()), theme::dim()), Span::styled("starting agent…", theme::dim())])),
-        _ if a.busy() || a.compacting => {
+        _ if a.swarm_waiting => Some(Line::from(Span::styled(format!("{} waiting for Akasha swarm", theme::g("◉", "@")), theme::fg(theme::AMBER)))),
+        _ if producing(a) || a.compacting => {
             let b = anim::breath(1600);
             let col = theme::named(&a.color);
             let glyph = Span::styled(format!("{} ", theme::g("✦", "*")), Style::default().fg(theme::mix(theme::FAINT, col, 0.35 + 0.65 * b)).add_modifier(Modifier::BOLD));
@@ -430,9 +438,13 @@ pub fn approval_height(ap: &Approval) -> u16 {
 
 pub fn draw_approval(f: &mut Frame, area: Rect, ap: &Approval, agent_name: &str) {
     let blk = block(&format!("{} {} · {}", theme::g("⚑", "!"), ap.title, agent_name), theme::AMBER);
-    let mut lines: Vec<Line> = ap.detail.lines().take(4).map(|l| Line::from(Span::styled(trunc(l, area.width.saturating_sub(4) as usize), theme::bold(theme::text())))).collect();
+    let detail_room = area.height.saturating_sub(3) as usize;
+    let mut lines: Vec<Line> = ap.detail.lines().take(detail_room.min(4)).map(|l| Line::from(Span::styled(trunc(l, area.width.saturating_sub(4) as usize), theme::bold(theme::text())))).collect();
     if ap.method == "item/tool/requestUserInput" {
-        lines.push(Line::from(Span::styled("type your answer below and press ⏎ · esc to skip", theme::fg(theme::AMBER))));
+        let hint = if area.width < 55 { "answer below · ⏎ send · esc skip" } else { "type your answer below and press ⏎ · esc to skip" };
+        lines.push(Line::from(Span::styled(hint, theme::fg(theme::AMBER))));
+    } else if area.width < 60 {
+        lines.push(Line::from(Span::styled("y yes · a session · n no · esc cancel", theme::fg(theme::AMBER))));
     } else {
         lines.push(Line::from(vec![
             Span::styled("[y]", theme::bold(theme::fg(theme::GREEN))),
@@ -518,5 +530,45 @@ mod tests {
 
         a.last_event = std::time::Instant::now() - Duration::from_secs(90);
         assert!(quiet_for(&a).is_some_and(|d| d.as_secs() >= 90), "a busy agent silent past the threshold reports how long");
+        a.status = Status::Waiting;
+        assert_eq!(quiet_for(&a), None, "approval is expected silence");
+        let waiting = busy_line(&a).unwrap();
+        let text = waiting.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.contains("waiting for approval") && !text.contains("quiet"), "{text}");
+        a.status = Status::Busy;
+        a.swarm_waiting = true;
+        assert_eq!(quiet_for(&a), None, "swarm children are expected silence");
+        let waiting = busy_line(&a).unwrap();
+        let text = waiting.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.contains("waiting for Akasha swarm") && !text.contains("quiet"), "{text}");
+        a.swarm_waiting = false;
+        a.status = Status::Retrying("rate limited".into());
+        assert!(!producing(&a));
+        assert_eq!(quiet_for(&a), None);
+        assert!(busy_line(&a).unwrap().spans.iter().any(|s| s.content.contains("retrying: rate limited")));
+    }
+
+    #[test]
+    fn ascii_pass_keeps_narrow_status_cells_printable() {
+        use ratatui::buffer::Buffer;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        buf.set_string(0, 0, "⚑ waiting for approval · ctrl+g", Style::default());
+        asciify(&mut buf);
+        assert!(buf.content.iter().all(|c| c.symbol().is_ascii()));
+        assert_eq!(buf[(0, 0)].symbol(), "!");
+    }
+
+    #[test]
+    fn compact_approval_keeps_actions_when_detail_is_long() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let ap = Approval {
+            agent: 1, id: serde_json::json!("tool-1"), method: "item/commandExecution/requestApproval".into(),
+            title: "Run command".into(), detail: "first detail\nsecond detail\nthird detail\nfourth detail".into(),
+            params: serde_json::json!({}), at: std::time::Instant::now(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        terminal.draw(|f| draw_approval(f, f.area(), &ap, "worker")).unwrap();
+        let row = (0..40).map(|x| terminal.backend().buffer()[(x, 1)].symbol().to_string()).collect::<String>();
+        assert!(row.contains("y yes") && row.contains("n no") && row.contains("esc cancel"), "{row}");
     }
 }

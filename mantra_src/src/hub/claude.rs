@@ -133,7 +133,13 @@ pub(super) async fn run_claude_process(
             c = cmds.recv() => {
                 // While a restart is pending the child is about to die: anything written to its
                 // stdin now would never get a reply, so text is held for the next process.
-                let Some(c) = hold_text(tr.restart_pending, replay, c.unwrap_or(Cmd::Shutdown)) else { continue };
+                let Some(c) = hold_text(tr.restart_pending, replay, c.unwrap_or(Cmd::Shutdown)) else {
+                    if !tr.turn_open && cmds.is_empty() {
+                        stop_child(&mut stdin, &mut child).await;
+                        return Exit::Restarting { reason: "restarting to apply the new model/effort".into(), fresh: false };
+                    }
+                    continue;
+                };
                 match c {
                     Cmd::Shutdown => {
                         if tr.turn_open {
@@ -185,18 +191,10 @@ pub(super) async fn run_claude_process(
                     }
                     Cmd::SetEffort(e) => {
                         *effort = e;
-                        if !tr.turn_open {
-                            stop_child(&mut stdin, &mut child).await;
-                            return Exit::Restarting { reason: "restarting to apply the new effort".into(), fresh: false };
-                        }
                         tr.restart_pending = true; // applied at the next idle moment, never mid-turn
                     }
                     Cmd::SetModel(m) => {
                         *model = m;
-                        if !tr.turn_open {
-                            stop_child(&mut stdin, &mut child).await;
-                            return Exit::Restarting { reason: "restarting to apply the new model".into(), fresh: false };
-                        }
                         tr.restart_pending = true;
                     }
                     // Claude Code sessions have no title API: the run's name stays on Mantra's side.
@@ -204,8 +202,7 @@ pub(super) async fn run_claude_process(
                     // No vision tools of its own: Mantra's refuse a model that does not see.
                     Cmd::SetVision(_) => {}
                     Cmd::SetApproval(_) => {
-                        // Only "never" (--dangerously-skip-permissions) is modeled until Role.permission
-                        // (WP3) lands in a later batch; every Claude agent runs unattended for now.
+                        let _ = ev.send(super::unsupported_approval(id, "Claude Code"));
                     }
                     Cmd::Restart => {
                         stop_child(&mut stdin, &mut child).await;
@@ -236,6 +233,13 @@ pub(super) async fn run_claude_process(
                         bridge_rx = Some(brx);
                         crate::mlog!("agent {id}: mcp bridge connected");
                     }
+                }
+                // A model pick sends SetModel and SetEffort together. Consume both before the
+                // idle relaunch, including any text held by hold_text, so the replacement starts
+                // with the chosen model *and* effort and no extra restart is needed.
+                if tr.restart_pending && !tr.turn_open && cmds.is_empty() {
+                    stop_child(&mut stdin, &mut child).await;
+                    return Exit::Restarting { reason: "restarting to apply the new model/effort".into(), fresh: false };
                 }
             }
             b = recv_bridge(&mut bridge_rx), if bridge_rx.is_some() => {
@@ -290,7 +294,7 @@ pub(super) async fn run_claude_process(
                             stop_child(&mut stdin, &mut child).await;
                             return Exit::Restarting { reason: "resumed session unusable".into(), fresh: true };
                         }
-                        if tr.restart_pending && !tr.turn_open {
+                        if tr.restart_pending && !tr.turn_open && cmds.is_empty() {
                             stop_child(&mut stdin, &mut child).await;
                             return Exit::Restarting { reason: "restarting to apply the new model/effort".into(), fresh: false };
                         }
@@ -1037,6 +1041,44 @@ fn tool_result_text(block: &Value, tool_use_result: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use crate::agent::{Agent, Kind, Signal};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_model_and_effort_change_relaunches_once_with_queued_text_held() {
+        let spec = SpawnSpec {
+            cwd: std::env::temp_dir(), model: "old".into(), provider: String::new(),
+            effort: "low".into(), approval: "never".into(), sandbox: "read-only".into(),
+            developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
+            extra_args: vec![], resume_thread: None, thread_name: None,
+            backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
+            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+                autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
+            bija: None, mcp: vec![],
+        };
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (tx, mut cmds) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut session = None;
+            let mut effort = "low".to_string();
+            let mut model = "old".to_string();
+            let mut replay = vec![];
+            let mut last_turn = None;
+            let exit = run_claude_process(1, &spec,
+                &["sh".into(), "-c".into(), "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"old\"}\\n'; cat >/dev/null".into()],
+                &ev, &mut cmds, &mut session, &mut effort, &mut model, &mut replay, &mut last_turn).await;
+            (exit, effort, model, replay)
+        });
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap(), Some(HubEvent::Ready { .. })));
+        tx.send(Cmd::SetApproval("on-request".into())).unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap(), Some(HubEvent::CmdFailed { what: "approval", .. })));
+        tx.send(Cmd::SetModel("new".into())).unwrap();
+        tx.send(Cmd::SetEffort("high".into())).unwrap();
+        tx.send(Cmd::Turn { text: "queued".into() }).unwrap();
+        let (exit, effort, model, replay) = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(matches!(exit, Exit::Restarting { fresh: false, .. }));
+        assert_eq!((model.as_str(), effort.as_str()), ("new", "high"));
+        assert_eq!(replay, vec!["queued".to_string()]);
+    }
 
     #[test]
     fn build_args_covers_resume_effort_autocompact_and_sandbox() {

@@ -195,6 +195,9 @@ pub(super) async fn run_bija_process(
                     Cmd::SetEffort(e) => *effort = e.clone(),
                     Cmd::SetModel(m) => *model = m.clone(),
                     Cmd::SetVision(v) => *vision = *v,
+                    Cmd::SetApproval(_) => {
+                        let _ = ev.send(super::unsupported_approval(id, "Bija"));
+                    }
                     Cmd::Compact if !tr.turn_open => tr.idle_compact = true,
                     _ => {}
                 }
@@ -398,7 +401,8 @@ fn build_args(cwd: &Path, bs: &BijaSpawn, files: &SessionFiles, model: &str, eff
 }
 
 /// The op a `Cmd` becomes on bija's stdin (SPEC §9.2). `None` for the commands with no bija
-/// equivalent: `Archive` (the session simply stays on disk), `SetApproval` (bija never asks),
+/// equivalent: `Archive` (the session simply stays on disk), `SetApproval` (reported as unsupported
+/// by the process loop; bija's native tools never ask),
 /// `Restart` (a relaunch, not an op) and `Bridge` (Claude Code's MCP side channel).
 fn op_for(c: &Cmd) -> Option<Value> {
     match c {
@@ -1438,6 +1442,9 @@ done"#;
         ctl.send(Cmd::SetEffort("high".into())).unwrap();
         let ops = wait_for_file(&fake.dir.join("ops.log"), "\"effort\":\"high\"").await;
         assert!(ops.contains(r#"{"model":"m2","op":"set"}"#) || ops.contains(r#""op":"set","model":"m2""#), "{ops}");
+        ctl.send(Cmd::SetApproval("on-request".into())).unwrap();
+        assert!(matches!(next(&mut rx).await, HubEvent::CmdFailed { what: "approval", error, .. } if error.contains("does not support")));
+        assert!(!fake.read("ops.log").contains("approval"), "an unsupported policy must not be sent as a bija op");
         ctl.send(Cmd::Shutdown).unwrap();
         assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 4 }), "a model switch never relaunched it, and shutdown ends it");
         assert!(fake.read("ops.log").contains("\"op\":\"shutdown\""));

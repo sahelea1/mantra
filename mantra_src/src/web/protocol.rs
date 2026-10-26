@@ -98,24 +98,39 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// Every command of design §6. Agent ids are the hub's `u32`s.
-///
-/// 0.8 added the configuration commands (`run_stop` to `add_backend` below) — additive, so a UI
-/// bundle built for 0.7 keeps working on protocol 1. They go through the same APIs the TUI's
-/// `/settings`, `/models` and `/studio` do (`web::ops`); no reply carries a key or a password.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum Command {
+macro_rules! define_commands {
+    ($( $(#[$meta:meta])* $variant:ident $( { $($fields:tt)* } )? => $wire:literal, )*) => {
+        /// Every command of design §6. Agent ids are the hub's `u32`s.
+        ///
+        /// 0.8 added the configuration commands (`run_stop` to `add_backend` below) — additive, so a UI
+        /// bundle built for 0.7 keeps working on protocol 1. They go through the same APIs the TUI's
+        /// `/settings`, `/models` and `/studio` do (`web::ops`); no reply carries a key or a password.
+        #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+        #[serde(tag = "cmd")]
+        pub enum Command {
+            $( $(#[$meta])* #[serde(rename = $wire)] $variant $( { $($fields)* } )?, )*
+        }
+
+        impl Command {
+            /// The wire names, for telling "unknown command" from "bad arguments".
+            pub const NAMES: &'static [&'static str] = &[$($wire,)*];
+        }
+    };
+}
+
+define_commands! {
     Send {
         agent: u32,
         #[serde(default)]
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         force: Option<bool>,
-    },
+    } => "send",
+
     RunInput {
         text: String,
-    },
+    } => "run_input",
+
     StartRun {
         goal: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,137 +139,175 @@ pub enum Command {
         /// `pattern::PARALLEL_RANGE`); absent = what the pattern says.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parallel: Option<usize>,
-    },
-    PlanApprove,
-    PauseResume,
+    } => "start_run",
+
+    PlanApprove => "plan_approve",
+
+    PauseResume => "pause_resume",
+
     Interrupt {
         agent: u32,
-    },
+    } => "interrupt",
+
     /// End the agent process (and Solo children), retaining its transcript.
     AgentStop {
         agent: u32,
-    },
+    } => "agent_stop",
+
     /// Close this Mantra instance through the normal, graceful quit path.
-    AppShutdown,
+    AppShutdown => "app_shutdown",
+
     Respawn {
         agent: u32,
-    },
+    } => "respawn",
+
     Compact {
         agent: u32,
-    },
+    } => "compact",
+
     SetModel {
         agent: u32,
         alias: String,
-    },
+    } => "set_model",
+
     SetRoleModel {
         role: String,
         alias: String,
         #[serde(default)]
         all: bool,
-    },
+    } => "set_role_model",
+
     /// A role's fallback model (`Role.fallback`) in the next run's pattern, saved like
     /// `set_role_model`: another alias than the role's own model, or none (`alias` null/absent).
     SetRoleFallback {
         role: String,
         #[serde(default)]
         alias: Option<String>,
-    },
+    } => "set_role_fallback",
+
     SetEffort {
         agent: u32,
         effort: String,
-    },
+    } => "set_effort",
+
     StepEffort {
         agent: u32,
         delta: i32,
-    },
+    } => "step_effort",
+
     Approve {
         key: String,
         decision: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer: Option<String>,
-    },
+    } => "approve",
+
     ApprovalMode {
         mode: String,
-    },
+    } => "approval_mode",
+
     DiscardQueue {
         agent: u32,
-    },
+    } => "discard_queue",
+
     PopQueued {
         agent: u32,
-    },
-    Land,
-    RunsList,
+    } => "pop_queued",
+
+    Land => "land",
+
+    RunsList => "runs_list",
+
     RunResume {
         id: String,
-    },
+    } => "run_resume",
+
     RunDelete {
         id: String,
-    },
-    NewSolo,
+    } => "run_delete",
+
+    NewSolo => "new_solo",
+
     SetPattern {
         name: String,
-    },
+    } => "set_pattern",
+
     Diff {
         agent: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
-    },
-    PlanMarkdown,
+    } => "diff",
+
+    PlanMarkdown => "plan_markdown",
+
     FetchItems {
         agent: u32,
         before: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         count: Option<u32>,
-    },
+    } => "fetch_items",
+
     PushSubscribe {
         subscription: PushSubscriptionJson,
         #[serde(default)]
         device: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prefs: Option<super::push::Prefs>,
-    },
+    } => "push_subscribe",
+
     PushUnsubscribe {
         endpoint: String,
-    },
+    } => "push_unsubscribe",
+
     PushPrefs {
         endpoint: String,
         prefs: super::push::Prefs,
-    },
+    } => "push_prefs",
+
     PushTest {
         endpoint: String,
-    },
-    RemoteRotate,
+    } => "push_test",
+
+    RemoteRotate => "remote_rotate",
+
     /// Stop the active run for good (`App::stop_run`): saved as "stopped", openable from the runs
     /// list to land or delete, and the way clear for `start_run`. → `{}`.
-    RunStop,
+    RunStop => "run_stop",
+
     /// Every pattern as a list shows it (`Pattern::summaries`). → `{patterns, current, default}`.
-    PatternsList,
+    PatternsList => "patterns_list",
+
     /// One pattern to edit. → `{pattern (JSON), toml, tag, builtin, edited, yours, path?, options}`;
     /// `options` holds the values its fields take (kinds, sandboxes, permissions, models, …).
     PatternGet {
         name: String,
-    },
+    } => "pattern_get",
+
     /// Validate and save `pattern` (the JSON `pattern_get` gave, edited) under `name`: its own name
     /// saves over it (a built-in gets an edited copy in ~/.mantra/patterns), another one saves a
     /// copy (`Pattern::save_as`). → `{name, path, tag}`; refused with every reason, one per line.
     PatternSave {
         name: String,
         pattern: Value,
-    },
+    } => "pattern_save",
+
     /// Delete a pattern's file (`Pattern::delete_file`): yours is gone, an edited built-in is the
     /// built-in again. → `{path}`.
     PatternDelete {
         name: String,
-    },
+    } => "pattern_delete",
+
     /// The settings as `/settings` shows them (`Settings::fields`), the MCP servers and what the
     /// web layer is serving. Secrets read "set" / "not set". → `{fields, mcp, web, demo}`.
-    SettingsGet,
+    SettingsGet => "settings_get",
+
     /// One setting (`App::set_setting`), the value as text. → `{note, settings}` (`note`: when it
     /// takes effect; `settings`: the `settings_get` reply after the change).
     SettingsSet {
         key: String,
         value: Secret,
-    },
+    } => "settings_set",
+
     /// Add an MCP server, or change one: `command` with `args` absent is a command line, split
     /// the way a shell would (`settings_ops::parse_command_line`); `env` replaces the server's;
     /// `enabled` alone switches it. Saved to settings.toml. → `{settings}`.
@@ -268,20 +321,24 @@ pub enum Command {
         env: Option<BTreeMap<String, Secret>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
-    },
+    } => "mcp_set",
+
     /// → `{settings}`.
     McpRemove {
         name: String,
-    },
+    } => "mcp_remove",
+
     /// Start the server, shake hands, list its tools (`mantra mcp test`); answered once it has.
     /// → `{report}`.
     McpTest {
         name: String,
-    },
+    } => "mcp_test",
+
     /// The model registry: models, providers (`api_key` as `••••` + its last four), the Codex
     /// account as a row of its own, which add-on backends can be added. → `{models, providers,
     /// backends, options}`.
-    ModelsGet,
+    ModelsGet => "models_get",
+
     /// One cell of a model (`alias`, `provider`, `model`, `context`, `compact`, `effort`,
     /// `efforts`, `vision`, `note`), saved to models.toml. → `{alias, registry}` (the alias after
     /// the change; `registry` is the `models_get` reply).
@@ -289,7 +346,8 @@ pub enum Command {
         alias: String,
         field: String,
         value: String,
-    },
+    } => "model_set",
+
     /// A new model on `provider`; without `model` (and `alias`) a placeholder row to fill in.
     /// → `{alias, registry}`.
     ModelAdd {
@@ -298,23 +356,27 @@ pub enum Command {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alias: Option<String>,
-    },
+    } => "model_add",
+
     /// → `{registry}`.
     ModelDelete {
         alias: String,
-    },
+    } => "model_delete",
+
     /// One cell of a provider (`id`, `name`, `base_url`, `env_key`, `api_key`, `kind`, `auth`,
     /// `wire`); a new id carries its models along. → `{id, registry}`.
     ProviderSet {
         id: String,
         field: String,
         value: Secret,
-    },
+    } => "provider_set",
+
     /// A provider and every model on it; `openai` is the Codex account (all its models).
     /// → `{models, registry}` (`models`: how many went with it).
     ProviderDelete {
         id: String,
-    },
+    } => "provider_delete",
+
     /// A provider from its API key (`provider_key::provider_from_key`). `probe: false` only says
     /// what the key looks like → `{draft}`; otherwise the provider is added (or the key put into
     /// the one at that URL) and its model list asked for off the App task, answered once it is
@@ -326,83 +388,29 @@ pub enum Command {
         base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probe: Option<bool>,
-    },
+    } => "provider_from_key",
+
     /// Add the chosen `candidates` (rows of a `provider_from_key` reply) to `provider`.
     /// → `{added, updated, registry}`.
     ModelsImport {
         provider: String,
         candidates: Vec<super::ops::CandidateView>,
-    },
+    } => "models_import",
+
     /// The live test of `/models`: a throwaway agent on the alias asked for one word, answered
     /// once it has. → `{status}` ("ok 0.4s · …"); a failed test is an error with the reason.
     ModelTest {
         alias: String,
-    },
+    } => "model_test",
+
     /// An add-on backend's default models, `kind` "codex" | "claude-code"
     /// (`provider_key::add_backend`). → `{added, registry}`.
     AddBackend {
         kind: String,
-    },
+    } => "add_backend",
 }
 
 impl Command {
-    /// The wire names, for telling "unknown command" from "bad arguments".
-    pub const NAMES: &'static [&'static str] = &[
-        "send",
-        "run_input",
-        "start_run",
-        "plan_approve",
-        "pause_resume",
-        "interrupt",
-        "agent_stop",
-        "app_shutdown",
-        "respawn",
-        "compact",
-        "set_model",
-        "set_role_model",
-        "set_role_fallback",
-        "set_effort",
-        "step_effort",
-        "approve",
-        "approval_mode",
-        "discard_queue",
-        "pop_queued",
-        "land",
-        "runs_list",
-        "run_resume",
-        "run_delete",
-        "new_solo",
-        "set_pattern",
-        "diff",
-        "plan_markdown",
-        "fetch_items",
-        "push_subscribe",
-        "push_unsubscribe",
-        "push_prefs",
-        "push_test",
-        "remote_rotate",
-        "run_stop",
-        "patterns_list",
-        "pattern_get",
-        "pattern_save",
-        "pattern_delete",
-        "settings_get",
-        "settings_set",
-        "mcp_set",
-        "mcp_remove",
-        "mcp_test",
-        "models_get",
-        "model_set",
-        "model_add",
-        "model_delete",
-        "provider_set",
-        "provider_delete",
-        "provider_from_key",
-        "models_import",
-        "model_test",
-        "add_backend",
-    ];
-
     /// The wire name of this command (for logs and error texts).
     pub fn name(&self) -> String {
         serde_json::to_value(self).ok().and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(|s| s.to_string())).unwrap_or_default()
@@ -633,10 +641,21 @@ mod tests {
             Command::ModelTest { alias: "sol".into() },
             Command::AddBackend { kind: "codex".into() },
         ];
-        assert_eq!(cmds.iter().map(|c| c.name()).collect::<std::collections::BTreeSet<_>>().len(), Command::NAMES.len(), "every command covered");
         for (i, cmd) in cmds.into_iter().enumerate() {
             round_client(ClientMsg::Cmd { req: i as u64, cmd });
         }
+    }
+
+    #[test]
+    fn command_names_are_unique_and_match_serialized_tags() {
+        let names: std::collections::BTreeSet<_> = Command::NAMES.iter().copied().collect();
+        assert_eq!(names.len(), Command::NAMES.len());
+
+        let cmd = Command::StartRun { goal: "g".into(), pattern: None, parallel: None };
+        let wire = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(wire["cmd"], "start_run");
+        assert!(names.contains(cmd.name().as_str()));
+        assert_eq!(serde_json::from_value::<Command>(wire).unwrap(), cmd);
     }
 
     /// A key or password in a command never shows in its `Debug` (test failures, log lines), and

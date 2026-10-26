@@ -220,6 +220,9 @@ pub struct AgentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_detail: Option<String>,
     pub busy: bool,
+    /// A turn can remain busy while its Akasha children are doing the work.
+    #[serde(default)]
+    pub swarm_waiting: bool,
     pub activity: String,
     pub turn_active: bool,
     pub awaiting_start: bool,
@@ -880,6 +883,7 @@ fn agent_view_with(app: &App, a: &Agent, facts: &RunFacts) -> AgentView {
         status: status.into(),
         status_detail,
         busy: a.busy(),
+        swarm_waiting: a.swarm_waiting,
         activity: a.activity.clone(),
         turn_active: a.turn_active,
         awaiting_start: a.awaiting_start,

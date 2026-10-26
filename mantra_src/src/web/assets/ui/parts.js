@@ -90,12 +90,14 @@
             case 'failed': return { text: 'failed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
             case 'crashed': return { text: 'crashed' + (a.status_detail ? ': ' + F.trunc(a.status_detail, 60) : ''), tone: 'bad' };
             case 'stopped': return { text: a.stopped_by_user ? 'stopped by you' : 'stopped', tone: 'wait' };
+            case 'waiting': return { text: a.status_detail || 'waiting', tone: 'wait' };
         }
+        if (a.swarm_waiting) return { text: 'waiting for Akasha swarm', tone: 'wait' };
         if (a.busy) {
             const label = a.compacting ? 'compacting' : (a.activity || (a.awaiting_start ? 'starting' : 'thinking')).replace(/…$/, '');
             const el = a.turn_started_at ? ' · ' + F.durShort(now - a.turn_started_at) : '';
             const quiet = a.quiet_ms && a.quiet_ms >= 20000 ? ' · quiet ' + F.durShort(a.quiet_ms) : '';
-            return { text: F.trunc(label, 40).toLowerCase() + el + quiet, tone: quiet ? 'wait' : 'busy', quiet: !!quiet };
+            return { text: F.trunc(label, 40).toLowerCase() + el + quiet, tone: 'busy', quiet: !!quiet };
         }
         if (w && w.state === 'done') return { text: 'done', tone: 'done' };
         if (w && w.state === 'failed') return { text: 'failed', tone: 'bad' };
@@ -329,9 +331,10 @@
         const s = S();
         const val = s.ui.drafts[key] || '';
         const submit = () => {
+            if (S().ui.busy[key]) return;
             const t = (S().ui.drafts[key] || '').trim();
             if (!t) return;
-            M.act.cmd('run_input', { text: t }, { busyKey: key, ok: 'Sent' }).then(() => { S().ui.drafts[key] = ''; M.act.changed(); }, () => { });
+            M.act.cmd('run_input', { text: t }, { busyKey: key, ok: 'Sent' }).then(() => { if ((S().ui.drafts[key] || '').trim() === t) S().ui.drafts[key] = ''; M.act.changed(); }, () => { });
         };
         return h('form', { class: 'inline-form', key: key, onsubmit: (e) => { e.preventDefault(); submit(); } },
             h('input', { class: 'input', value: val, placeholder, enterkeyhint: 'send', 'aria-label': placeholder, oninput: (e) => { S().ui.drafts[key] = e.target.value; M.act.changed(); } }),

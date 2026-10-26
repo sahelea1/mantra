@@ -116,6 +116,7 @@ fn vstate(w: Option<&Worker>, a: Option<&Agent>) -> V {
             Some(Status::Waiting) => V::Waiting,
             Some(Status::Retrying(_)) => V::Retrying,
             Some(Status::Crashed(_)) | Some(Status::Failed(_)) => V::Failed,
+            _ if a.is_some_and(|a| a.swarm_waiting) => V::Waiting,
             _ => V::Running,
         },
     }
@@ -199,7 +200,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             if app.demo {
                 crumbs.push(Span::styled("  DEMO", theme::bold(theme::fg(theme::ROSE))));
             }
-            let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(|x| x.busy()).unwrap_or(false)).count();
+            let active = r.all_agents().iter().filter(|a| app.agents.get(a).map(producing).unwrap_or(false)).count();
             let (tokens, cached) = super::run_token_totals(app, r);
             // The halt band (drawn in the rail, just under this header) already says why and
             // what to do — no separate badge needed here.
@@ -469,7 +470,7 @@ fn card_border(base: (u8, u8, u8), v: V, a: Option<&Agent>) -> (Style, bool) {
     let (col, dotted) = match v {
         V::NotStarted | V::Queued => (theme::c(theme::FAINT), true),
         V::Running => (theme::mix(theme::mix_rgb(base, theme::FAINT), base, 0.4 + 0.6 * b), false),
-        V::Waiting => (theme::mix(theme::AMBER, theme::TEXT, b * 0.4), false),
+        V::Waiting => (theme::c(theme::AMBER), false),
         V::Retrying => (theme::c(theme::AMBER), true),
         V::Done => (theme::mix(theme::mix_rgb(theme::GREEN, theme::FAINT), theme::TEXT, done_flash), false),
         V::Failed => (theme::c(theme::RED), false),
@@ -563,13 +564,14 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                     };
                     vec![Span::styled(trunc(&t, iw as usize), theme::fg(theme::AMBER))]
                 }
+                (V::Waiting, Some(a)) if a.swarm_waiting => vec![Span::styled("waiting for Akasha swarm", theme::fg(theme::AMBER))],
                 (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
                 (_, Some(a)) if !a.busy() && a.stopped_by_user => vec![Span::styled("stopped by you · r respawn", theme::fg(theme::AMBER))],
                 (_, Some(a)) if !a.busy() && run.waiting_for_answer(a.id) => vec![Span::styled("asked a question · waiting for the answer", theme::fg(theme::AMBER))],
                 // The shimmer only proves the frame is repainting; a `last_event` that has stopped
                 // moving is what actually answers "is it stuck?". The suffix takes its columns off
                 // the activity rather than pushing the line past the card's inner width.
-                (_, Some(a)) if a.busy() => match quiet_for(a) {
+                (_, Some(a)) if producing(a) => match quiet_for(a) {
                     Some(q) => {
                         let tail = format!(" · quiet {}", fmt_dur(q));
                         let room = (iw as usize).saturating_sub(w_of(&tail));
@@ -641,11 +643,13 @@ fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, gl
     let v = match a {
         None => V::NotStarted,
         Some(a) => match &a.status {
+            Status::Busy if a.swarm_waiting => V::Waiting,
             Status::Busy => V::Running,
             Status::Waiting => V::Waiting,
             Status::Retrying(_) => V::Retrying,
             Status::Failed(_) | Status::Crashed(_) => V::Failed,
             Status::Stopped => V::Done,
+            _ if a.swarm_waiting => V::Waiting,
             _ => V::Queued,
         },
     };
@@ -677,10 +681,17 @@ fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, gl
     title.push(Span::raw(" "));
     cv.spans(x - 1, y, &title, iw);
     if let Some(a) = a {
-        if a.busy() {
-            cv.put(r.x as i32 + r.width as i32 - 3, y, anim::spinner(), theme::bold(theme::fg(color)));
+        let mark = match v {
+            V::Running if producing(a) => Some((anim::spinner(), color)),
+            V::Waiting => Some((theme::g("⚑", "!"), theme::AMBER)),
+            V::Retrying => Some((theme::g("↻", "r"), theme::AMBER)),
+            _ => None,
+        };
+        if let Some((glyph, col)) = mark {
+            cv.put(r.x as i32 + r.width as i32 - 3, y, glyph, theme::bold(theme::fg(col)));
         }
-        let act: Vec<Span> = if a.busy() { anim::shimmer(&trunc(&a.activity, iw as usize), theme::mix_rgb(color, theme::MUTED), theme::TEXT) } else { vec![Span::styled(trunc(&a.activity, iw as usize), theme::dim())] };
+        let activity = if a.swarm_waiting { "waiting for Akasha swarm" } else if v == V::Waiting { "needs approval · ctrl+g" } else { &a.activity };
+        let act: Vec<Span> = if producing(a) { anim::shimmer(&trunc(activity, iw as usize), theme::mix_rgb(color, theme::MUTED), theme::TEXT) } else { vec![Span::styled(trunc(activity, iw as usize), if v == V::Waiting { theme::fg(theme::AMBER) } else { theme::dim() })] };
         if r.height >= 3 {
             cv.spans(x, y + 1, &act, iw);
         }
@@ -760,7 +771,14 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
             let col = role_col(run, &t.role);
             let glyph = run.pattern.role(&t.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default();
             let is_sel = wk.and_then(|w| w.agent).is_some() && wk.and_then(|w| w.agent) == sel;
-            let act = a.map(|a| a.activity.clone()).unwrap_or_else(|| if v == V::NotStarted { "not started".into() } else { "queued".into() });
+            let act = match (v, a) {
+                (V::Waiting, Some(a)) if a.swarm_waiting => "waiting for Akasha swarm".into(),
+                (V::Waiting, _) => "needs approval · ctrl+g".into(),
+                (V::Retrying, Some(a)) => match &a.status { Status::Retrying(m) => Status::retrying_text(m, 30), _ => "retrying".into() },
+                (_, Some(a)) => a.activity.clone(),
+                (V::NotStarted, _) => "not started".into(),
+                _ => "queued".into(),
+            };
             let line = format!("{} {glyph} {:<14} {}", if is_sel { theme::g("▶", ">") } else { " " }, t.id, act);
             cv.put(x0 + 1, y, &trunc(&line, (w as usize).saturating_sub(2)), if matches!(v, V::NotStarted | V::Queued) { theme::faint() } else { theme::fg(col) });
             y += 1;
@@ -792,7 +810,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     let ocol = role_col(run, &run.pattern.flow.orchestrator);
     let oglyph = run.pattern.role(&run.pattern.flow.orchestrator).map(|r| r.glyph.clone()).unwrap_or_else(|| "◉".into());
     let running = run.workers.iter().filter(|w| w.state == WState::Running).count();
-    let watching = if running > 0 && oa.map(|a| !a.busy()).unwrap_or(false) {
+    let watching = if running > 0 && oa.map(|a| !producing(a)).unwrap_or(false) {
         vec![Span::styled(format!("{} watching {running} worker{}", theme::g("◉", "@"), if running == 1 { "" } else { "s" }), theme::fg(theme::GREEN))]
     } else {
         let last = oa.and_then(|a| a.tail_lines(1).pop()).unwrap_or_default();
@@ -809,7 +827,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let ey = y0 + 1;
         let (ex1, ex2) = (x0 + 27, orch.x as i32 - 1);
         if ex2 > ex1 {
-            if prompting(run, run.orchestrator) && pa.map(|a| a.busy() || a.last_event.elapsed() < Duration::from_secs(3)).unwrap_or(false) {
+            if prompting(run, run.orchestrator) && pa.map(|a| producing(a) || a.last_event.elapsed() < Duration::from_secs(3)).unwrap_or(false) {
                 let ph = anim::march(90) as i32;
                 for x in ex1..=ex2 {
                     let c = if (x - ph).rem_euclid(4) == 0 { theme::g("▸", ">") } else { theme::g("─", "-") };
@@ -831,7 +849,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let ey = y0 + 1;
         let (ex1, ex2) = (orch.x as i32 + orch.width as i32, mr.x as i32 - 1);
         if ex2 > ex1 {
-            if ma.map(|a| a.busy()).unwrap_or(false) {
+            if ma.map(producing).unwrap_or(false) {
                 let ph = anim::march(90) as i32;
                 for x in ex1..=ex2 {
                     let c = if (x + ph).rem_euclid(4) == 0 { theme::g("◂", "<") } else { theme::g("─", "-") };
@@ -846,7 +864,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     // ── fork: stem, bus, drops
     let line = |s: &'static str, a: &'static str| theme::g(s, a);
     let any_prompt = run.workers.iter().any(|wk| prompting(run, wk.agent));
-    let obusy = oa.map(|a| a.busy()).unwrap_or(false);
+    let obusy = oa.map(producing).unwrap_or(false);
     let stem_st = if any_prompt { theme::fg(theme::ROSE) } else if obusy { theme::fg(ocol) } else if running > 0 { theme::fg(theme::GREEN) } else { theme::faint() };
     let y_stem = y0 + 4;
     let y_bus = y0 + 5;
@@ -955,6 +973,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         Stage::Phase { step, .. } => step.clone(),
         _ => PhaseStep::Orchestrating,
     };
+    let blocked = run.halted() || ga.is_some_and(|a| matches!(a.status, Status::Waiting | Status::Retrying(_)) || a.swarm_waiting);
     let mut line2: Vec<Span<'static>> = vec![];
     match &step {
         PhaseStep::Orchestrating => {
@@ -962,11 +981,11 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
             let total = run.current_phase().map(|p| p.tasks.len()).unwrap_or(0);
             line2.push(Span::styled(format!("gate opens when all tasks are done ({done}/{total})"), theme::faint()));
         }
-        PhaseStep::Merging => line2.push(Span::styled(format!("{} merging branches…", anim::spinner()), theme::fg(theme::AMBER))),
-        PhaseStep::Fix { round } => line2.push(Span::styled(format!("{} fix-{round} is working on {}…", anim::spinner(), if *round == 0 { "the merge" } else { "what QA found" }), theme::fg(theme::AMBER))),
+        PhaseStep::Merging => line2.push(Span::styled(if blocked { "merge paused".to_string() } else { format!("{} merging branches…", anim::spinner()) }, theme::fg(theme::AMBER))),
+        PhaseStep::Fix { round } => line2.push(Span::styled(if blocked { format!("fix-{round} paused") } else { format!("{} fix-{round} is working on {}…", anim::spinner(), if *round == 0 { "the merge" } else { "what QA found" }) }, theme::fg(theme::AMBER))),
         _ => {
             if run.checks.is_empty() && matches!(step, PhaseStep::Checks { .. }) {
-                line2.push(Span::styled(format!("{} running checks…", anim::spinner()), theme::fg(theme::BLUE)));
+                line2.push(Span::styled(if blocked { "checks paused".to_string() } else { format!("{} running checks…", anim::spinner()) }, theme::fg(theme::BLUE)));
             }
             for c in &run.checks {
                 line2.push(Span::styled(format!("{} ", if c.ok { theme::g("✓", "v") } else { theme::g("✗", "x") }), theme::fg(if c.ok { theme::GREEN } else { theme::RED })));
@@ -1241,6 +1260,26 @@ mod tests {
         app.run = Some(run);
         app.screen = crate::app::Screen::Stage;
         app
+    }
+
+    #[test]
+    fn waiting_worker_is_still_and_named_in_cards_and_40x12_list() {
+        let mut app = phase_app();
+        let a = app.agents.get_mut(&11).unwrap();
+        a.status = Status::Waiting;
+        a.turn_active = true;
+        a.activity = "working on a tool".into();
+        assert_eq!(vstate(app.run.as_ref().unwrap().workers.last(), app.agents.get(&11)), V::Waiting);
+        let large = frame(&mut app, 120, 36).join("\n");
+        assert!(large.contains("needs approval · ctrl+g"), "{large}");
+        assert!(large.contains("0 active"), "{large}");
+        assert!(!large.contains("working on a tool"), "{large}");
+        let small = frame(&mut app, 40, 12).join("\n");
+        assert!(small.contains("needs appro"), "{small}");
+        app.agents.get_mut(&11).unwrap().status = Status::Busy;
+        app.agents.get_mut(&11).unwrap().swarm_waiting = true;
+        let small = frame(&mut app, 40, 12).join("\n");
+        assert!(small.contains("waiting for Akasha"), "{small}");
     }
 
     /// The reported bug: after the role's model was changed, finished cards named the role's

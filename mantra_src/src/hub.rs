@@ -511,7 +511,10 @@ async fn agent_task(
                                 Some(Cmd::SetEffort(e)) => effort = e,
                                 Some(Cmd::SetModel(m)) => model = m,
                                 Some(Cmd::SetVision(v)) => vision = v,
-                                Some(Cmd::SetApproval(a)) => approval = a,
+                                Some(Cmd::SetApproval(a)) => {
+                                    if spec.backend == Backend::Codex { approval = a; }
+                                    else { let _ = ev.send(unsupported_approval(id, backend_name(spec.backend))); }
+                                }
                                 Some(Cmd::Restart) => continue 'outer,
                                 // Held, not failed: the retry is still coming, so this text still has
                                 // a process to reach — see `replay`'s drain once `Ready` fires again.
@@ -541,7 +544,10 @@ async fn agent_task(
                         Some(Cmd::SetEffort(e)) => effort = e,
                         Some(Cmd::SetModel(m)) => model = m,
                         Some(Cmd::SetVision(v)) => vision = v,
-                        Some(Cmd::SetApproval(a)) => approval = a,
+                        Some(Cmd::SetApproval(a)) => {
+                            if spec.backend == Backend::Codex { approval = a; }
+                            else { let _ = ev.send(unsupported_approval(id, backend_name(spec.backend))); }
+                        }
                         _ => {}
                     }
                 }
@@ -563,6 +569,23 @@ enum Exit {
     /// The process never reached `Ready`: spawn refused, handshake failed, thread start rejected.
     /// Deterministic in practice, so `agent_task` gives it the short `MAX_LAUNCH_ATTEMPTS` budget.
     LaunchFailed(String),
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Codex => "Codex",
+        Backend::ClaudeCode => "Claude Code",
+        Backend::Bija => "Bija",
+    }
+}
+
+fn unsupported_approval(agent: AgentId, backend: &str) -> HubEvent {
+    HubEvent::CmdFailed {
+        agent,
+        what: "approval",
+        error: format!("{backend} does not support live approval mode changes"),
+        text: None,
+    }
 }
 
 /// What a relaunch (`Exit::Restarting`) does to state carried across it, before the next launch
@@ -670,9 +693,11 @@ async fn run_process(
     }
     // Deliver anything held across the relaunch (a crash-backoff wait, or a Claude restart_pending
     // hold) now that there's a process again to send it to.
+    let mut awaiting_turn_start = false;
     for text in replay.drain(..) {
         let p = turn_params(&tid, &text, effort, model, approval);
         *last_turn = Some(text.clone());
+        awaiting_turn_start = true;
         fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
     }
 
@@ -694,6 +719,7 @@ async fn run_process(
                     Some(Cmd::Turn { text }) => {
                         let p = turn_params(&tid, &text, effort, model, approval);
                         *last_turn = Some(text.clone());
+                        awaiting_turn_start = true;
                         fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
                     }
                     Some(Cmd::Steer { text }) => {
@@ -707,13 +733,14 @@ async fn run_process(
                         } else {
                             // The turn ended just before this steer: start a new one, with the *current* policy.
                             let p = turn_params(&tid, &text, effort, model, approval);
+                            awaiting_turn_start = true;
                             fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
                         }
                     }
                     Some(Cmd::Interrupt) => {
                         if let Some(t) = &current_turn {
                             fire(&conn, ev, id, "turn/interrupt", json!({"threadId": tid, "turnId": t}), "interrupt", None);
-                        } else {
+                        } else if awaiting_turn_start {
                             interrupt_on_start = true;
                         }
                     }
@@ -744,6 +771,7 @@ async fn run_process(
                         match method.as_str() {
                             "turn/started" => {
                                 current_turn = params.pointer("/turn/id").and_then(|t| t.as_str()).map(str::to_string);
+                                awaiting_turn_start = false;
                                 if interrupt_on_start {
                                     if let Some(t) = &current_turn {
                                         fire(&conn, ev, id, "turn/interrupt", json!({"threadId": tid, "turnId": t}), "interrupt", None);
@@ -751,7 +779,7 @@ async fn run_process(
                                     }
                                 }
                             }
-                            "turn/completed" => { current_turn = None; interrupt_on_start = false; }
+                            "turn/completed" => { current_turn = None; awaiting_turn_start = false; interrupt_on_start = false; }
                             _ => {}
                         }
                         let _ = ev.send(HubEvent::Notif { agent: id, method, params });
@@ -1366,6 +1394,55 @@ done"#;
         assert!(lines.iter().any(|l| l.contains("\"threadId\":\"thr-1\"") && l.contains("Notes sync · qa")), "{lines:?}");
         drop(ctl);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stray stop while idle must not interrupt the next unrelated turn. A stop while the
+    /// turn is open still addresses the exact turn id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_codex_interrupt_does_not_carry_into_the_next_turn() {
+        let dir = std::env::temp_dir().join(format!("mantra-hub-idle-interrupt-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("interrupts.log");
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id";;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr"}}}\n' "$id";;
+    *'"method":"turn/start"'*) printf '{"id":%s,"result":{}}\n' "$id"; printf '{"method":"turn/started","params":{"turn":{"id":"t1"}}}\n';;
+    *'"method":"turn/interrupt"'*) printf '%s\n' "$line" >> "$INTERRUPTS_LOG"; printf '{"id":%s,"result":{}}\n' "$id";;
+  esac
+done"#;
+        let spec = SpawnSpec {
+            cwd: dir.clone(), model: "m".into(), provider: "openai".into(), effort: String::new(),
+            approval: "never".into(), sandbox: "read-only".into(), developer_instructions: String::new(),
+            dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
+            thread_name: None, backend: Backend::Codex,
+            envs: vec![("INTERRUPTS_LOG".into(), log.to_string_lossy().into_owned())],
+            claude: None, bija: None, mcp: vec![],
+        };
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        tokio::spawn(agent_task(91, spec, ["sh", "-c", script].map(str::to_string).to_vec(), ev, cmds, Duration::ZERO));
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap(), Some(HubEvent::Ready { .. })));
+        ctl.send(Cmd::Interrupt).unwrap();
+        ctl.send(Cmd::Turn { text: "hello".into() }).unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap() {
+                Some(HubEvent::Notif { method, .. }) if method == "turn/started" => break,
+                Some(HubEvent::CmdFailed { error, .. }) => panic!("{error}"),
+                Some(HubEvent::Crashed { reason, .. }) => panic!("{reason}"),
+                _ => {}
+            }
+        }
+        assert!(!log.exists(), "idle interrupt must not affect the new turn");
+        ctl.send(Cmd::Interrupt).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !log.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+        }).await.unwrap();
+        assert!(std::fs::read_to_string(&log).unwrap().contains("\"turnId\":\"t1\""));
+        ctl.send(Cmd::Shutdown).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

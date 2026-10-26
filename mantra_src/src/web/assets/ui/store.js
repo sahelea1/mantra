@@ -140,7 +140,9 @@
             for (const key of Object.keys(m.items)) {
                 const ag = S.agents.get(Number(key));
                 if (!ag) continue;
-                const items = ag.items = ag.items.slice();
+                // Replacing the touched item preserves old ItemView identities for the memoised
+                // transcript. Copying the whole history on every streamed token was unnecessary.
+                const items = ag.items;
                 let fresh = 0;
                 for (const d of m.items[key]) {
                     const isNew = !items.length || d.ord > items[items.length - 1].ord;

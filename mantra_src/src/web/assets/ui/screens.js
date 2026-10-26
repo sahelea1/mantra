@@ -32,14 +32,16 @@
         const goal = s.ui.runGoal || '';
         const width = s.ui.runParallel || '';
         const start = () => {
-            const g = (S().ui.runGoal || '').trim();
+            if (S().ui.busy['start-run']) return;
+            const rawGoal = S().ui.runGoal || '';
+            const g = rawGoal.trim();
             if (!g) return;
             const w = String(S().ui.runParallel || '').trim();
             const n = Number(w);
             s.ui.runErr = null;
             // a width that is not a number goes as typed: Mantra says what fits
             M.act.cmd('start_run', { goal: g, pattern: pat || undefined, parallel: w ? (Number.isInteger(n) ? n : w) : undefined }, { busyKey: 'start-run', ok: 'Run started', quiet: true })
-                .then(() => { S().ui.runGoal = ''; S().ui.runParallel = ''; M.act.nav('/run'); }, (e) => { S().ui.runErr = e.message; M.act.changed(); });
+                .then(() => { if (S().ui.runGoal === rawGoal) S().ui.runGoal = ''; if (S().ui.runParallel === w) S().ui.runParallel = ''; M.act.nav('/run'); }, (e) => { S().ui.runErr = e.message; M.act.changed(); });
         };
         return card(opts.title || 'Start a run', [
             h('p', { class: 'sec-sub', key: 'sub' }, 'A planner breaks the goal into phases, workers build them in parallel, a gate checks every phase.'),

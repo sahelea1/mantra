@@ -93,7 +93,7 @@ impl Settings {
         };
         let mut out = vec![
             f(SECTION_SOLO, "default_model", "Model", aliases, self.default_model.clone(), "The model a new Solo session starts on (ctrl+k switches the live one)."),
-            f(SECTION_SOLO, "approval_mode", "Approvals", options(APPROVAL_MODES), self.approval_mode.clone(), "never skips prompts but keeps the Sandbox setting. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox; entering or leaving it needs /new. Shift+tab cycles the ordinary approval modes."),
+            f(SECTION_SOLO, "approval_mode", "Approvals", options(APPROVAL_MODES), self.approval_mode.clone(), "never skips prompts but keeps the Sandbox setting. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox; entering or leaving it needs /new. Shift+tab cycles the ordinary approval modes. Codex applies these to native tools; Bija and Claude Code run native tools unattended and apply these modes to Mantra requests only."),
             f(SECTION_SOLO, "sandbox", "Sandbox", options(SANDBOXES), self.sandbox.clone(), "What Solo's commands may touch: read-only, the project (workspace-write), or everything."),
             f(SECTION_SOLO, "solo_mcp", "MCP servers", FieldKind::Enum(servers), solo_mcp, "Which MCP servers Solo agents get: all enabled ones, none, or the ones named."),
             f(SECTION_RUNS, "default_pattern", "Pattern", FieldKind::Enum(patterns.to_vec()), self.default_pattern.clone(), "The pattern new runs use: its roles, models and flow (/studio edits them)."),

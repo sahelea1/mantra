@@ -17,7 +17,7 @@
     // `edit` the one cell being edited, `errs` the error text per field or cell key.
     function C() {
         const ui = S().ui;
-        return ui.cfg || (ui.cfg = { settings: null, models: null, patterns: null, editor: null, loading: {}, err: {}, drafts: {}, errs: {}, pending: {}, saving: {}, edit: null, open: {}, mcpTest: {}, mcpAdd: { name: '', line: '' }, addModel: { provider: '', model: '' } });
+        return ui.cfg || (ui.cfg = { settings: null, models: null, patterns: null, editor: null, loading: {}, err: {}, drafts: {}, errs: {}, pending: {}, queued: {}, saving: {}, edit: null, open: {}, mcpTest: {}, mcpAdd: { name: '', line: '' }, addModel: { provider: '', model: '' } });
     }
 
     const LOADERS = { settings: 'settings_get', models: 'models_get', patterns: 'patterns_list' };
@@ -154,20 +154,33 @@
     async function setSetting(f, val, form) {
         const c = C();
         val = String(val);
-        if (c.pending[f.key] === val) return;
+        // Settings replies contain the whole settings view. Send changes to one field in order,
+        // otherwise a slower earlier reply can paint an old value over the last choice.
+        if (c.pending[f.key] !== undefined) {
+            if (c.pending[f.key] !== val) c.queued[f.key] = val;
+            else delete c.queued[f.key];
+            return;
+        }
         c.pending[f.key] = val;
         setStatus(form, 'saving');
         try {
             const d = await M.act.request('settings_set', { key: f.key, value: val });
             c.settings = d.settings;
-            delete c.drafts[f.key];
+            // A second edit can arrive while the first save is in flight. Keep that draft.
+            if (c.drafts[f.key] === val) delete c.drafts[f.key];
             delete c.errs[f.key];
-            setStatus(form, 'saved');
+            if (c.queued[f.key] === undefined) setStatus(form, 'saved');
             if (d.note) M.act.flash(f.label + ' saved — ' + d.note, 'info');
         } catch (e) {
             c.errs[f.key] = e.message;
             setStatus(form, null);
-        } finally { delete c.pending[f.key]; }
+        } finally {
+            delete c.pending[f.key];
+            const next = c.queued[f.key];
+            delete c.queued[f.key];
+            if (next !== undefined && next !== val) setSetting(f, next, form);
+            changed();
+        }
     }
 
     function fieldRow(f, form) {
@@ -398,8 +411,8 @@
                 P.btn('Test', () => modelTest(m.alias), { sm: true, kind: 'ghost', disabled: !!testing, key: 'test', title: 'Ask the model for one word' }),
                 P.iconBtn(more ? 'up' : 'down', () => { c.open['m:' + m.alias] = !more; changed(); }, more ? 'Fewer fields' : 'More fields', { key: 'more' }),
                 P.iconBtn('trash', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Delete ' + m.alias + '?', body: m.alias + ' (' + m.model + ') leaves models.toml. Patterns that name it need another model.', confirm: 'Delete', run: () => reg('model_delete', { alias: m.alias }, k('delete'), 'Deleted ' + m.alias) }), 'Delete ' + m.alias, { key: 'del' })),
-            status || m.problem ? h('div', { class: 'mt-note', key: 'note' },
-                status ? h('span', { class: 'mt-status' + (/^ok/.test(status) ? ' ok' : /^error/.test(status) ? ' bad' : '') }, status) : null,
+            (status && (more || !/^ok\b/i.test(status))) || m.problem ? h('div', { class: 'mt-note', key: 'note' },
+                status && (more || !/^ok\b/i.test(status)) ? h('span', { class: 'mt-status' + (/^ok/.test(status) ? ' ok' : /^error/.test(status) ? ' bad' : '') }, status) : null,
                 m.problem ? h('span', { class: 'mt-problem' }, m.problem) : null) : null,
             more ? h('div', { class: 'mt-more', key: 'more' },
                 labelled('Compacts at', cell(k('compact'), m.compact_percent ? m.compact_percent + '%' : '', m.compact_percent || '', modelSet(m.alias, 'compact'), { label: 'Compacts at', empty: '85%', placeholder: '85' })),

@@ -526,7 +526,8 @@ fn swarm_member_line(app: &App, id: crate::hub::AgentId, role: &str, width: usiz
             Status::Waiting => ("waiting for approval".to_string(), theme::AMBER),
             Status::Starting => ("starting".to_string(), theme::MUTED),
             Status::Stopped => ("stopped".to_string(), theme::MUTED),
-            _ if a.busy() => (if a.activity.is_empty() { "working".to_string() } else { a.activity.clone() }, theme::TEAL),
+            _ if a.swarm_waiting => ("waiting for Akasha swarm".to_string(), theme::AMBER),
+            _ if producing(a) => (if a.activity.is_empty() { "working".to_string() } else { a.activity.clone() }, theme::TEAL),
             _ => ("idle".to_string(), theme::MUTED),
         }
     };

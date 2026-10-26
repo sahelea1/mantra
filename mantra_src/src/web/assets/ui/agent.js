@@ -1,18 +1,21 @@
 // Mantra web UI — the Agent screen: header, actions, windowed transcript, approvals, queue, composer.
 //
 // Transcript items are memoised per (agent, ord, v, expanded, verbose): a streaming delta only
-// rebuilds the one item that changed, and dom.js skips identical vnodes, so a 200-item window
-// costs ~200 pointer comparisons per frame.
+// rebuilds the one item that changed, and dom.js skips identical vnodes. Loading older items
+// moves a bounded window through history instead of mounting an ever-growing transcript.
 'use strict';
 (function (M) {
     const h = M.h, F = M.fmt, P = M.parts;
     const S = () => M.store.S;
     const icon = F.icon;
     const WINDOW = 200;
+    const MAX_WINDOW = 400;
+    const MESSAGE_CHARS = 64000;
 
     const memo = new Map();
-    const scroll = {};   // agent id → {stick, el, anchor, seen}
-    const win = {};      // agent id → window size
+    const scroll = {};   // agent id → {stick, el, anchor, seen, top, endOrd}
+    const win = {};      // agent id → bounded window size
+    const knownAgents = new Set();
 
     // ── item renderers ───────────────────────────────────────────────────────────────────────────
     function expandKey(aid, it) { return aid + ':' + it.ord; }
@@ -46,28 +49,40 @@
         return lines.length > n ? { text: lines.slice(-n).join('\n'), cut: lines.length - n } : { text: lines.join('\n'), cut: 0 };
     }
 
-    function renderItem(a, it, exp, verbose) {
+    function messageText(it, full) {
+        const value = String(it.text || '');
+        return !full && value.length > MESSAGE_CHARS ? '… earlier text hidden; show full message to read it\n\n' + value.slice(-MESSAGE_CHARS) : value;
+    }
+
+    function fullMessage(a, it, full) {
+        return String(it.text || '').length > MESSAGE_CHARS
+            ? h('button', { type: 'button', class: 'link', onclick: () => toggleExpand(expandKey(a.id, it) + ':full') }, full ? 'Show recent text' : 'Show full message')
+            : null;
+    }
+
+    function renderItem(a, it, exp, verbose, full) {
         const k = 'i' + it.ord;
         switch (it.kind) {
             case 'user':
-                return h('div', { key: k, class: 'msg user' }, h('div', { class: 'bubble' }, F.inline(it.text)));
+                return h('div', { key: k, class: 'msg user' }, h('div', { class: 'bubble' }, fullMessage(a, it, full), F.inline(messageText(it, full))));
             case 'agent':
-                return h('div', { key: k, class: 'msg agent md' + (it.done ? '' : ' streaming') }, F.markdown(it.done ? it.text : openMarkers(it.text)));
+                return h('div', { key: k, class: 'msg agent md' + (it.done ? '' : ' streaming') },
+                    fullMessage(a, it, full), F.markdown(it.done ? messageText(it, full) : openMarkers(messageText(it, full))));
             case 'reasoning': {
                 const open = exp || verbose;
-                const first = String(it.text || '').trim().split('\n').filter(Boolean);
-                const summary = first.length ? first[first.length - 1].replace(/^\*\*|\*\*$/g, '') : '';
+                const recent = String(it.text || '').slice(-512).trimEnd();
+                const summary = recent.slice(recent.lastIndexOf('\n') + 1).replace(/^\*\*|\*\*$/g, '');
                 return h('div', { key: k, class: 'msg reason' + (open ? ' open' : '') },
                     h('button', { type: 'button', class: 'reason-head', onclick: () => toggleExpand(expandKey(a.id, it)), 'aria-expanded': String(!!open) },
                         h('span', { class: 'reason-label' + (it.done ? '' : ' shimmer') }, it.done ? 'Thought' : 'Thinking'),
                         !open && summary ? h('span', { class: 'reason-sum' }, F.trunc(summary, 120)) : null,
                         icon(open ? 'up' : 'down', 'chev')),
-                    open ? h('div', { class: 'reason-body md' }, F.markdown(it.text)) : null);
+                    open ? h('div', { class: 'reason-body md' }, fullMessage(a, it, full), F.markdown(messageText(it, full))) : null);
             }
             case 'plan':
                 return h('div', { key: k, class: 'card item plan-item' },
                     h('div', { class: 'item-head' }, icon('plan'), h('span', null, 'Plan')),
-                    h('div', { class: 'md' }, F.markdown(it.text)));
+                    h('div', { class: 'md' }, fullMessage(a, it, full), F.markdown(messageText(it, full))));
             case 'command': {
                 const st = cmdState(it);
                 const out = it.output || '';
@@ -123,28 +138,35 @@
     function itemView(a, it) {
         const ek = expandKey(a.id, it);
         const exp = !!S().ui.expanded[ek];
+        const full = !!S().ui.expanded[ek + ':full'];
         const verbose = !!S().ui.verbose;
         const c = memo.get(ek);
-        if (c && c.it === it && c.exp === exp && c.verbose === verbose) return c.node;
-        const node = renderItem(a, it, exp, verbose);
+        if (c && c.it === it && c.exp === exp && c.verbose === verbose && c.full === full) return c.node;
+        const node = renderItem(a, it, exp, verbose, full);
         if (memo.size > 6000) memo.clear();
-        memo.set(ek, { it, exp, verbose, node });
+        memo.set(ek, { it, exp, verbose, full, node });
         return node;
     }
 
     // ── busy line ────────────────────────────────────────────────────────────────────────────────
     function busyLine(a) {
         const now = Date.now();
+        if (a.waiting_answer)
+            return h('div', { class: 'busy-line wait', key: 'busy' }, icon('question'), h('span', null, 'Waiting for an answer'));
+        if (a.approval_pending || a.status === 'waiting')
+            return h('div', { class: 'busy-line wait', key: 'busy' }, icon('alert'), h('span', null, 'Waiting for approval'));
         if (a.status === 'retrying') {
-            return h('div', { class: 'busy-line wait', key: 'busy' }, h('span', { class: 'spin' }), h('span', null, P.retryingText(a, 80)), a.retry_note ? h('span', { class: 'dim' }, ' · ' + a.retry_note) : null);
+            return h('div', { class: 'busy-line wait', key: 'busy' }, icon('refresh'), h('span', null, P.retryingText(a, 80)), a.retry_note ? h('span', { class: 'dim' }, ' · ' + a.retry_note) : null);
         }
+        if (a.swarm_waiting)
+            return h('div', { class: 'busy-line wait', key: 'busy' }, icon('run'), h('span', null, 'Waiting for Akasha swarm'));
         if (a.status === 'starting' || a.awaiting_start) {
             return h('div', { class: 'busy-line', key: 'busy' }, h('span', { class: 'spin' }), h('span', { class: 'shimmer' }, 'Starting ' + F.backend(a.backend) + '…'));
         }
         if (!a.busy) return null;
         const label = a.compacting ? 'Compacting context…' : (a.activity || 'Thinking…');
         const quiet = a.quiet_ms && a.quiet_ms >= 20000;
-        return h('div', { class: 'busy-line' + (quiet ? ' wait' : ''), key: 'busy' },
+        return h('div', { class: 'busy-line', key: 'busy' },
             h('span', { class: 'spin' }),
             h('span', { class: 'shimmer' }, F.trunc(label, 50)),
             h('span', { class: 'dim' }, [
@@ -157,23 +179,56 @@
     }
 
     // ── transcript ───────────────────────────────────────────────────────────────────────────────
+    function endIndex(items, st) {
+        if (st.endOrd === undefined || st.endOrd === null) return items.length;
+        // Older pages can be prepended and fresh events appended without moving the viewed page.
+        let lo = 0, hi = items.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (items[mid].ord <= st.endOrd) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    function anchorAtTop(st) {
+        const el = st.el;
+        if (!el || !el.isConnected) return;
+        const top = el.getBoundingClientRect().top;
+        for (const child of el.firstElementChild.children) {
+            if (child.getBoundingClientRect().bottom <= top) continue;
+            const key = child.__v && child.__v.key;
+            if (typeof key === 'string' && key.startsWith('i')) {
+                st.anchor = { key, offset: child.getBoundingClientRect().top - top };
+                return;
+            }
+        }
+        st.anchor = { bottom: el.scrollHeight - el.scrollTop };
+    }
+
     function attach(el, id) {
         const st = scroll[id] || (scroll[id] = { stick: true, seen: -1 });
         st.el = el;
+        if (!st.stick && st.top !== undefined) st.restore = true;
         el.addEventListener('scroll', () => {
+            st.top = el.scrollTop;
             const near = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-            if (near !== st.stick) { st.stick = near; M.act.changed(); }
-            if (near) { const a = M.store.agent(id); if (a && a.items.length) st.seen = a.items[a.items.length - 1].ord; }
+            if (near !== st.stick && st.endOrd == null) { st.stick = near; M.act.changed(); }
+            if (near && st.endOrd == null) { const a = M.store.agent(id); if (a && a.items.length) st.seen = a.items[a.items.length - 1].ord; }
         }, { passive: true });
     }
 
     async function loadEarlier(a) {
         const st = scroll[a.id] || (scroll[a.id] = { stick: false, seen: -1 });
         const w = win[a.id] || WINDOW;
-        const shownFrom = Math.max(0, a.items.length - w);
+        const end = endIndex(a.items, st);
+        const shownFrom = Math.max(0, end - w);
         if (shownFrom > 0) {
-            if (st.el) st.anchor = st.el.scrollHeight - st.el.scrollTop;
-            win[a.id] = w + WINDOW; M.act.changed(); return;
+            anchorAtTop(st);
+            st.stick = false;
+            if (w < MAX_WINDOW) win[a.id] = Math.min(MAX_WINDOW, w + WINDOW);
+            else st.endOrd = a.items[Math.min(end - 1, shownFrom + WINDOW - 1)].ord;
+            M.act.changed(); return;
         }
         const before = a.items.length ? a.items[0].ord : a.items_total;
         S().ui.busy['earlier' + a.id] = true;
@@ -183,8 +238,14 @@
         try {
             const m = await M.act.request('fetch_items', { agent: a.id, before, count: WINDOW });
             const n = M.store.prependItems(a.id, m && m.items);
-            if (st.el) st.anchor = st.el.scrollHeight - st.el.scrollTop;
-            win[a.id] = w + n;
+            if (n) {
+                anchorAtTop(st);
+                st.stick = false;
+                // Keep the first part of the previous page mounted as the anchor. The tail of
+                // a long page can be revisited with the new-message button.
+                if (w + n > MAX_WINDOW) st.endOrd = a.items[n + Math.min(end - 1, WINDOW - 1)].ord;
+                win[a.id] = Math.min(MAX_WINDOW, w + n);
+            }
         } catch (e) {
             M.act.flash('Could not load earlier messages: ' + e.message, 'error');
         } finally {
@@ -206,11 +267,13 @@
     function transcript(a) {
         const w = win[a.id] || WINDOW;
         const items = a.items;
-        const start = Math.max(0, items.length - w);
+        const st = scroll[a.id] || (scroll[a.id] = { stick: true, seen: -1 });
+        const end = endIndex(items, st);
+        const start = Math.max(0, end - w);
         const more = start > 0 || (items.length ? items[0].ord > (a.items_first || 0) : (a.items_total || 0) > 0);
-        const st = scroll[a.id] || { stick: true, seen: -1 };
         const lastOrd = items.length ? items[items.length - 1].ord : -1;
-        const showNew = !st.stick && lastOrd > st.seen && st.seen >= 0;
+        const olderPage = end < items.length;
+        const showNew = olderPage || (!st.stick && lastOrd > st.seen && st.seen >= 0);
         const kids = [];
         if (more) kids.push(h('div', { class: 'earlier', key: 'earlier' }, P.btn('Load earlier', () => loadEarlier(a), { sm: true, kind: 'ghost', busyKey: 'earlier' + a.id, icon: 'up' })));
         else if (items.length) kids.push(h('div', { class: 'tx-begin', key: 'begin' }, h('span', null, 'Started ' + F.ago(a.created_at))));
@@ -220,20 +283,48 @@
                 h('div', { class: 'empty-title' }, a.role_kind === 'solo' ? 'Ready when you are' : a.name + ' hasn\'t said anything yet'),
                 h('div', { class: 'empty-body' }, a.role_kind === 'solo' ? 'Ask for anything in this project. Start a message with ! to run a shell command.' : 'Messages you send here go to ' + a.name + (a.in_run ? ' through the run.' : '.'))));
         }
-        for (let i = start; i < items.length; i++) kids.push(itemView(a, items[i]));
-        kids.push(busyLine(a));
+        for (let i = start; i < end; i++) kids.push(itemView(a, items[i]));
+        if (end === items.length) kids.push(busyLine(a));
         kids.push(h('div', { class: 'tx-end', key: 'end' }));
         return h('div', { class: 'tx-wrap', key: 'txw' + a.id },
             h('div', { class: 'tx', key: 'tx' + a.id, ref: (el) => attach(el, a.id), role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' }, h('div', { class: 'tx-inner' + (flashAboveComposer() ? ' flash-pad' : '') }, kids)),
-            showNew ? h('button', { type: 'button', class: 'new-pill', key: 'newpill', onclick: () => { const s2 = scroll[a.id]; if (s2 && s2.el) { s2.stick = true; s2.el.scrollTo({ top: s2.el.scrollHeight, behavior: M.act.motion() ? 'smooth' : 'auto' }); } } }, icon('arrowdown'), 'new') : null);
+            showNew ? h('button', { type: 'button', class: 'new-pill', key: 'newpill', onclick: () => { const s2 = scroll[a.id]; if (s2) { s2.endOrd = null; s2.stick = true; s2.anchor = undefined; M.act.changed(); } } }, icon('arrowdown'), olderPage ? 'latest' : 'new') : null);
     }
 
     // After every render: keep followed transcripts pinned; restore the anchor after "load earlier".
     function afterRender() {
+        const agents = S().agents;
+        const removed = [...knownAgents].filter((id) => !agents.has(id));
+        if (removed.length) {
+            const gone = new Set(removed.map(String));
+            for (const id of removed) { delete scroll[id]; delete win[id]; }
+            for (const key of memo.keys()) if (gone.has(key.slice(0, key.indexOf(':')))) memo.delete(key);
+            for (const key of Object.keys(S().ui.expanded)) {
+                const colon = key.indexOf(':');
+                if (colon > 0 && gone.has(key.slice(0, colon))) delete S().ui.expanded[key];
+            }
+        }
+        if (knownAgents.size !== agents.size || removed.length) {
+            knownAgents.clear();
+            for (const id of agents.keys()) knownAgents.add(id);
+        }
         for (const id in scroll) {
             const st = scroll[id];
-            if (!st.el || !st.el.isConnected) continue;
-            if (st.anchor !== undefined) { st.el.scrollTop = st.el.scrollHeight - st.anchor; st.anchor = undefined; continue; }
+            if (!st.el) continue;
+            if (!st.el.isConnected) {
+                st.top = st.el.scrollTop;
+                st.el = null; // the prior agent's mounted transcript can now be collected
+                continue;
+            }
+            if (st.anchor !== undefined) {
+                const anchor = st.anchor;
+                const child = anchor.key && Array.from(st.el.firstElementChild.children).find((x) => x.__v && x.__v.key === anchor.key);
+                if (child) st.el.scrollTop = child.getBoundingClientRect().top - st.el.getBoundingClientRect().top + st.el.scrollTop - anchor.offset;
+                else if (anchor.bottom !== undefined) st.el.scrollTop = st.el.scrollHeight - anchor.bottom;
+                st.top = st.el.scrollTop;
+                st.anchor = undefined; st.restore = false; continue;
+            }
+            if (st.restore) { st.el.scrollTop = st.top; st.restore = false; continue; }
             if (st.stick) {
                 st.el.scrollTop = st.el.scrollHeight;
                 const a = M.store.agent(id);
@@ -241,7 +332,7 @@
             }
         }
     }
-    function scrollToEnd(id) { const st = scroll[id]; if (st) { st.stick = true; } }
+    function scrollToEnd(id) { const st = scroll[id]; if (st) { st.stick = true; st.endOrd = null; } }
 
     // ── queue + composer ─────────────────────────────────────────────────────────────────────────
     function queueBar(a) {
@@ -350,7 +441,8 @@
             else if (a.busy && !force) M.act.flash('Queued — ' + a.name + ' gets it after this turn', 'info');
         } catch (e) {
             // Put the text back so nothing typed is lost.
-            if (!S().ui.drafts[key]) S().ui.drafts[key] = raw;
+            const newer = S().ui.drafts[key] || '';
+            S().ui.drafts[key] = newer ? raw + '\n' + newer : raw;
             M.act.flash(e.message, 'error');
             M.act.changed();
         }
@@ -362,7 +454,7 @@
         const key = 'c' + a.id;
         const text = s.ui.drafts[key] || '';
         const open = s.conn.state === 'open';
-        const sug = suggestions(a, text);
+        const sug = s.ui.sugDismiss === text ? [] : suggestions(a, text);
         const sel = Math.min(s.ui.sugSel || 0, Math.max(0, sug.length - 1));
         const wide = M.act.wide();
         const placeholder = a.role_kind === 'solo'
@@ -377,13 +469,13 @@
                 h('textarea', {
                     key: 'ta' + a.id, rows: 1, value: text, placeholder, 'aria-label': 'Message ' + a.name, enterkeyhint: wide ? 'send' : 'enter', autocomplete: 'off', autocapitalize: 'sentences', spellcheck: 'true',
                     ref: (el) => requestAnimationFrame(() => grow(el)),
-                    oninput: (e) => { s.ui.drafts[key] = e.target.value; s.ui.sugSel = 0; grow(e.target); M.act.changed(); },
+                    oninput: (e) => { s.ui.drafts[key] = e.target.value; s.ui.sugDismiss = null; s.ui.sugSel = 0; grow(e.target); M.act.changed(); },
                     onkeydown: (e) => {
                         if (sug.length && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { e.preventDefault(); s.ui.sugSel = (sel + (e.key === 'ArrowDown' ? 1 : sug.length - 1)) % sug.length; M.act.changed(); return; }
                         if (sug.length && (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && wide))) { e.preventDefault(); sug[sel].apply(); return; }
                         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(a, true); return; }
                         if (e.key === 'Enter' && !e.shiftKey && wide && !e.isComposing) { e.preventDefault(); submit(a, false); }
-                        if (e.key === 'Escape' && text) { e.preventDefault(); e.stopPropagation(); s.ui.drafts[key] = ''; M.act.changed(); }
+                        if (e.key === 'Escape' && sug.length) { e.preventDefault(); e.stopPropagation(); s.ui.sugDismiss = text; M.act.changed(); }
                     },
                 }),
                 h('div', { class: 'composer-btns' },

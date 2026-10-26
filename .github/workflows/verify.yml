@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - master
-      - codex/mantra-polish-akasha
+      - "codex/**"
 
 permissions:
   contents: read
@@ -36,6 +36,7 @@ jobs:
         run: |
           node docs/tools/web-e2e.mjs main
           node docs/tools/web-e2e.mjs ask
+          node docs/tools/web-state-e2e.mjs
       - name: Terminal integration
         run: bash mantra_src/scripts/stress.sh
       - name: Keep browser screenshots
@@ -45,3 +46,10 @@ jobs:
           name: browser-screenshots
           path: ${{ runner.temp }}/mantra-shots
           if-no-files-found: ignore
+      - name: Keep tested binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-linux-binaries
+          path: |
+            mantra_src/target/debug/mantra
+            mantra_src/target/debug/bija

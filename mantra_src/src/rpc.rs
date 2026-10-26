@@ -64,6 +64,9 @@ impl Conn {
         }
         let msg = json!({ "method": method, "id": id, "params": params });
         if self.out.send(msg.to_string()).is_err() {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&id);
+            }
             return Err(RpcError { code: -1, message: "connection closed".into() });
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -95,6 +98,20 @@ impl Conn {
     pub fn stderr_tail(&self) -> String {
         self.stderr_tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_closed_writer_does_not_leave_an_unanswerable_request_pending() {
+    let (out, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let conn = Conn {
+        out, pending: pending.clone(), next: Arc::new(AtomicI64::new(1)),
+        stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+    };
+    assert_eq!(conn.request("turn/start", json!({})).await.unwrap_err().message, "connection closed");
+    assert!(pending.lock().unwrap().is_empty());
 }
 
 /// Spawn `cmd` and wire up reader/writer tasks. `envs` are set on the child in addition to the

@@ -13,15 +13,33 @@ pub fn ms() -> u128 {
 }
 
 pub fn spinner() -> &'static str {
-    if !theme::motion() {
-        return theme::g("⠿", "*");
+    spinner_frame(theme::motion(), theme::ascii(), ms())
+}
+
+fn spinner_frame(motion: bool, ascii: bool, now_ms: u128) -> &'static str {
+    if !motion {
+        return if ascii { "*" } else { "⠿" };
     }
-    if theme::ascii() {
+    if ascii {
         const F: [&str; 4] = ["|", "/", "-", "\\"];
-        return F[(ms() / 120) as usize % 4];
+        return F[(now_ms / 120) as usize % 4];
     }
     const F: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    F[(ms() / 80) as usize % 10]
+    F[(now_ms / 80) as usize % 10]
+}
+
+#[cfg(test)]
+mod spinner_tests {
+    use super::spinner_frame;
+
+    #[test]
+    fn reduced_motion_keeps_a_still_mark_in_ascii_and_unicode() {
+        for ascii in [false, true] {
+            assert_eq!(spinner_frame(false, ascii, 0), spinner_frame(false, ascii, 2000));
+        }
+        assert_eq!(spinner_frame(false, true, 0), "*");
+        assert_ne!(spinner_frame(true, true, 0), spinner_frame(true, true, 120));
+    }
 }
 
 /// A small travelling spark, with a fading trail. Always five columns, so a busy label stays

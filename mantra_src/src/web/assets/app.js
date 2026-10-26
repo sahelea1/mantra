@@ -22,6 +22,7 @@
     let base = '';            // '/s/<sid>' in relay mode
     let navDepth = 0;
     let sheetReturnFocus = null; // element to refocus when the open sheet closes
+    let paletteReturnFocus = null;
 
     // ── rendering ────────────────────────────────────────────────────────────────────────────────
     let queued = false;
@@ -93,6 +94,13 @@
         sheetReturnFocus = null;
         if (el && typeof el.focus === 'function') requestAnimationFrame(() => { if (document.contains(el)) el.focus({ preventScroll: true }); });
     }
+    function closePalette(restore = true) {
+        S.ui.palette = null;
+        changed();
+        const el = paletteReturnFocus;
+        paletteReturnFocus = null;
+        if (restore && el && typeof el.focus === 'function') requestAnimationFrame(() => { if (document.contains(el)) el.focus({ preventScroll: true }); });
+    }
     // Focusable, visible descendants of a sheet, in DOM order (for the initial focus and the Tab trap).
     function focusables(el) {
         return Array.from(el.querySelectorAll('button, [href], input, select, textarea, [tabindex]')).filter((x) => !x.disabled && x.tabIndex !== -1 && x.offsetParent !== null);
@@ -154,6 +162,8 @@
         S.ui.route = r;
         S.ui.sheet = null;
         S.ui.palette = null;
+        sheetReturnFocus = null;
+        paletteReturnFocus = null;
         if (r.name === 'agent') { M.store.setPref('focus', r.id); delete S.ui.unread[r.id]; }
         if (r.name === 'runs' && S.conn.state === 'open') SC.loadRuns();
         CF.onRoute(r);
@@ -395,6 +405,11 @@
             h('span', { class: 'fkind k-' + (f.kind || 'update') }, (f.kind || 'update')[0].toUpperCase()), h('span', { class: 'fpath' }, f.path),
             h('span', { class: 'fnum' }, h('span', { class: 'add' }, '+' + f.adds), ' ', h('span', { class: 'del' }, '−' + f.dels)))))];
     }
+    function backendPolicyNote(a) {
+        return a.backend === 'bija' || a.backend === 'claude-code'
+            ? h('p', { class: 'sec-sub', key: 'policy' }, F.backend(a.backend) + ' runs its native tools unattended. Mantra approval and question requests still follow the approval mode; the sandbox setting still applies.')
+            : null;
+    }
     function contextPanel(a) {
         const w = a.worker;
         const rows = [
@@ -416,6 +431,7 @@
         return [
             h('div', { class: 'panel-sec', key: 'gauge' }, P.ctxGauge(a, true)),
             h('dl', { class: 'kv', key: 'kv' }, rows.map(([k, v]) => [h('dt', { key: 'k' + k }, k), h('dd', { key: 'v' + k, class: k === 'Working dir' || k === 'Thread' || k === 'Branch' ? 'mono' : null }, v)])),
+            backendPolicyNote(a),
             w && w.report_tail ? h('div', { class: 'panel-sec', key: 'rep' }, h('h3', { class: 'group-title' }, 'Latest report'), h('div', { class: 'md small' }, F.markdown(w.report_tail))) : null,
         ];
     }
@@ -510,6 +526,7 @@
                     h('div', { class: 'sheet-meta', key: 'meta' }, P.modelChip(a), P.ctxGauge(a), P.statusPill(a)),
                     h('div', { class: 'action-grid', key: 'grid' }, AV.actionList(a).map((x) => h('button', { type: 'button', key: x.id, class: 'action-tile', disabled: x.disabled || S.conn.state !== 'open' || null, onclick: () => { if (!['model', 'effort', 'diff', 'plan'].includes(x.id)) closeSheet(); x.run(); } }, icon(x.icon), h('span', null, x.label)))),
                     P.toggle(S.ui.verbose, (on) => M.store.setPref('verbose', on), 'Verbose transcript', 'expand reasoning and command output', { key: 'verbose' }),
+                    backendPolicyNote(a),
                     a.worker ? h('dl', { class: 'kv', key: 'kv' }, [['Task', a.worker.title], ['Attempt', String(a.worker.attempt)], ['Branch', a.worker.branch]].filter((x) => x[1]).map(([k, v]) => [h('dt', { key: 'k' + k }, k), h('dd', { key: 'v' + k }, v)])) : null,
                 ];
                 break;
@@ -585,7 +602,7 @@
                 title = sh.title;
                 body = [h('p', { class: 'sheet-text', key: 't' }, sh.body), h('div', { class: 'sheet-actions', key: 'a' },
                     P.btn('Cancel', closeSheet, { kind: 'ghost' }),
-                    P.btn(sh.confirm || 'OK', () => { closeSheet(); Promise.resolve(sh.run()).catch(() => { }); }, { kind: sh.danger ? 'danger' : 'primary' }))];
+                    P.btn(sh.confirm || 'OK', () => { if (sh.submitted) return; sh.submitted = true; closeSheet(); Promise.resolve().then(() => sh.run()).catch(() => { }); }, { kind: sh.danger ? 'danger' : 'primary' }))];
                 cls = 'small';
                 break;
             }
@@ -608,7 +625,7 @@
     }
 
     // ── command palette (Ctrl/⌘+K) ───────────────────────────────────────────────────────────────
-    function openPalette() { S.ui.palette = { q: '', sel: 0 }; changed(); requestAnimationFrame(() => { const i = document.querySelector('.palette input'); if (i) i.focus(); }); }
+    function openPalette() { paletteReturnFocus = document.activeElement; S.ui.palette = { q: '', sel: 0 }; changed(); requestAnimationFrame(() => { const i = document.querySelector('.palette input'); if (i) i.focus(); }); }
     function paletteItems(q) {
         const items = [];
         for (const a of M.store.agentList()) items.push({ key: 'a' + a.id, label: a.worker ? a.worker.task_id : a.name, sub: P.status(a).text, glyph: a, run: () => nav('/agent/' + a.id) });
@@ -641,9 +658,15 @@
         if (!pl) return null;
         const items = paletteItems(pl.q).slice(0, 40);
         const sel = Math.min(pl.sel, Math.max(0, items.length - 1));
-        const pick = (x) => { S.ui.palette = null; changed(); x.run(); };
-        return h('div', { class: 'sheet-layer palette-layer', key: 'palette', onclick: (e) => { if (e.target === e.currentTarget) { S.ui.palette = null; changed(); } } },
-            h('div', { class: 'palette', role: 'dialog', 'aria-label': 'Command palette' },
+        const pick = (x) => {
+            const prior = paletteReturnFocus;
+            closePalette(false);
+            x.run();
+            if (S.ui.sheet) sheetReturnFocus = prior;
+            else if (prior && typeof prior.focus === 'function') requestAnimationFrame(() => { if (document.contains(prior)) prior.focus({ preventScroll: true }); });
+        };
+        return h('div', { class: 'sheet-layer palette-layer', key: 'palette', onclick: (e) => { if (e.target === e.currentTarget) closePalette(); } },
+            h('div', { class: 'palette', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Command palette', onkeydown: (e) => trapTab(e.currentTarget, e) },
                 h('div', { class: 'palette-input' }, icon('search'), h('input', {
                     value: pl.q, placeholder: 'Jump to an agent or run a command…', 'aria-label': 'Search',
                     oninput: (e) => { pl.q = e.target.value; pl.sel = 0; changed(); },
@@ -660,9 +683,9 @@
     // ── keyboard ─────────────────────────────────────────────────────────────────────────────────
     function typing(el) { return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable); }
     document.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); if (S.ui.palette) { S.ui.palette = null; changed(); } else openPalette(); return; }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); if (S.ui.palette) closePalette(); else if (!S.ui.sheet) openPalette(); return; }
         if (e.key === 'Escape') {
-            if (S.ui.palette) { S.ui.palette = null; changed(); e.preventDefault(); return; }
+            if (S.ui.palette) { closePalette(); e.preventDefault(); return; }
             if (S.ui.sheet) { closeSheet(); e.preventDefault(); return; }
         }
         if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
