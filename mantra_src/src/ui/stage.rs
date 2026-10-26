@@ -1269,7 +1269,7 @@ mod tests {
         a.status = Status::Waiting;
         a.turn_active = true;
         a.activity = "working on a tool".into();
-        assert_eq!(vstate(app.run.as_ref().unwrap().workers.last(), app.agents.get(&11)), V::Waiting);
+        assert!(vstate(app.run.as_ref().unwrap().workers.last(), app.agents.get(&11)) == V::Waiting);
         let large = frame(&mut app, 120, 36).join("\n");
         assert!(large.contains("needs approval · ctrl+g"), "{large}");
         assert!(large.contains("0 active"), "{large}");

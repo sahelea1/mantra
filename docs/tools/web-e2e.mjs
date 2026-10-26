@@ -451,6 +451,51 @@ async function main() {
     }
 
     if (MODE === 'main') {
+        await step('main', driver, 'drafts survive navigation, Escape, palette, and a delayed failed send', async () => {
+            const ids = await driver.evaluate(() => [...window.Mantra.store.S.agents.keys()].slice(0, 2));
+            if (ids.length !== 2) throw new Error('need two retained agents');
+            const box = '.composer textarea';
+            await nav(driver, '/agent/' + ids[0]);
+            await driver.fill(box, 'draft for first agent');
+            await driver.press(box, 'Escape');
+            if (await driver.inputValue(box) !== 'draft for first agent') throw new Error('Escape erased draft');
+            await driver.press(box, 'Control+k');
+            await driver.waitForSelector('.palette input');
+            await driver.press('.palette input', 'Escape');
+            await waitForState(driver, () => document.activeElement === document.querySelector('.composer textarea'));
+            await nav(driver, '/agent/' + ids[1]);
+            await driver.fill(box, 'draft for second agent');
+            await nav(driver, '/agent/' + ids[0]);
+            if (await driver.inputValue(box) !== 'draft for first agent') throw new Error('agent switch lost draft');
+            await driver.evaluate(() => {
+                window.e2eRequest = window.Mantra.act.request;
+                window.Mantra.act.request = (cmd, ...args) => cmd === 'send'
+                    ? new Promise((resolve, reject) => { window.e2eRejectSend = reject; })
+                    : window.e2eRequest(cmd, ...args);
+            });
+            try {
+                await driver.click('.composer button.send');
+                await waitForState(driver, () => !!window.e2eRejectSend);
+                await driver.fill(box, 'newer draft');
+                await driver.evaluate(() => window.e2eRejectSend(new Error('simulated disconnected send')));
+                await waitForState(driver, () => document.querySelector('.composer textarea').value === 'draft for first agent\nnewer draft');
+            } finally {
+                await driver.evaluate(() => { window.Mantra.act.request = window.e2eRequest; delete window.e2eRequest; delete window.e2eRejectSend; });
+            }
+            await nav(driver, '/agent/' + ids[1]);
+            if (await driver.inputValue(box) !== 'draft for second agent') throw new Error('failed send affected another agent');
+        });
+        await step('main', driver, 'confirmation keeps keyboard focus and submits once', async () => {
+            await driver.evaluate(() => {
+                window.e2eConfirmed = 0;
+                window.Mantra.act.sheet({ kind: 'confirm', title: 'Fixture confirmation', body: 'Local UI regression', confirm: 'Confirm fixture', run: () => { window.e2eConfirmed++; } });
+            });
+            await driver.waitForSelector('.sheet');
+            await driver.keyboard.press('Control+k');
+            if (await driver.locator('.palette').count()) throw new Error('palette replaced confirmation');
+            await driver.evaluate(() => { const b = [...document.querySelectorAll('.sheet button')].find(x => x.textContent.includes('Confirm fixture')); b.click(); b.click(); });
+            await waitForState(driver, () => window.e2eConfirmed === 1 && !window.Mantra.store.S.ui.sheet);
+        });
         await step('main', driver, 'agent process: cancel stop → stop → transcript stays → new Solo', async () => {
             const fresh = await must(driver, 'new_solo');
             await nav(driver, '/agent/' + fresh.agent);
