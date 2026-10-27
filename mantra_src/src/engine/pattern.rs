@@ -258,6 +258,17 @@ impl Default for Group {
 }
 
 impl Pattern {
+    /// Auto starts with one planner, which designs a concrete workflow with the user.
+    pub fn builtin_auto() -> Pattern {
+        let mut p = Pattern { name: NAME_AUTO.into(), description: "Auto: design a workflow with the planner for this task".into(), ..Pattern::default() };
+        p.roles.insert("planner".into(), planner_role());
+        p.flow.orchestrator.clear();
+        p.flow.phase_gate.clear();
+        p
+    }
+
+    pub fn is_auto(&self) -> bool { self.name == NAME_AUTO }
+
     /// The balanced built-in: plan → phases, each closed by a fresh read-only QA gate with
     /// automatic fix workers → one QA pass over the run's diff → planner verification.
     pub fn builtin() -> Pattern {
@@ -277,12 +288,13 @@ impl Pattern {
 
     /// The names of the patterns that ship inside the binary (`load` finds them without a file).
     pub fn names() -> Vec<&'static str> {
-        vec![NAME_DEFAULT, NAME_LEAN, NAME_THOROUGH]
+        vec![NAME_DEFAULT, NAME_LEAN, NAME_THOROUGH, NAME_AUTO]
     }
 
     /// A built-in pattern by name (slug-insensitive), if `name` is one of `names()`.
     pub fn builtin_named(name: &str) -> Option<Pattern> {
         match crate::util::slug(name).as_str() {
+            NAME_AUTO => Some(Pattern::builtin_auto()),
             NAME_DEFAULT => Some(Pattern::builtin()),
             NAME_LEAN => Some(Pattern::builtin_lean()),
             NAME_THOROUGH => Some(Pattern::builtin_thorough()),
@@ -405,8 +417,12 @@ impl Pattern {
         if !self.flow.manager.trim().is_empty() {
             need(&self.flow.manager, "manager", "manager", &mut errs);
         }
-        need(&self.flow.orchestrator, "orchestrator", "orchestrator", &mut errs);
-        need(&self.flow.phase_gate, "gate", "phase_gate", &mut errs);
+        if !self.is_auto() {
+            need(&self.flow.orchestrator, "orchestrator", "orchestrator", &mut errs);
+            need(&self.flow.phase_gate, "gate", "phase_gate", &mut errs);
+        } else if self.roles.len() != 1 || !self.flow.orchestrator.is_empty() || !self.flow.phase_gate.is_empty() || !self.flow.manager.is_empty() || !self.flow.finale.is_empty() || !self.groups.is_empty() {
+            errs.push("Auto is a planner-only bootstrap; give a concrete workflow another name".into());
+        }
         if !self.roles.contains_key(&self.flow.on_reprompt) {
             errs.push(format!("flow.on_reprompt = '{}' is not a defined role", self.flow.on_reprompt));
         }
@@ -415,7 +431,7 @@ impl Pattern {
                 errs.push(format!("flow.finale[{i}] role '{}' is not defined", s.role));
             }
         }
-        if self.worker_roles().is_empty() {
+        if !self.is_auto() && self.worker_roles().is_empty() {
             errs.push("pattern needs at least one role with kind = \"worker\"".into());
         }
         if self.settings.max_parallel == 0 {
@@ -655,6 +671,7 @@ pub struct RoleSummary {
 // three worker classes, the phase QA) are defined once.
 
 pub const NAME_DEFAULT: &str = "mantra-default";
+pub const NAME_AUTO: &str = "auto";
 pub const NAME_LEAN: &str = "mantra-lean";
 pub const NAME_THOROUGH: &str = "mantra-thorough";
 
@@ -950,7 +967,22 @@ mod tests {
     use super::*;
 
     fn all_builtins() -> Vec<Pattern> {
-        Pattern::names().into_iter().map(|n| Pattern::builtin_named(n).unwrap()).collect()
+        Pattern::names().into_iter().filter(|n| *n != NAME_AUTO).map(|n| Pattern::builtin_named(n).unwrap()).collect()
+    }
+
+    #[test]
+    fn auto_is_only_a_valid_planner_bootstrap() {
+        let auto = Pattern::builtin_auto();
+        assert!(auto.validate().is_ok());
+        assert!(auto.is_auto());
+        assert_eq!(auto.roles.len(), 1);
+        assert!(auto.worker_roles().is_empty());
+        assert_eq!(Pattern::from_toml(&auto.to_toml()).unwrap(), auto);
+        let mut malformed = auto.clone();
+        malformed.roles.insert("worker".into(), Role::default());
+        assert!(malformed.validate().is_err(), "Auto cannot disguise a partially configured executable workflow");
+        let concrete = Pattern { name: "custom".into(), ..auto };
+        assert!(concrete.validate().is_err(), "a concrete workflow still needs orchestrator, worker and gate");
     }
 
     #[test]
@@ -967,7 +999,7 @@ mod tests {
 
     #[test]
     fn names_list_every_builtin_and_each_loads_by_name() {
-        assert_eq!(Pattern::names(), vec!["mantra-default", "mantra-lean", "mantra-thorough"]);
+        assert_eq!(Pattern::names(), vec!["mantra-default", "mantra-lean", "mantra-thorough", "auto"]);
         for n in Pattern::names() {
             let p = Pattern::load(n, Path::new("/nonexistent")).unwrap_or_else(|e| panic!("{n}: {e}"));
             assert_eq!(p.name, n);

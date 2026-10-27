@@ -404,7 +404,7 @@
                 m.default ? h('span', { class: 'mini-chip', title: 'Solo’s default model (Settings › Solo)' }, 'Solo') : null),
             h('div', { class: 'mt-cell', 'data-label': 'Provider', role: 'cell' }, select('provider', m.provider, provs, 'Provider')),
             h('div', { class: 'mt-cell c-model', 'data-label': 'Model', role: 'cell' }, cell(k('model'), m.model, m.model, modelSet(m.alias, 'model'), { label: 'Model id', mono: true })),
-            h('div', { class: 'mt-cell', 'data-label': 'Context', role: 'cell' }, cell(k('context'), m.context_window ? F.tokens(m.context_window) : '', m.context_window ? F.tokens(m.context_window) : '', modelSet(m.alias, 'context'), { label: 'Context window', empty: '200k?', title: 'Tokens: 200000, 200k or 1m — empty assumes 200k', placeholder: '200k' })),
+            h('div', { class: 'mt-cell', 'data-label': 'Context', role: 'cell' }, cell(k('context'), m.context_window ? F.tokens(m.context_window) : '', m.context_window ? F.tokens(m.context_window) : '', modelSet(m.alias, 'context'), { label: 'Context window', empty: F.tokens(m.effective_context_window || 200000) + ' (default)', title: 'Tokens: 200000, 200k or 1m — empty inherits the configured default model window', placeholder: F.tokens(m.effective_context_window || 200000) })),
             h('div', { class: 'mt-cell', 'data-label': 'Effort', role: 'cell' }, m.efforts.length ? select('effort', m.default_effort, m.efforts, 'Effort') : h('span', { class: 'dim cell-none', title: 'No effort levels: set some under More' }, 'none')),
             h('div', { class: 'mt-cell c-vision', 'data-label': 'Vision', role: 'cell' }, h('input', { type: 'checkbox', class: 'switch', checked: !!m.vision, title: 'Takes images (screenshots)', 'aria-label': 'Vision for ' + m.alias, onchange: (e) => modelSet(m.alias, 'vision')(e.target.checked ? 'on' : 'off') })),
             h('div', { class: 'mt-cell c-acts', role: 'cell' },
@@ -821,7 +821,7 @@
         ['stall_minutes', 'Stall after (min)', '', 'num'], ['check_timeout_secs', 'Check timeout (s)', '', 'num'],
         ['watchdog_seconds', 'Watchdog (s)', '', 'num'], ['watchdog_escalate_seconds', 'Escalate after (s)', '', 'num'],
         ['review_minutes', 'Coherence review (min)', '0 is off', 'num'], ['manager_minutes', 'Manager digest (min)', '0 is off', 'num'],
-        ['first_token_minutes', 'First token within (min)', '0 is off', 'num'], ['context_cap', 'Context cap (tokens)', '0 is the model’s full window', 'num'],
+        ['first_token_minutes', 'First token within (min)', '0 is off', 'num'], ['context_cap', 'Run context ceiling (tokens)', 'Each model keeps its smaller window; 0 removes the ceiling', 'num'],
         ['network', 'Network for workers', '', 'bool'], ['writable_roots', 'Extra writable dirs', 'comma-separated', 'list'],
     ];
     function settingCtl(S_, [key, label, hint, kind], O) {

@@ -16,9 +16,15 @@ use std::time::Duration;
 struct Cv<'a> {
     buf: &'a mut Buffer,
     clip: Rect,
+    nodes: Vec<(AgentId, u16, u16)>,
 }
 
 impl Cv<'_> {
+    fn node(&mut self, id: AgentId, r: Rect) {
+        if r.y >= self.clip.y && r.y + r.height <= self.clip.y + self.clip.height && r.x >= self.clip.x && r.x + r.width <= self.clip.x + self.clip.width {
+            self.nodes.push((id, r.x + r.width / 2, r.y));
+        }
+    }
     fn ch(&mut self, x: i32, y: i32, s: &str, st: Style) {
         if x < self.clip.x as i32 || y < self.clip.y as i32 || x >= (self.clip.x + self.clip.width) as i32 || y >= (self.clip.y + self.clip.height) as i32 {
             return;
@@ -138,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Small terminals (tmux splits!) lose the peek strip first, then the rail's second line.
     let peek_h = if has_run && !app.stage_nodes().is_empty() && area.height >= 26 { 4 } else { 0 };
     let rail_h = if !has_run { 0 } else if area.height >= 20 { 2 } else { 1 };
-    let sel_agent = app.stage_nodes().get(app.sel).copied();
+    let sel_agent = app.composer_agent();
     let chip_h = super::queue_chip_height(app, sel_agent);
     let in_h = input_height(app, area.width).min(area.height.saturating_sub(8).max(3));
     let rows = Layout::default()
@@ -170,7 +176,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Some(Stage::Review) => "type feedback for the planner, or tab → a to approve the plan".to_string(),
             Some(_) if app.run.as_ref().map(|r| r.question.is_some()).unwrap_or(false) => "answer the planner's question…".to_string(),
             Some(Stage::Planning) | Some(Stage::Setup) => "add details for the planner…".to_string(),
-            _ => "re-prompt the planner · @agent to talk to one agent directly".to_string(),
+            _ => "re-prompt the planner…".to_string(),
         }
     };
     draw_input(f, rows[5], app, &placeholder, theme::VIOLET, !app.canvas_focus);
@@ -183,7 +189,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             "untrusted" => "approvals: untrusted",
             _ => "approvals: on-request",
         };
-        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("@name", "direct"), ("⇧⇥", mode), ("tab", "navigate"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
+        vec![("⏎", "queue"), ("ctrl+f", "send now"), ("⇧⇥", mode), ("tab", "navigate"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
     };
     footer(f, rows[6], &hints);
 }
@@ -192,6 +198,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut crumbs = vec![Span::styled("  mandala", theme::bold(theme::fg(theme::VIOLET)))];
     crumbs.push(Span::styled(format!("  {} overview", theme::g("›", ">")), theme::faint()));
     let mut right = web_badges(app);
+    if area.width >= 100 {
+        right.push(Span::styled(if app.canvas_focus { "  focus:agents " } else { "  focus:input " }, theme::bold(theme::fg(theme::VIOLET))));
+    }
     if let Some(b) = app.inbox_badge() {
         right.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
     }
@@ -374,14 +383,15 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_canvas(f: &mut Frame, area: Rect, app: &App) {
+fn draw_canvas(f: &mut Frame, area: Rect, app: &mut App) {
     let nodes = app.stage_nodes();
     let Some(run) = &app.run else {
+        app.stage_nav.clear();
         welcome(f, area, app);
         return;
     };
     let buf = f.buffer_mut();
-    let mut cv = Cv { buf, clip: area };
+    let mut cv = Cv { buf, clip: area, nodes: vec![] };
     match &run.stage {
         Stage::Setup => {
             let y = area.y as i32 + area.height as i32 / 2;
@@ -393,6 +403,7 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &App) {
         Stage::Finale { idx } => finale(&mut cv, area, app, run, *idx, &nodes),
         Stage::Done | Stage::Failed(_) => done(&mut cv, area, app, run),
     }
+    app.stage_nav = cv.nodes;
 }
 
 fn welcome(f: &mut Frame, area: Rect, app: &App) {
@@ -482,6 +493,7 @@ fn card_border(base: (u8, u8, u8), v: V, a: Option<&Agent>) -> (Style, bool) {
 
 #[allow(clippy::too_many_arguments)]
 fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a: Option<&Agent>, selected: bool, app: &App) {
+    if let Some(id) = w.and_then(|w| w.agent) { cv.node(id, r); }
     let role: Option<&Role> = run.pattern.role(&t.role);
     let base = role.map(|r| theme::named(&r.color)).unwrap_or(theme::TEAL);
     let v = vstate(w, a);
@@ -640,6 +652,7 @@ fn attempt_model(w: Option<&Worker>, a: Option<&Agent>, role: Option<&Role>) -> 
 
 #[allow(clippy::too_many_arguments)]
 fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
+    if let Some(a) = a { cv.node(a.id, r); }
     let v = match a {
         None => V::NotStarted,
         Some(a) => match &a.status {
@@ -767,6 +780,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         for t in &ph.tasks {
             let wk = worker_of(t);
             let a = wk.and_then(|w| w.agent).and_then(|a| app.agents.get(&a));
+            if let Some(id) = wk.and_then(|w| w.agent) { cv.node(id, Rect { x: area.x, y: y as u16, width: area.width, height: 1 }); }
             let v = vstate(wk, a);
             let col = role_col(run, &t.role);
             let glyph = run.pattern.role(&t.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default();
@@ -1260,6 +1274,19 @@ mod tests {
         app.run = Some(run);
         app.screen = crate::app::Screen::Stage;
         app
+    }
+
+    #[test]
+    fn navigation_tracks_the_cards_visible_after_resize() {
+        let mut app = phase_app();
+        let large = frame(&mut app, 120, 36).join("\n");
+        assert!(large.contains("focus:input"));
+        assert_eq!(app.stage_nav.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![3, 10, 11]);
+        let small = frame(&mut app, 40, 12).join("\n");
+        assert!(small.contains("FOCUSED"), "{small}");
+        assert_eq!(app.stage_nav.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![10, 11], "a hidden orchestrator is not an arrow destination");
+        assert_eq!(app.stage_nav[0].1, app.stage_nav[1].1);
+        assert!(app.stage_nav[0].2 < app.stage_nav[1].2);
     }
 
     #[test]

@@ -614,6 +614,57 @@ pub(crate) fn wants_swarm(prompt: &str) -> bool {
     goal.to_lowercase().contains("swarm")
 }
 
+/// Auto's prompt carries the engine's schema with configured aliases already resolved. Keep
+/// its topology and isolation, and give the concrete workflow its own name.
+pub(crate) fn mock_auto_pattern(prompt: &str) -> Value {
+    let sample = prompt.split("```toml").nth(1).and_then(|s| s.split("```").next());
+    let mut pattern = sample.and_then(|s| crate::engine::pattern::Pattern::from_toml(s).ok())
+        .unwrap_or_else(crate::engine::pattern::Pattern::builtin_lean);
+    pattern.name = "demo-auto".into();
+    pattern.description = "A lean workflow for the demo project: plan, parallel workers, checks and QA.".into();
+    let aliases = prompt.split("Configured model aliases: ").nth(1)
+        .and_then(|s| s.split(". Use only these").next())
+        .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()).unwrap_or_default();
+    if let Some(preferred) = aliases.first() {
+        for role in pattern.roles.values_mut() {
+            if !aliases.contains(&role.model.as_str()) { role.model = (*preferred).to_string(); }
+            if role.fallback.as_ref().is_some_and(|f| !aliases.contains(&f.as_str())) { role.fallback = None; }
+        }
+    }
+    json!({"toml": pattern.to_toml(), "reason": "Use a lean workflow for this demo task: independent workers build disjoint modules, then checks and a fresh QA agent verify them. This creates Auto's concrete roles before planning work."})
+}
+
+pub(crate) fn mock_pattern_said(result: &str) -> &'static str {
+    if result.starts_with("ACCEPTED") {
+        "The workflow is installed. I will use the updated planning brief to submit the phased plan."
+    } else if result.starts_with("PROPOSED") {
+        "Proposed a lean workflow. Waiting for your approval before submitting a plan."
+    } else {
+        "The workflow proposal was not accepted. Review the tool result before continuing."
+    }
+}
+
+pub(crate) fn mock_planning_prompt(prompt: &str) -> bool {
+    prompt.contains("[mantra:plan]") || prompt.contains("[mantra:revise]") || prompt.contains("[mantra] You haven't")
+        || (prompt.contains("[mantra:resume]") && prompt.contains("mantra_submit_plan"))
+        || (prompt.contains("[mantra:pattern]") && prompt.contains("Submit the phased plan now."))
+}
+
+/// An answer to another supervisor still enters through the planner. Preserve the actual
+/// user decision when passing it back to the agent whose question is pending.
+pub(crate) fn mock_user_answer(prompt: &str) -> Option<(String, String)> {
+    let rest = prompt.strip_prefix("[from the user] Answering the ")?;
+    let (who, _) = rest.split_once("'s question (")?;
+    let answer = prompt.split_once('\n')?.1.split("\nDecide the next action and reply").next()?.trim();
+    (!who.is_empty() && !answer.is_empty()).then(|| (who.to_string(), format!("The user decided: {answer}")))
+}
+
+pub(crate) fn mock_relayed_user_decision(prompt: &str) -> Option<String> {
+    if !prompt.contains("[from the planner]") { return None; }
+    let decision = prompt.split_once("The user decided:")?.1.lines().next()?.trim();
+    (!decision.is_empty()).then(|| format!("The user decided: {decision}"))
+}
+
 /// What the demo planner says once its plan is in (all three mock backends).
 pub(crate) fn mock_plan_said(swarm: bool) -> String {
     if swarm {
@@ -666,7 +717,17 @@ pub(crate) fn mock_plan(first: bool, swarm: bool) -> Value {
 }
 
 async fn planner(e: &Em, text: &str) -> Outcome {
-    if text.contains("[mantra:plan]") || text.contains("[mantra:revise]") || text.contains("[mantra] You haven't") {
+    if let Some((who, message)) = mock_user_answer(text) {
+        let _ = e.tool("mantra_prompt", json!({"agent": who, "message": message})).await;
+        step!(e.say("The user decided; I passed the answer to the supervisor who asked, so it can brief the waiting worker.").await);
+        return Outcome::Done;
+    }
+    if text.contains("[mantra:auto]") {
+        let result = e.tool("mantra_revise_pattern", mock_auto_pattern(text)).await;
+        step!(e.say(mock_pattern_said(&result)).await);
+        return Outcome::Done;
+    }
+    if mock_planning_prompt(text) {
         step!(e.think("**Exploring the project**\n\nBefore planning I want to see the layout, the build system and existing tests.").await);
         step!(e.command("ls -R | head -30", "Cargo.toml\nREADME.md\nsrc\nsrc/lib.rs\nsrc/main.rs\ntests", 0).await);
         step!(e.command("cat README.md", "# demo\nA small demo project for Mantra.", 0).await);
@@ -718,6 +779,12 @@ async fn planner(e: &Em, text: &str) -> Outcome {
 }
 
 async fn orchestrator(e: &Em, text: &str) -> Outcome {
+    if let Some(message) = mock_relayed_user_decision(text) {
+        step!(e.think("**The user decided**\n\nPassing the planner's answer on to the waiting API worker.").await);
+        let _ = e.tool("mantra_prompt", json!({"agent": "p2-api", "message": message})).await;
+        let _ = e.tool("mantra_wait", json!({})).await;
+        return Outcome::Done;
+    }
     // WP7.2 demo: the watchdog nudged this (real, running) agent directly — acknowledge it and go
     // back to `mantra_wait`; there is nothing else queued to react to.
     if text.contains("[mantra:watchdog]") {
@@ -744,13 +811,6 @@ async fn orchestrator(e: &Em, text: &str) -> Outcome {
     // Demo (MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1): the orchestrator passes the worker's
     // question up to the user (the run's question band) and relays the answer back down.
     let ask_user = std::env::var("MANTRA_MOCK_ASK_USER").is_ok();
-    if ask_user && text.contains("[from the user] (answering your question") {
-        let answer = text.lines().nth(1).unwrap_or("").trim().to_string();
-        step!(e.think("**The user decided**\n\nPassing the decision on to the API worker.").await);
-        let _ = e.tool("mantra_prompt", json!({"agent": "p2-api", "message": format!("The user decided: {answer}")})).await;
-        let _ = e.tool("mantra_wait", json!({})).await;
-        return Outcome::Done;
-    }
     if let Some(rest) = text.split("QUESTION from ").nth(1) {
         let who = rest.split(':').next().unwrap_or("").trim().to_string();
         if ask_user {
@@ -960,6 +1020,27 @@ pub(crate) fn camel(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn auto_demo_proposes_a_concrete_workflow_using_the_configured_backend() {
+        for alias in ["sol", "claude-sonnet", "bija-only"] {
+            let mut sample = crate::engine::pattern::Pattern::builtin_lean();
+            sample.settings.isolation = "copy".into();
+            let prompt = format!("[mantra:auto]\nConfigured model aliases: {alias}. Use only these when the list is supplied.\n```toml\n{}\n```", sample.to_toml());
+            let proposal = mock_auto_pattern(&prompt);
+            let pattern = crate::engine::pattern::Pattern::from_toml(proposal["toml"].as_str().unwrap()).unwrap();
+            assert_eq!(pattern.name, "demo-auto");
+            assert!(!pattern.is_auto() && pattern.validate().is_ok());
+            assert_eq!(pattern.settings.isolation, "copy", "preserve the existing workspace isolation");
+            assert!(pattern.roles.values().all(|r| r.model == alias));
+            let mut plan = crate::engine::plan::Plan::from_value(&mock_plan(false, true)).unwrap();
+            plan.normalize();
+            assert!(plan.validate(&pattern).is_ok(), "the concrete roles support the shared demo plan");
+        }
+        assert!(mock_pattern_said("PROPOSED: pending").contains("Waiting for your approval"));
+        assert!(!mock_pattern_said("REJECTED: bad aliases").contains("installed"));
+        assert!(mock_planning_prompt("[mantra:pattern] Workflow demo-auto is now active. Submit the phased plan now."));
+    }
+
     /// A mock process with one worker thread (`p1-models`, offered `tools`) in a scratch dir.
     fn worker_em(demo_mcp: bool, screenshots: bool, tools: &[&str]) -> (Em, mpsc::UnboundedReceiver<String>, PathBuf) {
         let (out, rx) = mpsc::unbounded_channel();
@@ -1012,6 +1093,32 @@ mod tests {
         assert!(demo_mcp_in(&argv(&["mantra", "mock-codex", "-c", "mcp_servers.demo.command=\"/usr/bin/mantra\"", "-c", "mcp_servers.demo.args=[\"mock-mcp\"]"])));
         assert!(!demo_mcp_in(&argv(&["mantra", "mock-codex", "-c", "mcp_servers.node_repl.enabled=false", "-c", "mcp_servers.blender.command=\"uvx\""])));
         assert!(!demo_mcp_in(&argv(&["mantra", "mock-codex"])));
+    }
+
+    #[tokio::test]
+    async fn codex_auto_bootstrap_calls_pattern_proposal_without_submitting_a_plan() {
+        let (e, mut rx, cwd) = worker_em(false, false, &["mantra_revise_pattern", "mantra_submit_plan"]);
+        e.st.threads.lock().unwrap().get_mut(&e.tid).unwrap().role = "planner".into();
+        let responder_state = e.st.clone();
+        let answering = tokio::spawn(async move {
+            let mut tools = vec![];
+            while let Some(line) = rx.recv().await {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                if v["method"] == "item/tool/call" {
+                    tools.push(v["params"]["tool"].as_str().unwrap().to_string());
+                    if let Some(tx) = responder_state.pending.lock().unwrap().remove(&v["id"].as_i64().unwrap()) {
+                        let _ = tx.send(json!({"contentItems": [{"type": "inputText", "text": "PROPOSED: waiting for explicit user approval"}], "success": true}));
+                    }
+                }
+                if v["params"]["item"]["type"] == "agentMessage" && v["method"] == "item/completed" {
+                    return tools;
+                }
+            }
+            tools
+        });
+        assert!(matches!(script(&e, "[mantra:auto]\nConfigured model aliases: sol. Use only these when the list is supplied.").await, Outcome::Done));
+        assert_eq!(answering.await.unwrap(), vec!["mantra_revise_pattern"]);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// Given the demo server, the worker shows one `mcpToolCall{demo, scene_info}` pair, the

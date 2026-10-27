@@ -24,6 +24,10 @@ jobs:
       - name: Build both backends
         working-directory: mantra_src
         run: cargo build --locked
+      - name: Installer and remote view contracts
+        run: |
+          python3 docs/tools/install-test.py
+          node docs/tools/web-view-regression.mjs
       - name: Install browser test tools
         run: |
           npm install --prefix /tmp/mantra-browser-tools playwright@1.51.1

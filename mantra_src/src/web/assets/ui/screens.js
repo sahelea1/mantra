@@ -22,12 +22,12 @@
         opts = opts || {};
         const s = S();
         const app = s.app || {};
-        // pattern_list: built-ins first (mantra-default leading), then the user's own; an older
+        // pattern_list: built-ins first, then the user's own; an older
         // server only sends the names.
         const pats = app.pattern_list || (app.patterns || []).map((name) => ({ name, description: '', builtin: false }));
         const pat = s.ui.runPattern && pats.some((p) => p.name === s.ui.runPattern) ? s.ui.runPattern : app.pattern_name || (pats[0] && pats[0].name) || '';
         const cur = pats.find((p) => p.name === pat);
-        const opt = (p) => h('option', { value: p.name, key: p.name, selected: p.name === pat }, p.name + (TAG_SUFFIX[p.tag] || ''));
+        const opt = (p) => h('option', { value: p.name, key: p.name, selected: p.name === pat }, (p.name === 'auto' ? 'Auto — planner creates the pattern' : p.name) + (TAG_SUFFIX[p.tag] || ''));
         const builtins = pats.filter((p) => p.builtin), own = pats.filter((p) => !p.builtin);
         const goal = s.ui.runGoal || '';
         const width = s.ui.runParallel || '';
@@ -190,6 +190,12 @@
         if (over) kids.push(startRunCard({ title: 'Start a new run', key: 'startnew' }));
         // The review card below replaces the review band here.
         kids.push(P.haltBand(run), P.questionBand(run));
+        if (!over && run.planner && st.kind !== 'review' && !run.question) {
+            kids.push(card('Message the planner', [
+                run.planner_wait ? h('p', { class: 'sec-sub', role: 'status' }, 'Waiting: ' + run.planner_wait.condition + '. The planner checks again at ' + new Date(run.planner_wait.due_at).toLocaleTimeString() + '. A message resumes it now.') : null,
+                P.feedbackField('planner-message', 'Add details or ask for an update…', 'Send'),
+            ], { key: 'planner-message', icon: 'agent' }));
+        }
         if (st.kind === 'review' && plan) {
             kids.push(card('Review the plan', [
                 h('p', { class: 'sec-sub' }, 'Approve to start phase 1, or tell the planner what to change.'),

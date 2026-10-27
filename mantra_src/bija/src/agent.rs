@@ -1624,7 +1624,7 @@ mod tests {
         let meta = Meta { id: "idle".into(), cwd: home.clone(), provider_url: url.clone(), model: "m".into(), ..Meta::default() };
         std::fs::create_dir_all(&home).unwrap();
         let session = Session::create(&home, meta, Fsync::Never).unwrap();
-        let client = Client::new(crate::api::ClientConfig { base_url: url, wire: Default::default(), api_key: None, max_retries: 0, timeout: std::time::Duration::from_secs(30), stream: true, user_agent: "t".into() });
+        let client = Client::new(crate::api::ClientConfig { base_url: url, wire: Default::default(), api_key: None, headers: Default::default(), max_retries: 0, timeout: std::time::Duration::from_secs(30), stream: true, user_agent: "t".into() });
         let cfg = crate::tools::RuntimeConfig { cwd: home.clone(), sandbox: crate::tools::Sandbox::WorkspaceWrite, writable: vec![], network: false, no_bwrap: true, jobs_dir: home.join("jobs"), scrub_env: vec![], vision: false, images_dir: home.join("images") };
         let runtime = Runtime::new(cfg).await;
         let fanout = Fanout::default();

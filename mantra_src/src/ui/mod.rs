@@ -329,7 +329,8 @@ pub fn input_height(app: &App, width: u16) -> u16 {
 
 pub fn draw_input(f: &mut Frame, area: Rect, app: &App, placeholder: &str, color: (u8, u8, u8), focused: bool) {
     let border = if focused { color } else { theme::FAINT };
-    let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border));
+    let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border))
+        .title(if focused { " input · FOCUSED " } else { " input · tab to focus " });
     let inner = blk.inner(area);
     f.render_widget(blk, area);
     let prompt = Span::styled(format!("{} ", theme::g("›", ">")), theme::bold(theme::fg(color)));

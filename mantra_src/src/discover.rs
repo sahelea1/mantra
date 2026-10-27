@@ -54,6 +54,18 @@ pub fn key_header(p: &crate::config::ProviderEntry) -> KeyHeader {
 /// function no longer looks at the environment itself, so a key pasted into `api_key` works too.
 /// `header` is how the provider wants it presented (`key_header`).
 pub fn list_models(base_url: &str, key: Option<&str>, header: KeyHeader) -> Result<Vec<Found>, String> {
+    list_models_with_headers(base_url, key, header, &std::collections::BTreeMap::new())
+}
+
+pub fn list_models_with_headers(base_url: &str, key: Option<&str>, header: KeyHeader, headers: &std::collections::BTreeMap<String, String>) -> Result<Vec<Found>, String> {
+    validate_headers(headers)?;
+    if key.is_some_and(|k| k.trim().chars().any(char::is_control)) { return Err("the API key contains control characters".into()); }
+    let redact = |mut message: String| {
+        for secret in key.into_iter().map(str::trim).chain(headers.values().map(String::as_str)).filter(|s| !s.is_empty()) {
+            message = message.replace(secret, "[redacted]");
+        }
+        message
+    };
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("set the provider's base URL first".into());
@@ -66,15 +78,15 @@ pub fn list_models(base_url: &str, key: Option<&str>, header: KeyHeader) -> Resu
     }
     let mut last = String::new();
     for url in urls {
-        match curl_get(&url, key, header) {
+        match curl_get(&url, key.map(str::trim), header, headers) {
             Ok((200..=299, body)) => {
-                return parse_models(&body).ok_or_else(|| format!("{url} answered, but not with a model list: {}", one_line(&body)));
+                return parse_models(&body).ok_or_else(|| redact(format!("{url} answered, but not with a model list: {}", one_line(&body))));
             }
             Ok((code, body)) => last = format!("HTTP {code} from {url}: {}", one_line(&body)),
             Err(e) => last = e,
         }
     }
-    Err(last)
+    Err(redact(last))
 }
 
 /// What an answer says, on one line: the provider's own error message when the body is a JSON
@@ -87,18 +99,32 @@ fn one_line(body: &str) -> String {
     crate::util::trunc(&text.split_whitespace().collect::<Vec<_>>().join(" "), 120)
 }
 
-fn curl_get(url: &str, key: Option<&str>, header: KeyHeader) -> Result<(u16, String), String> {
-    let mut c = Command::new("curl");
-    c.args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/json", "-w", "\n%{http_code}"]);
-    if header == KeyHeader::Anthropic {
-        c.args(["-H", "anthropic-version: 2023-06-01"]);
+/// Refuse framing headers and injection before starting curl; errors never echo values.
+pub fn validate_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    for (name, value) in headers {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || value.chars().any(char::is_control) {
+            return Err("a custom provider header has an invalid name or value".into());
+        }
+        if ["host", "content-length", "transfer-encoding", "connection", "authorization", "x-api-key", "accept-encoding"].iter().any(|h| name.eq_ignore_ascii_case(h)) {
+            return Err("custom provider headers cannot override authentication or HTTP framing".into());
+        }
     }
-    if key.is_some() {
+    Ok(())
+}
+
+fn curl_get(url: &str, key: Option<&str>, header: KeyHeader, headers: &std::collections::BTreeMap<String, String>) -> Result<(u16, String), String> {
+    let mut c = Command::new("curl");
+    c.args(["-sS", "--max-time", "20", "-H", "Accept: application/json", "-w", "\n%{http_code}"]);
+    if key.is_some() || !headers.is_empty() || header == KeyHeader::Anthropic {
         c.args(["-H", "@-"]);
     }
     c.arg(url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("couldn't run curl ({e}) — is it installed?"))?;
     if let Some(mut stdin) = child.stdin.take() {
+        if header == KeyHeader::Anthropic && !headers.keys().any(|h| h.eq_ignore_ascii_case("anthropic-version")) {
+            let _ = writeln!(stdin, "anthropic-version: 2023-06-01");
+        }
+        for (name, value) in headers { let _ = writeln!(stdin, "{name}: {value}"); }
         if let Some(k) = key {
             let _ = match header {
                 KeyHeader::Bearer => writeln!(stdin, "Authorization: Bearer {k}"),
@@ -368,6 +394,37 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 mod tests {
     use super::*;
     #[test]
+    fn discovery_sends_messages_auth_version_and_custom_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let request = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0; 1024];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0); bytes.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"data":[{"id":"claude-test"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+        });
+        let headers = [("anthropic-beta".to_string(), "test-beta".to_string())].into_iter().collect();
+        let models = list_models_with_headers(&url, Some("sk-test"), KeyHeader::Anthropic, &headers).unwrap();
+        assert_eq!(models[0].id, "claude-test");
+        let request = request.join().unwrap();
+        assert!(request.starts_with("get /v1/models?limit=1000 "));
+        assert!(request.contains("x-api-key: sk-test\r\n"));
+        assert!(request.contains("anthropic-version: 2023-06-01\r\n"));
+        assert!(request.contains("anthropic-beta: test-beta\r\n"));
+        let invalid = [("anthropic-beta".to_string(), "secret\r\nx-evil: yes".to_string())].into_iter().collect();
+        let error = list_models_with_headers(&url, None, KeyHeader::Anthropic, &invalid).unwrap_err();
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
     fn an_error_answer_is_quoted_on_one_line() {
         let pretty = "{\n  \"error\": {\n    \"message\": \"Missing bearer authentication in header\",\n    \"type\": \"invalid_request_error\"\n  }\n}\n";
         assert_eq!(one_line(pretty), "Missing bearer authentication in header");
@@ -382,6 +439,7 @@ mod tests {
         let messages = ProviderEntry { kind: ProviderKind::Bija, wire: "anthropic".into(), ..Default::default() };
         assert_eq!(key_header(&messages), KeyHeader::Anthropic);
         assert_eq!(key_header(&ProviderEntry { wire: String::new(), ..messages.clone() }), KeyHeader::Bearer);
+        assert_eq!(key_header(&ProviderEntry { base_url: "https://api.anthropic.com/v1".into(), wire: String::new(), ..messages.clone() }), KeyHeader::Anthropic, "a direct Anthropic URL repairs a legacy provider without a wire");
         assert_eq!(key_header(&ProviderEntry { kind: ProviderKind::Codex, ..messages }), KeyHeader::Bearer, "only a Bija provider has a wire");
     }
     #[test]

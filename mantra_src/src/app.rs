@@ -360,6 +360,8 @@ pub struct App {
     pub approvals: Vec<Approval>,
     pub toast: Option<(String, Instant, Level)>,
     pub sel: usize,
+    /// Centers of the cards actually visible in the last overview frame.
+    pub stage_nav: Vec<(AgentId, u16, u16)>,
     /// When the halt the stage selection last jumped to began: a new halt about one agent
     /// selects it once, so the band's `m` / `r` act on the agent it names.
     halt_seen: Option<Instant>,
@@ -404,6 +406,7 @@ pub struct App {
 }
 
 /// Options for creating any agent (Solo, run agents, architect, probes).
+#[derive(Clone)]
 pub struct AgentOpts {
     pub name: String,
     pub role: String,
@@ -652,16 +655,13 @@ fn bija_spawn(reg: &Registry, m: &crate::config::ModelEntry, o: &AgentOpts, cw: 
         network: o.network,
         vision: reg.vision(&m.alias),
     };
-    (spawn, key.into_iter().collect())
+    let mut envs: Vec<(String, String)> = key.into_iter().collect();
+    let headers = provider.map(|p| &p.headers).cloned().unwrap_or_default();
+    envs.push(("BIJA_PROVIDER_HEADERS".into(), serde_json::to_string(&headers).unwrap_or_else(|_| "{}".into())));
+    (spawn, envs)
 }
 
-pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, mut o: AgentOpts) -> AgentId {
-    // Resolve once, before building any backend's sandbox configuration. The original permission
-    // stays on the agent/spec so the UI and Claude's explicit sandbox opt-out remain accurate.
-    if o.approval == crate::config::BYPASS_SANDBOX_DANGER {
-        o.sandbox = "danger-full-access".into();
-    }
-    let id = hub.alloc_id();
+fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, bool) {
     let m = reg.resolve(&o.model_alias);
     let wanted = o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort).to_string();
     let (effort, lowered) = m.resolve_effort_lowered(&wanted);
@@ -742,7 +742,24 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
         bija,
         mcp: o.mcp.clone(),
     };
+    (spec, wanted, lowered)
+}
+
+pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &Registry, mut o: AgentOpts) -> AgentId {
+    // Resolve once, before building any backend's sandbox configuration. The original permission
+    // stays on the agent/spec so the UI and Claude's explicit sandbox opt-out remain accurate.
+    if o.approval == crate::config::BYPASS_SANDBOX_DANGER {
+        o.sandbox = "danger-full-access".into();
+    }
+    let id = hub.alloc_id();
+    let (spec, wanted, lowered) = agent_spec(hub, reg, &o);
+    let m = reg.resolve(&o.model_alias);
+    let effort = spec.effort.clone();
+    let backend = spec.backend;
+    let cw = o.context_override.unwrap_or_else(|| m.effective_context());
+    let launch_options = o.clone();
     let mut a = Agent::new(id, &o.name, &o.role, o.cwd);
+    a.launch_options = Some(Box::new(launch_options));
     a.glyph = o.glyph;
     a.color = o.color;
     a.model_alias = m.alias.clone();
@@ -886,7 +903,7 @@ impl Ctx for Ctxt<'_> {
                 extra_writable: r.extra_writable,
                 network: r.network,
                 writable_roots: r.writable_roots,
-                context_override: r.context_override,
+                context_override: Some(r.context_override.filter(|n| *n > 0).unwrap_or(u64::MAX).min(self.registry.effective_context_window(&r.role.model, &self.settings.default_model))),
                 resume_thread: None,
                 thread_name: r.thread_name,
                 mcp: self.settings.mcp_for(&r.mcp),
@@ -915,7 +932,7 @@ impl Ctx for Ctxt<'_> {
                 extra_writable: r.extra_writable,
                 network: r.network,
                 writable_roots: r.writable_roots,
-                context_override: r.context_override,
+                context_override: Some(r.context_override.filter(|n| *n > 0).unwrap_or(u64::MAX).min(self.registry.effective_context_window(&r.role.model, &self.settings.default_model))),
                 resume_thread: Some(thread),
                 thread_name: r.thread_name,
                 mcp: self.settings.mcp_for(&r.mcp),
@@ -1026,6 +1043,7 @@ impl App {
             approvals: vec![],
             toast: None,
             sel: 0,
+            stage_nav: vec![],
             halt_seen: None,
             sel_follow: None,
             canvas_focus: false,
@@ -1160,7 +1178,7 @@ impl App {
                 extra_writable: vec![],
                 network: true,
                 writable_roots: vec![],
-                context_override: None,
+                context_override: Some(self.registry.effective_context_window(&chosen, &self.settings.default_model)),
                 resume_thread: None,
                 thread_name: None,
                 mcp,
@@ -1335,6 +1353,16 @@ impl App {
         }
     }
 
+    /// The text composer belongs to the planner throughout a run; card focus still controls
+    /// inspection, model changes and interrupts for the selected agent.
+    pub fn composer_agent(&self) -> Option<AgentId> {
+        match self.screen {
+            Screen::Stage => self.run.as_ref().and_then(|r| r.planner),
+            Screen::Zoom(id) if self.in_run(id) => self.run.as_ref().and_then(|r| r.planner),
+            _ => self.focus_agent(),
+        }
+    }
+
     /// The selectable agents of the stage, in card order: the fixed roles, one node per task,
     /// then the gate and the finale step. `sel` indexes this, so it must count exactly what the
     /// overview draws: a task retried twice has one card (the newest attempt — `stage::phase`'s
@@ -1414,12 +1442,8 @@ impl App {
         self.set_effort(a, &e);
     }
 
-    /// Switch a live agent's model. Refuses (rather than sending a `Cmd::SetModel` the process
-    /// cannot honour) an alias that isn't in `/models`, one with a `alias_problem` (draft
-    /// provider, missing key…), or one on a different backend than the agent is already running —
-    /// a backend is fixed at spawn, so that switch needs a respawn instead (the caller decides;
-    /// this never sends anything for it, which used to leave the next turn to fail with "the
-    /// requested model could not be resolved" and the watchdog respawning the agent anyway).
+    /// Switch a live agent in place. A provider/backend change gets a fresh compatible session
+    /// and an explicit context handoff; the logical agent, launch policy and pending text survive.
     pub fn set_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
         let Some(ag) = self.agents.get(&a) else { return Ok(()) };
         if self.registry.get(alias).is_none() {
@@ -1430,37 +1454,76 @@ impl App {
         }
         let new = self.registry.resolve(alias);
         let old = self.registry.resolve(&ag.model_alias);
-        // Solo just starts a new session on the new provider — and so on whatever backend that
-        // provider runs: a fresh install's Solo is on bija, and Codex's `sol` is one pick away.
-        if Some(a) == self.solo && old.provider != new.provider {
-            self.settings.default_model = new.alias.clone();
-            self.save_settings();
-            self.start_solo();
-            self.toast(format!("new session on {} (provider changed)", new.alias), Level::Info);
-            return Ok(());
-        }
         let new_backend = self.registry.backend_of(&new);
-        if new_backend != ag.backend {
-            let name = ag.name.clone();
-            return Err(format!(
-                "{alias} runs on {}; {name} is a {} agent: respawn it with that model instead",
-                crate::web::snapshot::backend_str(new_backend),
-                crate::web::snapshot::backend_str(ag.backend)
-            ));
-        }
         let effort = new.resolve_effort(&ag.effort);
+        let context_window = self.registry.effective_context_window(&new.alias, &self.settings.default_model);
         // a run agent keeps the run's context cap (the backend was told it at spawn): the gauge
         // shows the window it really has, not the new model's whole one
         let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).map(|r| r.pattern.settings.context_cap).filter(|c| *c > 0);
-        self.hub.send(a, Cmd::SetModel(new.model.clone()));
-        self.hub.send(a, Cmd::SetEffort(effort.clone()));
-        // bija's own screenshot and view_image follow the model (Mantra's refuse a blind one)
-        self.hub.send(a, Cmd::SetVision(self.registry.vision(&new.alias)));
+        let context_window = context_window.min(cap.unwrap_or(u64::MAX));
+        // Context limits are launch flags on each backend, so a change must reach the process
+        // as well as its gauge. Reuse the fresh-session handoff for that model configuration.
+        let incompatible = old.provider != new.provider || new_backend != ag.backend || ag.ctx_window != Some(context_window);
+        if incompatible {
+            let mut options = ag.launch_options.as_deref().cloned().ok_or_else(|| "agent launch policy is unavailable; respawn it before changing providers".to_string())?;
+            options.model_alias = new.alias.clone();
+            options.effort = Some(effort.clone());
+            options.approval = ag.approval.clone();
+            options.sandbox = ag.sandbox.clone();
+            options.resume_thread = None;
+            options.context_override = Some(context_window);
+            let (mut spec, _, _) = agent_spec(&self.hub, &self.registry, &options);
+            let handoff = ag.handoff_context();
+            spec.developer_instructions.push_str(&format!("\n\n{handoff}"));
+            if let Some(c) = spec.claude.as_mut() { c.system_prompt = spec.developer_instructions.clone(); }
+            if let Some(b) = spec.bija.as_mut() { b.system_prompt = spec.developer_instructions.clone(); }
+            let command = match new_backend {
+                crate::hub::Backend::Codex => self.hub.codex_cmd.clone(),
+                crate::hub::Backend::ClaudeCode => self.hub.claude_cmd.clone(),
+                crate::hub::Backend::Bija => self.hub.bija_cmd.clone(),
+            };
+            let continuing = ag.busy() && !ag.stopped_by_user;
+            let resume_text = continuing.then(|| "[mantra:backend-switch] Continue the active task using the handoff in your instructions. Preserve completed work and pending user requests.".to_string());
+            if let Some(run) = self.run.as_mut() { run.forget_agent_session(a); }
+            self.hub.send(a, Cmd::Reconfigure { spec: Box::new(spec), command, resume_text });
+            if let Some(ag) = self.agents.get_mut(&a) {
+                ag.abandon_backend_turn();
+                ag.launch_options = Some(Box::new(options));
+                ag.backend = new_backend;
+                ag.provider = new.provider.clone();
+                ag.thread_id = None;
+                ag.relaunching = true;
+                ag.switching_backend = true;
+                ag.turn_active = false;
+                ag.awaiting_start = continuing;
+                ag.turn_wait_since = continuing.then(Instant::now);
+                ag.compacting = false;
+                ag.compact_pending = false;
+                ag.ctx_used = 0;
+                ag.ctx_window = Some(context_window);
+                ag.ctx_warned = false;
+                ag.retry_note = None;
+                ag.status = Status::relaunching();
+                ag.activity = "applying model configuration".into();
+            }
+            self.approvals.retain(|approval| approval.agent != a);
+        } else {
+            self.hub.send(a, Cmd::SetModel(new.model.clone()));
+            self.hub.send(a, Cmd::SetEffort(effort.clone()));
+            self.hub.send(a, Cmd::SetVision(self.registry.vision(&new.alias)));
+        }
         if let Some(ag) = self.agents.get_mut(&a) {
             ag.model_alias = new.alias.clone();
             ag.model = new.model.clone();
-            ag.effort = effort;
-            ag.ctx_window = new.context_window.map(|w| cap.map_or(w, |c| w.min(c))).or(ag.ctx_window);
+            ag.effort = effort.clone();
+            if let Some(options) = ag.launch_options.as_mut() {
+                options.model_alias = new.alias.clone();
+                options.effort = Some(effort);
+                options.context_override = Some(context_window);
+                options.approval = ag.approval.clone();
+                options.sandbox = ag.sandbox.clone();
+            }
+            ag.ctx_window = Some(context_window);
             ag.notice(Level::Info, format!("model → {} ({})", new.alias, new.model));
         }
         if Some(a) == self.solo {
@@ -1482,7 +1545,7 @@ impl App {
             return;
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
-        let known = self.registry.context_windows();
+        let known = self.registry.context_windows_for_default(&self.settings.default_model);
         let sees = crate::engine::run::vision_aliases(&self.registry);
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
             // the switch may bring an alias the run has not seen: refresh what it knows first
@@ -1632,7 +1695,7 @@ impl App {
             run.log("⚙", "blue", format!("{rebound_roles} built-in roles use configured models; see this run's pattern copy"));
         }
         // the engine has no registry: what it knows about models (windows, which aliases exist)
-        run.set_known_models(self.registry.context_windows());
+        run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
@@ -1728,7 +1791,7 @@ impl App {
         let label = crate::engine::state::stage_label(&st.stage);
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
         // before the boot: it decides which saved per-agent models still exist in the registry
-        run.set_known_models(self.registry.context_windows());
+        run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         // before the boot too: the members it re-attaches get the akasha tools back
         run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
@@ -1783,7 +1846,7 @@ impl App {
                 role: "architect".into(),
                 glyph: "★".into(),
                 color: "saffron".into(),
-                model_alias: model,
+                model_alias: model.clone(),
                 effort: Some("high".into()),
                 cwd: self.project.clone(),
                 approval: "never".into(),
@@ -1793,7 +1856,7 @@ impl App {
                 extra_writable: vec![],
                 network: false,
                 writable_roots: vec![],
-                context_override: None,
+                context_override: Some(self.registry.effective_context_window(&model, &self.settings.default_model)),
                 resume_thread: None,
                 thread_name: None,
                 mcp: vec![],
@@ -1846,7 +1909,7 @@ impl App {
                 extra_writable: vec![],
                 network: false,
                 writable_roots: vec![],
-                context_override: None,
+                context_override: Some(self.registry.effective_context_window(&alias, &self.settings.default_model)),
                 resume_thread: None,
                 thread_name: None,
                 mcp: vec![],
@@ -1904,7 +1967,7 @@ impl App {
             tokio::task::spawn_blocking(move || {
                 // The key is strictly this provider's own (`resolve_key` on the entry being
                 // queried) — never another provider's, never a global one.
-                let r = crate::discover::list_models(&p.base_url, p.resolve_key().as_deref(), crate::discover::key_header(&p)).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
+                let r = crate::discover::list_models_with_headers(&p.base_url, p.resolve_key().as_deref(), crate::discover::key_header(&p), &p.headers).map(|found| found.iter().map(|f| crate::discover::from_provider(&p.id, f)).collect());
                 let _ = tx.send(AppEvent::Discovered { source: p.id.clone(), result: r });
             });
         }
@@ -2285,6 +2348,12 @@ impl App {
         if !self.hub.has_agent(id) && self.agents.get(&id).is_some_and(|a| a.stopped_by_user && a.status == Status::Stopped) {
             return;
         }
+        // The old backend may already have queued a failure or tool request when a switch
+        // was selected. Its replacement owns the same logical id; those events are obsolete.
+        if self.agents.get(&id).is_some_and(|a| a.switching_backend)
+            && matches!(&ev, HubEvent::Notif { .. } | HubEvent::Request { .. } | HubEvent::CmdFailed { .. }) {
+            return;
+        }
         match ev {
             HubEvent::Ready { agent, thread_id, model, resumed } => {
                 let mut was_busy = false;
@@ -2293,6 +2362,7 @@ impl App {
                     // it never earns the "continue where you left off" note below.
                     was_busy = (a.turn_active || a.awaiting_start) && !a.relaunching;
                     a.relaunching = false;
+                    a.switching_backend = false;
                     a.thread_id = Some(thread_id);
                     if !model.is_empty() {
                         a.model = model;
@@ -2422,7 +2492,7 @@ impl App {
                     if relaunch {
                         // A model/effort change waits for the turn to end and the hub replays any
                         // held turn itself; only a plain mid-turn restart loses work worth a nudge.
-                        a.relaunching = reason.starts_with("restarting to apply");
+                        a.relaunching = a.switching_backend || reason.starts_with("restarting to apply");
                         a.notice(Level::Info, format!("{what} relaunching: {reason}"));
                     } else {
                         // The hub's reason already names the backend ("bija exited (code 0)"):
@@ -2580,7 +2650,7 @@ impl App {
                         approval, sandbox: role_sandbox(&self.settings.sandbox, backend),
                         instructions: "You are an independent subagent working for a Solo session. Complete the assigned task, keep changes within the user's project, and return a concise result.".into(),
                         tools: if model.vision { tools::vision_tools() } else { vec![] }, extra_writable: vec![], network: true, writable_roots: vec![],
-                        context_override: None, resume_thread: None, thread_name: None, mcp,
+                        context_override: Some(self.registry.effective_context_window(alias, &self.settings.default_model)), resume_thread: None, thread_name: None, mcp,
                     });
                     self.solo_children.insert(child, parent);
                     prompt_agent(&self.hub, &mut self.agents, child, task.to_string(), true, Send::Auto);
@@ -3000,7 +3070,7 @@ impl App {
         }
         // Backspace on an empty input pops the last queued message back into the input to edit.
         if k.code == KeyCode::Backspace && self.input.is_empty() {
-            if let Some(a) = self.focus_agent() {
+            if let Some(a) = self.composer_agent() {
                 if let Some(text) = self.agents.get_mut(&a).and_then(|ag| ag.queued.pop()) {
                     self.input.set(&text);
                     return;
@@ -3081,16 +3151,44 @@ impl App {
         let nav = self.canvas_focus || alt;
         if nav {
             match k.code {
-                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                KeyCode::Left | KeyCode::Up | KeyCode::Right | KeyCode::Down => {
+                    self.sel_follow = None;
+                    let visible: Vec<_> = self.stage_nav.iter().filter(|(id, _, _)| nodes.contains(id)).copied().collect();
+                    if !visible.is_empty() {
+                        let selected = nodes.get(self.sel).copied();
+                        let origin = visible.iter().find(|(id, _, _)| Some(*id) == selected);
+                        let next = origin.and_then(|(_, x, y)| {
+                            visible.iter().filter_map(|(id, nx, ny)| {
+                                let dx = *nx as i32 - *x as i32;
+                                let dy = *ny as i32 - *y as i32;
+                                let (forward, sideways) = match k.code {
+                                    KeyCode::Left => (-dx, dy.abs()),
+                                    KeyCode::Right => (dx, dy.abs()),
+                                    KeyCode::Up => (-dy, dx.abs()),
+                                    _ => (dy, dx.abs()),
+                                };
+                                let distance = if matches!(k.code, KeyCode::Up | KeyCode::Down) { (forward, sideways) } else { (sideways, forward) };
+                                (forward > 0).then_some((distance, *id))
+                            }).min_by_key(|(distance, _)| *distance).map(|(_, id)| id)
+                        }).or_else(|| origin.is_none().then(|| visible[0].0));
+                        if let Some(id) = next {
+                            if let Some(i) = nodes.iter().position(|a| *a == id) { self.sel = i; }
+                        }
+                    } else if matches!(k.code, KeyCode::Left | KeyCode::Up) {
+                        self.sel = self.sel.saturating_sub(1);
+                    } else if !nodes.is_empty() {
+                        self.sel = (self.sel + 1).min(nodes.len() - 1);
+                    }
+                    return true;
+                }
+                KeyCode::Char('h') | KeyCode::Char('k') => {
                     self.sel_follow = None;
                     self.sel = self.sel.saturating_sub(1);
                     return true;
                 }
-                KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                KeyCode::Char('l') | KeyCode::Char('j') => {
                     self.sel_follow = None;
-                    if !nodes.is_empty() {
-                        self.sel = (self.sel + 1).min(nodes.len() - 1);
-                    }
+                    if !nodes.is_empty() { self.sel = (self.sel + 1).min(nodes.len() - 1); }
                     return true;
                 }
                 _ => {}
@@ -3206,7 +3304,8 @@ impl App {
             if self.screen != Screen::Stage || name.contains(char::is_whitespace) {
                 return vec![];
             }
-            return self.run_agent_choices().into_iter().filter(|c| c.label.starts_with(name)).map(|c| Suggestion { text: format!("@{} ", c.label), label: format!("@{}", c.label), about: c.detail }).collect();
+            let planner = self.run.as_ref().and_then(|r| r.planner.map(|id| r.name_of(id)));
+            return self.run_agent_choices().into_iter().filter(|c| Some(c.label.as_str()) == planner.as_deref() && c.label.starts_with(name)).map(|c| Suggestion { text: format!("@{} ", c.label), label: format!("@{}", c.label), about: c.detail }).collect();
         }
         if !t.starts_with('/') {
             return vec![];
@@ -3423,45 +3522,19 @@ impl App {
         }
     }
 
-    /// ctrl+f: deliver the focused agent's queued messages plus the current input into its
-    /// running turn right away. Applies to Solo, Zoom and `@name` messages from the stage — the
-    /// same places Enter can queue. Against an idle agent this just behaves like Enter.
+    /// Send the composer's draft and queued messages immediately. A run always targets its planner.
     fn force_send(&mut self) {
-        match self.screen {
-            Screen::Solo => {
-                if let Some(s) = self.solo {
-                    self.force_prompt(s);
-                }
-            }
-            Screen::Zoom(a) => {
-                if self.in_run(a) {
-                    let text = self.input.text().trim_end().to_string();
-                    let empty_queue = self.agents.get(&a).map(|x| x.queued.is_empty()).unwrap_or(true);
-                    if text.trim().is_empty() && empty_queue {
-                        return;
-                    }
-                    if !text.trim().is_empty() {
-                        self.input.take();
-                    }
-                    let name = self.run.as_ref().map(|r| r.name_of(a)).unwrap_or_default();
-                    self.with_run(|r, c| r.direct(c, &name, &text, Send::Force));
-                } else {
-                    self.force_prompt(a);
-                }
-            }
-            Screen::Stage => {
-                let raw = self.input.text();
-                if let Some(rest) = raw.strip_prefix('@') {
-                    let (name, msg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                    let (name, msg) = (name.to_string(), msg.trim().to_string());
-                    self.input.take();
-                    let ok = self.with_run(|r, c| r.direct(c, &name, &msg, Send::Force)).unwrap_or(false);
-                    if !ok {
-                        self.toast(format!("no agent named @{name}"), Level::Warn);
-                    }
-                }
-            }
-            _ => {}
+        let in_run = self.screen == Screen::Stage || matches!(self.screen, Screen::Zoom(id) if self.in_run(id));
+        if in_run {
+            let Some(planner) = self.composer_agent() else { return };
+            let text = self.input.text().trim_end().to_string();
+            let empty_queue = self.agents.get(&planner).map(|a| a.queued.is_empty()).unwrap_or(true);
+            if text.trim().is_empty() && empty_queue { return; }
+            self.input.take();
+            let text = text.strip_prefix('@').and_then(|rest| rest.split_once(char::is_whitespace)).map(|(_, body)| body.trim().to_string()).unwrap_or(text);
+            self.with_run(|r, c| r.direct(c, "planner", &text, Send::Force));
+        } else if let Some(id) = self.composer_agent() {
+            self.force_prompt(id);
         }
     }
 
@@ -3483,7 +3556,7 @@ impl App {
         if !self.input.is_empty() {
             return;
         }
-        if let Some(a) = self.focus_agent() {
+        if let Some(a) = self.composer_agent() {
             if let Some(ag) = self.agents.get_mut(&a) {
                 if !ag.queued.is_empty() {
                     ag.queued.clear();
@@ -4250,33 +4323,81 @@ done"#;
     }
 
     #[test]
-    fn set_model_refuses_unknown_and_cross_backend_aliases() {
+    fn cross_backend_switch_keeps_agent_task_queue_tools_and_permissions() {
         let mut reg = Registry::defaults();
         reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude".into(), kind: crate::config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "claude-model".into(), model: "claude-model".into(), provider: "cc".into(), ..Default::default() });
+        let id = 1;
+        let (hub, mut commands) = test_hub_with(id);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
         let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
-        let id: AgentId = 1;
         let mut a = Agent::new(id, "worker", "worker", PathBuf::from("."));
         a.model_alias = "sol".into();
         a.backend = crate::config::ProviderKind::Codex;
+        a.thread_id = Some("incompatible-codex-id".into());
+        a.turn_active = true;
+        a.queued.push("also check tests".into());
+        a.push_user("Build the parser without changing the wire format");
+        a.launch_options = Some(Box::new(AgentOpts {
+            name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(),
+            model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
+            approval: "never".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(),
+            tools: vec![json!({"name":"mantra_status"})], extra_writable: vec![], network: false,
+            writable_roots: vec![], context_override: None, resume_thread: None,
+            thread_name: Some("Run · worker".into()), mcp: vec![],
+        }));
         app.agents.insert(id, a);
-
         assert_eq!(app.set_model(id, "no-such-alias"), Err("unknown model".into()));
-        assert_eq!(app.agents[&id].model_alias, "sol");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.set_model(id, "claude-model"), Ok(()));
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents[&id].backend, crate::config::ProviderKind::ClaudeCode);
+        assert_eq!(app.agents[&id].queued, ["also check tests"]);
+        assert!(app.agents[&id].thread_id.is_none());
+        assert!(app.agents[&id].awaiting_start, "messages arriving during the switch must queue for the continued turn");
+        app.on_hub(HubEvent::Notif { agent: id, method: "turn/completed".into(), params: json!({"turn":{"status":"failed","error":{"message":"obsolete provider error"}}}) });
+        assert_eq!(app.agents[&id].status, Status::relaunching());
+        app.on_hub(HubEvent::Crashed { agent: id, reason: "new backend launch refused".into(), restarting: false, attempt: 3 });
+        assert_eq!(app.agents[&id].status, Status::Crashed("new backend launch refused".into()), "new launch failures must stay visible before Ready");
+        app.on_hub(HubEvent::Ready { agent: id, thread_id: "new-claude-session".into(), model: "claude-model".into(), resumed: false });
+        app.on_hub(HubEvent::Notif { agent: id, method: "turn/started".into(), params: json!({}) });
+        app.on_hub(HubEvent::Notif { agent: id, method: "turn/completed".into(), params: json!({"turn":{"status":"completed"}}) });
+        assert_eq!(app.agents[&id].status, Status::Idle);
+        assert!(app.agents[&id].retry_note.is_none());
 
-        let err = app.set_model(id, "claude-model").unwrap_err();
-        assert!(err.contains("claude-code") && err.contains("codex") && err.contains("respawn it"), "{err}");
-        assert_eq!(app.agents[&id].model_alias, "sol", "a refused switch never touches the agent");
+        match commands.try_recv().unwrap() {
+            Cmd::Reconfigure { spec, resume_text, .. } => {
+                assert!(spec.resume_thread.is_none());
+                assert_eq!(spec.approval, "never");
+                assert_eq!(spec.sandbox, "workspace-write");
+                assert_eq!(spec.dynamic_tools, vec![json!({"name":"mantra_status"})]);
+                assert!(spec.developer_instructions.contains("Keep the public API stable"));
+                assert!(spec.developer_instructions.contains("Build the parser without changing the wire format"));
+                assert_eq!(spec.claude.unwrap().system_prompt, spec.developer_instructions);
+                assert!(resume_text.unwrap().contains("Continue the active task"));
+            }
+            other => panic!("expected backend reconfiguration, got {other:?}"),
+        }
+        while commands.try_recv().is_ok() {}
+        // The same backend's context limit is a process flag, so choosing a smaller model
+        // must update its actual launch configuration as well as the displayed gauge.
+        app.registry.models.push(crate::config::ModelEntry { alias: "claude-small".into(), model: "small".into(), provider: "cc".into(), context_window: Some(16_000), ..Default::default() });
+        assert_eq!(app.set_model(id, "claude-small"), Ok(()));
+        match commands.try_recv().unwrap() {
+            Cmd::Reconfigure { spec, resume_text, .. } => {
+                assert_eq!(spec.backend, crate::hub::Backend::ClaudeCode);
+                assert_eq!(spec.claude.unwrap().autocompact, 16_000);
+                assert!(resume_text.is_none(), "an idle agent must stay idle");
+            }
+            other => panic!("expected context limit relaunch, got {other:?}"),
+        }
+        assert_eq!(app.agents[&id].ctx_window, Some(16_000));
+        assert_eq!(app.agents[&id].launch_options.as_ref().unwrap().model_alias, "claude-small");
     }
 
-    /// Solo is no run agent with a backend fixed at spawn: a model on another backend simply
-    /// starts a new Solo session there — a fresh install's Solo is on bija, Codex's `sol` one pick
-    /// away once Codex is added.
+    /// Solo keeps its logical identity and transcript when the backend changes.
     #[tokio::test]
-    async fn solo_changes_backend_by_starting_a_new_session() {
+    async fn solo_changes_backend_in_place_with_a_fresh_backend_session() {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4291,7 +4412,7 @@ done"#;
             assert_eq!(app.agents[&first].backend, crate::config::ProviderKind::Bija, "Solo defaults to bija");
             assert_eq!(app.set_model(first, "sol-codex"), Ok(()));
             let second = app.solo.expect("a new Solo");
-            assert_ne!(first, second);
+            assert_eq!(first, second);
             assert_eq!(app.agents[&second].backend, crate::config::ProviderKind::Codex);
             assert_eq!(app.settings.default_model, "sol-codex");
             assert_eq!(app.set_model(second, "luna-api"), Ok(()), "and back, through a 0.7 spelling");
@@ -4373,13 +4494,13 @@ done"#;
         };
         let (s, envs) = bija_spawn(&reg, &reg.resolve("big"), &o, 128_000, 80);
         assert_eq!((s.base_url.as_str(), s.wire.as_str(), s.api_key_env.as_deref()), ("https://gw.dev/v1", "anthropic", Some("MANTRA_GW_API_KEY")));
-        assert_eq!(envs, vec![("MANTRA_GW_API_KEY".to_string(), "sk-secret".to_string())]);
+        assert_eq!(envs, vec![("MANTRA_GW_API_KEY".to_string(), "sk-secret".to_string()), ("BIJA_PROVIDER_HEADERS".to_string(), "{}".to_string())]);
         assert_eq!((s.context_window, s.compact_pct, s.system_prompt.as_str(), s.sandbox.as_str(), s.network), (128_000, 80, "do the task", "full", true));
         assert!(s.writable_roots.is_empty(), "full access needs no roots");
         assert_eq!(s.home, crate::config::home().join("bija"));
         let o = AgentOpts { model_alias: "small".into(), sandbox: "workspace-write".into(), ..o };
         let (s, envs) = bija_spawn(&reg, &reg.resolve("small"), &o, 200_000, 85);
-        assert_eq!((s.wire.as_str(), s.api_key_env.as_deref(), envs.len()), ("openai-chat", None, 0), "a keyless local server");
+        assert_eq!((s.wire.as_str(), s.api_key_env.as_deref(), envs.len()), ("openai-chat", None, 1), "a keyless local server still clears inherited provider headers");
         assert_eq!((s.sandbox.as_str(), s.writable_roots.clone()), ("workspace-write", vec![PathBuf::from("/integ")]));
     }
 
@@ -4524,6 +4645,79 @@ done"#;
         app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
         app.select_halted_agent();
         assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
+    }
+
+    #[test]
+    fn run_composer_queue_controls_target_the_planner_from_every_view() {
+        use crate::web::snapshot::tests::{add_agent, worker};
+        use crate::engine::run::WState;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.workers.push(worker("task", 1, Some(2), WState::Running));
+        run.stage = Stage::Planning;
+        app.run = Some(run);
+        add_agent(&mut app, 1, "planner");
+        add_agent(&mut app, 2, "task");
+        app.agents.get_mut(&1).unwrap().turn_active = true;
+        app.agents.get_mut(&1).unwrap().status = Status::Busy;
+        let mut planner_rx = app.hub.test_register(1);
+        let mut worker_rx = app.hub.test_register(2);
+        app.agents.get_mut(&2).unwrap().queued.push("worker internal queue".into());
+        for screen in [Screen::Zoom(2), Screen::Stage] {
+            app.screen = screen;
+            assert_eq!(app.composer_agent(), Some(1));
+            app.agents.get_mut(&1).unwrap().queued.push("queued feedback".into());
+            app.input.set("new feedback");
+            app.force_send();
+            assert!(app.input.is_empty());
+            assert!(matches!(planner_rx.try_recv(), Ok(Cmd::Steer { text }) if text.contains("queued feedback") && text.contains("new feedback")));
+            assert!(worker_rx.try_recv().is_err());
+            app.agents.get_mut(&1).unwrap().queued.push("edit feedback".into());
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert_eq!(app.input.text(), "edit feedback");
+            app.input.clear();
+            app.agents.get_mut(&1).unwrap().queued.push("discard feedback".into());
+            app.discard_queue();
+            assert!(app.agents[&1].queued.is_empty());
+            assert_eq!(app.agents[&2].queued, vec!["worker internal queue".to_string()]);
+        }
+    }
+
+    #[test]
+    fn arrows_follow_visible_card_geometry_and_skip_hidden_agents() {
+        use crate::engine::run::WState;
+        use crate::web::snapshot::tests::worker;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.manager = Some(2);
+        run.orchestrator = Some(3);
+        run.workers.push(worker("left", 1, Some(10), WState::Running));
+        run.workers.push(worker("right", 1, Some(11), WState::Running));
+        run.gate_agent = Some(20);
+        app.run = Some(run);
+        app.screen = Screen::Stage;
+        // The list is planner, manager, orchestrator, workers, gate. The screen is different:
+        // planner -> orchestrator -> manager across the top, then workers, then the gate.
+        app.stage_nav = vec![(1, 10, 0), (3, 40, 0), (2, 70, 0), (10, 25, 7), (11, 55, 7), (20, 40, 15)];
+        app.canvas_focus = true;
+        app.stage_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(3), "right follows the screen, not the role list");
+        app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(10), "down reaches the nearest worker row before the centered gate");
+        app.stage_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(11));
+        app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(20));
+        // A narrow frame only shows the worker list. Fixed roles and offscreen cards are skipped.
+        app.stage_nav = vec![(10, 20, 0), (11, 20, 1)];
+        app.stage_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(10));
+        app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(11));
+        app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus_agent(), Some(11), "bottom edge stays on a visible card");
     }
 
     /// The reported bug: a task retried once had one card on the overview but two entries in

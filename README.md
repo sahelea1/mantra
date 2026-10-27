@@ -43,6 +43,8 @@ One line, Linux or macOS, no `sudo`:
 curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 ```
 
+Already installed: `mantra update`.
+
 <details>
 <summary>No curl, pinning a version, or building from source</summary>
 
@@ -58,7 +60,7 @@ MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahe
 cd mantra_src && cargo build --release && cp target/release/mantra target/release/bija ~/.local/bin/
 ```
 
-The installer puts two binaries side by side — `mantra` and `bija`, its agent harness — verifies a sha256 for each, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and finishes by running `mantra doctor`. Re-running it upgrades in place. If no release binary matches your platform (or its download or checksum fails) it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent; a release without a `bija` asset still installs `mantra` and reports the missing harness when a configured model needs it; a source build always brings both.
+The installer puts two binaries side by side — `mantra` and `bija`, its agent harness — verifies a sha256 for each, installs to `~/.local/bin` (override with `MANTRA_INSTALL_DIR`), adds that directory to your `PATH` if it is missing, and ends with a compact launch summary. `mantra doctor` runs diagnostics when you need them; `MANTRA_INSTALL_VERBOSE=1` includes them during installation. `mantra update` upgrades both binaries beside the executable you launched, checks both downloads before replacing either, and keeps settings and sessions. Existing sessions continue on the old binary until restarted. Re-running the installer also upgrades in place. If no release binary matches your platform (or its download or checksum fails) it builds from source, installing a minimal `rustup` toolchain first when `cargo` is absent; a release without a `bija` asset still installs `mantra` and reports the missing harness when a configured model needs it; a source build always brings both.
 
 </details>
 
@@ -175,6 +177,18 @@ Press `ctrl+o`, describe the goal, and this happens:
 **4. The finale** depends on the pattern (below). In the default one: a single QA pass that starts from the run's diff and the gate reports — security is a checklist inside it, defects go to fix workers — then the planner verifying its own plan against the same diff and reports, able to spawn fix workers for real gaps.
 
 **5. `/land`** merges the run branch into yours. Everything else lives in `~/.mantra` — plan, journal, per-phase outputs, merge logs. Nothing is written into your project.
+
+Mantra-created commits use your configured Git identity (falling back to `Mantra <mantra@localhost>` only when absent). Set exact project trailers in the repository's local Git config; repeated entries apply to worker, phase, initial and merge commits:
+
+```sh
+git config --local --add mantra.commitTrailer 'Co-Authored-By: Your Helper <helper@example.com>'
+git config --local --add mantra.commitTrailer 'Claude-Session: your-explicit-session-id'
+git config --local --add mantra.decisionLog 'docs/architecture-decisions.md'
+```
+
+No model credit or session identifier is invented. This policy covers commits made by Mantra itself; externally created commits retain their messages. `DECISIONS.md` and any additional `mantra.decisionLog` paths preserve their existing Markdown headings: Mantra refuses a commit or merge that removes one. Keep past entries and append a superseding decision. Additional paths must be repository-relative files.
+
+Workers, resumed workers and fix workers receive up to 12,000 characters of the run brief, including project and per-ticket rules. Obvious credential assignments, bearer credentials, authenticated URLs and private-key blocks are omitted; keep credentials out of briefs and use the configured secret environment instead. A clipped brief tells the worker to ask for missing rules.
 
 <img src="docs/img/done.png" alt="A finished run: phases, durations, token total and the branch that is ready to land" width="920">
 
@@ -385,7 +399,7 @@ Each agent is one `bija` process speaking NDJSON over stdio, its session in `~/.
 <details>
 <summary>Claude Code as a backend for any role</summary>
 
-With `claude` on your `PATH`, *Claude Code* in the add menu (`ctrl+n` in `/models`) adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. Claude Code announces your account's real window a second after each agent starts, and on a subscription login that is what the gauge uses — so it is right from the first turn whatever your plan grants (an `api_key` gateway keeps the window you configured). An older `models.toml` keeps whatever `context_window` it has — set it to `1000000`, or delete the Claude models and add Claude Code again. Point any role at a Claude model in the Studio, like any other model — the planner and the manager on Claude with the workers on bija, say, is a few edits there, or one sentence to the architect.
+With `claude` on your `PATH`, *Claude Code* in the add menu (`ctrl+n` in `/models`) adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. Claude Code announces your account's real window a second after each agent starts. On a subscription login, the gauge uses the smaller of that reported window and the configured model/run ceiling, so a larger account allowance never raises your configured maximum (an `api_key` gateway keeps the window you configured). An older `models.toml` keeps whatever `context_window` it has — set it to `1000000`, or delete the Claude models and add Claude Code again. Point any role at a Claude model in the Studio, like any other model — the planner and the manager on Claude with the workers on bija, say, is a few edits there, or one sentence to the architect.
 
 Under the hood each agent is one long-lived `claude -p --input-format stream-json …` process. Mantra translates its event stream into the same shapes the UI already renders, so nothing else in the app knows the difference: steering lands at the next tool boundary, `x` sends a real interrupt, `/compact` compacts the session, and a crashed process restarts with `--resume`.
 
@@ -452,7 +466,20 @@ A provider whose URL and key are not real yet is a **draft**: `/models` shows *d
 <details>
 <summary>Context and compaction</summary>
 
-Every agent is launched with an explicit context window and compaction threshold — its own numbers, or a conservative assumed 200k / 85% — passed as `model_context_window` + `model_auto_compact_token_limit` to Codex and `--autocompact` to Claude. A 16k model compacts instead of dying. A worker that still overflows on an assumed window gets it halved for the next attempt, with a log line telling you to set the real one.
+Pasted provider keys and web passwords are stored in `~/.mantra/secrets.toml`, with owner-only permissions on Unix. Existing inline credentials migrate automatically: the secrets file is saved before the ordinary configuration is rewritten. Malformed files are preserved and saves are refused until repaired. `MANTRA_WEB_PASSWORD` and the provider's configured key environment variable retain precedence. MCP environment values still reside in the restricted settings file; configuration files should not be printed into agent conversations. This separates routine settings from credentials; it is not an isolation boundary against a full-access process.
+
+For a provider needing extra API headers, configure its ID in the secrets file:
+
+```toml
+[provider_headers.anthropic]
+anthropic-version = "2023-06-01"
+# anthropic-beta = "the beta identifier your endpoint requires"
+# anthropic-workspace-id = "your workspace identifier"
+```
+
+These headers reach model discovery and Bija Messages requests. Required API-key and version headers are automatic for the direct Anthropic endpoint; authentication and HTTP framing headers cannot be overridden by custom headers.
+
+Every agent is launched with an explicit context window and compaction threshold — its own context window, inherited from the default model when unset, with a 200k fallback if neither specifies one; compaction defaults to 85% — passed as `model_context_window` + `model_auto_compact_token_limit` to Codex and `--autocompact` to Claude. A 16k model compacts instead of dying. A worker that still overflows on an assumed window gets it halved for the next attempt, with a log line telling you to set the real one.
 
 `/compact` compacts by hand (deferred to the end of the turn if one is running), each compaction appears once in the log as `⇣ context compacted · 182k → 31k`, and the orchestrator is reset or compacted between phases. A turn that contains only a compaction never counts as "the agent finished".
 
@@ -573,7 +600,11 @@ Each has the same three worker classes, and the planner assigns every task to on
 
 Every built-in role prompt is short and says what it owns, what it never does, when to stop — and not to re-read files it already read or run the full suite more than once a turn unless it failed.
 
-Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap, so the backend compacts there — a 500k-token context once let one worker cycle tools for hours (6.8M tokens, mostly cached input) on a single task. `0` is the model's full window; the Studio edits it (`200k`, `off`) under settings.
+Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap. A model without its own window inherits the configured default model's window (200k only when neither specifies one). For example, a 1M run ceiling keeps models configured for 250k, 500k and 1M at those respective limits. `0` removes the run ceiling; the Studio edits it (`200k`, `off`) under settings. A live model change applies the new effective window to the backend as well as the gauge.
+
+Choose **Auto** in the pattern picker, or use `mantra run "your goal" --pattern auto`, to start with a planner that designs a workflow for the task. It proposes a validated pattern before submitting a plan. User messages in Mandala enter through the planner, which normally briefs the orchestrator and can directly steer or stop another agent in an emergency. A workflow proposal asks for approval unless the planner's active permission mode is **never ask** or **BYPASS-SANDBOX-DANGER**. Pending approval survives a restart. Existing worktrees and required active task roles are preserved when the workflow changes.
+
+The planner can explicitly update an approved task scope with `mantra_set_task_scope`; overlapping parallel scopes remain invalid. `mantra_wait_for_external_condition` schedules one re-entry (1 second to 24 hours), then releases the planner's turn. On waking, the planner checks the condition; Mantra does not execute a background polling command. A user message cancels that scheduled wait. Provider quota/billing failures use the role's configured fallback, including another backend, and produce an owner alert. A fresh backend receives a bounded task/conversation handoff rather than an incompatible session ID.
 
 Worktree isolation (`isolation = worktree`, or `auto` in a git repository) needs a commit to branch from. A repository that has none yet — `git init` and nothing else — gets an empty `mantra: initial commit` (files you already staged stay staged), and the run says so: `⎇ created the initial commit so workers get isolated worktrees`. Only a directory that is not a git repository at all makes `auto` fall back to one shared directory.
 
@@ -615,7 +646,7 @@ On a phone the settings are a list of sections that open as pages, all of it fro
 <details>
 <summary><code>--web</code>: on this machine or your LAN</summary>
 
-`--web` (optionally `--web ADDR:PORT`, or the explicit `--web-listen ADDR:PORT`) starts an HTTP+WebSocket server in the same process, defaulting to `127.0.0.1:7777` — loopback, no password needed, since anyone who can reach it can already run `mantra` itself (mind that a port-forward or tunnel to that port — `ssh -L`, `docker -p` — lets its other end in too; Mantra says so once at start). Bind anything else (`--web 0.0.0.0:7777` for the LAN) and Mantra refuses to start without a password: `--web-password PW`, the environment variable `MANTRA_WEB_PASSWORD` (preferred — flags show up in `ps`), or `[web] password` in `settings.toml`. *Web & remote* in the TUI's `/settings` shows the exact URL(s), whether TLS and a password are on, and how many browsers are connected right now.
+`--web` (optionally `--web ADDR:PORT`, or the explicit `--web-listen ADDR:PORT`) starts an HTTP+WebSocket server in the same process, defaulting to `127.0.0.1:7777` — loopback, no password needed, since anyone who can reach it can already run `mantra` itself (mind that a port-forward or tunnel to that port — `ssh -L`, `docker -p` — lets its other end in too; Mantra says so once at start). Bind anything else (`--web 0.0.0.0:7777` for the LAN) and Mantra refuses to start without a password: `--web-password PW`, the environment variable `MANTRA_WEB_PASSWORD` (preferred — flags show up in `ps`), or `web_password` in `secrets.toml` (legacy `[web] password` entries are migrated). *Web & remote* in the TUI's `/settings` shows the exact URL(s), whether TLS and a password are on, and how many browsers are connected right now.
 
 `--web-tls` serves HTTPS with a small private certificate authority Mantra makes for itself the first time (`$MANTRA_HOME/web/tls/`), covering `localhost`, your LAN address and hostname, reissued only when those change or it is close to expiring. `/cert.pem` on the running server hands out that CA (the web app's Settings › Certificate card has the download button and these same steps) — install it *once* per device and every certificate this Mantra ever issues for itself afterwards (even after your IP changes) is already trusted:
 

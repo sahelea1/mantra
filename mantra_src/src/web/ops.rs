@@ -412,7 +412,7 @@ impl App {
             .map(|m| {
                 json!({
                     "alias": m.alias, "provider": if m.is_custom_provider() { m.provider.as_str() } else { CODEX_ACCOUNT }, "provider_name": reg.provider_name(&m.provider),
-                    "model": m.model, "backend": kind_str(reg.backend_of(m)), "context_window": m.context_window, "compact_percent": m.auto_compact_percent,
+                    "model": m.model, "backend": kind_str(reg.backend_of(m)), "context_window": m.context_window, "effective_context_window": reg.effective_context_window(&m.alias, &self.settings.default_model), "compact_percent": m.auto_compact_percent,
                     "default_effort": m.default_effort, "efforts": m.efforts(), "vision": m.vision, "note": m.note,
                     "problem": reg.alias_problem(&m.alias), "test": self.models_ui.status.get(&m.alias), "default": m.alias == self.settings.default_model,
                 })

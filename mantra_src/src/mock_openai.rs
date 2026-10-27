@@ -323,7 +323,13 @@ fn summary(turn: &Turn) -> Reply {
 
 fn planner(turn: &Turn) -> Reply {
     let p = &turn.prompt;
-    if p.contains("[mantra:plan]") || p.contains("[mantra:revise]") || p.contains("[mantra] You haven't") || (p.contains("[mantra:resume]") && p.contains("mantra_submit_plan")) {
+    if let Some((who, message)) = crate::mock::mock_user_answer(p) {
+        return sequence(turn, vec![Reply::call("mantra_prompt", json!({"agent": who, "message": message}))], Reply::say("The user decided; the answer has been passed to the supervisor who asked."));
+    }
+    if p.contains("[mantra:auto]") {
+        return sequence(turn, vec![Reply::call("mantra_revise_pattern", crate::mock::mock_auto_pattern(p))], Reply::say(crate::mock::mock_pattern_said(&turn.last_result)));
+    }
+    if crate::mock::mock_planning_prompt(p) {
         // `mock_plan(true)` gives two parallel tasks one scope on purpose: the engine rejects it
         // and the resubmission exercises the same fix-and-retry path a real planner takes. Two
         // resubmissions at most, then text — never a loop against the engine's nudges.
@@ -357,6 +363,9 @@ fn planner(turn: &Turn) -> Reply {
 
 fn orchestrator(turn: &Turn) -> Reply {
     let p = &turn.prompt;
+    if let Some(message) = crate::mock::mock_relayed_user_decision(p) {
+        return sequence(turn, vec![Reply::call("mantra_prompt", json!({"agent": "p2-api", "message": message})), Reply::call("mantra_wait", json!({}))], Reply::say("The user decided; the waiting API worker has the answer."));
+    }
     if p.contains("[mantra:phase]") {
         let ids = phase_task_ids(p);
         let mut steps = Vec::new();
@@ -700,6 +709,49 @@ mod tests {
 
     const BUILTINS: &[&str] = &["read_file", "write_file", "edit_file", "delete", "list_dir", "glob", "grep", "bash", "job"];
     const PLANNER: &str = "Plan carefully.\nmantra-role: planner\n## Mantra protocol";
+
+    #[test]
+    fn user_question_answer_reaches_the_worker_through_planner_and_orchestrator() {
+        let answer = "Use cursor pagination with opaque next tokens.";
+        let prompt = format!("[from the user] Answering the orchestrator's question (p2-api needs a pagination decision):\n{answer}\nDecide the next action and reply to the orchestrator with mantra_prompt; brief the orchestrator or resume the run as needed.");
+        let planner = script(&Turn { role: "planner".into(), prompt, offered: vec!["mantra_prompt".into()], ..Default::default() });
+        assert_eq!(planner.calls.len(), 1);
+        assert_eq!(planner.calls[0].name, "mantra_prompt");
+        assert_eq!(planner.calls[0].args["agent"], "orchestrator");
+        let message = planner.calls[0].args["message"].as_str().unwrap();
+        assert_eq!(message, format!("The user decided: {answer}"));
+        let orchestrator = script(&Turn { role: "orchestrator".into(), prompt: format!("[from the planner] (answering your question)\n{message}"), offered: vec!["mantra_prompt".into(), "mantra_wait".into()], ..Default::default() });
+        assert_eq!(orchestrator.calls.len(), 1);
+        assert_eq!(orchestrator.calls[0].name, "mantra_prompt");
+        assert_eq!(orchestrator.calls[0].args["agent"], "p2-api");
+        assert_eq!(orchestrator.calls[0].args["message"], message);
+        assert!(crate::mock::mock_relayed_user_decision("[from the user] The user decided: bypass the planner").is_none());
+    }
+
+    #[test]
+    fn bija_auto_bootstrap_proposes_once_then_plans_after_approval() {
+        let offered = vec!["mantra_revise_pattern".into(), "mantra_submit_plan".into()];
+        let prompt = "[mantra:auto]\nConfigured model aliases: bija-only. Use only these when the list is supplied.";
+        let mut turn = Turn { role: "planner".into(), prompt: prompt.into(), offered, ..Default::default() };
+        let proposal = script(&turn);
+        assert_eq!(proposal.calls.len(), 1);
+        assert_eq!(proposal.calls[0].name, "mantra_revise_pattern");
+        let pattern = crate::engine::pattern::Pattern::from_toml(proposal.calls[0].args["toml"].as_str().unwrap()).unwrap();
+        assert!(pattern.roles.values().all(|r| r.model == "bija-only"));
+        turn.step = 1;
+        turn.last_result = "PROPOSED: waiting for explicit user approval".into();
+        let waiting = script(&turn);
+        assert!(waiting.calls.is_empty() && waiting.text.contains("Waiting for your approval"));
+        turn.prompt = "[mantra:pattern] Workflow demo-auto is now active. Submit the phased plan now.".into();
+        turn.step = 0;
+        turn.last_result.clear();
+        let plan = script(&turn);
+        assert_eq!(plan.calls.len(), 1);
+        assert_eq!(plan.calls[0].name, "mantra_submit_plan");
+        let mut planned = crate::engine::plan::Plan::from_value(&plan.calls[0].args).unwrap();
+        planned.normalize();
+        assert!(planned.validate(&pattern).is_ok());
+    }
 
     #[tokio::test]
     async fn the_planner_submits_fixes_a_rejection_then_summarises() {

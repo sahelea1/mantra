@@ -265,7 +265,6 @@ impl App {
                 // An active run on a *different* pattern keeps its own agents untouched too — only
                 // its role names happened to collide with this pattern's.
                 let run_mismatch = self.run.as_ref().map(|r| r.pattern.name != pattern.name).unwrap_or(false);
-                let new_backend = self.registry.backend_of(&self.registry.resolve(&alias));
                 // Only agents that will run again are switched. An archived one, or a worker
                 // whose attempt is over (done, failed, cancelled), is kept for its card and its
                 // log: it ran on the model it ran on, and rewriting its alias would make a
@@ -279,16 +278,10 @@ impl App {
                     if run_mismatch && self.in_run(id) {
                         continue;
                     }
-                    let same_backend = self.agents.get(&id).map(|a| a.backend == new_backend).unwrap_or(false);
-                    if same_backend {
-                        let in_run = self.in_run(id);
-                        if self.set_model(id, &alias).is_ok() && in_run {
-                            self.model_switched_for_run_agent(id);
-                        }
-                    } else if let Some(a) = self.agents.get_mut(&id) {
-                        let name = a.name.clone();
-                        let old = a.model_alias.clone();
-                        a.notice(Level::Warn, format!("{name} keeps {old} until respawned (other backend)"));
+                    let in_run = self.in_run(id);
+                    self.set_model(id, &alias)?;
+                    if in_run {
+                        self.model_switched_for_run_agent(id);
                     }
                 }
                 Ok(json!({"changed": targets, "path": path.display().to_string()}))
@@ -544,6 +537,20 @@ mod tests {
         app.solo = Some(1);
         let rx = app.hub.test_register(1);
         (app, h, rx)
+    }
+
+    /// A switchable fixture follows the production spawn path, retaining its launch policy.
+    /// Test hubs have empty backend commands, so these tests cannot contact a provider.
+    fn spawn_launchable_test_agent(app: &mut App, name: &str, role: &str) -> AgentId {
+        let id = crate::app::spawn_agent(&mut app.hub, &mut app.agents, &app.registry, crate::app::AgentOpts {
+            name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(),
+            model_alias: "sol".into(), effort: Some("medium".into()), cwd: std::path::PathBuf::from("."),
+            approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture task".into(),
+            tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
+            context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
+        });
+        app.agents.get_mut(&id).unwrap().status = crate::agent::Status::Idle;
+        id
     }
 
     fn reply(h: &mut crate::web::ConnHandle) -> ServerMsg {
@@ -876,8 +883,8 @@ mod tests {
     /// finished workers included, so a done card read the role's new model although its attempt
     /// ran on another one. An attempt that is over keeps the alias it ran with; only agents that
     /// will run again are switched, and the role itself takes the new model for the next spawn.
-    #[test]
-    fn set_role_model_leaves_finished_attempts_on_the_model_they_ran_with() {
+    #[tokio::test]
+    async fn set_role_model_leaves_finished_attempts_on_the_model_they_ran_with() {
         with_mantra_home(|| {
             let (mut app, mut h, _rx) = wired();
             let mut pattern = Pattern::builtin();
@@ -886,12 +893,9 @@ mod tests {
             app.pattern_name = pattern.name.clone();
             let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern.clone(), "goal".into());
             let worker = |id: &str, agent: AgentId, state: WState| crate::web::snapshot::tests::worker(id, 1, Some(agent), state);
+            assert_eq!(app.hub.alloc_id(), 1, "reserve wired's synthetic Solo id");
             for (id, name) in [(2, "p1-done"), (3, "p1-live"), (4, "p1-old")] {
-                add_agent(&mut app, id, name);
-                let a = app.agents.get_mut(&id).unwrap();
-                a.role = "worker-small".into();
-                a.model_alias = "sol".into();
-                a.backend = crate::config::ProviderKind::Bija; // where the default models run
+                assert_eq!(spawn_launchable_test_agent(&mut app, name, "worker-small"), id);
             }
             app.agents.get_mut(&4).unwrap().status = crate::agent::Status::Stopped;
             run_.workers.push(worker("p1-done", 2, WState::Done));
@@ -910,8 +914,8 @@ mod tests {
 
     /// Changing the model of the role that halted the run applies the change but never resumes
     /// the run behind the user's back — they resume it themselves, and the toast says how.
-    #[test]
-    fn set_role_model_on_a_halted_run_applies_the_change_and_leaves_it_halted() {
+    #[tokio::test]
+    async fn set_role_model_on_a_halted_run_applies_the_change_and_leaves_it_halted() {
         with_mantra_home(|| {
             let (mut app, mut h, _rx) = wired();
             let mut pattern = Pattern::builtin();
@@ -919,10 +923,8 @@ mod tests {
             pattern.save().unwrap();
             app.pattern_name = pattern.name.clone();
             let mut run_ = crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern.clone(), "goal".into());
-            let planner: AgentId = 2;
-            add_agent(&mut app, planner, "planner");
-            app.agents.get_mut(&planner).unwrap().role = "planner".into();
-            app.agents.get_mut(&planner).unwrap().backend = crate::config::ProviderKind::Bija; // where the default models run
+            assert_eq!(app.hub.alloc_id(), 1, "reserve wired's synthetic Solo id");
+            let planner = spawn_launchable_test_agent(&mut app, "planner", "planner");
             run_.planner = Some(planner);
             let msg = "planner (astra via zai): Unexpected message role.".to_string();
             run_.halt = Some(crate::engine::run::Halt { reason: crate::engine::run::HaltReason::ProviderRejected, agent: Some(planner), message: msg.clone(), full: msg, since: Instant::now() });

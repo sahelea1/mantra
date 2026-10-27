@@ -630,7 +630,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let new_role = app.edit.as_ref().filter(|e| e.target == EditTarget::NewRole);
     let mut cursor = None;
     // list: the selected entry is the band while the list has the focus, bold and accent always
-    let lblk = block("roles", if flash > 0.0 { theme::SAFFRON } else if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT });
+    let lblk = block(if app.studio.focus == 0 { "roles · FOCUSED" } else { "roles" }, if flash > 0.0 { theme::SAFFRON } else if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT });
     let linner = lblk.inner(cols[0]);
     f.render_widget(lblk, cols[0]);
     let mut l = vec![];
@@ -675,7 +675,8 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let fs = fields(app, &entry);
     let fsel = app.studio.field.min(fs.len().saturating_sub(1));
     let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
-    let fblk = block(&entry, fcol);
+    let field_title = if app.studio.focus == 1 { format!("{entry} · FOCUSED") } else { entry.clone() };
+    let fblk = block(&field_title, fcol);
     let finner = fblk.inner(cols[1]);
     f.render_widget(fblk, cols[1]);
     // name column as wide as the longest name (settings has a 25-char one); the value column gets
@@ -855,7 +856,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
 
     // architect
     let acol = if app.studio.focus == 2 { theme::SAFFRON } else { theme::FAINT };
-    let blk = block(&format!("{} architect — describe a change, it edits the pattern live", theme::g("★", "*")), acol);
+    let blk = block(&format!("{} architect{} — describe a change, it edits the pattern live", theme::g("★", "*"), if app.studio.focus == 2 { " · FOCUSED" } else { "" }), acol);
     let inner = blk.inner(rows[2]);
     f.render_widget(blk, rows[2]);
     let mut al: Vec<Line> = vec![];
@@ -943,7 +944,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
-        "context_cap" => "Tokens of context every agent is told it has, whatever its model's window (the smaller of the two): a huge window lets an agent cycle tools for hours. 0 = the model's full window; 200k is the built-in default.",
+        "context_cap" => "Run context ceiling: each agent keeps its model's configured window up to this cap. A smaller model window stays smaller. 0 = the model's full window; 200k is the built-in default.",
         _ => return None,
     })
 }
@@ -1266,6 +1267,20 @@ mod tests {
             assert_eq!(get_value(&app, "worker-big", "swarm"), "on");
             assert!(field_hint("swarm").is_some());
         });
+    }
+
+    #[test]
+    fn each_studio_pane_names_its_keyboard_focus() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        for (focus, title) in [(0, "roles · FOCUSED"), (1, "· FOCUSED"), (2, "architect · FOCUSED")] {
+            app.studio.focus = focus;
+            term.draw(|f| draw_studio(f, &mut app)).unwrap();
+            let b = term.backend().buffer();
+            let screen: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+            assert!(screen.contains(title), "focus {focus}: {screen}");
+            assert_eq!(screen.matches("FOCUSED").count(), 1, "exactly one pane owns keyboard focus");
+        }
     }
 
     /// The pattern's name is the first field of its settings: a new name saves a copy under it

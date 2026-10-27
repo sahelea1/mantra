@@ -10,7 +10,8 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
     let area = f.area();
     let id = zoom.or(app.solo);
     let approval = app.approval_for(id);
-    let chip_h = super::queue_chip_height(app, id);
+    let recipient = app.composer_agent();
+    let chip_h = super::queue_chip_height(app, recipient);
     let min_approval = if approval.is_some() { 3 } else { 0 };
     let input_room = area.height.saturating_sub(1 + 3 + chip_h + min_approval + 1).max(3);
     let in_h = input_height(app, area.width).min(input_room);
@@ -86,11 +87,12 @@ pub fn draw(f: &mut Frame, app: &mut App, zoom: Option<AgentId>) {
         let name = app.agents.get(&app.approvals[i].agent).map(|a| a.name.clone()).unwrap_or_default();
         draw_approval(f, rows[2], &app.approvals[i], &name);
     }
-    super::draw_queue_chip(f, rows[3], app, id);
+    super::draw_queue_chip(f, rows[3], app, recipient);
 
     // input
     let busy = id.and_then(|a| app.agents.get(&a)).map(producing).unwrap_or(false);
     let placeholder = match (zoom, id.and_then(|a| app.agents.get(&a))) {
+        (Some(a), _) if app.in_run(a) => "message the planner…  (⏎ queue · ctrl+f send now · esc overview)".to_string(),
         (Some(_), Some(a)) if busy => format!("message {} {} …  (⏎ queue · ctrl+f send now · esc overview)", theme::role_glyph(&a.glyph), a.role),
         (Some(_), _) => "message this agent…  (esc back to overview)".to_string(),
         (None, _) if busy => "type to queue for the running turn…".to_string(),

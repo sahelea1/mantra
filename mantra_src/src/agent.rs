@@ -145,6 +145,8 @@ pub fn looks_like_broken_sandbox(text: &str) -> bool {
 
 pub struct Agent {
     pub id: AgentId,
+    /// Original launch policy, retained to rebuild another backend without losing tools or scope.
+    pub launch_options: Option<Box<crate::app::AgentOpts>>,
     pub name: String,
     pub role: String,
     pub glyph: String,
@@ -213,6 +215,8 @@ pub struct Agent {
     /// a plain restart): the hub holds and replays any turn sent meanwhile, so the next `Ready`
     /// must not also send a "continue where you left off" note. Cleared on `Ready`.
     pub relaunching: bool,
+    /// Ignore queued notifications from the incompatible process until its replacement is ready.
+    pub switching_backend: bool,
     pub created: Instant,
     pub finished: Option<Instant>,
     pub scroll: usize,
@@ -229,6 +233,7 @@ impl Agent {
     pub fn new(id: AgentId, name: &str, role: &str, cwd: PathBuf) -> Agent {
         Agent {
             id,
+            launch_options: None,
             name: name.to_string(),
             role: role.to_string(),
             glyph: "●".into(),
@@ -269,6 +274,7 @@ impl Agent {
             queued: vec![],
             stopped_by_user: false,
             relaunching: false,
+            switching_backend: false,
             created: Instant::now(),
             finished: None,
             scroll: 0,
@@ -326,6 +332,41 @@ impl Agent {
     pub fn plan_progress(&self) -> (usize, usize) {
         let done = self.plan.iter().filter(|(_, s)| s == "completed").count();
         (done, self.plan.len())
+    }
+
+    /// Close partial output owned by the replaced process; the transcript remains readable
+    /// and its tools cannot continue spinning after a fresh backend starts.
+    pub fn abandon_backend_turn(&mut self) {
+        for item in &mut self.items {
+            if item.done { continue; }
+            match &mut item.kind {
+                Kind::Command { status, .. } | Kind::Files { status, .. } | Kind::Tool { status, .. } => *status = "interrupted".into(),
+                _ => {}
+            }
+            item.done = true;
+            item.touch();
+        }
+        self.final_message = None;
+        self.retry_note = None;
+    }
+
+    /// Bounded plain-text context for a fresh thread on an incompatible provider/backend.
+    /// Keep the original task as well as recent work; backend session identifiers never cross.
+    pub fn handoff_context(&self) -> String {
+        let task = self.items.iter().find(|i| matches!(i.kind, Kind::User)).map(|i| crate::util::trunc(&i.text, 6000)).unwrap_or_default();
+        let mut recent = Vec::new();
+        let mut budget = 18000usize;
+        for item in self.items.iter().rev() {
+            let role = match item.kind { Kind::User => "User", Kind::Agent => "Assistant", Kind::Plan => "Plan", _ => continue };
+            if item.text.trim().is_empty() || budget == 0 { continue; }
+            let text = crate::util::trunc(&item.text, budget.min(6000));
+            budget = budget.saturating_sub(text.len());
+            recent.push(format!("{role}: {text}"));
+        }
+        recent.reverse();
+        let plan = self.plan.iter().take(40).map(|(step, status)| format!("- [{status}] {}", crate::util::trunc(step, 300))).collect::<Vec<_>>().join("\n");
+        let files = self.files.keys().take(80).cloned().collect::<Vec<_>>().join(", ");
+        format!("[mantra:backend-handoff] You are the same logical agent ({}, role {}). Your backend changed and this is a fresh session. Preserve the task, decisions and completed work below; inspect the existing workspace before repeating work.\nOriginal task: {task}\nCurrent plan:\n{plan}\nFiles changed: {files}\nRecent conversation:\n{}", self.name, self.role, recent.join("\n\n"))
     }
 
     pub fn push_user(&mut self, text: &str) {
@@ -901,11 +942,17 @@ impl Agent {
     /// the agent last did or the last real notice, not that Codex could not write its own logs.
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
         let mut out = vec![];
-        for it in self.items.iter().rev() {
+        for (i, it) in self.items.iter().enumerate().rev() {
             if out.len() >= n {
                 break;
             }
             if it.id.starts_with(FOOTNOTE) {
+                continue;
+            }
+            // Keep the error in the transcript, but a new healthy turn must not keep the
+            // previous failure on its card when it finishes without visible assistant text.
+            if i < self.turn_first_item && matches!(it.kind, Kind::Notice { level: Level::Error })
+                && !matches!(self.status, Status::Failed(_) | Status::Crashed(_)) {
                 continue;
             }
             let line = match &it.kind {
@@ -1083,11 +1130,25 @@ fn transport_text(m: &str) -> bool {
 /// Codex's own classification wins; otherwise the text decides, except for errors that are
 /// plainly something else (credentials, quota, a full context, a rejected effort).
 pub fn is_transport_error(kind: Option<ErrKind>, msg: &str) -> bool {
+    if is_usage_limit_error(kind, msg) {
+        return false;
+    }
     match kind {
         Some(ErrKind::Transient) => true,
         Some(ErrKind::Auth | ErrKind::UsageLimit | ErrKind::ContextFull) => false,
         _ => !rejects_effort(msg) && transport_text(&msg.to_lowercase()),
     }
+}
+
+/// Billing and capacity failures may arrive as a generic bad request or rate-limit error.
+/// Match complete status tokens so token counts and request ids do not look like HTTP errors.
+pub fn is_usage_limit_error(kind: Option<ErrKind>, msg: &str) -> bool {
+    if kind == Some(ErrKind::UsageLimit) {
+        return true;
+    }
+    let m = msg.to_lowercase();
+    let status = m.split(|c: char| !c.is_ascii_alphanumeric()).any(|s| matches!(s, "402" | "429"));
+    status || ["insufficient_quota", "insufficient quota", "quota exceeded", "quota exhausted", "exceeded your current quota", "usage limit", "usage_limit", "insufficient credits", "requires more credits", "out of credits", "credit balance is too low", "payment required", "rate limit exceeded", "rate limit reached", "rate_limit_exceeded", "resource_exhausted", "resource exhausted", "session budget exceeded"].iter().any(|s| m.contains(s))
 }
 
 fn rejects_effort(msg: &str) -> bool {
@@ -1123,13 +1184,16 @@ pub fn nearest_effort(want: &str, allowed: &[String]) -> Option<String> {
 
 /// Use the message when Codex doesn't classify the error (e.g. HTTP 401/403 from a proxy).
 pub fn refine(k: ErrKind, msg: &str) -> ErrKind {
+    if is_usage_limit_error(Some(k), msg) {
+        return ErrKind::UsageLimit;
+    }
     if k != ErrKind::Other {
         return k;
     }
     let m = msg.to_lowercase();
     if m.contains("401") || m.contains("403") || m.contains("forbidden") || m.contains("unauthorized") || m.contains("api key") {
         ErrKind::Auth
-    } else if m.contains("429") || transport_text(&m) {
+    } else if transport_text(&m) {
         ErrKind::Transient
     } else if m.contains("400") || m.contains("422") || m.contains("unexpected message role") || m.contains("unsupported") || m.contains("invalid_request_error") {
         ErrKind::ProviderRejected
@@ -1409,6 +1473,39 @@ mod tests {
         assert!(!is_transport_error(Some(ErrKind::Auth), "401 upstream"));
         assert!(!is_transport_error(None, "unexpected status 400: reasoning_effort must be low, high"));
         assert!(!is_transport_error(None, "Unexpected message role."));
+    }
+
+    #[test]
+    fn successful_fresh_turn_clears_stale_failure_from_status_and_card() {
+        let mut a = Agent::new(1, "planner", "planner", PathBuf::from("."));
+        a.apply("turn/started", &json!({}));
+        a.apply("turn/completed", &json!({"turn":{"status":"failed","error":{"message":"old provider failure"}}}));
+        assert!(a.tail_lines(1).iter().any(|line| line.contains("old provider failure")));
+        a.retry_note = Some("old retry".into());
+        a.apply("turn/started", &json!({}));
+        a.apply("turn/completed", &json!({"turn":{"status":"completed"}}));
+        assert_eq!(a.status, Status::Idle);
+        assert!(a.retry_note.is_none());
+        assert!(!a.tail_lines(3).iter().any(|line| line.contains("old provider failure")));
+        assert!(a.items.iter().any(|item| item.text.contains("old provider failure")), "the historical transcript remains intact");
+    }
+
+    #[test]
+    fn billing_and_quota_failures_override_transient_classification() {
+        for msg in [
+            "HTTP 402: Insufficient credits. Add more credits",
+            "unexpected status 429: insufficient_quota",
+            "You’ve hit your usage limit. Try again later",
+            "quota exhausted",
+            "This request requires more credits, or fewer max_tokens",
+        ] {
+            assert_eq!(refine(ErrKind::Other, msg), ErrKind::UsageLimit, "{msg}");
+            assert_eq!(refine(ErrKind::Transient, msg), ErrKind::UsageLimit, "{msg}");
+            assert!(!is_transport_error(Some(ErrKind::Transient), msg), "{msg}");
+        }
+        for msg in ["used 1402 tokens", "request req429abc failed", "HTTP 503 Service Unavailable", "context window exceeded"] {
+            assert!(!is_usage_limit_error(None, msg), "{msg}");
+        }
     }
 
     #[test]

@@ -206,6 +206,12 @@ fn scopes_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
+    // A recursive directory claim includes every more-specific rooted glob beneath it,
+    // e.g. src/** and src/auth/**. Comparing only equal roots missed this overlap.
+    let below = |parent: &str, child: &str| child == parent || child.strip_prefix(parent).is_some_and(|rest| rest.starts_with('/'));
+    if a == "**" || b == "**" || a.strip_suffix("/**").is_some_and(|parent| below(parent, &rb)) || b.strip_suffix("/**").is_some_and(|parent| below(parent, &ra)) {
+        return true;
+    }
     // a concrete file claimed by both, or one glob fully inside the other's concrete root
     let a_concrete = !a.contains('*');
     let b_concrete = !b.contains('*');
@@ -300,6 +306,18 @@ mod tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn recursive_directory_globs_conflict_with_nested_globs() {
+        assert!(scopes_overlap("src/**", "src/auth/**"));
+        assert!(scopes_overlap("src/auth/**", "src/**"));
+        assert!(scopes_overlap("**", "src/auth/**"));
+        assert!(!scopes_overlap("src/**", "src2/auth/**"));
+        assert!(!scopes_overlap("src/auth/**", "src/orders/**"));
+        let mut plan = sample();
+        plan.phases[0].tasks[0].scope = vec!["src/**".into()];
+        assert!(plan.validate(&Pattern::builtin()).is_err());
+    }
+
     #[test]
     fn validates() {
         let p = Pattern::builtin();

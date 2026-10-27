@@ -237,7 +237,13 @@ impl Mock {
 }
 
 async fn planner_turn(m: &mut Mock, text: &str) {
-    if text.contains("[mantra:plan]") {
+    if let Some((who, message)) = crate::mock::mock_user_answer(text) {
+        let _ = m.tool_use("mantra_prompt", json!({"agent": who, "message": message})).await;
+        m.say("The user decided; the answer has been passed to the supervisor who asked.").await;
+    } else if text.contains("[mantra:auto]") {
+        let (_, result) = m.tool_use("mantra_revise_pattern", crate::mock::mock_auto_pattern(text)).await;
+        m.say(crate::mock::mock_pattern_said(&result)).await;
+    } else if crate::mock::mock_planning_prompt(text) {
         let swarm = crate::mock::wants_swarm(text);
         let (_, r) = m.tool_use("mantra_submit_plan", crate::mock::mock_plan(true, swarm)).await;
         if r.starts_with("REJECTED") {
@@ -260,7 +266,10 @@ async fn planner_turn(m: &mut Mock, text: &str) {
 }
 
 async fn orchestrator_turn(m: &mut Mock, text: &str) {
-    if text.contains("[mantra:phase]") {
+    if let Some(message) = crate::mock::mock_relayed_user_decision(text) {
+        let _ = m.tool_use("mantra_prompt", json!({"agent": "p2-api", "message": message})).await;
+        let _ = m.tool_use("mantra_wait", json!({})).await;
+    } else if text.contains("[mantra:phase]") {
         let json_block = text.split("```json").nth(1).and_then(|s| s.split("```").next()).unwrap_or("{}");
         let phase: Value = serde_json::from_str(json_block).unwrap_or_else(|_| json!({}));
         let ids: Vec<String> = phase.get("tasks").and_then(|t| t.as_array()).map(|a| a.iter().filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect()).unwrap_or_default();
@@ -412,6 +421,21 @@ done
             Out::Captured(all) => all,
             Out::Stdout(_) => &[],
         }
+    }
+
+    #[tokio::test]
+    async fn claude_auto_bootstrap_proposes_a_workflow_before_any_plan() {
+        let cwd = scratch();
+        let mut m = mock(vec![], cwd.clone());
+        planner_turn(&mut m, "[mantra:auto]\nConfigured model aliases: claude-only. Use only these when the list is supplied.").await;
+        let calls: Vec<&Value> = captured(&m).iter().filter_map(|v| v.pointer("/message/content/0"))
+            .filter(|v| v["type"] == "tool_use").collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "mcp__mantra__mantra_revise_pattern");
+        let pattern = crate::engine::pattern::Pattern::from_toml(calls[0]["input"]["toml"].as_str().unwrap()).unwrap();
+        assert!(pattern.roles.values().all(|r| r.model == "claude-only"));
+        assert!(!pattern.is_auto());
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// The first content block of every event that has one.

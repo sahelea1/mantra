@@ -16,6 +16,7 @@ mod provider_key;
 mod rpc;
 mod settings_ops;
 mod ui;
+mod update;
 mod util;
 mod web;
 
@@ -50,10 +51,8 @@ use tokio::sync::mpsc;
 
 const HELP: &str = "mantra — one terminal for coding agents on configured Bija, Codex or Claude Code models
 
-  Solo and every built-in pattern start on `sol` and its siblings through the OpenAI API (the key
-  in $OPENAI_API_KEY, or pasted in /models). /models adds any other provider from just its API key
-  — Mantra finds the API and lists its models — a local server with no key at all, and Codex or
-  Claude Code as extra backends.
+  Add your provider and model in /models, or use Codex or Claude Code as a backend.
+  Solo uses your default model; Mandala coordinates agents through a pattern or Auto.
 
 USAGE
   mantra [--cwd DIR] [--demo]           open the TUI (Solo mode)
@@ -64,6 +63,7 @@ USAGE
                                          refused while another Mantra has it open, unless --take-over
   mantra runs delete <id> [--yes]        remove a run: its branches, worktrees and journal
   mantra doctor                          check bija, the providers, the optional backends, the terminal
+  mantra update                          install the latest mantra + bija release
   mantra experimental                    list experimental features, on or off
   mantra experimental enable|disable <name>   switch one in settings.toml (akasha: shared notes
                                          for agent groups)
@@ -241,6 +241,10 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>> {
             },
             "doctor" if command => {
                 doctor();
+                return Ok(None);
+            }
+            "update" if command => {
+                update::run(&args[i + 1..]).map_err(anyhow::Error::msg)?;
                 return Ok(None);
             }
             other if bare.is_none() && (!command || !other.starts_with('-')) => bare = Some(other.to_string()),
@@ -1486,9 +1490,10 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
     let key_src = if key.is_some() { key_src } else { "no key".to_string() };
     // `GET /models` on a thread with a hard cap: curl's own limit is longer than PROBE_TIMEOUT.
     let (base, model, header, sent) = (p.base_url.clone(), m.model.clone(), discover::key_header(p), key.is_some());
+    let headers = p.headers.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(discover::list_models(&base, key.as_deref(), header));
+        let _ = tx.send(discover::list_models_with_headers(&base, key.as_deref(), header, &headers));
     });
     let host = p.base_url.trim().trim_end_matches('/').to_string();
     match rx.recv_timeout(PROBE_TIMEOUT) {

@@ -141,19 +141,20 @@ pub fn provider_at<'a>(reg: &'a Registry, base_url: &str) -> Option<&'a Provider
 /// Puts the draft in the registry and returns the provider's id: the key goes into the Bija
 /// provider already at that URL (replacing any `env_key`: a pasted key is the user's say), else a
 /// new Bija provider under a unique id with the key stored in `api_key` — never in `env_key`, and
-/// `Registry::save` writes models.toml 0600 for it. A draft with no usable URL is refused.
+/// `Registry::save` writes it to owner-only secrets.toml. A draft with no usable URL is refused.
 pub fn add_provider(reg: &mut Registry, draft: &ProviderDraft) -> Result<String, String> {
     if draft.needs_url() {
         return Err("give the API's base URL — this key's prefix names no provider".into());
     }
     let key = Some(draft.key.trim().to_string()).filter(|k| !k.is_empty());
     let wire = if draft.wire == WIRE_ANTHROPIC { WIRE_ANTHROPIC.to_string() } else { String::new() };
-    let entry = ProviderEntry { id: String::new(), name: draft.name.clone(), base_url: draft.base_url.trim().to_string(), api_key: key.clone(), kind: ProviderKind::Bija, wire, ..Default::default() };
+    let entry = ProviderEntry { id: String::new(), name: draft.name.clone(), base_url: draft.base_url.trim().to_string(), api_key: key.clone(), kind: ProviderKind::Bija, wire: wire.clone(), ..Default::default() };
     if let Some(why) = entry.url_problem() {
         return Err(why);
     }
     let existing = provider_at(reg, &entry.base_url).map(|p| p.id.clone());
     if let Some(p) = existing.as_ref().and_then(|id| reg.providers.iter_mut().find(|p| p.id == *id)) {
+        p.wire = wire;
         if key.is_some() {
             p.api_key = key;
             p.env_key = String::new();
@@ -173,7 +174,7 @@ pub fn probe(p: &ProviderEntry) -> Result<Vec<Found>, String> {
     if let Some(why) = p.url_problem().or_else(|| p.wire_problem()) {
         return Err(why);
     }
-    crate::discover::list_models(&p.base_url, p.resolve_key().as_deref(), crate::discover::key_header(p)).map_err(|e| probe_error(&e))
+    crate::discover::list_models_with_headers(&p.base_url, p.resolve_key().as_deref(), crate::discover::key_header(p), &p.headers).map_err(|e| probe_error(&e))
 }
 
 fn probe_error(e: &str) -> String {
@@ -354,6 +355,9 @@ mod tests {
         // Messages API: the wire is written; a URL that cannot be used is refused, nothing added
         let ant = add_provider(&mut bare, &provider_from_key("sk-ant-k", None)).unwrap();
         assert_eq!(bare.providers.iter().find(|p| p.id == ant).unwrap().wire, "anthropic");
+        bare.providers.iter_mut().find(|p| p.id == ant).unwrap().wire.clear();
+        assert_eq!(add_provider(&mut bare, &provider_from_key("sk-ant-next", None)).unwrap(), ant);
+        assert_eq!(bare.providers.iter().find(|p| p.id == ant).unwrap().wire, "anthropic", "re-pasting a key repairs a previously wrong wire");
         let n = bare.providers.len();
         assert!(add_provider(&mut bare, &provider_from_key("ip_x", None)).unwrap_err().contains("base URL"));
         assert!(add_provider(&mut bare, &provider_from_key("ip_x", Some("https://example.com/v1"))).unwrap_err().contains("placeholder"));

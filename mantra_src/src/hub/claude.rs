@@ -128,6 +128,16 @@ pub(super) async fn run_claude_process(
     let mut bridge_write: Option<OwnedWriteHalf> = None;
     let mut bridge_rx: Option<mpsc::UnboundedReceiver<LineIn>> = None;
 
+    // Claude may wait for its first user line before system/init, including on --resume.
+    // Text already owned by the hub must bootstrap that launch instead of waiting for Ready.
+    let mut submitted_before_ready = !replay.is_empty();
+    for text in replay.drain(..) {
+        *last_turn = Some(text.clone());
+        if write_line(&mut stdin, &user_line(&text)).await.is_err() {
+            let _ = ev.send(stdin_lost(id, "claude", text));
+        }
+    }
+
     loop {
         tokio::select! {
             c = cmds.recv() => {
@@ -150,12 +160,14 @@ pub(super) async fn run_claude_process(
                         return Exit::Shutdown;
                     }
                     Cmd::Turn { text } => {
+                        submitted_before_ready |= !ready;
                         *last_turn = Some(text.clone());
                         if write_line(&mut stdin, &user_line(&text)).await.is_err() {
                             let _ = ev.send(stdin_lost(id, "claude", text));
                         }
                     }
                     Cmd::Steer { text } => {
+                        submitted_before_ready |= !ready;
                         // Claude does its own queueing: a line written mid-turn is injected at the
                         // next tool boundary (verified, §10.1) — Turn and Steer are the same wire op.
                         // Steer only ever adds to an already-open turn, so fold it into `last_turn`
@@ -203,6 +215,10 @@ pub(super) async fn run_claude_process(
                     Cmd::SetVision(_) => {}
                     Cmd::SetApproval(_) => {
                         let _ = ev.send(super::unsupported_approval(id, "Claude Code"));
+                    }
+                    Cmd::Reconfigure { spec, command, resume_text } => {
+                        stop_child(&mut stdin, &mut child).await;
+                        return Exit::Reconfigure { spec, command, resume_text };
                     }
                     Cmd::Restart => {
                         stop_child(&mut stdin, &mut child).await;
@@ -265,9 +281,14 @@ pub(super) async fn run_claude_process(
             l = line_rx.recv() => {
                 match l {
                     Some(LineIn::Line(v)) => {
-                        for e in tr.on_line(&v, is_restart) {
+                        for mut e in tr.on_line(&v, is_restart) {
                             // As in every backend, `replay` is drained right after `Ready` is sent.
                             let is_ready = matches!(e, HubEvent::Ready { .. });
+                            if let HubEvent::Ready { resumed, .. } = &mut e {
+                                // Already supplied the real prompt: the engine must not send a
+                                // second resume nudge just because init follows the first input.
+                                if submitted_before_ready { *resumed = false; }
+                            }
                             if let HubEvent::Ready { thread_id, .. } = &e {
                                 *session_id = Some(thread_id.clone());
                                 ready = true;
@@ -550,10 +571,9 @@ struct Translator {
     open_tools: HashMap<String, ToolOpen>,
     /// The context window Mantra configured for this agent (passed as `--autocompact`).
     autocompact: u64,
-    /// Prefer the window the CLI reports (`autocompact_state.value.effective_window` at spawn,
-    /// then `result.modelUsage.*.contextWindow`) over `autocompact` for the gauge. True for a
-    /// subscription login — the CLI knows what the plan really grants — and false for a custom
-    /// `api_key` gateway, whose real window only the user's config knows.
+    /// On a subscription login, the CLI's reported account window can lower the configured
+    /// ceiling (`autocompact_state` at spawn, then `result.modelUsage.*.contextWindow`). A custom
+    /// `api_key` gateway prefers the user's configuration and uses reports only as a fallback.
     trust_reported_window: bool,
     /// The window the CLI last reported: `autocompact_state` seconds after spawn, then whatever a
     /// `result` line says (last writer wins — both are the CLI's own account-aware answer, and the
@@ -625,10 +645,11 @@ impl Translator {
     /// The window the gauge and the compaction threshold are measured against.
     fn window(&self) -> Option<u64> {
         let configured = Some(self.autocompact).filter(|w| *w > 0);
+        let reported = self.reported_window.filter(|w| *w > 0);
         if self.trust_reported_window {
-            self.reported_window.or(configured)
+            configured.into_iter().chain(reported).min()
         } else {
-            configured.or(self.reported_window)
+            configured.or(reported)
         }
     }
 
@@ -763,9 +784,8 @@ impl Translator {
         // `Agent` field, which this change deliberately doesn't add.
         let threshold = v.pointer("/value/threshold").and_then(as_u64).unwrap_or(0);
         let before = self.window();
-        // Just a much earlier and better *reported* window — the precedence rule in `window()` is
-        // untouched, so a subscription login takes this over `--autocompact` while an `api_key`
-        // gateway (whose real window only the user's config knows) still keeps the configured one.
+        // A subscription report can lower the configured ceiling but never inflate it. An
+        // api_key gateway keeps its configured window and uses the report only as a fallback.
         self.reported_window = Some(w);
         let (agent, after) = (self.agent, self.window());
         crate::mlog!("claude {agent}: autocompact_state window={w} threshold={threshold}, gauge uses {}", after.unwrap_or(0));
@@ -1042,6 +1062,69 @@ mod tests {
     use super::*;
     use crate::agent::{Agent, Kind, Signal};
 
+    /// The stream CLI may produce init only after its first input. A held prompt must
+    /// bootstrap a resumed planner, and a second prompt must still start a real turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_planner_bootstraps_held_input_and_accepts_later_prompts() {
+        let spec = SpawnSpec {
+            cwd: std::env::temp_dir(), model: "planner".into(), provider: "cc".into(),
+            effort: "low".into(), approval: "never".into(), sandbox: "read-only".into(),
+            developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
+            extra_args: vec![], resume_thread: Some("saved-planner".into()), thread_name: None,
+            backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
+            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+                autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
+            bija: None, mcp: vec![],
+        };
+        let script = r#"case "$*" in *'--resume saved-planner'*) ;; *) exit 4;; esac
+first=true
+while IFS= read -r line; do
+  if $first; then
+    printf '{"type":"system","subtype":"init","session_id":"saved-planner","model":"planner"}\n'
+    first=false
+  fi
+  printf '{"type":"assistant","message":{"id":"m-%s","content":[{"type":"text","text":"accepted"}]}}\n' "$RANDOM"
+  printf '{"type":"result","subtype":"success","num_turns":1,"duration_api_ms":5,"is_error":false,"result":"accepted"}\n'
+done"#;
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (tx, mut cmds) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut session = Some("saved-planner".to_string());
+            let mut effort = "low".to_string();
+            let mut model = "planner".to_string();
+            let mut replay = vec!["Continue the saved plan".to_string()];
+            let mut last_turn = None;
+            run_claude_process(1, &spec, &["sh".into(), "-c".into(), script.into(), "fake".into()],
+                &ev, &mut cmds, &mut session, &mut effort, &mut model, &mut replay, &mut last_turn).await
+        });
+        let mut ready = 0;
+        for turn in 0..2 {
+            let mut started = false;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap() {
+                    HubEvent::Ready { resumed, thread_id, .. } => {
+                        ready += 1;
+                        assert!(!resumed, "the held prompt already continues this session");
+                        assert_eq!(thread_id, "saved-planner");
+                    }
+                    HubEvent::Notif { method, params, .. } if method == "turn/started" => { started = true; assert!(params.is_object()); }
+                    HubEvent::Notif { method, params, .. } if method == "turn/completed" => {
+                        assert!(started, "turn {turn} must start");
+                        assert_eq!(params["turn"]["status"], "completed");
+                        break;
+                    }
+                    HubEvent::Crashed { reason, .. } => panic!("{reason}"),
+                    _ => {}
+                }
+            }
+            if turn == 0 { tx.send(Cmd::Turn { text: "Revise the plan with this new requirement".into() }).unwrap(); }
+        }
+        assert_eq!(ready, 1);
+        tx.send(Cmd::Shutdown).unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap(), Exit::Shutdown));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn idle_model_and_effort_change_relaunches_once_with_queued_text_held() {
@@ -1297,7 +1380,7 @@ mod tests {
         assert_eq!(agent.tokens_total, 55_300 + 56_200);
         assert_eq!(agent.tokens_cached, 50_000 + 55_000, "cache reads add up like the total; cache writes are plain input");
         assert_eq!(agent.cached_share().as_deref(), Some("105.0k cached"), "most of the total was the cached prefix, and the label says so");
-        assert_eq!(agent.ctx_window, Some(1_000_000), "subscription auth trusts the window the CLI reports");
+        assert_eq!(agent.ctx_window, Some(200_000), "a subscription report cannot inflate the configured ceiling");
         assert!(!agent.turn_active);
     }
 
@@ -1366,8 +1449,8 @@ mod tests {
 
     /// `autocompact_state` arrives a second or two after spawn — long before the first `result`
     /// could report `modelUsage.*.contextWindow` — so taking the window from it is what makes the
-    /// gauge right from the very first turn instead of showing Mantra's configured guess. It is a
-    /// *reported* window, so the existing precedence still decides who wins.
+    /// gauge respect the account's smaller window from the very first turn while preserving
+    /// Mantra's configured ceiling when the account offers more.
     #[test]
     fn autocompact_state_gives_the_gauge_the_real_window_before_the_first_result() {
         let state = json!({"type": "autocompact_state", "value": {"enabled": true, "effective_window": 980_000, "threshold": 784_000, "enforced": true, "source": "model-default"}, "session_id": "s"});
@@ -1377,10 +1460,10 @@ mod tests {
         let mut tr = Translator::new(1, 200_000, true);
         let mut agent = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
         feed(&mut tr, &mut agent, std::slice::from_ref(&state));
-        assert_eq!(tr.window(), Some(980_000), "a subscription login trusts the window the CLI announced");
+        assert_eq!(tr.window(), Some(200_000), "a larger subscription window cannot override the configured ceiling");
         assert_eq!(agent.ctx_window, None, "no real counts exist yet — none may be invented just to carry the window");
         feed(&mut tr, &mut agent, std::slice::from_ref(&call));
-        assert_eq!(agent.ctx_window, Some(980_000), "the very first turn's gauge already knows the real window");
+        assert_eq!(agent.ctx_window, Some(200_000), "the very first turn already respects the configured ceiling");
         assert_eq!(agent.ctx_used, 5_100);
 
         // An `api_key` gateway's real window is only ever in the user's config; the CLI's
@@ -1395,15 +1478,15 @@ mod tests {
         // straight away, re-using the counts already on hand rather than making any up.
         let mut tr3 = Translator::new(1, 200_000, true);
         let mut agent3 = Agent::new(1, "t", "planner", std::path::PathBuf::from("/tmp/x"));
-        feed(&mut tr3, &mut agent3, &[call, state]);
-        assert_eq!(agent3.ctx_window, Some(980_000));
+        let smaller_state = json!({"type":"autocompact_state","value":{"effective_window":128_000,"threshold":102_400}});
+        feed(&mut tr3, &mut agent3, &[call, smaller_state]);
+        assert_eq!(agent3.ctx_window, Some(128_000), "a smaller account limit lowers the gauge immediately");
         assert_eq!(agent3.ctx_used, 5_100, "the re-emitted gauge must repeat the real counts, not reset them");
         assert_eq!(agent3.tokens_total, 5_100, "and must not double-count them either");
     }
 
-    /// The announced window holds for the rest of the session until the CLI reports a newer one of
-    /// its own in a `result` line: both are the CLI's account-aware answer, so `reported_window` is
-    /// last-writer-wins, and on a subscription login the configured guess never takes the gauge back.
+    /// Account reports are last-writer-wins, but both init-time and result-time reports remain
+    /// bounded by the configured ceiling. A missing report must preserve the previous limit.
     #[test]
     fn the_autocompact_window_holds_until_a_result_reports_its_own() {
         let mut tr = Translator::new(1, 200_000, true);
@@ -1411,18 +1494,41 @@ mod tests {
         let state = json!({"type": "autocompact_state", "value": {"effective_window": 980_000, "threshold": 784_000}, "session_id": "s"});
         let call = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 4000, "output_tokens": 100}, "content": [{"type": "text", "text": "hi"}]}});
         feed(&mut tr, &mut agent, &[state, call]);
-        assert_eq!(agent.ctx_window, Some(980_000));
+        assert_eq!(agent.ctx_window, Some(200_000));
 
-        // A turn that ends without a window of its own must not quietly fall back to --autocompact.
+        // A turn that ends without a window of its own must preserve the bounded window.
         let plain = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 1000, "output_tokens": 100}});
         feed(&mut tr, &mut agent, &[plain]);
-        assert_eq!(agent.ctx_window, Some(980_000), "a result carrying no modelUsage must not undo the announced window");
+        assert_eq!(agent.ctx_window, Some(200_000), "a result carrying no modelUsage must preserve the configured ceiling");
 
-        // The CLI naming a window for the model actually used is the newer answer, so it wins.
+        // A newer result report is still bounded by the configured ceiling.
         let result = json!({"type": "result", "is_error": false, "num_turns": 1, "usage": {"input_tokens": 2000, "output_tokens": 200}, "modelUsage": {"claude-sonnet-5": {"contextWindow": 1_000_000}}});
         feed(&mut tr, &mut agent, &[result]);
-        assert_eq!(tr.window(), Some(1_000_000));
-        assert_eq!(agent.ctx_window, Some(1_000_000));
+        assert_eq!(tr.window(), Some(200_000));
+        assert_eq!(agent.ctx_window, Some(200_000));
+
+        let smaller = json!({"type":"result","is_error":false,"num_turns":1,"usage":{"input_tokens":2000,"output_tokens":200},"modelUsage":{"claude-sonnet-5":{"contextWindow":128_000}}});
+        feed(&mut tr, &mut agent, &[smaller]);
+        assert_eq!(agent.ctx_window, Some(128_000), "a newer smaller model window remains authoritative");
+        let no_window = json!({"type":"result","is_error":false,"num_turns":1});
+        feed(&mut tr, &mut agent, &[no_window]);
+        assert_eq!(agent.ctx_window, Some(128_000), "a missing report preserves the previous smaller limit");
+    }
+
+    #[test]
+    fn context_window_fallbacks_preserve_unconfigured_and_gateway_behavior() {
+        for subscription in [true, false] {
+            let mut unconfigured = Translator::new(1, 0, subscription);
+            assert_eq!(unconfigured.window(), None);
+            unconfigured.reported_window = Some(980_000);
+            assert_eq!(unconfigured.window(), Some(980_000), "without a configured ceiling, use the report");
+            unconfigured.reported_window = Some(0);
+            assert_eq!(unconfigured.window(), None, "zero is not a usable window");
+            let mut configured = Translator::new(1, 200_000, subscription);
+            assert_eq!(configured.window(), Some(200_000), "without a report, use the configured window");
+            configured.reported_window = Some(128_000);
+            assert_eq!(configured.window(), Some(if subscription {128_000} else {200_000}));
+        }
     }
 
     /// `rate_limit_event` lands once per turn: silent while the plan's windows are healthy, and

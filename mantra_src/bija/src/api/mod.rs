@@ -42,15 +42,22 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 /// so this only guards against a provider that rejects everything.
 const MAX_ADAPTATIONS: u32 = 6;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
     pub base_url: String,
     pub wire: Wire,
     pub api_key: Option<String>,
+    pub headers: std::collections::BTreeMap<String, String>,
     pub max_retries: u32,
     pub timeout: Duration,
     pub stream: bool,
     pub user_agent: String,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig").field("base_url", &self.base_url).field("wire", &self.wire).field("api_key", &"[redacted]").field("headers", &"[redacted]").finish_non_exhaustive()
+    }
 }
 
 pub struct Client {
@@ -76,11 +83,14 @@ impl Client {
         let mut retries = 0;
         let mut adaptations = 0;
         loop {
-            let err = match self.attempt(req, on_delta).await {
+            let mut err = match self.attempt(req, on_delta).await {
                 Ok(resp) if !is_empty_completion(&resp) => return Ok(with_usage_estimate(resp, req)),
                 Ok(_) => ApiError::new(ErrorKind::Transient, "the provider returned an empty completion (no text, no tool calls, no usage)"),
                 Err(e) => e,
             };
+            for secret in self.cfg.api_key.iter().map(|s| s.trim()).chain(self.cfg.headers.values().map(|s| s.as_str())).filter(|s| !s.is_empty()) {
+                err.message = err.message.replace(secret, "[redacted]");
+            }
             if adaptations < MAX_ADAPTATIONS {
                 let adapted = match self.cfg.wire {
                     Wire::OpenaiChat => self.chat.adapt(&err),
@@ -117,7 +127,8 @@ impl Client {
             Wire::Anthropic => anthropic::body(req, self.cfg.stream, &mut self.messages),
         };
         let body = serde_json::to_vec(&body).map_err(|e| ApiError::internal(format!("cannot encode the request: {e}")))?;
-        let headers = self.headers()?;
+        let owned_headers = self.headers()?;
+        let headers: Vec<(&str, String)> = owned_headers.iter().map(|(name, value)| (name.as_str(), value.clone())).collect();
         let mut resp = self.http.send(&http::HttpRequest { method: "POST", url: &url, headers: &headers, body: &body, streaming: self.cfg.stream }).await?;
         // The request body can be the size of the whole context; it is not needed while streaming.
         drop(body);
@@ -164,21 +175,31 @@ impl Client {
         }
     }
 
-    fn headers(&self) -> Result<Vec<(&'static str, String)>, ApiError> {
+    fn headers(&self) -> Result<Vec<(String, String)>, ApiError> {
         let user_agent = if self.cfg.user_agent.trim().is_empty() { format!("bija/{}", env!("CARGO_PKG_VERSION")) } else { self.cfg.user_agent.clone() };
         let accept = if self.cfg.stream { "text/event-stream" } else { "application/json" };
-        let mut headers = vec![("User-Agent", user_agent), ("Content-Type", "application/json".to_string()), ("Accept", accept.to_string())];
+        let mut headers: Vec<(String, String)> = vec![("User-Agent".into(), user_agent), ("Content-Type".into(), "application/json".to_string()), ("Accept".into(), accept.to_string())];
         // A key read from a file often ends in a newline; anything else unprintable is a mistake.
         let key = self.cfg.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
         if key.is_some_and(|k| k.chars().any(char::is_control)) {
             return Err(ApiError::new(ErrorKind::Auth, "the API key contains control characters"));
         }
         match self.cfg.wire {
-            Wire::OpenaiChat => headers.extend(key.map(|k| ("Authorization", format!("Bearer {k}")))),
+            Wire::OpenaiChat => headers.extend(key.map(|k| ("Authorization".into(), format!("Bearer {k}")))),
             Wire::Anthropic => {
-                headers.extend(key.map(|k| ("x-api-key", k.to_string())));
-                headers.push(("anthropic-version", anthropic::API_VERSION.to_string()));
+                headers.extend(key.map(|k| ("x-api-key".into(), k.to_string())));
+                headers.push(("anthropic-version".into(), anthropic::API_VERSION.to_string()));
             }
+        }
+        for (name, value) in &self.cfg.headers {
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || value.chars().any(char::is_control) {
+                return Err(ApiError::new(ErrorKind::BadRequest, "a custom provider header has an invalid name or value"));
+            }
+            if ["host", "content-length", "transfer-encoding", "connection", "authorization", "x-api-key", "accept-encoding"].iter().any(|h| name.eq_ignore_ascii_case(h)) {
+                return Err(ApiError::new(ErrorKind::BadRequest, "custom provider headers cannot override authentication or HTTP framing"));
+            }
+            headers.retain(|(existing, _)| !name.eq_ignore_ascii_case(existing));
+            headers.push((name.clone(), value.clone()));
         }
         Ok(headers)
     }
@@ -616,10 +637,37 @@ mod tests {
     // ----------------------------------------------------------------- against a scripted server
 
     fn client(base: &str, wire: Wire, max_retries: u32) -> Client {
-        let mut c = Client::new(ClientConfig { base_url: base.into(), wire, api_key: Some("sk-test\n".into()), max_retries, timeout: Duration::from_secs(10), stream: true, user_agent: String::new() });
+        let mut c = Client::new(ClientConfig { base_url: base.into(), wire, api_key: Some("sk-test\n".into()), headers: Default::default(), max_retries, timeout: Duration::from_secs(10), stream: true, user_agent: String::new() });
         c.http.set_proxy(http::ProxyEnv::default());
         c.backoff_unit = Duration::from_millis(1);
         c
+    }
+
+    #[tokio::test]
+    async fn messages_request_carries_auth_version_and_custom_headers() {
+        let server = test_server::start(vec![Reply {
+            bytes: test_server::response(200, "", r#"{"id":"test","type":"message","role":"assistant","model":"m1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#),
+            after: After::Close,
+        }]).await;
+        let mut c = client(&server.url("/v1"), Wire::Anthropic, 0);
+        c.cfg.stream = false;
+        c.cfg.headers.insert("anthropic-beta".into(), "test-beta".into());
+        c.cfg.headers.insert("anthropic-workspace-id".into(), "wrkspc_test".into());
+        assert!(run(&mut c).await.result.is_ok());
+        let requests = server.requests.lock().unwrap();
+        let head = requests[0].to_ascii_lowercase();
+        assert!(head.starts_with("post /v1/messages "));
+        assert!(head.contains("x-api-key: sk-test\r\n"));
+        assert!(head.contains("anthropic-version: 2023-06-01\r\n"));
+        assert!(head.contains("anthropic-beta: test-beta\r\n"));
+        assert!(head.contains("anthropic-workspace-id: wrkspc_test\r\n"));
+        drop(requests);
+        c.cfg.headers.insert("x-api-key".into(), "forbidden-secret".into());
+        let err = c.headers().unwrap_err();
+        assert!(!err.message.contains("forbidden-secret"));
+        c.cfg.headers.remove("x-api-key");
+        c.cfg.headers.insert("anthropic-beta".into(), "secret\r\nx-evil: yes".into());
+        assert!(c.headers().is_err());
     }
 
     const HELLO: &[&str] = &[r#"data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}"#, r#"data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}"#, r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#, "data: [DONE]"];

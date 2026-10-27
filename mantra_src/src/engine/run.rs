@@ -340,6 +340,19 @@ pub struct Question {
     pub since: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PatternProposal {
+    pub pattern: Pattern,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlannerWait {
+    pub due_unix: u64,
+    pub condition: String,
+    pub on_reentry: String,
+}
+
 /// Per-agent watchdog progress: how far up the escalation ladder (WP7.2) this agent's *current*
 /// idle spell has gone, and the `last_event` we last saw from it (any new event resets the ladder
 /// back to the bottom — the plan text "cleared on any event from that agent").
@@ -478,6 +491,12 @@ pub struct Run {
     active_since: Option<u64>,
     /// The planner's open question to the user, if any.
     pub question: Option<Question>,
+    pub(super) pending_pattern: Option<PatternProposal>,
+    pub(super) planner_wait: Option<PlannerWait>,
+    /// Refresh after the current tool result and turn have completed.
+    planner_refresh_pending: bool,
+    /// Emergency stops are deliberate; late process events must not auto-restart them.
+    killed_agents: HashSet<AgentId>,
     /// Agents waiting on an answer from the rung above them (worker/gate/finale → orchestrator,
     /// orchestrator → planner), keyed by the asker. Cleared when the answer is delivered.
     pending_questions: HashMap<AgentId, String>,
@@ -628,6 +647,10 @@ impl Run {
             active_secs: 0,
             active_since: Some(crate::util::unix_secs()),
             question: None,
+            pending_pattern: None,
+            planner_wait: None,
+            planner_refresh_pending: false,
+            killed_agents: HashSet::new(),
             pending_questions: HashMap::new(),
             last_review: Instant::now(),
             last_verify_sig: None,
@@ -789,6 +812,8 @@ impl Run {
             stage: self.stage.clone(),
             halted: self.halt.as_ref().map(|h| h.full.clone()),
             pending: self.pending.clone(),
+            pending_pattern: self.pending_pattern.clone(),
+            planner_wait: self.planner_wait.clone(),
             started_unix: self.started_unix,
             finished_unix: self.finished_unix,
             active_secs: Some(self.elapsed().as_secs()),
@@ -873,6 +898,15 @@ impl Run {
         self.save_state();
     }
 
+    /// Persist the fresh-session boundary before replacing a backend. A crash between the
+    /// model change and its Ready event must never resume a foreign backend's session id.
+    pub fn forget_agent_session(&mut self, a: AgentId) {
+        if let Some(meta) = self.agent_meta.get_mut(&a) {
+            meta.thread_id = None;
+            self.save_state();
+        }
+    }
+
     /// The role as a spawn into `slot` should see it: with the model the user chose live for
     /// that slot, if any, in place of the role's (`set_agent_model`).
     fn role_for_slot(&self, slot: &str, role_name: &str) -> Role {
@@ -889,11 +923,11 @@ impl Run {
     /// through hours of tool cycling. An alias the registry does not know is capped as it is.
     fn context_for(&self, alias: &str, over: Option<u64>) -> Option<u64> {
         let cap = self.pattern.settings.context_cap;
-        if cap == 0 {
-            return over;
-        }
-        let window = over.or_else(|| self.known_models.get(alias).copied());
-        Some(window.map_or(cap, |w| w.min(cap)))
+        self.known_models.get(alias).copied().into_iter()
+            .chain(over)
+            .chain((cap > 0).then_some(cap))
+            .filter(|w| *w > 0)
+            .min()
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -1028,12 +1062,12 @@ impl Run {
         if self.halt.is_none() {
             return;
         }
-        self.halt = None;
+        let resolved = self.halt.take().unwrap();
         self.clock_start();
         self.escalation_open = false;
         self.manager_escalation = None;
         self.last_verify_sig = None;
-        self.alerts.clear();
+        self.alerts.retain(|alert| *alert != resolved.message);
         let paused = std::mem::take(&mut self.paused_agents);
         self.log("▶", "green", "run resumed");
         self.save_state();
@@ -1068,6 +1102,7 @@ impl Run {
                     }
                 }
                 PhaseStep::Fix { round } => self.resume_fix(ctx, idx, round),
+                PhaseStep::Handoff if !self.cleanup_done && resolved.message == format!("phase {} commit failed", idx + 1) => self.launch_phase_commit(ctx, idx),
                 _ => {}
             }
         }
@@ -1605,7 +1640,7 @@ Then summarize in 2-4 lines.",
         let mut v = vec![];
         // An agent waiting on an answer (from the rung above it, or — for the planner — from the
         // user) is idle on purpose; the rung above is the one expected to act.
-        let asking = |a: AgentId| self.pending_questions.contains_key(&a) || self.question.as_ref().map(|q| q.from == a).unwrap_or(false);
+        let asking = |a: AgentId| self.pending_questions.contains_key(&a) || self.question.as_ref().map(|q| q.from == a).unwrap_or(false) || (Some(a) == self.planner && (self.planner_wait.is_some() || self.pending_pattern.is_some()));
         match &self.stage {
             Stage::Planning => {
                 if let Some(p) = self.planner.filter(|p| !asking(*p)) {
@@ -1727,6 +1762,7 @@ Then summarize in 2-4 lines.",
 
     /// `resume`: a saved thread/session id to re-attach to (`mantra runs resume`).
     pub(super) fn spawn_planner_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
+        self.planner_refresh_pending = false;
         let name = self.pattern.flow.planner.clone();
         let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
@@ -1755,6 +1791,17 @@ Then summarize in 2-4 lines.",
     }
 
     pub(super) fn planning_prompt(&self) -> String {
+        if self.pattern.is_auto() {
+            let mut sample = Pattern::builtin_lean();
+            let preferred = self.pattern.roles.get(&self.pattern.flow.planner).map(|r| r.model.clone()).unwrap_or_else(|| "sol".into());
+            let mut available: Vec<_> = self.known_models.keys().cloned().collect();
+            available.sort();
+            let model = if self.known_models.is_empty() || self.known_models.contains_key(&preferred) { preferred } else { available[0].clone() };
+            for role in sample.roles.values_mut() {
+                if !self.known_models.is_empty() && !self.known_models.contains_key(&role.model) { role.model = model.clone(); }
+            }
+            return format!("[mantra:auto]\nUSER REQUEST:\n{}\n\nProject directory: {}\nAuto has no fixed workflow yet. Work with the user to choose a proportional topology and roles, then call mantra_revise_pattern with full valid TOML and your rationale. Wait for approval before planning work. Configured model aliases: {}. Use only these when the list is supplied. Here is a valid starting schema (adapt it, including its name, to the task):\n```toml\n{}\n```", self.brief, self.workspace_dir().display(), available.join(", "), sample.to_toml());
+        }
         let s = &self.pattern.settings;
         let workers = self.pattern.worker_roles();
         // Each role with how many of it run at once — its own class, or the pool it shares — so
@@ -1990,9 +2037,10 @@ Then summarize in 2-4 lines.",
             w.task.title,
             if w.task.acceptance.is_empty() { "the task is fully done and verified" } else { &w.task.acceptance }
         );
+        let brief_context = worker_brief_context(&self.brief);
         let prompt = match &resume {
-            Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
-            None => format!("{}\n\n(Context — overall project goal: {plan_summary})", w.prompt),
+            Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
+            None => format!("{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
         };
         let requested = w.effort.clone().or(w.task.effort.clone());
         let name = w.task.id.clone();
@@ -2201,6 +2249,7 @@ Then summarize in 2-4 lines.",
             self.check_summary(),
             self.phase_diff.render()
         );
+        let prompt = format!("{prompt}\n\n{}", worker_brief_context(&self.brief));
         let prompt = match self.resume_note.take() {
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
@@ -2359,21 +2408,7 @@ Then summarize in 2-4 lines.",
         for w in &self.workers {
             let _ = std::fs::write(pdir.join(format!("{}.md", w.task.id)), format!("# {} — {}\nstate: {:?}\nattempt: {}\n\n{}\n", w.task.id, w.task.title, w.state, w.attempt, w.report));
         }
-        let ws = self.ws.clone();
-        let wts: Vec<(PathBuf, String)> = self.workers.iter().filter(|w| !w.adhoc).filter_map(|w| w.wt.clone().map(|d| (d, w.branch.clone()))).collect();
-        let msg = format!("mantra: phase {} — {}", idx + 1, phase_name);
-        ctx.job(
-            JobTag::Cleanup { phase: idx },
-            Box::new(move || {
-                let Some(ws) = ws else { return JobOut::Cleanup(Ok(String::new()), git::ReviewDiff::default()) };
-                let committed = git::phase_commit(&ws, &msg);
-                for (d, b) in wts {
-                    git::remove_worker(&ws, &d, &b, false);
-                }
-                let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES);
-                JobOut::Cleanup(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }), diff)
-            }),
-        );
+        self.launch_phase_commit(ctx, idx);
         match self.orchestrator {
             Some(o) => {
                 self.mark_edge(o);
@@ -2382,6 +2417,23 @@ Then summarize in 2-4 lines.",
             None => self.handoff_note_done = true,
         }
         self.save_state();
+    }
+
+    /// Also used on explicit resume after a refused phase commit; no repeated archiving.
+    pub(super) fn launch_phase_commit(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+        let ws = self.ws.clone();
+        let wts: Vec<(PathBuf, String)> = self.workers.iter().filter(|w| !w.adhoc).filter_map(|w| w.wt.clone().map(|d| (d, w.branch.clone()))).collect();
+        let phase_name = self.current_phase().map(|p| p.name.clone()).unwrap_or_default();
+        let msg = format!("mantra: phase {} — {}", idx + 1, phase_name);
+        ctx.job(JobTag::Cleanup { phase: idx }, Box::new(move || {
+            let Some(ws) = ws else { return JobOut::Cleanup(Ok(String::new()), git::ReviewDiff::default()) };
+            let committed = git::phase_commit(&ws, &msg);
+            if committed.is_ok() {
+                for (d, b) in wts { git::remove_worker(&ws, &d, &b, false); }
+            }
+            let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES);
+            JobOut::Cleanup(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }), diff)
+        }));
     }
 
     pub(super) fn maybe_next_phase(&mut self, ctx: &mut dyn Ctx) {
@@ -2612,6 +2664,13 @@ Then summarize in 2-4 lines.",
                 }
             }
             (JobTag::Merge { phase }, JobOut::Merge(m)) => {
+                let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), &m.log);
+                if !m.blocked.is_empty() {
+                    self.stage = Stage::Phase { idx: phase, step: PhaseStep::Orchestrating };
+                    let detail = format!("phase {} integration blocked:\n{}\nRestore protected decision headings or fix the project commit policy before explicitly resuming. Worker branches and worktrees are retained; do not bypass the safeguard with a manual merge.", phase + 1, m.blocked.join("\n"));
+                    self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, None, format!("phase {} integration blocked by commit/policy failure", phase + 1), detail, None);
+                    return;
+                }
                 if !m.merged.is_empty() {
                     self.log("⇲", "green", format!("merged {}", m.merged.join(", ")));
                 }
@@ -2619,7 +2678,6 @@ Then summarize in 2-4 lines.",
                     self.log("⚠", "amber", format!("{} merge conflict(s) → handed to the gate agent", m.conflicts.len()));
                 }
                 self.conflicts = m.conflicts;
-                let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), m.log);
                 self.run_checks(ctx, phase, 0);
             }
             (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
@@ -2686,7 +2744,9 @@ Then summarize in 2-4 lines.",
             }
             (JobTag::Cleanup { phase }, JobOut::Cleanup(r, diff)) => {
                 if let Err(e) = r {
-                    self.log("⚠", "amber", format!("phase {} commit: {e}", phase + 1));
+                    self.cleanup_done = false;
+                    self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, None, format!("phase {} commit failed", phase + 1), format!("phase {} commit failed: {e}\nWorker branches/worktrees are retained. Correct the commit policy or restore protected decision headings, then explicitly resume to retry the phase commit.", phase + 1), None);
+                    return;
                 }
                 self.run_diff = Some(diff);
                 self.cleanup_done = true;
@@ -2759,6 +2819,11 @@ Then summarize in 2-4 lines.",
         if !self.is_active() {
             return;
         }
+        // A stopped process may deliver its final error after its replacement has started.
+        // It no longer owns a live slot and must not restore the failure we just recovered.
+        if self.killed_agents.contains(&a) || !self.all_agents().contains(&a) || self.worker_idx(a).map(|wi| matches!(self.workers[wi].state, WState::Cancelled)).unwrap_or(false) {
+            return;
+        }
         // The user stopped this agent by hand (ctrl+c, or `x`), and that outranks every
         // self-healing path below — the planner nudge, the next gate round, the worker's report to
         // the orchestrator, the transient retry — each of which would put it straight back to work
@@ -2796,6 +2861,12 @@ Then summarize in 2-4 lines.",
                 if self.remap_effort(ctx, a, &allowed) {
                     return;
                 }
+            }
+            // Quota and billing errors are sometimes reported as transient or bad-request
+            // failures. A configured replacement gets a fresh process before any retry/halt.
+            let kind = if crate::agent::is_usage_limit_error(kind, &msg) { Some(ErrKind::UsageLimit) } else { kind };
+            if kind == Some(ErrKind::UsageLimit) && self.fallback_after_usage_limit(ctx, a, &msg) {
+                return;
             }
             // A dead or flaky gateway is nobody's fault: it never costs an attempt, so it is
             // handled here, before the counted retry ladder.
@@ -2919,6 +2990,15 @@ Then summarize in 2-4 lines.",
             }
         }
 
+        if Some(a) == self.planner && self.planner_refresh_pending && status == "completed" {
+            self.planner_refresh_pending = false;
+            self.respawn_planner(ctx, Some("The workflow changed; continue with its updated role instructions and tools.".into()));
+            return;
+        }
+        if Some(a) == self.planner && (self.planner_wait.is_some() || self.pending_pattern.is_some()) {
+            return; // Includes the planner's finale slot: waiting is never a verification pass.
+        }
+
         if Some(a) == self.manager {
             if status == "completed" {
                 self.manager_watchdog = None;
@@ -2943,6 +3023,7 @@ Then summarize in 2-4 lines.",
         }
 
         if Some(a) == self.planner && matches!(self.stage, Stage::Planning) {
+            if self.planner_wait.is_some() || self.pending_pattern.is_some() { return; }
             if self.plan.is_some() && self.plan_version > 0 && self.planner_nudges < 100 {
                 if self.pattern.settings.review_plan {
                     self.stage = Stage::Review;
@@ -2953,7 +3034,7 @@ Then summarize in 2-4 lines.",
                     self.start_phase(ctx, 0);
                 }
             } else {
-                if self.question.is_some() {
+                if self.question.is_some() || self.pending_pattern.is_some() || self.planner_wait.is_some() {
                     return; // it asked the user something first; the answer restarts it
                 }
                 self.planner_nudges += 1;
@@ -3166,6 +3247,65 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
+    }
+
+    /// A provider's exhausted balance is not a failed implementation attempt. Replace just
+    /// this agent, keeping a worker's current worktree, task, and attempt budget intact.
+    fn fallback_after_usage_limit(&mut self, ctx: &mut dyn Ctx, a: AgentId, error: &str) -> bool {
+        if self.halted() {
+            return false;
+        }
+        let Some(role_name) = self.role_name_of(a) else { return false };
+        let running = self.worker_idx(a).and_then(|wi| self.workers[wi].model.clone())
+            .or_else(|| self.slot_models.get(&self.slot_of(a)).cloned())
+            .or_else(|| ctx.agent(a).map(|ag| ag.model_alias.clone()).filter(|m| !m.is_empty()))
+            .unwrap_or_else(|| self.role_for_slot(&self.slot_of(a), &role_name).model);
+        let fallback = self.pattern.role(&role_name).and_then(|role| role.fallback.as_ref())
+            .filter(|alias| !alias.trim().is_empty() && **alias != running && self.knows_model(alias)).cloned();
+        let Some(alias) = fallback else { return false };
+        let name = self.name_of(a);
+        let first_token_key = self.first_token_key(a);
+        let note = format!("[mantra:fallback] The previous provider hit its billing or usage limit ({}). You are its replacement on {alias}. Your current files contain the work so far. Continue where it left off.", trunc(error, 240));
+        self.forget_agent_session(a);
+        self.set_agent_model(a, &alias);
+        let restarted = if let Some(wi) = self.worker_idx(a) {
+            let dir = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone()));
+            if let Some(dir) = dir {
+                self.tokens_prev += ctx.agent(a).map(|ag| ag.tokens_total).unwrap_or(0);
+                ctx.stop(a, true);
+                let branch = self.workers[wi].branch.clone();
+                self.workers[wi].finished = None;
+                self.workers[wi].transient = false;
+                let task_prompt = self.workers[wi].prompt.clone();
+                self.workers[wi].prompt = join_note(Some(note), task_prompt.clone());
+                self.launch_worker(ctx, wi, dir, branch);
+                self.workers[wi].prompt = task_prompt;
+                true
+            } else {
+                false
+            }
+        } else {
+            self.respawn(ctx, a, Some(note)).is_ok()
+        };
+        if !restarted {
+            return false;
+        }
+        self.clear_replaced_agent(a);
+        if let Some(key) = first_token_key {
+            self.first_token_strikes.remove(&key);
+        }
+        self.alert(ctx, format!("{name}: {running} hit a provider billing or usage limit — continuing on fallback {alias}. {}", trunc(error, 160)));
+        self.save_state();
+        true
+    }
+
+    fn clear_replaced_agent(&mut self, a: AgentId) {
+        self.retry_counts.remove(&a);
+        self.gateway_streak.remove(&a);
+        self.transport_errs.remove(&a);
+        self.effort_retried.remove(&a);
+        self.continue_queue.retain(|(agent, _, _)| *agent != a);
+        self.paused_agents.retain(|agent| *agent != a);
     }
 
     /// Did every agent that is working fail on the gateway within the last minute (and `a` too)?
@@ -3418,6 +3558,7 @@ Then summarize in 2-4 lines.",
         if self.halted() {
             return;
         }
+        self.planner_wait_tick(ctx);
         let now = Instant::now();
         // continue after backoff
         let due: Vec<(AgentId, String)> = self.continue_queue.iter().filter(|(_, t, _)| *t <= now).map(|(a, _, m)| (*a, m.clone())).collect();
@@ -3829,12 +3970,36 @@ Then summarize in 2-4 lines.",
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
     pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str) {
+        self.planner_wait = None;
+        if let Some(proposal) = self.pending_pattern.take() {
+            self.question = None;
+            self.alerts.retain(|a| !a.starts_with("Approve workflow change"));
+            let answer = text.trim().to_lowercase();
+            if matches!(answer.as_str(), "yes" | "y" | "approve" | "approved" | "yes, approve") {
+                self.install_pattern(ctx, proposal);
+            } else if let Some(p) = self.planner {
+                self.mark_edge(p);
+                ctx.prompt(p, format!("[from the user] Workflow proposal was not approved. Feedback: {text}\nKeep the active workflow; revise your proposal if needed."));
+            }
+            self.save_state();
+            return;
+        }
         if let Some(q) = self.question.take() {
             // The planner (or the manager) asked; this is the answer — straight back to it,
             // whatever the stage.
             let who = self.name_of(q.from);
             let asked = format!("the {who} asks: {}", q.text);
             self.alerts.retain(|a| *a != asked);
+            if Some(q.from) != self.planner {
+                // Even an answer to a supervisor enters through the planner. It decides how
+                // to brief the requester and retains the ordinary chain of command.
+                self.pending_questions.insert(q.from, q.text.clone());
+                let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+                self.mark_edge(p);
+                self.log("›", "rose", format!("you → planner (answer for {who}): {}", trunc(text, 60)));
+                ctx.prompt(p, format!("[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
+                return;
+            }
             self.log("›", "rose", format!("you → {who} (answer): {}", trunc(text, 60)));
             self.mark_edge(q.from);
             let next = if Some(q.from) == self.manager {
@@ -3877,13 +4042,28 @@ Then summarize in 2-4 lines.",
     /// agent's current turn) or `Force` for ctrl+f (delivered right away).
     pub fn direct(&mut self, ctx: &mut dyn Ctx, name: &str, text: &str, mode: Send) -> bool {
         if text.trim().is_empty() {
+            if mode == Send::Force {
+                if let Some(p) = self.planner.filter(|p| ctx.agent(*p).is_some_and(|ag| !ag.queued.is_empty())) {
+                    ctx.prompt_mode(p, String::new(), mode);
+                    return true;
+                }
+            }
             return false;
         }
-        match self.resolve(name) {
+        // Every user message enters through the planner, including a composer focused on a
+        // worker. Emergency direct control belongs to the planner's tools.
+        if self.pending_pattern.is_some() || self.question.is_some() || matches!(self.stage, Stage::Setup | Stage::Review) {
+            self.user_input(ctx, text);
+            return true;
+        }
+        self.planner_wait = None;
+        let _ = name;
+        let target = self.planner.or_else(|| self.is_active().then(|| self.spawn_planner(ctx)));
+        match target {
             Some(a) => {
                 self.mark_edge(a);
                 ctx.prompt_mode(a, format!("[from the user] {text}"), mode);
-                self.log("›", "rose", format!("you → {name}: {}", trunc(text, 60)));
+                self.log("›", "rose", format!("you → planner: {}", trunc(text, 60)));
                 true
             }
             None => false,
@@ -4154,6 +4334,16 @@ Then summarize in 2-4 lines.",
         if !matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed) {
             return false;
         }
+        if h.reason == HaltReason::AgentTurnFailed && h.agent != Some(target) {
+            return false;
+        }
+        if h.reason == HaltReason::AttemptsExhausted && h.agent != Some(target) {
+            let owns_task = self.worker_idx(target).map(|wi| h.agent.is_none()
+                && h.message.starts_with(&format!("{} has used all ", self.workers[wi].task.id))).unwrap_or(false);
+            if !owns_task {
+                return false;
+            }
+        }
         if h.reason == HaltReason::AttemptsExhausted {
             self.extra_attempts += 1;
         }
@@ -4212,9 +4402,31 @@ Then summarize in 2-4 lines.",
     /// `Ok` says what happened: `RESPAWNED`, or `RESPAWN_DEFERRED` for a gate/finale agent while
     /// the run is halted (the pause boundary — the fresh agent, note included, starts on resume).
     pub fn respawn(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<&'static str, String> {
+        // Replacing the failed agent resolves its old provider/turn failure. A pause or a
+        // failure belonging to another agent remains active, including its owner alert.
+        let valid = self.worker_idx(a).is_some()
+            || Some(a) == self.planner || Some(a) == self.orchestrator || Some(a) == self.manager
+            || (Some(a) == self.gate_agent && self.phase_idx().is_some())
+            || (Some(a) == self.finale_agent && matches!(self.stage, Stage::Finale { .. }));
+        let resolves = valid && self.halt.as_ref().map(|h| {
+            h.agent == Some(a) && matches!(h.reason, HaltReason::Auth | HaltReason::UsageLimit | HaltReason::ProviderRejected | HaltReason::AgentTurnFailed)
+        }).unwrap_or(false);
+        if resolves {
+            self.resume_for_restart(ctx, Some(a), a);
+        }
+        let result = self.respawn_inner(ctx, a, note);
+        if matches!(result, Ok(RESPAWNED)) {
+            self.clear_replaced_agent(a);
+            self.save_state();
+        }
+        result
+    }
+
+    fn respawn_inner(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<&'static str, String> {
         if let Some(wi) = self.worker_idx(a) {
             // `r` on the task that exhausted its attempts *is* the decision to try once more.
-            if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted).unwrap_or(false) {
+            if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted
+                && (h.agent == Some(a) || (h.agent.is_none() && h.message.starts_with(&format!("{} has used all ", self.workers[wi].task.id))))).unwrap_or(false) {
                 self.extra_attempts += 1;
                 self.resume_for_restart(ctx, None, a);
             }
@@ -4248,11 +4460,19 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_planner(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        let shared_finale = self.planner.is_some() && self.finale_agent == self.planner && matches!(self.stage, Stage::Finale { .. });
         if let Some(old) = self.planner.take() {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_planner(ctx);
+        if shared_finale {
+            self.finale_agent = Some(id);
+            if let Stage::Finale { idx } = self.stage {
+                self.start_finale(ctx, idx);
+                return;
+            }
+        }
         self.mark_edge(id);
         let stage_txt = super::state::stage_label(&self.stage);
         // The whole plan used to be attached here, which is exactly the huge context a respawn is
@@ -4415,8 +4635,101 @@ Then summarize in 2-4 lines.",
                 _ => vec![],
             }
         };
+        if matches!(tool, "mantra_revise_pattern" | "mantra_read_pattern" | "mantra_kill" | "mantra_wait_for_external_condition" | "mantra_set_task_scope") && Some(a) != self.planner {
+            return ("REFUSED: only the planner controls the workflow and scheduled re-entry".into(), false);
+        }
         match tool {
+            "mantra_read_pattern" => (self.pattern.to_toml(), true),
+            "mantra_revise_pattern" => {
+                if self.pending_pattern.is_some() || self.question.is_some() { return ("REFUSED: wait for the open user decision first".into(), false); }
+                let reason = s("reason");
+                if reason.trim().is_empty() { return ("REJECTED: give the reason and impact of changing the workflow".into(), false); }
+                let pattern = match Pattern::from_toml(&s("toml")) { Ok(p) => p, Err(e) => return (format!("REJECTED: {e}"), false) };
+                if let Err(e) = self.validate_pattern_replacement(&pattern) { return (format!("REJECTED: {e}"), false); }
+                let proposal = PatternProposal { pattern, reason };
+                let bypass = ctx.agent(a).map(|ag| crate::config::approval_policy(&ag.approval) == "never").unwrap_or(false);
+                if bypass {
+                    self.install_pattern(ctx, proposal);
+                    ("ACCEPTED: workflow installed under the user's don't-ask approval mode. Read the active pattern and submit/revise the plan using its roles.".into(), true)
+                } else {
+                    let question = format!("Approve workflow change {} → {}? {}\nReply 'approve' or send feedback. Proposed workflow:\n{}", self.pattern.name, proposal.pattern.name, proposal.reason, proposal.pattern.to_toml());
+                    self.pending_pattern = Some(proposal);
+                    self.question = Some(Question { from: a, text: question.clone(), since: Instant::now() });
+                    self.alerts.push(question);
+                    self.log("?", "saffron", "workflow proposal awaits your approval");
+                    ctx.notify("Mantra: workflow change awaits your approval");
+                    self.save_state();
+                    ("PROPOSED: waiting for explicit user approval. End your turn; the active workflow is unchanged.".into(), true)
+                }
+            }
+            "mantra_wait_for_external_condition" => {
+                let Some(seconds) = args.get("seconds").and_then(Value::as_u64).filter(|s| (1..=86_400).contains(s)) else { return ("REJECTED: seconds must be an integer from 1 to 86400".into(), false) };
+                let (condition, on_reentry) = (s("condition"), s("on_reentry"));
+                if condition.trim().is_empty() || on_reentry.trim().is_empty() { return ("REJECTED: provide the condition to inspect and instructions for re-entry".into(), false); }
+                if self.planner_wait.is_some() { return ("REFUSED: one scheduled re-entry is already pending".into(), false); }
+                self.planner_wait = Some(PlannerWait { due_unix: crate::util::unix_secs().saturating_add(seconds), condition, on_reentry });
+                self.yielded.insert(a);
+                self.log("◷", "teal", format!("planner scheduled external-condition check in {seconds}s"));
+                self.save_state();
+                (format!("SCHEDULED: end your turn now. Mantra will wake you once after {seconds}s to inspect the condition; the event loop remains free."), true)
+            }
+            "mantra_kill" => {
+                let reason = s("reason");
+                if reason.trim().is_empty() { return ("REJECTED: give the emergency reason".into(), false); }
+                let Some(t) = self.resolve(&s("agent")) else { return ("unknown agent".into(), false) };
+                if t == a { return ("REFUSED: the planner cannot kill itself".into(), false); }
+                ctx.stop(t, true);
+                self.killed_agents.insert(t);
+                self.continue_queue.retain(|(id, _, _)| *id != t);
+                self.pending_questions.remove(&t);
+                if let Some(wi) = self.worker_idx(t) { self.workers[wi].state = WState::Cancelled; self.workers[wi].paused = true; }
+                self.paused_agents.retain(|id| *id != t);
+                if self.worker_idx(t).is_none() {
+                    // Keep the caller's turn alive so it receives this tool result and can
+                    // recover the stopped role immediately. A normal halt interrupts it too.
+                    for other in self.all_agents().into_iter().filter(|id| *id != a && Some(*id) != self.manager) {
+                        if ctx.agent(other).is_some_and(|ag| ag.busy()) {
+                            ctx.interrupt(other);
+                            if !self.paused_agents.contains(&other) { self.paused_agents.push(other); }
+                        }
+                    }
+                    let message = format!("planner stopped {} for emergency recovery", s("agent"));
+                    self.halt = Some(Halt { reason: HaltReason::AgentTurnFailed, agent: Some(t), message: message.clone(), full: format!("{message}: {reason}. Restart it with mantra_respawn after repairing the cause."), since: Instant::now() });
+                    self.clock_stop();
+                    self.alerts.push(message);
+                } else {
+                    self.orch_inbox.push(format!("[from the planner] Emergency stopped {}: {reason}. Revisit the task; use mantra_retry only after addressing the cause.", s("agent")));
+                    self.wake_orch(ctx);
+                }
+                self.log("■", "amber", format!("planner killed {}: {}", s("agent"), reason));
+                self.save_state();
+                ("stopped; repair the plan or brief the orchestrator to recover".into(), true)
+            }
+            "mantra_set_task_scope" => {
+                let tid = s("task_id");
+                let reason = s("reason");
+                let Some(scope) = args.get("scope_globs").and_then(Value::as_array).filter(|v| v.iter().all(|x| x.as_str().is_some_and(|s| !s.trim().is_empty()))).map(|v| v.iter().map(|x| x.as_str().unwrap().to_string()).collect::<Vec<_>>()) else { return ("REJECTED: scope_globs must be an array of nonempty strings".into(), false) };
+                if scope.is_empty() || reason.trim().is_empty() { return ("REJECTED: provide explicit scope globs and a reason".into(), false); }
+                let Some(idx) = self.phase_idx() else { return ("REFUSED: there is no current phase".into(), false) };
+                let Some(mut plan) = self.plan.clone() else { return ("REFUSED: no plan".into(), false) };
+                let Some(task) = plan.phases.get_mut(idx).and_then(|p| p.tasks.iter_mut().find(|t| t.id == tid)) else { return ("REJECTED: task is not in the current phase".into(), false) };
+                task.scope = scope.clone();
+                let mut remaining = plan.clone();
+                remaining.phases = remaining.phases.into_iter().skip(idx).collect();
+                if let Err(e) = remaining.validate(&self.pattern) { return (format!("REJECTED: {}", e.join("; ")), false); }
+                self.plan = Some(plan);
+                self.plan_version += 1;
+                for w in self.workers.iter_mut().filter(|w| w.task.id == tid) { w.task.scope = scope.clone(); w.tripwires.retain(|p| !crate::util::in_scope(&scope, p)); }
+                self.save_plan();
+                self.log("☰", "saffron", format!("planner updated {tid} scope: {} ({reason})", scope.join(", ")));
+                self.orch_inbox.push(format!("[from the planner] Task {tid} scope is now {}. Reason: {reason}", scope.join(", ")));
+                self.wake_orch(ctx);
+                self.save_state();
+                ("ACCEPTED: live plan and worker scopes updated; matching tripwires cleared, QA still required".into(), true)
+            }
             "mantra_submit_plan" | "mantra_revise_plan" => {
+                if Some(a) != self.planner { return ("REFUSED: only the planner may submit or revise the plan".into(), false); }
+                if self.pattern.is_auto() { return ("REJECTED: Auto needs a concrete approved workflow first; use mantra_revise_pattern".into(), false); }
                 let mut plan = match Plan::from_value(args) {
                     Ok(p) => p,
                     Err(e) => return (format!("REJECTED: {e}"), false),
@@ -4433,7 +4746,9 @@ Then summarize in 2-4 lines.",
                         plan.phases = phases;
                     }
                 }
-                if let Err(errs) = plan.validate(&self.pattern) {
+                let mut validation_plan = plan.clone();
+                if revising { validation_plan.phases = validation_plan.phases.into_iter().skip(self.phase_idx().unwrap_or(0)).collect(); }
+                if let Err(errs) = validation_plan.validate(&self.pattern) {
                     self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
                     return (format!("REJECTED — fix these and resubmit:\n- {}", errs.join("\n- ")), false);
                 }
@@ -4572,6 +4887,7 @@ Then summarize in 2-4 lines.",
                 let m = s("message");
                 match self.resolve(&n) {
                     Some(t) if t != a => {
+                        if self.killed_agents.contains(&t) { return ("REFUSED: this agent was emergency-stopped; use mantra_respawn to recover it".into(), false); }
                         // An answer to a question the target asked up the chain: it is waiting
                         // for exactly this, so none of the idle-worker guards apply.
                         let answering = self.pending_questions.remove(&t).is_some();
@@ -4753,6 +5069,88 @@ Then summarize in 2-4 lines.",
             other => (format!("tool '{other}' is not available here"), false),
         }
     }
+
+    fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
+        pattern.validate().map_err(|e| e.join("; "))?;
+        if pattern.is_auto() { return Err("a running workflow cannot be replaced with the Auto bootstrap".into()); }
+        if !self.known_models.is_empty() {
+            for (name, role) in &pattern.roles {
+                if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}'", role.model)); }
+                if let Some(fallback) = &role.fallback {
+                    if !self.known_models.contains_key(fallback) { return Err(format!("role '{name}' names an unconfigured fallback model alias '{fallback}'")); }
+                }
+            }
+        }
+        if let Some(plan) = self.plan.as_ref().filter(|_| !matches!(self.stage, Stage::Finale { .. })) {
+            let mut remaining = plan.clone();
+            if let Some(idx) = self.phase_idx() { remaining.phases = remaining.phases.into_iter().skip(idx).collect(); }
+            remaining.validate(pattern).map_err(|e| format!("the remaining plan must stay valid: {}", e.join("; ")))?;
+        }
+        for w in self.workers.iter().filter(|w| !matches!(w.state, WState::Cancelled | WState::Done)) {
+            if !pattern.roles.get(&w.task.role).is_some_and(|r| r.kind == "worker") { return Err(format!("retain worker role '{}' until its task is retired", w.task.role)); }
+        }
+        if let Stage::Finale { idx } = self.stage {
+            if pattern.flow.finale.get(idx).is_none() { return Err("retain the current finale step until it finishes".into()); }
+        }
+        // Isolation belongs to the already-created workspace and cannot be changed retroactively.
+        if self.ws.is_some() && pattern.settings.isolation != self.pattern.settings.isolation { return Err("workspace isolation cannot change after setup".into()); }
+        Ok(())
+    }
+
+    fn install_pattern(&mut self, ctx: &mut dyn Ctx, proposal: PatternProposal) {
+        if let Err(e) = self.validate_pattern_replacement(&proposal.pattern) {
+            self.log("✗", "amber", format!("workflow proposal is no longer applicable: {e}"));
+            if let Some(p) = self.planner { ctx.prompt(p, format!("[mantra:pattern] Proposal could not be applied: {e}. Re-read state and propose a correction.")); }
+            return;
+        }
+        let previous = self.pattern.clone();
+        self.pattern = proposal.pattern;
+        // Existing workers keep their live process, scope and worktree. New spawns use the new
+        // role definitions; fixed supervisors are refreshed only when their definition changed.
+        if previous.flow.manager != self.pattern.flow.manager || previous.roles.get(&previous.flow.manager) != self.pattern.roles.get(&self.pattern.flow.manager) {
+            if let Some(m) = self.manager.take() { ctx.stop(m, true); }
+            if self.phase_idx().is_some() { self.ensure_manager(ctx); }
+        }
+        if previous.flow.orchestrator != self.pattern.flow.orchestrator || previous.roles.get(&previous.flow.orchestrator) != self.pattern.roles.get(&self.pattern.flow.orchestrator) {
+            if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) { self.respawn_orchestrator(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
+            else if let Some(o) = self.orchestrator.take() { ctx.stop(o, true); }
+        }
+        if previous.flow.phase_gate != self.pattern.flow.phase_gate || previous.roles.get(&previous.flow.phase_gate) != self.pattern.roles.get(&self.pattern.flow.phase_gate) {
+            if self.gate_agent.is_some() { self.respawn_gate(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
+        }
+        if let Stage::Finale { idx } = self.stage {
+            if previous.flow.finale.get(idx) != self.pattern.flow.finale.get(idx) { self.respawn_finale(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
+        }
+        self.log("✦", "saffron", format!("workflow {} → {}: {}", previous.name, self.pattern.name, proposal.reason));
+        self.save_state();
+        if let Some(p) = self.planner {
+            let changed = previous.flow.planner != self.pattern.flow.planner || previous.roles.get(&previous.flow.planner) != self.pattern.roles.get(&self.pattern.flow.planner) || previous.worker_roles() != self.pattern.worker_roles();
+            if changed {
+                if ctx.agent(p).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
+                else { self.respawn_planner(ctx, Some("Workflow approved; use the updated role instructions and tools.".into())); }
+                return;
+            }
+            self.mark_edge(p);
+            ctx.prompt(p, format!("[mantra:pattern] Workflow {} is now active. Read mantra_read_pattern; use its current roles for all future plan changes. {}", self.pattern.name, if self.plan.is_none() { "Submit the phased plan now." } else { "Brief the orchestrator with any resulting change." }));
+        }
+    }
+
+    pub(super) fn planner_wait_tick(&mut self, ctx: &mut dyn Ctx) {
+        let due = self.planner_wait.as_ref().is_some_and(|w| w.due_unix <= crate::util::unix_secs());
+        if !due || self.halted() || !self.is_active() { return; }
+        let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+        if ctx.agent(p).is_some_and(|ag| ag.busy()) { return; }
+        let wait = self.planner_wait.take().unwrap();
+        // Clear and persist before dispatch so subsequent ticks cannot enqueue duplicates.
+        self.log("◷", "teal", "planner external-condition check is due");
+        self.save_state();
+        self.mark_edge(p);
+        ctx.prompt(p, format!("[mantra:external-condition] Scheduled re-entry is due. Inspect this condition once: {}\nInstructions: {}\nThe condition has not been evaluated by Mantra. Report the observed result; if still pending schedule a bounded re-entry instead of a sleep/poll loop.", wait.condition, wait.on_reentry));
+    }
+
+    pub fn pending_pattern_review(&self) -> bool { self.pending_pattern.is_some() }
+
+    pub fn planner_wait_info(&self) -> Option<&PlannerWait> { self.planner_wait.as_ref() }
 
     /// Fold a revised plan into the running phase. Returns a one-line "what happens next" for the
     /// planner. A task that changed after its worker finished is re-opened (its old worker is
@@ -4988,6 +5386,32 @@ fn failing_sig(checks: &[CheckResult]) -> String {
         .join("\n")
 }
 
+/// The run brief is explicit user context, not a dump of project/settings files. Carry it to
+/// every worker (including retries and ad-hoc fixes), with obvious credential lines omitted.
+fn worker_brief_context(brief: &str) -> String {
+    const LIMIT: usize = 12_000;
+    let mut safe = String::new();
+    let mut private_block = false;
+    for line in brief.lines() {
+        let low = line.to_ascii_lowercase();
+        if low.contains("-----begin ") && low.contains("private key") { private_block = true; }
+        let key = low.split_once(['=', ':']).map(|(k, _)| k.trim().trim_start_matches("export ").replace(['-', ' '], "_"));
+        let credential = key.as_ref().map(|k| k.contains("password") || k.contains("secret") || k.contains("api_key") || k.ends_with("token") || k.ends_with("authorization")).unwrap_or(false)
+            || low.contains("bearer ")
+            || low.split_once("://").map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default().contains('@')).unwrap_or(false);
+        if private_block || credential {
+            safe.push_str("[credential omitted]\n");
+        } else {
+            safe.push_str(line);
+            safe.push('\n');
+        }
+        if low.contains("-----end ") && low.contains("private key") { private_block = false; }
+    }
+    let clipped = safe.chars().count() > LIMIT;
+    if clipped { safe = safe.chars().take(LIMIT).collect(); }
+    format!("Run brief — apply project and per-ticket rules (including language/order of status updates) to this task; read applicable AGENTS.md and project instructions. Do not print credentials or settings files. If a needed rule is omitted or unclear, ask the orchestrator before the affected action.\n{}{}", safe, if clipped { "\n[brief clipped at 12000 characters; ask for missing ticket/project rules]" } else { "" })
+}
+
 /// True when `dir` holds nothing but `.git`, `.mantra` and dotfiles — a fresh/greenfield project
 /// the planner does not need to explore before submitting a plan. An unreadable directory is
 /// never treated as empty (the old "explore first" behaviour is the safe default).
@@ -5077,6 +5501,7 @@ mod halt_tests {
         mcp: Vec<String>,
     }
     impl TestCtx {
+        // Tests below exercise the Conductor's decisions without making a provider call.
         fn new() -> TestCtx {
             TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
         }
@@ -5122,6 +5547,214 @@ mod halt_tests {
                 ag.turn_active = true;
             }
         }
+    }
+
+    fn planner_feature_run(name: &str, pattern: Pattern) -> (Run, TestCtx, AgentId) {
+        let mut run = Run::new(PathBuf::from("."), pattern, name.into());
+        run.dir = std::env::temp_dir().join(format!("mantra-planner-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run.dir);
+        run.stage = Stage::Planning;
+        let mut ctx = TestCtx::new();
+        let p = ctx.add_idle();
+        ctx.agents.get_mut(&p).unwrap().approval = "on-request".into();
+        run.planner = Some(p);
+        (run, ctx, p)
+    }
+
+    #[test]
+    fn auto_workflow_requires_user_approval_and_survives_resume() {
+        let (mut run, mut ctx, p) = planner_feature_run("auto-approval", Pattern::builtin_auto());
+        assert!(run.planning_prompt().contains("[mantra:auto]"));
+        let (_, ok) = run.handle_tool(&mut ctx, p, "mantra_submit_plan", &json!({"plan": {}}));
+        assert!(!ok, "Auto cannot submit a plan before creating its workflow");
+        let proposed = Pattern::builtin_lean();
+        let (reply, ok) = run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &json!({"toml": proposed.to_toml(), "reason": "A short task needs a lean workflow; one QA gate is enough", "approved": true}));
+        assert!(ok && reply.starts_with("PROPOSED"), "{reply}");
+        assert!(run.pattern.is_auto(), "an agent-supplied approved field cannot grant consent");
+        assert!(run.expected_active().is_empty(), "approval wait is intentional idleness");
+        let st = RunState::load(&run.dir).unwrap();
+        let mut restored = Run::from_state(&st, Pattern::builtin_auto(), None, run.dir.clone());
+        let mut fresh = TestCtx::new();
+        restored.resume_boot(&mut fresh, &st);
+        assert!(restored.pending_pattern.is_some() && restored.question.is_some());
+        assert!(fresh.prompts.is_empty(), "resume does not poll or imply approval");
+        restored.user_input(&mut fresh, "approve");
+        assert_eq!(restored.pattern.name, proposed.name);
+        assert!(restored.pending_pattern.is_none());
+        let disk = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
+        assert_eq!(disk.name, proposed.name, "resume uses the concrete workflow after approval");
+        let planner = restored.planner.unwrap();
+        let (reply, ok) = restored.handle_tool(&mut fresh, planner, "mantra_submit_plan", &json!({"plan": {"title": "small task", "phases": [{"name": "Build", "tasks": [{"id": "a", "title": "Task", "role": "worker-small", "prompt": "Implement the requested small task", "scope": ["src/a/**"]}]}]}}));
+        assert!(ok, "{reply}");
+        restored.on_turn_done(&mut fresh, planner, "completed", None, None);
+        assert_eq!(restored.stage, Stage::Review, "Auto becomes a normal concrete run after bootstrapping");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn workflow_rejection_and_dont_ask_mode_have_distinct_boundaries() {
+        let (mut run, mut ctx, p) = planner_feature_run("approval-boundary", Pattern::builtin());
+        let mut next = Pattern::builtin_lean();
+        next.name = "adapted".into();
+        let args = json!({"toml": next.to_toml(), "reason": "The manager topology is unnecessary for this task"});
+        assert!(run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &args).1);
+        run.user_input(&mut ctx, "Do not approve this change");
+        assert_eq!(run.pattern.name, super::super::pattern::NAME_DEFAULT);
+        assert!(run.pending_pattern.is_none());
+        ctx.agents.get_mut(&p).unwrap().approval = "never".into();
+        assert!(run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &args).1);
+        assert_eq!(run.pattern.name, "adapted");
+        assert!(run.pending_pattern.is_none() && run.question.is_none());
+        let other = ctx.add_idle();
+        assert!(!run.handle_tool(&mut ctx, other, "mantra_revise_pattern", &args).1);
+        assert!(!run.handle_tool(&mut ctx, other, "mantra_kill", &json!({"agent": "planner", "reason": "override"})).1);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn direct_user_message_routes_to_planner_and_planner_can_steer_worker() {
+        let (mut run, mut ctx, p) = planner_feature_run("planner-routing", Pattern::builtin());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let w = ctx.add_idle();
+        run.workers.push(mk_worker("task", "worker-small", w, WState::Running));
+        assert!(run.direct(&mut ctx, "task", "new requirement", Send::Force));
+        assert!(ctx.prompts.iter().any(|(id, text)| *id == p && text.contains("new requirement")));
+        assert!(ctx.prompts.iter().all(|(id, _)| *id != w));
+        assert!(run.handle_tool(&mut ctx, p, "mantra_prompt", &json!({"agent": "task", "message": "Emergency: stop the repeated write"})).1);
+        assert!(ctx.prompts.iter().any(|(id, text)| *id == w && text.contains("Emergency")));
+        assert!(run.handle_tool(&mut ctx, p, "mantra_kill", &json!({"agent": "task", "reason": "repeated writes"})).1);
+        assert!(ctx.stopped.contains(&w));
+        assert_eq!(run.workers[0].state, WState::Cancelled);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn planner_external_wait_is_bounded_persisted_and_wakes_once() {
+        let (mut run, mut ctx, p) = planner_feature_run("external-wait", Pattern::builtin());
+        let args = json!({"seconds": 30, "condition": "latest required CI pipeline for this SHA is terminal", "on_reentry": "Read CI once, distinguish cancelled from failed, and report evidence"});
+        assert!(!run.handle_tool(&mut ctx, p, "mantra_wait_for_external_condition", &json!({"seconds": 86401, "condition": "CI", "on_reentry": "check"})).1);
+        assert!(run.handle_tool(&mut ctx, p, "mantra_wait_for_external_condition", &args).1);
+        run.on_turn_done(&mut ctx, p, "completed", None, None);
+        assert!(ctx.prompts.is_empty(), "waiting does not trigger the missing-plan nudge");
+        assert!(run.expected_active().is_empty());
+        let st = RunState::load(&run.dir).unwrap();
+        let mut restored = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+        let mut fresh = TestCtx::new();
+        restored.resume_boot(&mut fresh, &st);
+        assert!(fresh.prompts.is_empty());
+        restored.planner_wait_tick(&mut fresh);
+        assert!(fresh.prompts.is_empty(), "not due yet");
+        restored.planner_wait.as_mut().unwrap().due_unix = 0;
+        restored.planner_wait_tick(&mut fresh);
+        restored.planner_wait_tick(&mut fresh);
+        assert_eq!(fresh.prompts.len(), 1);
+        assert!(fresh.prompts[0].1.contains("[mantra:external-condition]") && fresh.prompts[0].1.contains("latest required CI"));
+        assert!(restored.planner_wait.is_none());
+        assert!(RunState::load(&run.dir).unwrap().planner_wait.is_none());
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn planner_finale_external_wait_does_not_advance_or_wake_early_on_resume() {
+        let (mut run, mut ctx, p) = planner_feature_run("finale-wait", Pattern::builtin_lean());
+        run.stage = Stage::Finale { idx: 0 };
+        run.finale_agent = Some(p);
+        assert!(run.handle_tool(&mut ctx, p, "mantra_wait_for_external_condition", &json!({"seconds": 30, "condition": "CI is complete", "on_reentry": "Check required CI, then report the verification verdict"})).1);
+        run.on_turn_done(&mut ctx, p, "completed", None, None);
+        assert_eq!(run.stage, Stage::Finale { idx: 0 }, "scheduled waiting is not a verification report");
+        assert!(ctx.prompts.is_empty());
+        let st = RunState::load(&run.dir).unwrap();
+        let mut restored = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+        let mut fresh = TestCtx::new();
+        restored.resume_boot(&mut fresh, &st);
+        assert_eq!(restored.stage, Stage::Finale { idx: 0 });
+        assert!(fresh.prompts.is_empty(), "restart retains the wait instead of starting verification early");
+        assert_eq!(restored.finale_agent, restored.planner);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn planner_scope_update_changes_live_validation_and_refuses_overlap() {
+        let (mut run, mut ctx, p) = planner_feature_run("scope-update", Pattern::builtin());
+        run.plan = Some(Plan::from_value(&json!({"plan": {"title": "Build", "phases": [{"name": "Build", "tasks": [
+            {"id": "a", "title": "A", "role": "worker-small", "prompt": "Implement the first independent component", "scope": ["src/a/**"]},
+            {"id": "b", "title": "B", "role": "worker-small", "prompt": "Implement the second independent component", "scope": ["src/b/**"]}
+        ]}]}})).unwrap());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let w = ctx.add_idle();
+        let mut worker = mk_worker("a", "worker-small", w, WState::Running);
+        worker.task = run.plan.as_ref().unwrap().phases[0].tasks[0].clone();
+        worker.tripwires = vec!["src/shared/api.rs".into()];
+        run.workers.push(worker);
+        let (reply, ok) = run.handle_tool(&mut ctx, p, "mantra_set_task_scope", &json!({"task_id": "a", "scope_globs": ["src/a/**", "src/shared/**"], "reason": "Shared API belongs to this task"}));
+        assert!(ok, "{reply}");
+        assert!(run.workers[0].tripwires.is_empty());
+        assert_eq!(run.workers[0].task.scope, run.plan.as_ref().unwrap().phases[0].tasks[0].scope);
+        assert!(!run.handle_tool(&mut ctx, p, "mantra_set_task_scope", &json!({"task_id": "a", "scope_globs": ["src/**"], "reason": "overlap"})).1);
+        assert_eq!(run.workers[0].task.scope, vec!["src/a/**", "src/shared/**"]);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn auto_sample_uses_configured_aliases_and_refreshes_planner_after_tool_result() {
+        let mut auto = Pattern::builtin_auto();
+        auto.roles.get_mut("planner").unwrap().model = "budget".into();
+        let (mut run, mut ctx, p) = planner_feature_run("auto-model-tools", auto);
+        run.set_known_models([("budget".into(), 128_000)].into_iter().collect());
+        let prompt = run.planning_prompt();
+        assert!(prompt.contains("model = \"budget\""));
+        assert!(!prompt.contains("model = \"sol\"") && !prompt.contains("model = \"astra\""));
+        let mut concrete = Pattern::builtin_lean();
+        for role in concrete.roles.values_mut() { role.model = "budget".into(); }
+        concrete.roles.get_mut("planner").unwrap().instructions = "Updated planner contract".into();
+        ctx.agents.get_mut(&p).unwrap().approval = "never".into();
+        ctx.agents.get_mut(&p).unwrap().turn_active = true;
+        let (reply, ok) = run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &json!({"toml": concrete.to_toml(), "reason": "Create the task workflow"}));
+        assert!(ok, "{reply}");
+        assert_eq!(run.planner, Some(p), "the caller lives until its tool result is delivered");
+        assert!(!ctx.stopped.contains(&p));
+        ctx.agents.get_mut(&p).unwrap().turn_active = false;
+        run.on_turn_done(&mut ctx, p, "completed", None, None);
+        let next = run.planner.unwrap();
+        assert_ne!(next, p);
+        assert!(ctx.stopped.contains(&p));
+        assert!(ctx.spawned_instructions.iter().any(|(id, instructions)| *id == next && instructions.contains("Updated planner contract")));
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn workflow_replacement_rejects_unknown_primary_and_fallback_models() {
+        let (mut run, _ctx, _p) = planner_feature_run("pattern-model-validation", Pattern::builtin());
+        run.set_known_models([("known".into(), 128_000)].into_iter().collect());
+        let mut candidate = Pattern::builtin_lean();
+        for role in candidate.roles.values_mut() { role.model = "known".into(); }
+        assert!(run.validate_pattern_replacement(&candidate).is_ok());
+        candidate.roles.get_mut("planner").unwrap().fallback = Some("missing".into());
+        assert!(run.validate_pattern_replacement(&candidate).unwrap_err().contains("fallback"));
+        candidate.roles.get_mut("planner").unwrap().fallback = Some("known".into());
+        candidate.roles.get_mut("worker-small").unwrap().model = "missing".into();
+        assert!(run.validate_pattern_replacement(&candidate).unwrap_err().contains("worker-small"));
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn planner_emergency_stop_of_supervisor_is_recoverable_without_self_interrupt() {
+        let (mut run, mut ctx, p) = planner_feature_run("kill-supervisor", Pattern::builtin());
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let orch = ctx.add_busy();
+        run.orchestrator = Some(orch);
+        ctx.agents.get_mut(&p).unwrap().turn_active = true;
+        assert!(run.handle_tool(&mut ctx, p, "mantra_kill", &json!({"agent": "orchestrator", "reason": "irrecoverable loop"})).1);
+        assert!(run.halted());
+        assert!(!ctx.interrupted.contains(&p), "the caller must receive the tool result");
+        run.on_turn_done(&mut ctx, orch, "failed", Some("late process error".into()), None);
+        assert_eq!(run.orchestrator, Some(orch), "late errors do not restart the killed role");
+        let (reply, ok) = run.handle_tool(&mut ctx, p, "mantra_respawn", &json!({"agent": "orchestrator", "note": "Continue with one action per event"}));
+        assert!(ok, "{reply}");
+        assert_ne!(run.orchestrator, Some(orch));
+        assert!(!run.halted());
+        let _ = std::fs::remove_dir_all(&run.dir);
     }
 
     /// A minimal `Worker` for tests that don't need a real workspace/prepare cycle.
@@ -6196,7 +6829,7 @@ mod halt_tests {
         assert_eq!((st.stage_label(), st.finished(), st.halted.is_none()), ("stopped".to_string(), true, true));
         assert!(st.finished_unix.is_some());
         // a merge that was in flight does not start a gate in the stopped run
-        run.on_job(&mut ctx, JobTag::Merge { phase: 0 }, JobOut::Merge(git::MergeResult { merged: vec!["b2".into()], conflicts: vec![], log: String::new() }));
+        run.on_job(&mut ctx, JobTag::Merge { phase: 0 }, JobOut::Merge(git::MergeResult { merged: vec!["b2".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
         assert_eq!((ctx.spawns.len(), &run.stage), (spawns, &Stage::Failed(STOPPED_BY_USER.into())));
         // stopping twice changes nothing
         let lines = run.pulse.len();
@@ -7545,7 +8178,8 @@ mod halt_tests {
         assert!(run.alerts.iter().any(|a| a.starts_with("the manager asks:")));
         ctx.prompts.clear();
         run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2");
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == manager && t.contains("[from the user]") && t.contains("mantra_resume_run")), "{:?}", ctx.prompts);
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[from the user]") && t.contains("mantra_prompt")), "{:?}", ctx.prompts);
+        assert!(ctx.prompts.iter().all(|(a, _)| *a != manager), "user answers enter through the planner");
         assert!(run.question.is_none() && run.alerts.is_empty());
     }
 
@@ -7590,6 +8224,106 @@ mod halt_tests {
         run.spawn_task(ctx, task, None, effort);
         let wi = run.workers.iter().position(|w| w.task.id == id).unwrap();
         run.launch_worker(ctx, wi, PathBuf::from(format!("/tmp/wt-{id}")), String::new());
+    }
+
+    #[test]
+    fn worker_and_resumed_fix_prompts_inherit_ticket_rules_without_credential_lines() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut ctx = TestCtx::new();
+            let brief = "Build the requested integration.\nNoel tickets #14 and #15: German above English in every status block.\nAPI_KEY=must-not-reach-workers\nexport access_token=private-value\n-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----\nPreserve the decision log.";
+            let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), brief.into());
+            run.plan = Some(one_task_phase());
+            run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+            let task = Task { id: "ticket-14".into(), role: "worker-small".into(), prompt: "Implement ticket #14.".into(), ..Default::default() };
+            launch(&mut ctx, &mut run, task, None);
+            let first = run.workers[0].agent.unwrap();
+            let fix = Task { id: "fix-1".into(), role: "worker-small".into(), prompt: "Repair ticket #15.".into(), ..Default::default() };
+            run.spawn_task(&mut ctx, fix, None, None);
+            let wi = run.workers.len() - 1;
+            run.launch_worker_with(&mut ctx, wi, PathBuf::from("/tmp/fix-rules"), String::new(), Some("saved-session".into()));
+            let resumed = run.workers[wi].agent.unwrap();
+            for agent in [first, resumed] {
+                let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == agent).unwrap().1;
+                assert!(prompt.contains("Noel tickets #14 and #15: German above English"), "{prompt}");
+                assert!(prompt.contains("Preserve the decision log."));
+                assert!(!prompt.contains("must-not-reach-workers") && !prompt.contains("private-value") && !prompt.contains("private-key-material"));
+                let instructions = &ctx.spawned_instructions.iter().find(|(a, _)| *a == agent).unwrap().1;
+                assert!(instructions.contains("Retry-After") && instructions.contains("Never blindly repeat a patch"));
+                assert!(instructions.contains("never invent model credits or session identifiers"));
+            }
+            assert!(ctx.prompts.iter().any(|(a, p)| *a == resumed && p.starts_with("[mantra:resume]")));
+        });
+    }
+
+    #[test]
+    fn inherited_brief_is_bounded_and_marks_missing_rules() {
+        let prompt = worker_brief_context(&"ä".repeat(20_000));
+        assert!(prompt.chars().count() < 13_000);
+        assert!(prompt.contains("brief clipped at 12000 characters"));
+        assert!(prompt.contains("ask for missing ticket/project rules"));
+    }
+
+    #[test]
+    fn refused_history_merge_halts_without_an_automatic_merge_fixer() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.plan = Some(one_task_phase());
+        run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
+        let agent = ctx.add_idle();
+        run.workers.push(mk_worker("t1", "worker-small", agent, WState::Done));
+        run.on_job(&mut ctx, JobTag::Merge { phase: 0 }, JobOut::Merge(git::MergeResult {
+            merged: vec![], conflicts: vec![], blocked: vec!["t1: decision-log safeguard: DECISIONS.md lost heading #106".into()], log: "refused".into(),
+        }));
+        assert!(run.halted());
+        assert!(run.halt.as_ref().unwrap().full.contains("DECISIONS.md lost heading #106"));
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Orchestrating });
+        assert!(ctx.jobs.is_empty(), "no checks or fix worker may bypass a refused merge");
+        assert_eq!(run.workers.len(), 1);
+        assert_eq!(run.workers[0].state, WState::Done);
+        run.resume(&mut ctx);
+        assert!(!run.halted());
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Merging });
+        assert!(ctx.jobs.iter().any(|j| j.contains("Merge")));
+    }
+
+    #[test]
+    fn refused_phase_commit_halts_and_explicit_resume_retries_without_archiving_twice() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.plan = Some(two_phase_plan());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Handoff };
+        run.handoff_note_done = true;
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Cleanup(Err("decision-log safeguard: lost heading".into()), git::ReviewDiff::default()));
+        assert!(run.halted() && !run.cleanup_done);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+        let history = run.history.len();
+        run.resume(&mut ctx);
+        assert!(!run.halted());
+        assert_eq!(run.history.len(), history);
+        assert!(ctx.jobs.iter().any(|j| j.contains("Cleanup")));
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+        run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Cleanup(Ok("committed".into()), git::ReviewDiff::default()));
+        assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
+    }
+
+    #[test]
+    fn planner_and_gate_challenge_contract_and_security_protocol_requirements() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "Review Noel's ticket: German above English.".into());
+        let planner = run.spawn_planner(&mut ctx);
+        let instructions = &ctx.spawned_instructions.iter().find(|(a, _)| *a == planner).unwrap().1;
+        assert!(instructions.contains("abandoned/pending/cancelled attempts"));
+        assert!(instructions.contains("GitLab auto-cancel") && instructions.contains("commit SHA"));
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+        run.spawn_gate_at_round(&mut ctx, 0, 1);
+        let gate = run.gate_agent.unwrap();
+        let instructions = &ctx.spawned_instructions.iter().find(|(a, _)| *a == gate).unwrap().1;
+        assert!(instructions.contains("authoritative protocol/provider specification"));
+        assert!(instructions.contains("signed/covered fields") && instructions.contains("trusted issuer/endpoints"));
+        assert!(instructions.contains("negative test") && instructions.contains("replay protection"));
+        assert!(ctx.prompts.iter().any(|(a, p)| *a == gate && p.contains("German above English")));
     }
 
     #[test]
@@ -8140,13 +8874,17 @@ mod halt_tests {
         let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
         let orch = ctx.add_idle();
         run.orchestrator = Some(orch);
+        let planner = ctx.add_idle();
+        run.planner = Some(planner);
+        run.stage = Stage::Planning;
 
         assert!(!run.direct(&mut ctx, "orchestrator", "   ", Send::Auto), "an empty message is not delivered");
         assert!(ctx.prompts.is_empty(), "nothing must be sent: {:?}", ctx.prompts);
         assert!(run.pulse.is_empty(), "and nothing logged for it");
 
         assert!(run.direct(&mut ctx, "orchestrator", "status?", Send::Auto), "a real message still goes through");
-        assert!(ctx.prompts.iter().any(|(a, t)| *a == orch && t.contains("status?")));
+        assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("status?")));
+        assert!(ctx.prompts.iter().all(|(a, _)| *a != orch));
     }
 
     // mantra_wait really ends the turn ----------------------------------------------------------
@@ -8966,6 +9704,25 @@ mod halt_tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    #[test]
+    fn a_backend_switch_checkpoint_never_pairs_new_model_with_old_session() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("switch-checkpoint");
+        run.set_known_models(known(&[("astra", 200_000), ("nova", 128_000)]));
+        run.stage = Stage::Planning;
+        let planner = run.spawn_planner(&mut ctx);
+        ctx.agents.get_mut(&planner).unwrap().thread_id = Some("old-backend-only".into());
+        run.on_ready(&mut ctx, planner, false, false);
+        run.forget_agent_session(planner);
+        run.set_agent_model(planner, "nova");
+        let saved = RunState::load(&run.dir).unwrap();
+        let slot = saved.agents.iter().find(|a| a.slot == "planner").unwrap();
+        assert_eq!(slot.model_alias, "nova");
+        assert_eq!(slot.thread_id, None, "a crash before Ready must start a fresh compatible session");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
     /// A finale agent's switch is for its step: a respawn of that step keeps it, the next step —
     /// another role — starts on that role's own model.
     #[test]
@@ -9011,6 +9768,97 @@ mod halt_tests {
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
+    #[test]
+    fn billing_fallback_keeps_worker_files_and_attempt_and_alerts_the_owner() {
+        let mut ctx = TestCtx::new();
+        let mut pat = no_manager();
+        pat.roles.get_mut("worker-small").unwrap().fallback = Some("claude-fallback".into());
+        let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+        run.dir = scratch_dir("billing-fallback");
+        run.plan = Some(one_task_phase());
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+        let a = ctx.add_busy();
+        ctx.agents.get_mut(&a).unwrap().model_alias = "openrouter-primary".into();
+        let mut worker = mk_worker("t1", "worker-small", a, WState::Running);
+        worker.wt = Some(PathBuf::from("existing-worktree"));
+        worker.branch = "existing-branch".into();
+        worker.prompt = "Finish the partial implementation".into();
+        worker.attempt = run.max_attempts();
+        run.workers.push(worker);
+        run.retry_counts.insert(a, 2);
+        run.continue_queue.push((a, Instant::now(), "old retry".into()));
+        run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 402: Insufficient credits".into()), Some(ErrKind::ProviderRejected));
+        let fresh = run.workers[0].agent.unwrap();
+        assert_ne!(fresh, a);
+        assert!(!run.halted());
+        assert_eq!(run.workers.len(), 1, "billing does not create a counted attempt");
+        assert_eq!(run.workers[0].attempt, run.max_attempts());
+        assert_eq!(run.workers[0].branch, "existing-branch");
+        assert_eq!(ctx.spawned("t1")[0].cwd, PathBuf::from("existing-worktree"));
+        assert_eq!(ctx.spawned("t1")[0].model, "claude-fallback", "a different backend alias is accepted");
+        assert_eq!(run.workers[0].model.as_deref(), Some("claude-fallback"));
+        assert!(run.continue_queue.is_empty() && !run.retry_counts.contains_key(&a));
+        assert!(run.alerts.iter().any(|alert| alert.contains("fallback claude-fallback")));
+        assert!(ctx.notified.iter().any(|alert| alert.contains("billing or usage limit")));
+        // A late error from the stopped primary cannot restore the halt.
+        run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 402: Insufficient credits".into()), Some(ErrKind::UsageLimit));
+        assert!(!run.halted());
+        // The fallback is tried once; exhaustion there has no recursive fallback loop.
+        run.on_turn_done(&mut ctx, fresh, "failed", Some("HTTP 429: quota exhausted".into()), Some(ErrKind::Transient));
+        assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::UsageLimit);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn quota_fallback_restarts_a_fixed_slot_before_transport_retries() {
+        let mut ctx = TestCtx::new();
+        let mut pat = no_manager();
+        pat.roles.get_mut("planner").unwrap().fallback = Some("fallback-api".into());
+        let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+        run.dir = scratch_dir("quota-fixed-fallback");
+        run.stage = Stage::Planning;
+        let a = run.spawn_planner(&mut ctx);
+        run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 429: quota exceeded".into()), Some(ErrKind::Transient));
+        assert_ne!(run.planner, Some(a));
+        assert_eq!(ctx.spawned("planner").last().unwrap().model, "fallback-api");
+        assert!(!run.halted() && run.continue_queue.is_empty());
+        let fresh = run.planner.unwrap();
+        ctx.agents.get_mut(&fresh).unwrap().model_alias = "fallback-api".into();
+        run.on_ready(&mut ctx, fresh, false, false);
+        run.save_state();
+        assert_eq!(RunState::load(&run.dir).unwrap().agents.iter().find(|agent| agent.slot == "planner").unwrap().model_alias, "fallback-api");
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
+    #[test]
+    fn respawn_resolves_only_its_own_failure_and_discards_old_retry_state() {
+        let mut ctx = TestCtx::new();
+        let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+        run.dir = scratch_dir("respawn-recovery");
+        run.stage = Stage::Planning;
+        let a = run.spawn_planner(&mut ctx);
+        run.halt(&mut ctx, HaltReason::UsageLimit, Some(a), "primary quota exhausted".into());
+        run.alerts.push("unrelated owner alert".into());
+        run.retry_counts.insert(a, 2);
+        run.continue_queue.push((a, Instant::now(), "old retry".into()));
+        assert_eq!(run.respawn(&mut ctx, a, None).unwrap(), RESPAWNED);
+        let fresh = run.planner.unwrap();
+        assert_ne!(fresh, a);
+        assert!(!run.halted());
+        assert_eq!(run.alerts, vec!["unrelated owner alert"]);
+        assert!(!run.retry_counts.contains_key(&a) && run.continue_queue.is_empty());
+        assert_eq!(RunState::load(&run.dir).unwrap().halted, None);
+        run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 402".into()), Some(ErrKind::UsageLimit));
+        assert!(!run.halted(), "late old-process failure is ignored");
+        let other = ctx.add_idle();
+        run.orchestrator = Some(other);
+        run.halt(&mut ctx, HaltReason::ProviderRejected, Some(other), "orchestrator request rejected".into());
+        run.respawn(&mut ctx, fresh, None).unwrap();
+        assert_eq!(run.halt.as_ref().unwrap().agent, Some(other));
+        assert!(run.alerts.iter().any(|alert| alert == "orchestrator request rejected"));
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+
     // The context cap ---------------------------------------------------------------------------
 
     /// Every spawn is told `min(model window, context_cap)`: a big model is capped, a small one
@@ -9038,10 +9886,13 @@ mod halt_tests {
         assert_eq!(run.context_for("unknown-alias", None), Some(200_000), "nothing known: the cap stands");
         // 0 = the model's own window, whatever it is
         run.pattern.settings.context_cap = 0;
-        assert_eq!(run.context_for(&planner_model, None), None);
+        assert_eq!(run.context_for(&planner_model, None), Some(1_000_000));
         assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
+        assert_eq!(run.context_for(&worker_model, Some(400_000)), Some(128_000), "an override cannot inflate the model's limit");
+        assert_eq!(run.context_for("unknown-alias", None), None);
+        let orchestrator_window = run.context_for(&run.role(&run.pattern.flow.orchestrator).model, None);
         run.respawn_orchestrator(&mut ctx, None);
-        assert_eq!(ctx.spawned("orchestrator")[0].context_override, None);
+        assert_eq!(ctx.spawned("orchestrator")[0].context_override, orchestrator_window);
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 

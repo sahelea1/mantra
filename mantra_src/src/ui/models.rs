@@ -251,7 +251,7 @@ fn set_model_cell(reg: &mut Registry, row: usize, col: usize, text: &str) -> Res
         CONTEXT_COL => {
             let n = parse_tokens(t);
             if n.is_none() && !t.is_empty() && !["none", "default"].contains(&t.to_ascii_lowercase().as_str()) {
-                return Err("context: a number of tokens — 200000, 400k or 1m (empty: the assumed 200k)".into());
+                return Err("context: a number of tokens — 200000, 400k or 1m (empty: inherit the default model window)".into());
             }
             m.context_window = n;
         }
@@ -914,7 +914,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     f.render_widget(mblk, rows[1]);
     let hints = [
         " context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)",
-        " dim \"(assumed)\" / \"(default)\" = not set here, using Mantra's built-in 200k / 85% · +/- steps values",
+        " dim \"(default)\" = not set here; context inherits the default model, compact uses 85% · +/- steps values",
         " vision = the model takes images: its agents get the screenshot and view-image tools · space flips it",
     ];
     // the hints (and a blank line above them) only while every model row fits beside them
@@ -934,7 +934,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             m.model.clone(),
             match m.context_window {
                 Some(cw) => short_tokens(cw),
-                None => format!("{} (assumed)", short_tokens(m.effective_context())),
+                None => format!("{} (default)", short_tokens(app.registry.effective_context_window(&m.alias, &app.settings.default_model))),
             },
             match m.auto_compact_percent {
                 Some(p) => format!("{p}%"),
@@ -1434,7 +1434,7 @@ mod tests {
     }
 
     /// The key flow: an inline row with the key field already being edited (masked), ⏎ → the
-    /// base URL its prefix suggests, ⏎ → the provider added (the key in models.toml only) and its
+    /// base URL its prefix suggests, ⏎ → the provider added (the key saved privately) and its
     /// models asked for off the event loop; esc cancels. The key never shows on screen.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_key_flow_adds_a_provider_and_probes_it() {
@@ -1470,7 +1470,8 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             let p = app.registry.providers.iter().find(|p| p.id == "local").expect("added");
             assert_eq!(p.api_key.as_deref(), Some("zz-unknown-1234"));
-            assert!(std::fs::read_to_string(Registry::path()).unwrap().contains("zz-unknown-1234"), "saved");
+            assert!(!std::fs::read_to_string(Registry::path()).unwrap().contains("zz-unknown-1234"), "models.toml stays shareable");
+            assert!(std::fs::read_to_string(crate::config::home().join("secrets.toml")).unwrap().contains("zz-unknown-1234"), "saved privately");
             assert!(app.models_ui.keyflow.as_ref().is_some_and(|k| k.probing.as_ref().is_some_and(|(id, host)| id == "local" && host == "127.0.0.1:9") && k.key.is_empty()));
             assert!(app.animating(), "the spinner turns");
             // the probe's answer: a refusal keeps the provider and says why, without the key

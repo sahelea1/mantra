@@ -32,6 +32,10 @@ pub struct RunState {
     pub halted: Option<String>,
     /// A transition that became due during that halt, performed once on resume (`Pending`).
     pub pending: Option<Pending>,
+    /// Validated workflow awaiting explicit user approval. Never applied on restore alone.
+    pub pending_pattern: Option<super::run::PatternProposal>,
+    /// A single scheduled planner re-entry; unix time survives process restarts.
+    pub planner_wait: Option<super::run::PlannerWait>,
     pub started_unix: u64,
     /// When the run completed or stopped, so a finished run's duration stays what it was.
     pub finished_unix: Option<u64>,
@@ -446,6 +450,8 @@ pub(crate) mod tests {
             stage: Stage::Phase { idx: 1, step: PhaseStep::Gate { round: 2 } },
             halted: Some("paused by you".into()),
             pending: Some(Pending::Handoff { idx: 1 }),
+            pending_pattern: None,
+            planner_wait: None,
             started_unix: 10,
             finished_unix: None,
             active_secs: Some(7),

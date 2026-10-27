@@ -50,6 +50,46 @@ fn migrate_old_home(old: &Path, new: &Path) {
     let _ = std::fs::write(new.join("MIGRATED.txt"), format!("Settings, models and patterns were copied from {} on first start.\nThe old directory can be deleted once no old runs need it.\n", old.display()));
 }
 
+/// Secrets stay separate from ordinary settings; never include their contents in parse errors.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Secrets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_password: Option<String>,
+    provider_keys: BTreeMap<String, String>,
+    provider_headers: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl Secrets {
+    fn load() -> Result<Self> {
+        use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match options.open(home().join("secrets.toml")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(_) => anyhow::bail!("secrets.toml cannot be read; fix it before saving"),
+        };
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600)).context("restrict secrets.toml permissions")?;
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text).context("read secrets.toml")?;
+        toml::from_str(&text).map_err(|_| anyhow::anyhow!("secrets.toml does not parse; fix it before saving"))
+    }
+    fn save(&self) -> Result<()> {
+        atomic_write_restricted(&home().join("secrets.toml"), &toml::to_string_pretty(self)?)
+    }
+}
+
+/// Serialize updates to the shared secrets file from settings and model saves.
+static SECRETS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Per-project run journals: `~/.mantra/runs/<project>-<hash>/` (never inside the project).
 pub fn runs_dir(project: &Path) -> PathBuf {
     let abs = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
@@ -194,8 +234,19 @@ impl Settings {
     pub fn load_on_disk() -> std::result::Result<Settings, String> {
         let path = home().join("settings.toml");
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str::<Settings>(&text).map_err(|e| format!("{} does not parse, fix it first: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+            Ok(text) => {
+                let mut settings = toml::from_str::<Settings>(&text).map_err(|_| format!("{} does not parse, fix it first", path.display()))?;
+                let secrets = Secrets::load().map_err(|e| e.to_string())?;
+                let legacy = !settings.web.password.is_empty();
+                if let Some(password) = secrets.web_password { settings.web.password = password; }
+                if legacy { settings.save().map_err(|e| e.to_string())?; }
+                Ok(settings)
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut s = Settings::default();
+                s.web.password = Secrets::load().map_err(|e| e.to_string())?.web_password.unwrap_or_default();
+                Ok(s)
+            },
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
@@ -207,7 +258,7 @@ impl Settings {
 /// the file until they fix it. `None` = go (the file parses, or there is none yet).
 fn unparseable<T: serde::de::DeserializeOwned>(path: &Path) -> Option<String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str::<T>(&text).err().map(|e| format!("{} does not parse, so it was not saved over — fix it first: {}", path.display(), e.to_string().lines().next().unwrap_or_default())),
+        Ok(text) => toml::from_str::<T>(&text).err().map(|_e| format!("{} does not parse, so it was not saved over — fix it first: {}", path.display(), "invalid TOML")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!("{} cannot be read, so it was not saved over: {e}", path.display())),
     }
@@ -237,13 +288,14 @@ pub fn mcp_name_problem(name: &str) -> Option<String> {
 }
 
 /// `[web]` in settings.toml: defaults for `--web` / `--remote`. Flags override.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WebSettings {
     /// Listen address; "" → 127.0.0.1:7777.
     pub listen: String,
     /// Web UI password ("" → none). `MANTRA_WEB_PASSWORD` is the preferred way; when one is stored
-    /// here settings.toml is written 0600.
+    /// in memory it is persisted separately in owner-only secrets.toml.
+    #[serde(skip_serializing)]
     pub password: String,
     /// Self-signed TLS (ignored when `cert`/`key` are set).
     pub tls: bool,
@@ -262,6 +314,12 @@ pub struct WebSettings {
     pub push: bool,
     /// VAPID `sub` claim (mailto:… or https://…); "" → https://mantra.codes.
     pub contact: String,
+}
+
+impl std::fmt::Debug for WebSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSettings").field("listen", &self.listen).field("password", &"[redacted]").field("tls", &self.tls).finish_non_exhaustive()
+    }
 }
 
 impl Default for WebSettings {
@@ -299,21 +357,16 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load() -> Settings {
-        let p = home().join("settings.toml");
-        match std::fs::read_to_string(&p) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                crate::mlog!("settings.toml invalid ({e}); using defaults");
-                Settings::default()
-            }),
+        match Self::load_on_disk() {
+            Ok(s) => s,
             Err(_) => {
-                let s = Settings::default();
-                let _ = s.save();
-                s
+                crate::mlog!("settings.toml or secrets.toml invalid/unreadable; using defaults until fixed");
+                Settings::default()
             }
         }
     }
-    /// Whether settings.toml holds a secret: a web password, or any value in an MCP server's
-    /// `env` (a token, typically) — what makes `save` write it 0600.
+    /// Whether the settings hold credentials. MCP env still lives in settings.toml, owner-only;
+    /// the web password is written separately to secrets.toml.
     pub fn holds_secrets(&self) -> bool {
         !self.web.password.is_empty() || self.mcp_servers.values().any(|s| !s.env.is_empty())
     }
@@ -323,9 +376,15 @@ impl Settings {
             anyhow::bail!(why);
         }
         std::fs::create_dir_all(home())?;
-        let body = toml::to_string_pretty(self)?;
+        let _lock = SECRETS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut secrets = Secrets::load()?;
+        secrets.web_password = Some(self.web.password.clone());
+        secrets.save()?; // Persist first: failed migration leaves the original settings intact.
+        let mut public = self.clone();
+        public.web.password.clear();
+        let body = toml::to_string_pretty(&public)?;
         let body = format!("# Mantra settings\n{body}");
-        // A secret in the file makes it restricted (same rule as a key in models.toml).
+        // MCP env values still make the settings file restricted.
         if !self.holds_secrets() {
             atomic_write(&home().join("settings.toml"), &body)
         } else {
@@ -466,7 +525,7 @@ pub enum ProviderKind {
     Bija,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ProviderEntry {
     pub id: String,
@@ -474,9 +533,8 @@ pub struct ProviderEntry {
     pub base_url: String,
     /// Name of the environment variable holding the API key (preferred: never touches disk).
     pub env_key: String,
-    /// The key itself, stored directly — optional, alongside `env_key`. Written to `models.toml`
-    /// (0600 on Unix) only when the user pastes one in here; never logged or put on argv.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The key itself, stored separately in owner-only secrets.toml; never logged or put on argv.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     /// Codex only speaks the Responses API since Feb 2026.
     /// Legacy field: Codex only supports the Responses API, so Mantra always sends "responses".
@@ -492,11 +550,20 @@ pub struct ProviderEntry {
     /// (Messages). Written only when set, so a models.toml without Bija providers never shows it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wire: String,
+    /// Extra request headers (e.g. anthropic-beta or anthropic-workspace-id). Values are secrets.
+    #[serde(default, skip_serializing)]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ProviderEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderEntry").field("id", &self.id).field("name", &self.name).field("base_url", &self.base_url).field("kind", &self.kind).field("wire", &self.wire).field("api_key", &"[redacted]").field("headers", &"[redacted]").finish_non_exhaustive()
+    }
 }
 
 impl Default for ProviderEntry {
     fn default() -> Self {
-        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new() }
+        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new(), headers: BTreeMap::new() }
     }
 }
 
@@ -538,7 +605,8 @@ impl ProviderEntry {
     /// The `--wire` a Bija process is launched with: the Messages API for `anthropic`, else Chat
     /// Completions (`""` or `openai`; anything else is a `wire_problem` and never launched).
     pub fn bija_wire(&self) -> &'static str {
-        if self.wire.trim().eq_ignore_ascii_case("anthropic") {
+        let direct_anthropic = self.wire.trim().is_empty() && self.host().is_some_and(|host| host.split(':').next().is_some_and(|h| h.eq_ignore_ascii_case("api.anthropic.com")));
+        if self.wire.trim().eq_ignore_ascii_case("anthropic") || direct_anthropic {
             "anthropic"
         } else {
             "openai-chat"
@@ -1060,25 +1128,40 @@ impl Registry {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => match toml::from_str::<Registry>(&s) {
                 Ok(mut r) if !r.models.is_empty() => {
-                    if r.migrate(&s, codex_available()) {
-                        let _ = r.save();
-                    }
+                    let changed = r.migrate(&s, codex_available());
+                    r.restore_secrets_and_migrate(changed);
                     r
                 }
                 // No models at all: preserve configured providers, but do not create implicit
                 // providers or models.
-                Ok(r) => r,
-                Err(e) => {
+                Ok(mut r) => { r.restore_secrets_and_migrate(false); r },
+                Err(_e) => {
                     // `save` refuses to write over the file while it does not parse (`unparseable`).
-                    crate::mlog!("models.toml invalid ({e}); using defaults until it is fixed");
+                    crate::mlog!("models.toml invalid; using defaults until it is fixed");
                     Registry::defaults()
                 }
             },
             Err(_) => {
-                let r = Registry::defaults();
-                let _ = r.save();
-                r
+                // A missing/unreadable public registry must never clear the separate secrets
+                // file. The first explicit model edit will create models.toml.
+                Registry::defaults()
             }
+        }
+    }
+
+    fn restore_secrets_and_migrate(&mut self, changed: bool) {
+        let legacy = self.providers.iter().any(|p| p.api_key.is_some() || !p.headers.is_empty());
+        match Secrets::load() {
+            Ok(secrets) => {
+                for p in &mut self.providers {
+                    if let Some(key) = secrets.provider_keys.get(&p.id) { p.api_key = Some(key.clone()); }
+                    if let Some(headers) = secrets.provider_headers.get(&p.id) { p.headers = headers.clone(); }
+                }
+                if legacy || changed {
+                    if self.save().is_err() { crate::mlog!("models.toml secret/schema migration could not be saved; original preserved"); }
+                }
+            }
+            Err(_) => crate::mlog!("secrets.toml invalid/unreadable; model secrets could not be loaded"),
         }
     }
 
@@ -1097,6 +1180,11 @@ impl Registry {
             anyhow::bail!(why);
         }
         std::fs::create_dir_all(home())?;
+        let _lock = SECRETS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut secrets = Secrets::load()?;
+        secrets.provider_keys = self.providers.iter().filter_map(|p| p.api_key.as_ref().map(|key| (p.id.clone(), key.clone()))).collect();
+        secrets.provider_headers = self.providers.iter().filter(|p| !p.headers.is_empty()).map(|p| (p.id.clone(), p.headers.clone())).collect();
+        secrets.save()?;
         let body = toml::to_string_pretty(self).context("serialize models")?;
         let text = format!("{REGISTRY_HEADER}{body}");
         // A registry holding a pasted-in key is written 0600 (Unix) so it isn't world-readable.
@@ -1157,6 +1245,20 @@ impl Registry {
             model: alias.to_string(),
             ..Default::default()
         })
+    }
+
+    /// An unset model context inherits the configured default model, then the assumed window.
+    pub fn effective_context_window(&self, alias: &str, default_alias: &str) -> u64 {
+        self.get(alias).and_then(|m| m.context_window).filter(|n| *n > 0)
+            .or_else(|| self.get(default_alias).and_then(|m| m.context_window).filter(|n| *n > 0))
+            .unwrap_or(crate::discover::ASSUMED_CONTEXT)
+    }
+
+    pub fn context_windows_for_default(&self, default_alias: &str) -> std::collections::HashMap<String, u64> {
+        self.names().into_iter().map(|(name, _)| {
+            let window = self.effective_context_window(&name, default_alias);
+            (name, window)
+        }).collect()
     }
 
     /// Every alias with its effective context window (its own, or the assumed one) — what the
@@ -1293,7 +1395,7 @@ pub fn atomic_write(path: &Path, body: &str) -> Result<()> {
 }
 
 /// Like `atomic_write`, but the file is 0600 (Unix) from the moment it exists — used when the
-/// content holds a secret (an API key pasted into `models.toml`, the web layer's keys and tokens).
+/// content holds a secret (secrets.toml or the web layer's keys and tokens).
 pub fn atomic_write_restricted(path: &Path, body: &str) -> Result<()> {
     write_atomic(path, body, true)
 }
@@ -1320,7 +1422,10 @@ fn write_restricted(tmp: &Path, body: &str) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     let mut f = opts.open(tmp)?;
     #[cfg(unix)]
     {
@@ -1342,6 +1447,56 @@ mod tests {
 
     /// A hand edit that broke settings.toml or models.toml is never written over: the session ran
     /// on defaults, and saving those would throw away what the file held — a pasted key included.
+    #[test]
+    fn secrets_migrate_and_round_trip_without_entering_public_configuration() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            std::fs::write(home().join("settings.toml"), "[web]\npassword = \"web-secret\"\n").unwrap();
+            std::fs::write(Registry::path(), "[[provider]]\nid = \"test\"\napi_key = \"provider-secret\"\n[provider.headers]\nanthropic-beta = \"beta-secret\"\n").unwrap();
+            let settings = Settings::load_on_disk().unwrap();
+            let registry = Registry::load();
+            assert_eq!(settings.web.password, "web-secret");
+            assert_eq!(registry.providers[0].api_key.as_deref(), Some("provider-secret"));
+            assert_eq!(registry.providers[0].headers["anthropic-beta"], "beta-secret");
+            let settings_text = std::fs::read_to_string(home().join("settings.toml")).unwrap();
+            let models_text = std::fs::read_to_string(Registry::path()).unwrap();
+            assert!(!settings_text.contains("web-secret"));
+            assert!(!models_text.contains("provider-secret") && !models_text.contains("beta-secret"));
+            assert_eq!(Settings::load().web.password, "web-secret");
+            assert_eq!(Registry::load().providers[0].api_key.as_deref(), Some("provider-secret"));
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(home().join("secrets.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+                std::fs::set_permissions(home().join("secrets.toml"), std::fs::Permissions::from_mode(0o644)).unwrap();
+                assert_eq!(Settings::load().web.password, "web-secret");
+                assert_eq!(std::fs::metadata(home().join("secrets.toml")).unwrap().permissions().mode() & 0o777, 0o600, "existing permissive files are narrowed on load");
+            }
+            assert!(!format!("{:?}", settings).contains("web-secret"));
+            assert!(!format!("{:?}", registry).contains("provider-secret"));
+            let mut settings = settings;
+            settings.web.password.clear(); settings.save().unwrap();
+            assert!(Settings::load().web.password.is_empty());
+            assert_eq!(Registry::load().providers[0].api_key.as_deref(), Some("provider-secret"), "saving settings preserves provider secrets");
+            std::fs::remove_file(Registry::path()).unwrap();
+            assert!(Registry::load().providers.is_empty());
+            assert_eq!(Secrets::load().unwrap().provider_keys["test"], "provider-secret", "a missing public registry cannot erase stored credentials");
+            registry.save().unwrap();
+            std::fs::write(home().join("secrets.toml"), "web_password = \"unterminated-secret").unwrap();
+            let err = settings.save().unwrap_err().to_string();
+            assert!(!err.contains("unterminated-secret"));
+            assert!(std::fs::read_to_string(home().join("secrets.toml")).unwrap().contains("unterminated-secret"));
+        });
+    }
+
+    #[test]
+    fn unset_model_context_inherits_configured_default() {
+        let mut r = Registry::defaults();
+        r.models = vec![ModelEntry { alias: "default".into(), context_window: Some(64_000), ..Default::default() }, ModelEntry { alias: "other".into(), ..Default::default() }];
+        assert_eq!(r.effective_context_window("other", "default"), 64_000);
+        assert_eq!(r.effective_context_window("unknown", "default"), 64_000);
+        assert_eq!(r.context_windows_for_default("default")["other"], 64_000);
+        assert_eq!(r.effective_context_window("other", "missing"), crate::discover::ASSUMED_CONTEXT);
+    }
+
     #[test]
     fn a_file_that_does_not_parse_is_never_saved_over() {
         crate::web::snapshot::tests::with_mantra_home(|| {

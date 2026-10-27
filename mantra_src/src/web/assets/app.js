@@ -56,11 +56,13 @@
     async function cmd(name, args, opts) {
         opts = opts || {};
         if (opts.busyKey) { S.ui.busy[opts.busyKey] = true; changed(); }
+        if (name === 'respawn') AV.trackRespawn(args.agent);
         try {
             const d = await request(name, args, opts.timeout);
             if (opts.ok) flash(opts.ok, 'ok');
             return d;
         } catch (e) {
+            if (name === 'respawn') AV.cancelRespawn(args.agent);
             if (!opts.quiet) flash(e.message || String(e), 'error');
             throw e;
         } finally {
@@ -509,7 +511,7 @@
             onclick: () => onPick(m.alias),
         }, h('span', { class: 'pick-main' }, h('b', null, m.alias), h('span', { class: 'dim mono sm' }, ' ' + m.model)),
             // the backend only when the provider's name does not already say it ("Bija · Bija")
-            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend && m.backend !== 'codex' && F.backend(m.backend) !== m.provider_name ? F.backend(m.backend) : null, m.context_window ? F.tokens(m.context_window) + ' ctx' : null, m.note].filter(Boolean).join(' · ')),
+            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend && m.backend !== 'codex' && F.backend(m.backend) !== m.provider_name ? F.backend(m.backend) : null, (m.effective_context_window || m.context_window) ? F.tokens(m.effective_context_window || m.context_window) + ' ctx' + (m.context_window ? '' : ' (default)') : null, m.note].filter(Boolean).join(' · ')),
             m.problem ? h('span', { class: 'pick-problem' }, m.problem) : null,
             m.alias === currentAlias ? icon('check', 'pick-check') : null)));
     }

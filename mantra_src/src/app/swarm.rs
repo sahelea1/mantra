@@ -123,7 +123,8 @@ impl App {
                 sandbox: role_sandbox(&sandbox, backend),
                 instructions: "You are one member of a bounded Akasha swarm. Complete your assigned task, coordinate through the shared notes, stay within the parent's working directory, and return a concise result. You cannot delegate or spawn other agents.\n".to_string() + MEMBER_PROTOCOL,
                 tools: { let mut t = tools::swarm_member_note_tools(); if model.vision { t.extend(tools::vision_tools()); } t },
-                extra_writable: vec![], network, writable_roots: writable_roots.clone(), context_override: None,
+                extra_writable: vec![], network, writable_roots: writable_roots.clone(),
+                context_override: Some(self.registry.effective_context_window(&task.model, &self.settings.default_model).min(self.run.as_ref().filter(|_| in_run).map(|r| r.pattern.settings.context_cap).filter(|n| *n > 0).unwrap_or(u64::MAX))),
                 resume_thread: None, thread_name: Some(format!("Akasha swarm · {}", task.model)), mcp: mcp.clone(),
             });
             self.swarms.get_mut(&owner).unwrap().children.push(child);

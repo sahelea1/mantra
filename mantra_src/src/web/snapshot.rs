@@ -88,6 +88,9 @@ pub struct ModelInfo {
     pub default_effort: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The configured window, inheriting the default model when unset.
+    #[serde(default)]
+    pub effective_context_window: u64,
     pub compact_percent: u8,
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +460,12 @@ pub struct CheckView {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PlannerWaitView {
+    pub due_at: u64,
+    pub condition: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RunView {
     pub id: String,
     /// The run's name for people (the plan's title, else the goal's first words); `id` stays the key.
@@ -468,6 +477,10 @@ pub struct RunView {
     pub halted: Option<HaltView>,
     pub question: Option<QuestionView>,
     pub want_review: bool,
+    #[serde(default)]
+    pub pattern_review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_wait: Option<PlannerWaitView>,
     pub plan_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<u32>,
@@ -1066,6 +1079,8 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         halted,
         question,
         want_review: r.want_review || r.stage == Stage::Review,
+        pattern_review: r.pending_pattern_review(),
+        planner_wait: r.planner_wait_info().map(|w| PlannerWaitView { due_at: w.due_unix.saturating_mul(1000), condition: w.condition.clone() }),
         plan_version: r.plan_version,
         planner: r.planner,
         manager: r.manager,
@@ -1211,6 +1226,7 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 efforts: m.efforts(),
                 default_effort: m.default_effort.clone(),
                 context_window: m.context_window,
+                effective_context_window: app.registry.effective_context_window(&m.alias, &app.settings.default_model),
                 compact_percent: m.effective_compact_percent(),
                 note: m.note.clone(),
                 problem: app.registry.alias_problem(&m.alias),

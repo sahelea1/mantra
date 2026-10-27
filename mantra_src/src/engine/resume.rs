@@ -49,6 +49,8 @@ impl Run {
         // a finished run written before `finished_unix` existed: its last save is the closest
         run.finished_unix = st.finished_unix.or_else(|| st.finished().then_some(st.updated_unix));
         run.pending = st.pending.clone();
+        run.pending_pattern = st.pending_pattern.clone();
+        run.planner_wait = st.planner_wait.clone();
         run.restore_clock(st, crate::util::unix_secs());
         run.history = st.history.iter().map(|h| PhaseRecord { name: h.name.clone(), workers: h.workers.clone(), duration: Duration::from_secs(h.secs), ended: Instant::now() }).collect();
         run
@@ -118,8 +120,13 @@ impl Run {
                             PhaseStep::Handoff => {
                                 self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
                                 self.handoff_note_done = true;
-                                self.cleanup_done = true;
-                                self.maybe_next_phase(ctx);
+                                if st.halted.as_deref().map(|h| h.starts_with(&format!("phase {} commit failed:", idx + 1))).unwrap_or(false) {
+                                    self.cleanup_done = false;
+                                    self.launch_phase_commit(ctx, idx);
+                                } else {
+                                    self.cleanup_done = true;
+                                    self.maybe_next_phase(ctx);
+                                }
                             }
                             PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. } => {
                                 // Every task had finished; merging is idempotent, so start the gate
@@ -160,6 +167,12 @@ impl Run {
                 // the previous step reported while the run was paused: its successor was due
                 match pending {
                     Some(p @ Pending::Finale { .. }) => self.perform_pending(ctx, p),
+                    _ if (self.planner_wait.is_some() || self.pending_pattern.is_some()) && self.pattern.flow.finale.get(idx).is_some_and(|step| step.role == self.pattern.flow.planner) => {
+                        let thread = st.agents.iter().find(|a| a.slot == "planner" || a.slot == "finale").and_then(|a| a.thread_id.clone());
+                        let p = self.spawn_planner_with(ctx, thread);
+                        self.finale_agent = Some(p);
+                        self.log("◷", "teal", "planner finale restored — waiting for scheduled re-entry or workflow approval");
+                    }
                     _ => self.start_finale(ctx, idx),
                 }
                 for (task, prompt, effort, outage) in redo {
@@ -174,6 +187,18 @@ impl Run {
             Stage::Done => self.log("✦", "saffron", "this run is finished — /land merges its branch; delete it from /runs when you're done with it"),
             Stage::Failed(why) if why == super::run::STOPPED_BY_USER => self.log("■", "amber", "you stopped this run — opened read-only; /land merges what it built, or delete it from /runs"),
             Stage::Failed(why) => self.log("✗", "red", format!("this run had failed ({why}) — opened read-only; delete it from /runs")),
+        }
+        if self.planner_wait.is_some() && self.planner.is_none() {
+            let thread = st.agents.iter().find(|a| a.slot == "planner").and_then(|a| a.thread_id.clone());
+            self.spawn_planner_with(ctx, thread);
+        }
+        // Pending workflow approval survives a restart and remains a user decision. It must
+        // never be interpreted as consent just because the process was resumed.
+        if let Some(proposal) = &self.pending_pattern {
+            let text = format!("Approve workflow change {} → {}? {}\nReply 'approve' or send feedback. Proposed workflow:\n{}", self.pattern.name, proposal.pattern.name, proposal.reason, proposal.pattern.to_toml());
+            let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+            self.question = Some(super::run::Question { from: p, text: text.clone(), since: Instant::now() });
+            self.alerts.push(text);
         }
         self.save_state();
     }
@@ -198,6 +223,10 @@ impl Run {
         let thread = st.agents.iter().find(|a| a.slot == "planner").and_then(|a| a.thread_id.clone());
         let attached = thread.is_some();
         let p = self.spawn_planner_with(ctx, thread);
+        if self.planner_wait.is_some() || self.pending_pattern.is_some() {
+            self.log("◷", "teal", "planner restored — waiting for scheduled re-entry or workflow approval");
+            return;
+        }
         self.mark_edge(p);
         let prompt = if attached {
             format!("[mantra:resume] Mantra restarted while you were planning. Whatever you already explored still counts — continue and submit the plan with mantra_submit_plan.\n\n{}", self.planning_prompt())
@@ -643,6 +672,21 @@ mod tests {
         run.resume_boot(&mut ctx, &st);
         assert_eq!(run.stage, Stage::Phase { idx: 1, step: PhaseStep::Orchestrating });
         assert!(ctx.spawned.iter().any(|(n, _)| n == "orchestrator"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_failed_phase_commit_is_retried_before_advancing() {
+        let dir = tmp("handoff-commit-failed");
+        let mut st = state(&dir, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, vec![worker("a", "done", 1, None)], vec![]);
+        st.halted = Some("phase 1 commit failed: decision-log safeguard: DECISIONS.md lost heading #106\nWorker branches/worktrees are retained.".into());
+        let mut run = Run::from_state(&st, Pattern::builtin(), Some(plan()), dir.join("run"));
+        let mut ctx = Fake::new();
+        run.resume_boot(&mut ctx, &st);
+        assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+        assert!(!run.cleanup_done);
+        assert!(ctx.jobs.iter().any(|j| j.contains("Cleanup")));
+        assert!(!ctx.spawned.iter().any(|(n, _)| n == "orchestrator"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

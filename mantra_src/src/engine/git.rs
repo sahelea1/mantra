@@ -43,6 +43,110 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Repository-local policy only: never copy global settings or credentials into a prompt.
+fn project_values(dir: &Path, key: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["config", "--local", "-z", "--get-all", key]).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    if out.status.code() == Some(1) { return Ok(vec![]); }
+    if !out.status.success() { return Err(format!("cannot read project policy {key}")); }
+    Ok(String::from_utf8_lossy(&out.stdout).split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
+fn commit(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let mut owned: Vec<String> = vec![];
+    for (key, fallback) in [("user.name", "Mantra"), ("user.email", "mantra@localhost")] {
+        if git(dir, &["config", key]).map(|v| v.is_empty()).unwrap_or(true) {
+            owned.extend(["-c".into(), format!("{key}={fallback}")]);
+        }
+    }
+    owned.push("commit".into());
+    owned.extend(args.iter().map(|s| s.to_string()));
+    for trailer in project_values(dir, "mantra.commitTrailer")? {
+        let valid = trailer.split_once(':').map(|(k, v)| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !v.trim().is_empty()).unwrap_or(false);
+        if !valid || trailer.chars().any(char::is_control) { return Err("invalid mantra.commitTrailer: use one Key: value per git config entry".into()); }
+        owned.extend(["--trailer".into(), trailer]);
+    }
+    git(dir, &owned.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
+}
+
+fn decision_logs(dir: &Path) -> Result<Vec<String>, String> {
+    let mut paths = vec!["DECISIONS.md".to_string()];
+    paths.extend(project_values(dir, "mantra.decisionLog")?);
+    if paths.len() > 33 { return Err("too many mantra.decisionLog paths (maximum 32)".into()); }
+    for path in &paths {
+        if path.is_empty() || !Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || path.split('/').any(|c| c == ".git") {
+            return Err("mantra.decisionLog must be a repository-relative file path".into());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Headings outside fenced code, counted so deleting one of two identical entries is caught.
+fn headings(text: &str) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut previous = "";
+    for line in text.lines() {
+        if line.starts_with("    ") || line.starts_with('\t') {
+            previous = "";
+            continue;
+        }
+        let t = line.trim();
+        let first = t.chars().next().unwrap_or(' ');
+        let run = if first == '`' || first == '~' { t.chars().take_while(|c| *c == first).count() } else { 0 };
+        if run >= 3 {
+            let ch = t.chars().next().unwrap();
+            match fence {
+                Some((open, n)) if ch == open && run >= n => fence = None,
+                None => fence = Some((ch, run)),
+                _ => {},
+            }
+            previous = "";
+            continue;
+        }
+        if fence.is_some() { continue; }
+        let hashes = t.bytes().take_while(|b| *b == b'#').count();
+        let heading = if (1..=6).contains(&hashes) && (t.len() == hashes || t.as_bytes()[hashes].is_ascii_whitespace()) {
+            Some(t.trim_end_matches('#').trim().to_string())
+        } else if !previous.is_empty() && t.len() >= 3 && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-')) {
+            Some(format!("{} {previous}", if t.starts_with('=') { "#" } else { "##" }))
+        } else { None };
+        if let Some(h) = heading { *out.entry(h).or_default() += 1; }
+        previous = t;
+    }
+    out
+}
+
+/// Inspect the exact staged tree that would be committed, including deletions and renames.
+fn protect_decisions(dir: &Path) -> Result<(), String> {
+    for path in decision_logs(dir)? {
+        let Ok(before) = git(dir, &["show", &format!("HEAD:{path}")]) else { continue };
+        let after = git(dir, &["show", &format!(":{path}")]).unwrap_or_default();
+        let after = headings(&after);
+        for (heading, count) in headings(&before) {
+            if after.get(&heading).copied().unwrap_or(0) < count {
+                return Err(format!("decision-log safeguard: {path} lost heading {heading:?}; preserve past decisions and append a superseding entry"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn guarded_merge(dir: &Path, branch: &str) -> Result<(), String> {
+    if let Err(e) = git(dir, &["merge", "--no-ff", "--no-commit", "-q", branch]) {
+        let conflict = git(dir, &["ls-files", "-u"]).map(|s| !s.is_empty()).unwrap_or(false);
+        let _ = git(dir, &["merge", "--abort"]);
+        return Err(if conflict { format!("merge conflict: {e}") } else { e });
+    }
+    let result = protect_decisions(dir).and_then(|()| {
+        // An already-integrated branch does not create MERGE_HEAD and needs no commit.
+        if git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok() { commit(dir, &["-q", "--no-edit"]) } else { Ok(()) }
+    });
+    if result.is_err() { let _ = git(dir, &["merge", "--abort"]); }
+    result
+}
+
 pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace, String> {
     let shared = |note: Option<String>| Workspace {
         worktree: false,
@@ -118,15 +222,8 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
 /// `--no-verify`: the repo's hooks are for the user's own commits — a linter or a commit-message
 /// policy has nothing to check in an empty one, and must not stop the run before it starts.
 fn initial_empty_commit(top: &Path) -> Result<(), String> {
-    let mut args: Vec<&str> = vec![];
-    if git(top, &["config", "user.name"]).map(|v| v.is_empty()).unwrap_or(true) {
-        args.extend(["-c", "user.name=Mantra"]);
-    }
-    if git(top, &["config", "user.email"]).map(|v| v.is_empty()).unwrap_or(true) {
-        args.extend(["-c", "user.email=mantra@localhost"]);
-    }
-    args.extend(["commit", "-q", "--allow-empty", "--only", "--no-verify", "-m", "mantra: initial commit"]);
-    git(top, &args).map(|_| ()).map_err(|e| format!("the repository has no commit yet and Mantra could not create one for the worktrees ({e}) — commit once yourself, or set isolation = shared"))
+    commit(top, &["-q", "--allow-empty", "--only", "--no-verify", "-m", "mantra: initial commit"])
+        .map_err(|e| format!("the repository has no commit yet and Mantra could not create one for the worktrees ({e}) — commit once yourself, or set isolation = shared"))
 }
 
 fn ensure_excluded(top: &Path) -> std::io::Result<()> {
@@ -168,18 +265,21 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<bool, String> {
     if !changed {
         return Ok(false);
     }
-    git(dir, &["-c", "user.name=Mantra", "-c", "user.email=mantra@localhost", "commit", "-q", "-m", message])?;
+    protect_decisions(dir)?;
+    commit(dir, &["-q", "-m", message])?;
     Ok(true)
 }
 
 pub struct MergeResult {
     pub merged: Vec<String>,
     pub conflicts: Vec<String>,
+    /// Policy or commit failures must be escalated, never handed to an automatic merge fixer.
+    pub blocked: Vec<String>,
     pub log: String,
 }
 
 pub fn merge_workers(ws: &Workspace, workers: &[(String, PathBuf, String)]) -> MergeResult {
-    let mut r = MergeResult { merged: vec![], conflicts: vec![], log: String::new() };
+    let mut r = MergeResult { merged: vec![], conflicts: vec![], blocked: vec![], log: String::new() };
     if !ws.worktree {
         return r;
     }
@@ -188,21 +288,32 @@ pub fn merge_workers(ws: &Workspace, workers: &[(String, PathBuf, String)]) -> M
             // worker ran on the shared integration copy (fallback) — just commit there
             match commit_all(&ws.integ, &format!("mantra: {task}")) {
                 Ok(_) => r.merged.push(task.clone()),
-                Err(e) => r.log.push_str(&format!("{task}: commit failed: {e}\n")),
+                Err(e) => {
+                    r.log.push_str(&format!("{task}: commit failed: {e}\n"));
+                    r.blocked.push(format!("{task}: commit failed: {e}"));
+                }
             }
             continue;
         }
         match commit_all(dir, &format!("mantra: {task}")) {
             Ok(true) => r.log.push_str(&format!("committed {task}\n")),
             Ok(false) => r.log.push_str(&format!("{task}: no changes\n")),
-            Err(e) => r.log.push_str(&format!("{task}: commit failed: {e}\n")),
+            Err(e) => {
+                r.log.push_str(&format!("{task}: commit failed: {e}\n"));
+                r.blocked.push(format!("{task} ({branch}): commit failed: {e}"));
+                continue;
+            }
         }
-        match git(&ws.integ, &["-c", "user.name=Mantra", "-c", "user.email=mantra@localhost", "merge", "--no-ff", "--no-edit", "-q", branch]) {
+        match guarded_merge(&ws.integ, branch) {
             Ok(_) => r.merged.push(task.clone()),
             Err(e) => {
                 let _ = git(&ws.integ, &["merge", "--abort"]);
-                r.log.push_str(&format!("{task}: conflict — {}\n", crate::util::trunc(&e, 200)));
-                r.conflicts.push(branch.clone());
+                r.log.push_str(&format!("{task}: merge refused — {e}\n"));
+                if e.starts_with("merge conflict:") {
+                    r.conflicts.push(branch.clone());
+                } else {
+                    r.blocked.push(format!("{task} ({branch}): {e}"));
+                }
             }
         }
     }
@@ -276,7 +387,7 @@ pub fn land(ws: &Workspace) -> Result<String, String> {
     if dirty {
         return Err("your working tree has uncommitted changes — commit or stash, then /land again".into());
     }
-    git(&ws.repo, &["-c", "user.name=Mantra", "-c", "user.email=mantra@localhost", "merge", "--no-ff", "--no-edit", &ws.branch])?;
+    guarded_merge(&ws.repo, &ws.branch)?;
     let _ = git(&ws.repo, &["worktree", "remove", "--force", &ws.integ.to_string_lossy()]);
     Ok(format!("merged {} into {}", ws.branch, ws.base_branch))
 }
@@ -494,6 +605,124 @@ mod tests {
 
     fn head_files(dir: &Path) -> Vec<String> {
         git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap().lines().map(str::to_string).collect()
+    }
+
+    fn worker_repo(dir: &Path, tag: &str) -> PathBuf {
+        let worker = dir.with_file_name(format!("mantra-worker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&worker);
+        git(dir, &["worktree", "add", "-q", "-b", "test-worker", &worker.to_string_lossy(), "HEAD"]).unwrap();
+        worker
+    }
+
+    #[test]
+    fn project_trailers_and_identity_reach_worker_and_merge_commits() {
+        let dir = temp_repo("trailers");
+        git(&dir, &["config", "user.name", "Project Author"]).unwrap();
+        git(&dir, &["config", "user.email", "project@example.test"]).unwrap();
+        git(&dir, &["config", "--add", "mantra.commitTrailer", "Co-Authored-By: Project Helper <helper@example.test>"]).unwrap();
+        git(&dir, &["config", "--add", "mantra.commitTrailer", "Claude-Session: configured-session"]).unwrap();
+        let worker = worker_repo(&dir, "trailers");
+        std::fs::write(worker.join("worker.txt"), "change\n").unwrap();
+        let ws = test_ws(&dir, None);
+        let result = merge_workers(&ws, &[("task".into(), worker.clone(), "test-worker".into())]);
+        assert_eq!(result.merged, vec!["task"]);
+        assert!(result.conflicts.is_empty(), "{}", result.log);
+        for rev in ["test-worker", "HEAD"] {
+            let message = git(&dir, &["log", "-1", "--format=%B", rev]).unwrap();
+            assert!(message.contains("Co-Authored-By: Project Helper <helper@example.test>"), "{message}");
+            assert!(message.contains("Claude-Session: configured-session"), "{message}");
+            assert!(!message.contains("Claude Fable"), "{message}");
+            assert_eq!(git(&dir, &["log", "-1", "--format=%an <%ae>", rev]).unwrap(), "Project Author <project@example.test>");
+        }
+        let _ = std::fs::remove_dir_all(worker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleted_decision_headings_refuse_merge_and_land_without_advancing_head() {
+        for landing in [false, true] {
+            let tag = if landing { "decisions-land" } else { "decisions-merge" };
+            let dir = temp_repo(tag);
+            git(&dir, &["config", "--add", "mantra.decisionLog", "docs/history.md"]).unwrap();
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            std::fs::write(dir.join("DECISIONS.md"), "# Decisions\n\n## #106 Past choice\nKeep this.\n").unwrap();
+            std::fs::write(dir.join("docs/history.md"), "Earlier decision\n================\nKeep this too.\n").unwrap();
+            commit_all(&dir, "history").unwrap();
+            let before = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+            let worker = worker_repo(&dir, tag);
+            let path = if landing { "docs/history.md" } else { "DECISIONS.md" };
+            std::fs::write(worker.join(path), "# Replacement\n").unwrap();
+            // Simulate a commit created externally: the merge still has to defend history.
+            git(&worker, &["add", "-A"]).unwrap();
+            commit(&worker, &["-q", "-m", "overwrite history"]).unwrap();
+            let mut ws = test_ws(&dir, None);
+            ws.branch = "test-worker".into();
+            if landing {
+                ws.integ = worker.clone();
+                assert!(land(&ws).unwrap_err().contains("decision-log safeguard"));
+            } else {
+                let result = merge_workers(&ws, &[("task".into(), worker.clone(), "test-worker".into())]);
+                assert!(result.merged.is_empty());
+                assert!(result.conflicts.is_empty());
+                assert_eq!(result.blocked.len(), 1);
+                assert!(result.log.contains("decision-log safeguard"), "{}", result.log);
+            }
+            assert_eq!(git(&dir, &["rev-parse", "HEAD"]).unwrap(), before);
+            assert!(git(&dir, &["status", "--porcelain"]).unwrap().is_empty());
+            assert!(git(&dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_err());
+            let _ = std::fs::remove_dir_all(worker);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn failed_worker_commit_does_not_merge_an_older_branch_tip() {
+        let dir = temp_repo("commit-refusal");
+        std::fs::write(dir.join("DECISIONS.md"), "# Decisions\n## Historical decision\n").unwrap();
+        commit_all(&dir, "history").unwrap();
+        let before = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        let worker = worker_repo(&dir, "commit-refusal");
+        std::fs::write(worker.join("safe.txt"), "earlier commit\n").unwrap();
+        commit_all(&worker, "earlier worker work").unwrap();
+        std::fs::remove_file(worker.join("DECISIONS.md")).unwrap();
+        let result = merge_workers(&test_ws(&dir, None), &[("task".into(), worker.clone(), "test-worker".into())]);
+        assert!(result.merged.is_empty());
+        assert!(result.log.contains("commit failed: decision-log safeguard"), "{}", result.log);
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(!dir.join("safe.txt").exists());
+        let _ = std::fs::remove_dir_all(worker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn appending_superseding_decisions_is_allowed_but_duplicate_heading_loss_is_not() {
+        let dir = temp_repo("append-decisions");
+        std::fs::write(dir.join("DECISIONS.md"), "# Decisions\n## Choice\n## Choice\n```md\n## Example\n```\n").unwrap();
+        commit_all(&dir, "history").unwrap();
+        std::fs::write(dir.join("DECISIONS.md"), "# Decisions\n## Choice\n## Choice\n## Superseding choice\n~~~md\n## Other example\n~~~\n").unwrap();
+        assert!(commit_all(&dir, "append").unwrap());
+        std::fs::write(dir.join("DECISIONS.md"), "# Decisions\n## Choice\n## Superseding choice\n").unwrap();
+        assert!(commit_all(&dir, "remove duplicate").unwrap_err().contains("lost heading"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ordinary_content_conflicts_remain_fixable_and_keep_both_branch_tips() {
+        let dir = temp_repo("real-conflict");
+        let worker = worker_repo(&dir, "real-conflict");
+        std::fs::write(worker.join("tracked.txt"), "worker contribution\n").unwrap();
+        std::fs::write(dir.join("tracked.txt"), "integration contribution\n").unwrap();
+        commit_all(&dir, "other task").unwrap();
+        let before = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        let result = merge_workers(&test_ws(&dir, None), &[("task".into(), worker.clone(), "test-worker".into())]);
+        assert_eq!(result.conflicts, vec!["test-worker"]);
+        assert!(result.blocked.is_empty(), "{}", result.log);
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(git(&dir, &["show", "test-worker:tracked.txt"]).unwrap(), "worker contribution");
+        assert_eq!(git(&dir, &["show", "HEAD:tracked.txt"]).unwrap(), "integration contribution");
+        assert!(git(&dir, &["status", "--porcelain"]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(worker);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -66,7 +66,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         k("ctrl+e", "verbose log (full reasoning, output, diffs)"),
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
         k("pgup / pgdn · ctrl+l", "scroll (mouse wheel too) · redraw the screen"),
-        k("/ · F1", "commands — tab completes them and their arguments (@names, groups, agents) · this help"),
+        k("/ · F1", "commands — tab completes them and their arguments (groups, agents) · this help"),
         gap(),
         h("chat (solo, a zoomed agent, the stage's prompt)"),
         k("⏎ / alt+⏎", "send / newline (or end a line with \\) · ! runs a shell command in Solo"),
@@ -83,7 +83,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         k("r · x · c", "retry (or restart a crashed agent) · interrupt · compact"),
         k("m · +/-", "switch the selected agent's model (fixes a rejected model) · its effort"),
         k("p · a", "plan · approve the plan (during review)"),
-        k("@name msg", "message one agent directly; plain text re-prompts the planner"),
+        k("message", "all run messages go to the planner; agent views inspect each role’s work"),
         k("/stop · /runs", "stop the run for good · this project's runs: resume, land or delete"),
         gap(),
         h("config screens (/models, /studio, /settings)"),
@@ -234,7 +234,7 @@ fn new_run(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoi
             Err(e) => (trunc(&format!("{} does not load: {e}", theme::g("⚠", "!")), dw), theme::fg(theme::RED)),
         };
         l.push(Line::from(vec![
-            Span::styled(format!("  {:<nw$}", p.name), st),
+            Span::styled(format!("  {:<nw$}", if p.name == "auto" { "Auto" } else { &p.name }), st),
             Span::styled(format!("{:<10}", p.tag), tag_st),
             Span::styled(format!("{about:<dw$}"), about_st),
             Span::styled(if on { mark.clone() } else { String::new() }, theme::fg(theme::GREEN)),
@@ -1313,7 +1313,7 @@ mod tests {
             app.project = project;
             app.command("/run");
             let Some(Overlay::NewRun { sel: 0, list, goal: Some(_) }) = app.overlays.last() else { panic!("the new-run overlay") };
-            assert_eq!(list.iter().take(3).map(|p| p.name.as_str()).collect::<Vec<_>>(), crate::engine::pattern::Pattern::names());
+            assert_eq!(list.iter().take(crate::engine::pattern::Pattern::names().len()).map(|p| p.name.as_str()).collect::<Vec<_>>(), crate::engine::pattern::Pattern::names());
             let s = screen_of(&mut app, 120, 30);
             assert!(s.contains("mantra-default") && s.contains("default") && s.contains("for new runs") && s.contains("goal ›"), "{s}");
             press(&mut app, KeyCode::Enter);

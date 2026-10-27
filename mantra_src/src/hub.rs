@@ -71,6 +71,8 @@ pub enum Cmd {
     Shell { command: String },
     SetEffort(String),
     SetModel(String),
+    /// Replace backend/provider or context configuration inside the same logical agent/channel.
+    Reconfigure { spec: Box<SpawnSpec>, command: Vec<String>, resume_text: Option<String> },
     /// After a `SetModel`: whether the new model takes images. bija offers or withdraws its own
     /// vision tools (`set{vision}`) and launches with or without `--vision` from then on; Codex
     /// and Claude Code have no tools of their own to switch (Mantra's `mantra_*` vision tools
@@ -150,8 +152,8 @@ pub struct Hub {
     /// Code agent then runs without Mantra's tools, which the user must hear about from the app —
     /// not only from `mantra.log` (`Hub::bridge_problem`).
     bridge_problem: Option<String>,
-    /// Cloned into every bija agent's task, which drops it once its process is reaped; nothing is
-    /// ever sent. `shutdown_all` lets go of the Hub's own and waits on `bija_gone`, which closes
+    /// Cloned into every agent task (any may switch to bija), and dropped once its process is
+    /// reaped; nothing is ever sent. `shutdown_all` lets go of the Hub's own and waits on `bija_gone`, which closes
     /// when the last clone is gone.
     bija_alive: Option<mpsc::Sender<()>>,
     bija_gone: Option<mpsc::Receiver<()>>,
@@ -208,7 +210,8 @@ impl Hub {
         } else {
             Duration::ZERO
         };
-        let alive = if spec.backend == Backend::Bija { self.bija_alive.clone() } else { None };
+        // Any logical agent may switch to bija later; keep it in the graceful quit budget.
+        let alive = self.bija_alive.clone();
         let task = agent_task(id, spec, cmd, ev, rx, delay);
         let task = tokio::spawn(async move {
             // Held for as long as the task runs: see `Stopping`.
@@ -261,8 +264,8 @@ impl Hub {
     }
 }
 
-/// The bija agents still finishing after `Hub::shutdown_all`. Codex and Claude Code agents are not
-/// waited for: their processes are killed with the runtime, as they always were.
+/// Agents still finishing after `Hub::shutdown_all`. Every logical task is tracked because it
+/// may have switched to bija; one shared grace budget bounds cleanup for all backends.
 pub struct Stopping(Option<mpsc::Receiver<()>>);
 
 impl Stopping {
@@ -423,8 +426,8 @@ fn restart_backoff(attempt: u32, launch_failure: bool) -> Option<Duration> {
 
 async fn agent_task(
     id: AgentId,
-    spec: SpawnSpec,
-    cmd: Vec<String>,
+    mut spec: SpawnSpec,
+    mut cmd: Vec<String>,
     ev: mpsc::UnboundedSender<HubEvent>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     initial_delay: Duration,
@@ -461,16 +464,49 @@ async fn agent_task(
             let _ = ev.send(HubEvent::Exited { agent: id });
             return;
         }
-        let started = match spec.backend {
-            Backend::Codex => run_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
-            Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
-            Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut vision, &mut replay, &mut last_turn, &mut turn_cut).await,
+        // Request-response tasks can outlive their child. Scope their event channel to this
+        // process attempt so a late old request failure cannot overwrite the next backend's
+        // healthy state after Ready has already cleared the app's switch fence.
+        let (attempt_ev, mut attempt_events) = mpsc::unbounded_channel();
+        let started = {
+            let process = async {
+                match spec.backend {
+                    Backend::Codex => run_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
+                    Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
+                    Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut vision, &mut replay, &mut last_turn, &mut turn_cut).await,
+                }
+            };
+            tokio::pin!(process);
+            loop {
+                tokio::select! {
+                    exit = &mut process => break exit,
+                    Some(event) = attempt_events.recv() => { let _ = ev.send(event); }
+                }
+            }
         };
+        while let Ok(event) = attempt_events.try_recv() { let _ = ev.send(event); }
+        drop(attempt_events);
         let launch_failure = matches!(started, Exit::LaunchFailed(_));
         match started {
             Exit::Shutdown => {
                 let _ = ev.send(HubEvent::Exited { agent: id });
                 return;
+            }
+            Exit::Reconfigure { spec: next, command, resume_text } => {
+                spec = *next;
+                cmd = command;
+                thread_id = None;
+                effort = spec.effort.clone();
+                model = spec.model.clone();
+                approval = spec.approval.clone();
+                vision = spec.bija.as_ref().is_some_and(|b| b.vision);
+                last_turn = None;
+                turn_cut = false;
+                restarts = 0;
+                launch_failures = 0;
+                prepare_switch_replay(&mut replay, resume_text);
+                let _ = ev.send(HubEvent::Crashed { agent: id, reason: "restarting to apply model configuration".into(), restarting: true, attempt: 0 });
+                continue 'outer;
             }
             Exit::Restarting { reason, fresh } => {
                 // Never a failure: no counter, no backoff, no window reset — just go again.
@@ -515,6 +551,14 @@ async fn agent_task(
                                     if spec.backend == Backend::Codex { approval = a; }
                                     else { let _ = ev.send(unsupported_approval(id, backend_name(spec.backend))); }
                                 }
+                                Some(Cmd::Reconfigure { spec: next, command, resume_text }) => {
+                                    spec = *next; cmd = command; thread_id = None;
+                                    effort = spec.effort.clone(); model = spec.model.clone(); approval = spec.approval.clone();
+                                    vision = spec.bija.as_ref().is_some_and(|b| b.vision); last_turn = None; turn_cut = false;
+                                    restarts = 0; launch_failures = 0;
+                                    prepare_switch_replay(&mut replay, resume_text);
+                                    continue 'outer;
+                                }
                                 Some(Cmd::Restart) => continue 'outer,
                                 // Held, not failed: the retry is still coming, so this text still has
                                 // a process to reach — see `replay`'s drain once `Ready` fires again.
@@ -530,6 +574,14 @@ async fn agent_task(
                         None | Some(Cmd::Shutdown) => {
                             let _ = ev.send(HubEvent::Exited { agent: id });
                             return;
+                        }
+                        Some(Cmd::Reconfigure { spec: next, command, resume_text }) => {
+                            spec = *next; cmd = command; thread_id = None;
+                            effort = spec.effort.clone(); model = spec.model.clone(); approval = spec.approval.clone();
+                            vision = spec.bija.as_ref().is_some_and(|b| b.vision); last_turn = None; turn_cut = false;
+                            restarts = 0; launch_failures = 0;
+                            prepare_switch_replay(&mut replay, resume_text);
+                            continue 'outer;
                         }
                         Some(Cmd::Restart) => {
                             restarts = 0;
@@ -558,6 +610,7 @@ async fn agent_task(
 
 enum Exit {
     Shutdown,
+    Reconfigure { spec: Box<SpawnSpec>, command: Vec<String>, resume_text: Option<String> },
     /// The process died unexpectedly (not a self-inflicted relaunch — see `Restarting`) after it
     /// had reached `Ready`.
     Crashed(String),
@@ -569,6 +622,15 @@ enum Exit {
     /// The process never reached `Ready`: spawn refused, handshake failed, thread start rejected.
     /// Deterministic in practice, so `agent_task` gives it the short `MAX_LAUNCH_ATTEMPTS` budget.
     LaunchFailed(String),
+}
+
+/// A new session receives pending input as one ordered turn. Starting several Codex turns
+/// before the first turn/started would reject later messages and lose their intent.
+fn prepare_switch_replay(replay: &mut Vec<String>, resume_text: Option<String>) {
+    if let Some(text) = resume_text { replay.insert(0, text); }
+    if replay.len() > 1 {
+        *replay = vec![replay.join("\n\n")];
+    }
 }
 
 fn backend_name(backend: Backend) -> &'static str {
@@ -761,6 +823,10 @@ async fn run_process(
                         // Apply to the live thread now (not just the next turn/start we send).
                         fire(&conn, ev, id, "thread/settings/update", json!({"threadId": tid, "approvalPolicy": crate::config::approval_policy(&a)}), "settings", None);
                         *approval = a;
+                    }
+                    Some(Cmd::Reconfigure { spec, command, resume_text }) => {
+                        let _ = child.kill().await;
+                        return Exit::Reconfigure { spec, command, resume_text };
                     }
                     Some(Cmd::Restart) => {
                         let _ = child.kill().await;
@@ -1212,6 +1278,84 @@ mod tests {
         prepare_relaunch(true, &mut thread_id2, &None, &mut replay2);
         assert_eq!(thread_id2, None);
         assert!(replay2.is_empty(), "no last turn yet: nothing to replay");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_agent_changes_backend_without_reusing_session_ids_or_losing_text() {
+        let dir = std::env::temp_dir().join(format!("mantra-backend-switch-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Each stand-in speaks its own backend protocol. Launch/input logs prove we did not
+        // resume an incompatible id or send a queued request to the process being replaced.
+        let script = r#"import sys,json,os
+kind=os.environ['FAKE_BACKEND']
+with open(os.environ['TRACE'],'a') as f: f.write(kind+' argv '+json.dumps(sys.argv)+'\n')
+def emit(v): print(json.dumps(v),flush=True)
+if kind=='bija': emit({'ev':'ready','session':'fresh-bija','model':'b','resumed':False,'pending':False})
+for line in sys.stdin:
+ v=json.loads(line)
+ with open(os.environ['TRACE'],'a') as f: f.write(kind+' input '+line)
+ if kind=='codex':
+  method=v.get('method')
+  if method=='initialize': emit({'id':v['id'],'result':{}})
+  elif method=='thread/start': emit({'id':v['id'],'result':{'thread':{'id':'fresh-codex'},'model':'c'}})
+  elif method=='turn/start':
+   emit({'id':v['id'],'result':{}})
+   emit({'method':'turn/started','params':{'turn':{'id':'active'}}})
+ elif kind=='bija':
+  if v.get('op')=='shutdown': break
+  if v.get('op')=='prompt': emit({'ev':'turn_started','turn':'b-turn'})
+ else:
+  emit({'type':'system','subtype':'init','session_id':'fresh-claude','model':'cc'})
+  emit({'type':'assistant','message':{'id':'msg','content':[{'type':'text','text':'continued'}]}})
+  emit({'type':'result','subtype':'success','num_turns':1,'duration_api_ms':5,'is_error':False})
+"#;
+        let command = vec!["python3".into(), "-u".into(), "-c".into(), script.into()];
+        let make_spec = |backend: Backend, name: &str| SpawnSpec {
+            cwd: dir.clone(), model: name.into(), provider: name.into(), effort: "low".into(),
+            approval: "never".into(), sandbox: "read-only".into(), developer_instructions: "task handoff".into(),
+            dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
+            thread_name: None, backend,
+            envs: vec![("FAKE_BACKEND".into(), name.into()), ("TRACE".into(), dir.join("trace").to_string_lossy().into_owned())],
+            claude: (backend == Backend::ClaudeCode).then(|| ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: "task handoff".into(), mcp_sock: None, strict_mcp: false }),
+            bija: (backend == Backend::Bija).then(|| BijaSpawn { base_url: "http://unused".into(), wire: "openai-chat".into(), api_key_env: None, context_window: 1000, compact_pct: 85, system_prompt: "task handoff".into(), home: dir.clone(), sandbox: "none".into(), writable_roots: vec![], network: false, vision: false }),
+            mcp: vec![],
+        };
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (tx, cmds) = mpsc::unbounded_channel();
+        tokio::spawn(agent_task(42, make_spec(Backend::Codex, "codex"), command.clone(), ev, cmds, Duration::ZERO));
+        async fn until(events: &mut mpsc::UnboundedReceiver<HubEvent>, expected: &str) {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(8), events.recv()).await.unwrap().unwrap() {
+                    HubEvent::Ready { agent, thread_id, resumed, .. } => {
+                        assert_eq!(agent, 42);
+                        assert!(!resumed, "every backend switch must start fresh");
+                        if thread_id == expected { return; }
+                    }
+                    HubEvent::Notif { agent, method, .. } if method == expected => { assert_eq!(agent, 42); return; }
+                    HubEvent::Crashed { attempt: 0, .. } => {}
+                    HubEvent::Crashed { reason, .. } | HubEvent::CmdFailed { error: reason, .. } => panic!("{reason}"),
+                    _ => {}
+                }
+            }
+        }
+        until(&mut events, "fresh-codex").await;
+        tx.send(Cmd::Turn { text: "active original task".into() }).unwrap();
+        until(&mut events, "turn/started").await;
+        tx.send(Cmd::Reconfigure { spec: Box::new(make_spec(Backend::Bija, "bija")), command: command.clone(), resume_text: Some("continue after switch".into()) }).unwrap();
+        until(&mut events, "fresh-bija").await;
+        until(&mut events, "turn/started").await;
+        tx.send(Cmd::Reconfigure { spec: Box::new(make_spec(Backend::ClaudeCode, "claude")), command: command.clone(), resume_text: Some("pending new instruction".into()) }).unwrap();
+        until(&mut events, "fresh-claude").await;
+        until(&mut events, "turn/completed").await;
+        tx.send(Cmd::Reconfigure { spec: Box::new(make_spec(Backend::Codex, "codex")), command, resume_text: None }).unwrap();
+        until(&mut events, "fresh-codex").await;
+        tx.send(Cmd::Shutdown).unwrap();
+        let trace = std::fs::read_to_string(dir.join("trace")).unwrap();
+        assert!(!trace.contains("thread/resume") && !trace.contains("--resume"), "{trace}");
+        assert_eq!(trace.matches("continue after switch").count(), 1, "{trace}");
+        assert_eq!(trace.matches("pending new instruction").count(), 1, "{trace}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(target_os = "linux")]

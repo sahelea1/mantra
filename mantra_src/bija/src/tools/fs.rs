@@ -513,6 +513,19 @@ fn not_found_hint(text: &str, old: &str, shown: &str) -> String {
     } else {
         msg.push_str("; it must match the file exactly, including whitespace and indentation — read the file again and copy the text");
     }
+    // Give a bounded window around the best matching line, so the next edit can be repaired
+    // from the actual file instead of blindly retrying the same stale patch.
+    let actual: Vec<&str> = text.lines().collect();
+    let wanted: Vec<&str> = old.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let score = |line: &str| wanted.iter().map(|w| {
+        if line.trim() == *w { 1000 + w.len() } else { line.split_whitespace().filter(|word| w.split_whitespace().any(|x| x == *word)).map(str::len).sum() }
+    }).max().unwrap_or(0);
+    if let Some((at, _)) = actual.iter().enumerate().map(|(i, line)| (i, score(line))).filter(|(_, n)| *n > 0).max_by_key(|(_, n)| *n) {
+        msg.push_str("\nNearby file context (line numbers):");
+        for (i, line) in actual.iter().enumerate().take((at + 4).min(actual.len())).skip(at.saturating_sub(3)) {
+            msg.push_str(&format!("\n{}: {}", i + 1, prefix(line, 240)));
+        }
+    }
     msg
 }
 
@@ -848,6 +861,14 @@ mod tests {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn stale_edit_reports_bounded_actual_context() {
+        let text = "header\nfn callback() {\n    verify_nonce();\n    complete_login();\n}\nfooter\n";
+        let hint = not_found_hint(text, "fn callback() {\n    verify_old_nonce();", "callback.rs");
+        assert!(hint.contains("Nearby file context") && hint.contains("3:     verify_nonce();"));
+        assert!(hint.len() < 2200);
     }
 
     #[test]

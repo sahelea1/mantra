@@ -55,7 +55,7 @@
             return a.tokens_total ? h('span', { class: 'ctx none' }, F.tokens(a.tokens_total) + ' tok', cachedNote(a.tokens_total, a.tokens_cached)) : null;
         }
         const p = a.ctx_percent;
-        return h('span', { class: 'ctx' + (wide ? ' wide' : ''), title: 'context ' + p + '% of ' + F.tokens(a.ctx_window) + (a.ctx_assumed ? ' (window assumed)' : '') + ' · compacts at ' + a.compact_percent + '%' },
+        return h('span', { class: 'ctx' + (wide ? ' wide' : ''), title: 'context ' + p + '% of ' + F.tokens(a.ctx_window) + (a.ctx_assumed ? ' (default window)' : '') + ' · compacts at ' + a.compact_percent + '%' },
             h('span', { class: 'ctx-track' },
                 h('span', { class: 'ctx-fill', style: { width: p + '%', background: ctxColor(p) } }),
                 a.compact_percent ? h('span', { class: 'ctx-tick', style: { left: a.compact_percent + '%' } }) : null),
@@ -377,9 +377,10 @@
         const q = run.question;
         if (!q) return null;
         return h('div', { class: 'band question', key: 'question', role: 'alert' },
-            h('div', { class: 'band-head' }, h('span', { class: 'band-ico' }, '?'), h('b', null, (q.from_name || 'An agent') + ' has a question'), h('span', { class: 'band-age' }, F.ago(q.since_at))),
+            h('div', { class: 'band-head' }, h('span', { class: 'band-ico' }, '?'), h('b', null, run.pattern_review ? 'Approve workflow change' : (q.from_name || 'An agent') + ' has a question'), h('span', { class: 'band-age' }, F.ago(q.since_at))),
             h('div', { class: 'band-msg md' }, F.markdown(q.text)),
-            feedbackField('answer', 'Your answer…', 'Answer'));
+            run.pattern_review ? h('div', { class: 'band-actions' }, btn('Approve workflow', () => M.act.cmd('run_input', { text: 'approve' }, { busyKey: 'approve-workflow', ok: 'Workflow approved' }), { kind: 'primary', busyKey: 'approve-workflow', icon: 'check' })) : null,
+            feedbackField('answer', run.pattern_review ? 'Feedback for the planner…' : 'Your answer…', run.pattern_review ? 'Request changes' : 'Answer'));
     }
     function reviewBand(run) {
         if (!run.want_review || (run.stage && run.stage.kind !== 'review')) return null;

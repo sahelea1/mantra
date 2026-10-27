@@ -2,7 +2,7 @@
 // backend (see `mantra_src/scripts/web-e2e.sh`, which builds mantra, starts/stops it, and runs
 // this script). Implements the scenario in WEB-DESIGN.md §13: login, the Solo agent's
 // message → command approval → approve flow, starting a run from the Team screen, plan review,
-// approving the plan, phase-1 workers appearing, talking to a worker, its diff, the question
+// approving the plan, phase-1 workers appearing, messaging the planner from a worker view, its diff, the question
 // band, the pulse/runs/inbox/settings screens — and saves the screenshots the README/docs use.
 // Since 0.8 also the configuration the web shares with the TUI: settings, models and providers
 // (a provider from a key against the demo's mock API), patterns, MCP, and stopping a run.
@@ -10,7 +10,7 @@
 // Two passes, run by web-e2e.sh against two separate `mantra --demo` processes (the question
 // band only appears when the backend was started with MANTRA_MOCK_ASK=1 MANTRA_MOCK_ASK_USER=1 —
 // see mock.rs — so it needs its own run rather than a flag flipped mid-scenario):
-//   node web-e2e.mjs main   (default) — solo approval, start a run, workers, worker chat + diff,
+//   node web-e2e.mjs main   (default) — solo approval, start a run, workers, planner chat + worker diff,
 //                                        pulse/runs/settings; captures 4 of the 5 required shots;
 //                                        then settings, models, providers, patterns, MCP, and
 //                                        stop the run → start the next from the Run screen.
@@ -104,7 +104,7 @@ async function main() {
     const { chromium, devices } = await loadPlaywright();
     const server = BIN ? await startServer() : null;
     fs.mkdirSync(OUT, { recursive: true });
-    const b = await chromium.launch();
+    const b = await chromium.launch(process.env.MANTRA_E2E_CHROMIUM ? { executablePath: process.env.MANTRA_E2E_CHROMIUM } : {});
     let fails = 0;
     const errs = [];
     const shots = [];
@@ -171,6 +171,11 @@ async function main() {
             await driver.waitForSelector('.start-row option[value="e2e-on-codex"]', { state: 'attached', timeout: 15000 });
             await driver.selectOption('.start-row select', 'e2e-on-codex');
             await driver.fill('textarea.goal', 'Add a REST API with auth and a small web UI');
+            const selected = await driver.inputValue('.start-row select');
+            await driver.selectOption('.start-row select', 'auto');
+            await driver.waitForSelector('.pat-desc:has-text("planner")');
+            await shot(driver, 'web-auto-picker-desktop.png');
+            await driver.selectOption('.start-row select', selected);
             await driver.click('button:has-text("Start run")');
             await waitForState(driver, () => { const r = window.Mantra.store.S.run; return r && r.stage && r.stage.kind === 'review'; }, null, { timeout: 60000 });
         });
@@ -245,15 +250,21 @@ async function main() {
             await shot(phone, 'web-team-phone.png');
         });
         let worker = null;
-        await step('main', driver, 'open a running worker + send a message', async () => {
+        await step('main', driver, 'open a worker log + send only to the planner', async () => {
             await waitForState(driver, () => { const s = window.Mantra.store.S; return [...s.agents.values()].some((a) => a.role_kind === 'worker' && a.busy); }, null, { timeout: 30000 });
             worker = await driver.evaluate(() => { const s = window.Mantra.store.S; const w = [...s.agents.values()].find((a) => a.role_kind === 'worker' && a.busy); return w && w.id; });
             if (!worker) throw new Error('no busy worker found in the roster');
             await nav(driver, '/agent/' + worker);
             await driver.waitForSelector('.composer textarea');
+            const label = await driver.getAttribute('.composer textarea', 'aria-label');
+            if (!/planner/i.test(label || '')) throw new Error('worker view composer is not addressed to the planner: ' + label);
+            const planner = await driver.evaluate(() => window.Mantra.store.S.run.planner);
             await driver.fill('.composer textarea', 'please keep the handlers small');
             await driver.click('.composer button.send');
-            await waitForState(driver, () => /please keep the handlers small/.test(document.body.textContent), null, { timeout: 10000 });
+            await nav(driver, '/agent/' + planner);
+            await waitForState(driver, () => /please keep the handlers small/.test(document.querySelector('.tx')?.textContent || ''), null, { timeout: 10000 });
+            await nav(driver, '/agent/' + worker);
+            if (/please keep the handlers small/.test(await driver.locator('.tx').textContent())) throw new Error('the worker received the planner message');
         });
         await step('main', phone, 'screenshot: worker agent screen', async () => {
             await nav(phone, '/agent/' + worker);

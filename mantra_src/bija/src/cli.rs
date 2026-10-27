@@ -684,7 +684,7 @@ async fn launch(flags: &Flags, env: Env<'_>) -> Result<Launch, Fail> {
     let dir = Session::dir_for(&home, &meta.id);
     let (jobs_dir, images_dir) = (dir.join("jobs"), dir.join("images"));
     // The key's variable (and bija's default one) never reaches a command's environment.
-    let scrub_env: Vec<String> = [meta.api_key_env.trim(), session::DEFAULT_KEY_ENV].iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
+    let scrub_env: Vec<String> = [meta.api_key_env.trim(), session::DEFAULT_KEY_ENV, "BIJA_PROVIDER_HEADERS"].iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
     let mut runtime = Runtime::new(RuntimeConfig { cwd: meta.cwd.clone(), sandbox, writable: meta.writable.clone(), network: meta.network, no_bwrap: flags.no_bwrap, jobs_dir, scrub_env, vision: meta.vision, images_dir }).await;
     // The preamble is rebuilt on every launch (cwd, sandbox, bwrap and the servers may have
     // changed); the caller's part is the flag's, or the stored one.
@@ -713,6 +713,9 @@ async fn launch(flags: &Flags, env: Env<'_>) -> Result<Launch, Fail> {
         base_url: session.meta.provider_url.clone(),
         wire: session.meta.wire,
         api_key,
+        headers: env("BIJA_PROVIDER_HEADERS").filter(|s| !s.trim().is_empty())
+            .map(|s| serde_json::from_str(&s).map_err(|_| Fail::Runtime("BIJA_PROVIDER_HEADERS must be a JSON object of header names and values".into())))
+            .transpose()?.unwrap_or_default(),
         max_retries: flags.max_retries.unwrap_or(8),
         timeout: Duration::from_secs(flags.timeout_secs.unwrap_or(600)),
         stream: !flags.no_stream,

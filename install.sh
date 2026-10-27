@@ -9,13 +9,14 @@
 # x86_64/aarch64, macOS arm64/x86_64), verifying each one's sha256, and falls back to building
 # both from source with cargo when there is no mantra binary for the platform or its download or
 # checksum fails. A release without a bija asset (or one that fails its checksum) still installs
-# mantra. Never uses sudo; installs to a per-user directory, adds it to PATH if needed, and runs
-# `mantra doctor` at the end.
+# mantra. Never uses sudo; installs to a per-user directory and adds it to PATH if needed.
+# Full diagnostics remain available through `mantra doctor`.
 #
 # Environment overrides:
 #   MANTRA_INSTALL_DIR   where to install (default: $HOME/.local/bin)
 #   MANTRA_VERSION       release tag to install, e.g. v0.2.0 (default: latest)
 #   MANTRA_FROM_SOURCE   set to 1 to skip release assets and always build from source
+#   MANTRA_INSTALL_VERBOSE set to 1 for download details and the doctor report
 #   MANTRA_REPO_URL      (undocumented, for testing) git URL to clone for source builds
 #
 # POSIX sh only — no bashisms. Idempotent: re-running upgrades an existing install.
@@ -29,9 +30,10 @@ VERSION="${MANTRA_VERSION:-latest}"
 FROM_SOURCE="${MANTRA_FROM_SOURCE:-0}"
 
 TMP_DIRS=""
+STAGE_DIR=""
 
 log() {
-    printf '%s\n' "$*"
+    if [ "${MANTRA_INSTALL_VERBOSE:-0}" = "1" ]; then printf '%s\n' "$*"; fi
 }
 
 err() {
@@ -39,11 +41,18 @@ err() {
 }
 
 cleanup() {
+    if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi
     for d in $TMP_DIRS; do
         rm -rf "$d"
     done
 }
 trap cleanup EXIT INT TERM
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    printf '\n\033[1;31m  mantra\033[0m  ·  installing %s\n' "$VERSION"
+else
+    printf '\n  mantra  ·  installing %s\n' "$VERSION"
+fi
 
 # Prints a fresh temp dir. NOTE: always call as `d=$(new_tmpdir); TMP_DIRS="$TMP_DIRS $d"`
 # on its own line — command substitution runs in a subshell, so TMP_DIRS cannot be
@@ -233,12 +242,38 @@ fi
 # --- install ----------------------------------------------------------------
 
 mkdir -p "$INSTALL_DIR"
-cp "$binary_path" "$INSTALL_DIR/mantra"
-chmod +x "$INSTALL_DIR/mantra"
+if [ -d "$INSTALL_DIR/mantra" ] || [ -d "$INSTALL_DIR/bija" ]; then
+    err "installation target contains a directory named mantra or bija; existing files kept."
+    exit 1
+fi
+if [ "${MANTRA_UPDATE:-0}" = "1" ] && [ -z "$bija_path" ]; then
+    err "this release did not provide a verified bija binary; existing installation kept. Retry with MANTRA_FROM_SOURCE=1."
+    exit 1
+fi
+# Stage on the same filesystem and rename, so a running mantra can update itself without
+# ETXTBSY or a partly copied executable. Both downloads are verified before either is installed.
+STAGE_DIR=$(mktemp -d "$INSTALL_DIR/.mantra-install.XXXXXX")
+cp "$binary_path" "$STAGE_DIR/mantra"
+chmod +x "$STAGE_DIR/mantra"
+if [ -n "$bija_path" ]; then
+    cp "$bija_path" "$STAGE_DIR/bija"
+    chmod +x "$STAGE_DIR/bija"
+    if [ -f "$INSTALL_DIR/bija" ]; then cp -p "$INSTALL_DIR/bija" "$STAGE_DIR/bija.previous"; fi
+    mv -f "$STAGE_DIR/bija" "$INSTALL_DIR/bija"
+fi
+if ! mv -f "$STAGE_DIR/mantra" "$INSTALL_DIR/mantra"; then
+    if [ -n "$bija_path" ]; then
+        if [ -f "$STAGE_DIR/bija.previous" ]; then
+            mv -f "$STAGE_DIR/bija.previous" "$INSTALL_DIR/bija"
+        else
+            rm -f "$INSTALL_DIR/bija"
+        fi
+    fi
+    err "could not replace mantra; previous installation restored."
+    exit 1
+fi
 log "Installed mantra to $INSTALL_DIR/mantra"
 if [ -n "$bija_path" ]; then
-    cp "$bija_path" "$INSTALL_DIR/bija"
-    chmod +x "$INSTALL_DIR/bija"
     log "Installed bija to $INSTALL_DIR/bija"
 elif [ -f "$INSTALL_DIR/bija" ]; then
     log "Kept the existing $INSTALL_DIR/bija; it may be older than this mantra."
@@ -251,7 +286,7 @@ case ":$PATH:" in
     *) on_path=0 ;;
 esac
 
-if [ "$on_path" -eq 0 ]; then
+if [ "$on_path" -eq 0 ] && [ "${MANTRA_UPDATE:-0}" != "1" ]; then
     case "$SHELL" in
         */zsh) rc_file="$HOME/.zshrc" ;;
         */bash) rc_file="$HOME/.bashrc" ;;
@@ -274,17 +309,19 @@ else
     log "$INSTALL_DIR is already on PATH."
 fi
 
-# --- doctor -------------------------------------------------------------
+# --- compact completion -------------------------------------------------
 
-log ""
-log "Running mantra doctor..."
-set +e
-"$INSTALL_DIR/mantra" doctor
-doctor_status=$?
-set -e
-if [ "$doctor_status" -ne 0 ]; then
-    log ""
-    log "mantra doctor reported issues above (exit $doctor_status). Installation itself succeeded."
+installed_version=$("$INSTALL_DIR/mantra" --version 2>/dev/null || printf 'mantra')
+printf '  %s ready  ·  %s\n' "$installed_version" "$INSTALL_DIR"
+if [ "${MANTRA_UPDATE:-0}" = "1" ]; then
+    printf '  Restart mantra to use the new version.\n\n'
+else
+    printf '  Start: mantra  ·  Add a model: /models\n'
+    if [ "$on_path" -eq 0 ]; then printf '  Open a new terminal to use mantra.\n'; fi
+    printf '  Update: mantra update  ·  Check: mantra doctor\n\n'
+fi
+if [ "${MANTRA_INSTALL_VERBOSE:-0}" = "1" ]; then
+    "$INSTALL_DIR/mantra" doctor || log "Installation succeeded; doctor reported issues above."
 fi
 
 exit 0

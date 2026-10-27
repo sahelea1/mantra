@@ -172,6 +172,10 @@ pub(super) async fn run_bija_process(
                         shut_down(&mut stdin, &mut child).await;
                         return Exit::Shutdown;
                     }
+                    Cmd::Reconfigure { spec, command, resume_text } => {
+                        shut_down(&mut stdin, &mut child).await;
+                        return Exit::Reconfigure { spec: spec.clone(), command: command.clone(), resume_text: resume_text.clone() };
+                    }
                     Cmd::Restart => {
                         // Ended like a shutdown, so its command and jobs die with it (a SIGKILL
                         // would orphan their process groups); `--resume` carries on from there.
@@ -426,7 +430,7 @@ fn op_for(c: &Cmd) -> Option<Value> {
             op
         }),
         Cmd::Shutdown => Some(json!({"op": "shutdown"})),
-        Cmd::Archive | Cmd::SetApproval(_) | Cmd::Restart | Cmd::Bridge(_) => None,
+        Cmd::Archive | Cmd::SetApproval(_) | Cmd::Restart | Cmd::Reconfigure { .. } | Cmd::Bridge(_) => None,
     }
 }
 

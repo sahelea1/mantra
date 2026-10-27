@@ -282,7 +282,7 @@
             kids.push(h('div', { class: 'tx-empty', key: 'txempty' },
                 h('div', { class: 'glyph xl', style: { color: F.colorVar(a.color) } }, a.glyph || '●'),
                 h('div', { class: 'empty-title' }, a.role_kind === 'solo' ? 'Ready when you are' : a.name + ' hasn\'t said anything yet'),
-                h('div', { class: 'empty-body' }, a.role_kind === 'solo' ? 'Ask for anything in this project. Start a message with ! to run a shell command.' : 'Messages you send here go to ' + a.name + (a.in_run ? ' through the run.' : '.'))));
+                h('div', { class: 'empty-body' }, a.role_kind === 'solo' ? 'Ask for anything in this project. Start a message with ! to run a shell command.' : a.in_run ? 'Messages go to the planner; this view shows ' + a.name + '’s transcript.' : 'Messages you send here go to ' + a.name + '.')));
         }
         for (let i = start; i < end; i++) kids.push(itemView(a, items[i]));
         if (end === items.length) kids.push(busyLine(a));
@@ -396,7 +396,7 @@
             return slashCommands(a).filter((c) => c.n.startsWith(q)).map((c) => ({ key: c.n, label: c.n, desc: c.d, apply: () => { if (c.arg) setDraft(a, c.n + ' '); else { setDraft(a, ''); c.f(); } } }));
         }
         const m = /^@([\w.-]*)$/.exec(text);
-        if (m && S().run) {
+        if (m && S().run && !a.in_run) {
             const q = m[1].toLowerCase();
             return mentionTargets().filter((t) => t.name.toLowerCase().startsWith(q) && t.id !== a.id).slice(0, 8)
                 .map((t) => ({ key: '@' + t.id, label: '@' + t.name, desc: P.status(t.a).text, glyph: t.a, apply: () => setDraft(a, '@' + t.name + ' ') }));
@@ -426,9 +426,9 @@
             M.act.flash('Unknown command ' + name + ' — type / to see what works here', 'warn');
             return;
         }
-        let target = a;
+        let target = a.in_run && S().run ? M.store.agent(S().run.planner) || a : a;
         const m = /^@([\w.-]+)\s+([\s\S]+)$/.exec(text);
-        if (m && S().run) {
+        if (m && S().run && !a.in_run) {
             const t = mentionTargets().find((x) => x.name.toLowerCase() === m[1].toLowerCase());
             if (t) { target = t.a; text = m[2].trim(); }
         }
@@ -463,7 +463,7 @@
         const wide = M.act.wide();
         const placeholder = a.role_kind === 'solo'
             ? 'Message ' + a.name + (wide ? '…  (! runs a shell command)' : '…')
-            : 'Message ' + (a.run_name || a.name) + '…' + (s.run && wide ? '  (@name redirects)' : '');
+            : a.in_run ? 'Message the planner…' : 'Message ' + (a.run_name || a.name) + '…';
         return h('div', { class: 'composer' + (a.busy ? ' busy' : ''), key: 'composer' },
             sug.length ? h('div', { class: 'suggest', role: 'listbox', key: 'sug' }, sug.map((x, i) => h('button', {
                 type: 'button', key: x.key, role: 'option', 'aria-selected': String(i === sel), class: 'sug' + (i === sel ? ' on' : ''),
@@ -568,6 +568,34 @@
                     h('div', { class: 'note-x' }, F.inline(note.text))))) : h('p', { class: 'sec-sub' }, 'No notes yet.')));
     }
 
+    function trackRespawn(id) {
+        const s = S(), a = M.store.agent(id), run = s.run;
+        if (!a || !run || !a.in_run) return;
+        const role = ['planner', 'manager', 'orchestrator', 'gate_agent', 'finale_agent'].find((key) => run[key] === a.id);
+        const task = (run.workers || []).find((w) => w.agent === a.id);
+        if (!role && !task) return;
+        (s.ui.respawns || (s.ui.respawns = {}))[id] = { run: run.id, role, task: task && task.task_id };
+        M.act.changed();
+    }
+    function cancelRespawn(id) {
+        if (S().ui.respawns) delete S().ui.respawns[id];
+        M.act.changed();
+    }
+    function respawning(a) {
+        const s = S(), pending = s.ui.respawns && s.ui.respawns[a.id];
+        if (!pending) return false;
+        if (!s.run || s.run.id !== pending.run) { delete s.ui.respawns[a.id]; return false; }
+        const w = pending.task && (s.run.workers || []).find((w) => w.task_id === pending.task);
+        const id = pending.role ? s.run[pending.role] : w && w.agent;
+        if (id !== undefined && id !== null && id !== a.id && M.store.agent(id)) {
+            requestAnimationFrame(() => {
+                if (S().ui.route.name === 'agent' && S().ui.route.id === a.id) M.act.nav('/agent/' + id);
+                cancelRespawn(a.id);
+            });
+        }
+        return true;
+    }
+
     function agentScreen(id) {
         const s = S();
         const a = M.store.agent(id);
@@ -578,19 +606,22 @@
         delete s.ui.unread[a.id];
         const aps = s.approvals.filter((x) => x.agent === a.id);
         const q = s.run && s.run.question && s.run.question.from === a.id ? P.questionBand(s.run) : null;
-        const trouble = troubleCard(a);
+        const retrying = respawning(a);
+        const trouble = retrying ? h('div', { class: 'composer-note', key: 'respawning', role: 'status' }, 'Respawning ' + a.name + '… ' + (s.run && s.run.halted ? 'Resume the run to start the new attempt.' : 'Opening the new attempt when it is ready.')) : troubleCard(a);
+        const recipient = a.in_run && s.run ? M.store.agent(s.run.planner) || a : a;
         return h('div', { class: 'agent-screen', key: 'agent' + a.id },
             header(a),
             swarmCard(a),
             transcript(a),
             h('div', { class: 'agent-foot', key: 'foot' },
-                q || trouble || aps.length || (a.queued || []).length ? h('div', { class: 'foot-stack', key: 'stack' },
+                q || trouble || aps.length || (recipient.queued || []).length ? h('div', { class: 'foot-stack', key: 'stack' },
                     trouble,
                     q,
                     aps.length ? h('div', { class: 'approvals', key: 'aps' }, aps.map((ap) => P.approvalCard(ap))) : null,
-                    queueBar(a)) : null,
-                composer(a)));
+                    queueBar(recipient)) : null,
+                a.in_run && recipient.id !== a.id ? h('div', { class: 'composer-note', key: 'planner-recipient' }, 'Messages go to the planner. ', h('button', { class: 'btn sm ghost', type: 'button', onclick: () => M.act.nav('/agent/' + recipient.id) }, 'Open planner')) : null,
+                retrying ? null : composer(recipient)));
     }
 
-    M.agentView = { agentScreen, header, actionList, transcript, afterRender, scrollToEnd, focusComposer, grow };
+    M.agentView = { agentScreen, header, actionList, transcript, afterRender, scrollToEnd, focusComposer, grow, trackRespawn, cancelRespawn };
 })(window.Mantra = window.Mantra || {});

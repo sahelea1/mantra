@@ -2,6 +2,41 @@
 
 All notable changes to Mantra are recorded here.
 
+## Unreleased
+
+- **Per-model context ceilings.** Unset model windows inherit the configured default model;
+  each Mandala agent uses the smaller of its own window and the run maximum. Model changes
+  update the backend's actual limit as well as the display.
+- **Recovery across providers and backends.** Billing, quota and exhausted-usage failures
+  select a configured role fallback and alert the owner. Live agents can move between Codex,
+  Claude Code and Bija with a fresh compatible session and a bounded task handoff. Worker
+  fallback keeps its worktree and attempt budget. Old process errors cannot poison a replacement;
+  a crash during a switch cannot resume the previous backend's session ID.
+- **Planner continuity and control.** Resumed Claude planners accept prompts again. Mandala
+  user messages go to the planner, which normally briefs the orchestrator and can directly
+  steer or stop agents in emergencies. Explicit scope updates change live tripwire rules while
+  preserving disjoint parallel scopes. Scheduled re-entry replaces blocking sleep loops.
+- **Auto workflows.** Auto begins with one planner that proposes a validated workflow before
+  planning. Rare live workflow changes follow the active approval policy; pending approvals
+  and scheduled re-entry survive restart. Existing workspaces and active tasks stay intact.
+- **Navigation and focus.** Terminal arrows follow the visible card layout. Studio and run
+  input clearly identify focus. Remote views follow respawned roles, clear obsolete failure
+  state and consistently address the planner. The established layout and Mandala remain.
+- **Production safeguards.** Workers and gates inherit bounded project/ticket instructions;
+  protocols challenge ambiguous contracts and require specification-based security checks.
+  Repository-local commit trailers are honored. Deleted decision headings and failed commits
+  block integration, preserve worktrees and offer explicit recovery. Native Bija edit failures
+  show bounded nearby context. External CLI API writes remain outside Mantra's dispatch;
+  guidance requires bounded concurrency and Retry-After handling rather than claiming a global
+  limiter for arbitrary commands.
+- **Provider setup and secrets.** Direct Anthropic endpoints infer the Messages wire correctly,
+  including reused providers. Required headers and optional custom headers reach discovery
+  and Bija requests. Pasted keys and web passwords migrate to owner-only `secrets.toml`;
+  credential-bearing errors and debug values are redacted.
+- **Installation.** `mantra update` installs verified Mantra/Bija binaries beside the running
+  executable, with atomic replacement and a paired-asset check. Fresh-install output is short,
+  with detailed diagnostics available through `mantra doctor` or verbose installation.
+
 ## v0.9.0 — 2026-10-26
 
 - **Consistent activity states.** Approval, question, swarm, and retry waits are distinct from

@@ -176,7 +176,71 @@ try {
     assert.equal(finished.stoppedFailedWorker.trouble, true);
     assert.equal(finished.failed.status.tone, 'bad');
     assert.equal(finished.failed.trouble, true);
-    console.log('web-state-e2e: transcript window, scroll, streaming, waiting, long response, removal, completed worker passed');
+    // Run composers always address the planner, even while inspecting a worker's log.
+    const routed = await page.evaluate(async () => {
+        const M = window.Mantra, s = M.store.S;
+        const base = { status: 'idle', busy: false, items: [], items_first: 0, items_total: 0, created_at: Date.now(), in_run: true, model_alias: 'luna' };
+        s.agents.set(9, { ...base, id: 9, name: 'Planner', role_kind: 'planner' });
+        s.agents.set(7, { ...base, id: 7, name: 'Worker 7', role_kind: 'worker', worker: { task_id: 'p2-ui', state: 'running', attempt: 1 } });
+        s.order = [7, 9];
+        s.run = { id: 'test-run', planner: 9, stage: { kind: 'phase' }, workers: [{ task_id: 'p2-ui', agent: 7, attempt: 1 }] };
+        s.ui.route = { name: 'agent', id: 7 };
+        s.conn.state = 'open';
+        const calls = [];
+        M.act.request = async (name, args) => { calls.push({ name, ...args }); return {}; };
+        M.act.flash = () => {};
+        M.act.nav = (url) => { s.ui.route = { name: 'agent', id: Number(url.split('/').at(-1)) }; };
+        M.patch(document.getElementById('root'), M.agentView.agentScreen(7));
+        const textarea = document.querySelector('.composer textarea');
+        textarea.value = 'Please adjust the plan';
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        M.patch(document.getElementById('root'), M.agentView.agentScreen(7));
+        document.querySelector('.composer .send').click();
+        await Promise.resolve();
+        return { calls, label: textarea.getAttribute('aria-label'), note: document.querySelector('.composer-note')?.textContent };
+    });
+    assert.equal(routed.calls[0].agent, 9, 'worker-page messages address the planner');
+    assert.equal(routed.label, 'Message Planner');
+    assert.match(routed.note, /Messages go to the planner/);
+
+    // Respawn replaces an id. Hide its stale failure while pending and follow the new attempt.
+    const pending = await page.evaluate(() => {
+        const M = window.Mantra, s = M.store.S;
+        Object.assign(s.agents.get(7), { status: 'failed', status_detail: 'old provider error' });
+        M.agentView.trackRespawn(7);
+        M.patch(document.getElementById('root'), M.agentView.agentScreen(7));
+        return { trouble: !!document.querySelector('.agent-trouble'), text: document.querySelector('.agent-foot').textContent };
+    });
+    assert.equal(pending.trouble, false);
+    assert.match(pending.text, /Respawning Worker 7/);
+    await page.evaluate(() => {
+        const M = window.Mantra, s = M.store.S;
+        const old = s.agents.get(7);
+        s.agents.set(8, { ...old, id: 8, name: 'Worker 8', status: 'busy', status_detail: undefined, worker: { ...old.worker, attempt: 2 } });
+        old.in_run = false; old.status = 'stopped';
+        s.run.workers = [{ task_id: 'p2-ui', agent: 8, attempt: 2 }];
+        M.patch(document.getElementById('root'), M.agentView.agentScreen(7));
+    });
+    await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(() => Mantra.store.S.ui.route.id), 8, 'respawn opens the replacement attempt');
+    const recovered = await page.evaluate(() => {
+        const M = window.Mantra;
+        M.patch(document.getElementById('root'), M.agentView.agentScreen(8));
+        return { trouble: !!document.querySelector('.agent-trouble'), text: document.querySelector('.agent-foot').textContent };
+    });
+    assert.equal(recovered.trouble, false);
+    assert.doesNotMatch(recovered.text, /old provider error|Respawning/);
+
+    await page.addScriptTag({ path: path.join(ui, 'screens.js') });
+    const auto = await page.evaluate(() => {
+        const M = window.Mantra, s = M.store.S;
+        s.app = { pattern_name: 'auto', pattern_list: [{ name: 'auto', builtin: true, description: 'Planner creates a pattern' }, { name: 'mantra-default', builtin: true }] };
+        M.patch(document.getElementById('root'), M.screens.startRunCard());
+        return { selected: document.querySelector('select').value, label: document.querySelector('option').textContent };
+    });
+    assert.equal(auto.selected, 'auto');
+    assert.match(auto.label, /Auto.*planner creates the pattern/);
+    console.log('web-state-e2e: transcript, completed worker, planner routing, respawn recovery and Auto picker passed');
 } finally {
     await browser.close();
 }

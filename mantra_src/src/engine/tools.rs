@@ -103,7 +103,13 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
             json!({"note": {"type": "string"}}),
             &[],
         ),
-        tool("mantra_prompt", "Send a message to an agent — e.g. answer a finale agent's question. For the orchestrator use mantra_brief_orchestrator.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        tool("mantra_prompt", "Send a message to any role or task. Normally brief the orchestrator; directly steer a worker or other role only for an emergency or to answer its question.", json!({"agent": {"type": "string"}, "message": {"type": "string"}}), &["agent", "message"]),
+        tool("mantra_kill", "Emergency control: stop a role or worker that is broken, wasting work or unsafe. Give a concrete reason, then repair the plan or brief the orchestrator to recover.", json!({"agent": {"type": "string"}, "reason": {"type": "string"}}), &["agent", "reason"]),
+        tool("mantra_respawn", "Emergency recovery: restart a stopped or broken role or worker in place with a fresh thread. Give concrete recovery instructions; normally delegate ordinary worker recovery to the orchestrator.", json!({"agent": {"type": "string"}, "note": {"type": "string"}}), &["agent"]),
+        tool("mantra_read_pattern", "Read the active run's workflow as TOML. Auto must create a concrete workflow before submitting a plan.", json!({}), &[]),
+        tool("mantra_set_task_scope", "Update the current phase task's live scope globs after deciding a scope tripwire is legitimate. Validates that parallel tasks remain disjoint, updates the plan and active worker, clears matching tripwires, and briefs the orchestrator. This does not bypass QA.", json!({"task_id": {"type": "string"}, "scope_globs": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}}), &["task_id", "scope_globs", "reason"]),
+        tool("mantra_revise_pattern", "Propose a complete replacement workflow as TOML, with the reason and impact. Use rarely when the current workflow is broken or inappropriate, or to create Auto's first workflow. Mantra asks the user to approve unless they explicitly enabled approve-all. You cannot approve your own proposal.", json!({"toml": {"type": "string"}, "reason": {"type": "string"}}), &["toml", "reason"]),
+        tool("mantra_wait_for_external_condition", "Schedule a bounded, nonblocking re-entry, then end your turn. Mantra wakes you once after seconds; inspect the condition then and act on the result. Use for CI, deployment, or another external dependency instead of shell sleep/poll loops. This does not evaluate the condition automatically.", json!({"seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "condition": {"type": "string"}, "on_reentry": {"type": "string"}}), &["seconds", "condition", "on_reentry"]),
         read_phase_tool(),
         tool("mantra_read_plan", "Read the full plan (every phase), as last submitted — mantra_read_phase only shows the current one. Use before revising a phase you haven't seen in this thread.", json!({}), &[]),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
@@ -124,6 +130,16 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
     v.extend(agent_tools());
     v.extend(spawner_tools(worker_roles));
     v.push(gate_report_tool());
+    // A planner can replace the workflow, so its tool schema must allow the next workflow's
+    // role names. The deterministic plan validator remains the authority on available roles.
+    for t in &mut v {
+        if t["name"] == "mantra_submit_plan" || t["name"] == "mantra_revise_plan" {
+            if let Some(role) = t.pointer_mut("/inputSchema/properties/plan/properties/phases/items/properties/tasks/items/properties/role").and_then(Value::as_object_mut) { role.remove("enum"); }
+        }
+        if t["name"] == "mantra_spawn_adhoc" {
+            if let Some(role) = t.pointer_mut("/inputSchema/properties/role").and_then(Value::as_object_mut) { role.remove("enum"); }
+        }
+    }
     v
 }
 
@@ -387,6 +403,13 @@ fn next_shot(shots: &Path, stem: &str) -> std::path::PathBuf {
 pub const PLANNER_PROTOCOL: &str = r#"
 mantra-role: planner
 ## Mantra protocol
+- User messages come to you. Normally route work through planner → orchestrator → worker. You may directly prompt or kill any role in an emergency; explain why and restore normal routing afterwards.
+- The active pattern is a workflow, distinct from the phased plan. Read it with mantra_read_pattern. Change it rarely, only when broken or inappropriate, with mantra_revise_pattern and a reason/impact. Mantra enforces user approval unless the user chose approve-all/don't-ask. Never claim approval yourself.
+- Auto begins with only you: discuss the task and design a concrete pattern with the user, then propose its full TOML using mantra_revise_pattern before submitting a plan. The new workflow must have its own name, planner, orchestrator, workers and gate. Use mantra_read_pattern for the current schema; ordinary patterns can also be read from the project's pattern files.
+- For external dependencies use mantra_wait_for_external_condition with a bounded delay, condition and re-entry instructions, then end your turn. Do not run sleep loops or repeatedly poll status while nothing can change. Mantra wakes you once to check the condition.
+- Challenge the contract before implementation: walk through success, abandoned/pending/cancelled attempts, retries, recovery and irreversible limits. Ask what an abandoned attempt means before turning it into a lifetime restriction. Check the user's intended outcome independently of the proposed contract; tests must challenge that interpretation rather than merely encode it.
+- Carry project and per-ticket rules from the brief into task prompts, including recipient language, status format, decision logs and configured commit trailers; do not copy credentials.
+- For CI, identify the target ref and commit SHA. A superseded pipeline cancelled by GitLab auto-cancel is not a failed build or a passing gate: follow the newest required pipeline for that same target, inspect required jobs, and record its SHA/status. Runner queue time alone is not a failure; schedule re-entry while queued or running.
 - Submit your plan by calling `mantra_submit_plan`. Never just write the plan as text or into a file.
 - Mantra validates the plan and returns errors; fix them and resubmit.
 - When re-prompted by the user during a run ([mantra:reprompt]): read state with `mantra_status`/`mantra_log`,
@@ -451,7 +474,10 @@ pub const WORKER_PROTOCOL: &str = r#"
 mantra-role: worker
 ## Mantra protocol
 - You work in your own isolated copy of the repository. Only change files inside your scope.
-- Don't commit, don't push, don't switch branches — Mantra handles version control.
+- Don't commit, don't push, don't switch branches — Mantra handles version control. Project-configured trailers take precedence over model defaults; never invent model credits or session identifiers.
+- Apply the run brief's project and per-ticket rules, including language and status ordering. Read applicable repository instructions; preserve existing decision-log headings and append superseding decisions.
+- Bound concurrent external API writes and coordinate through the orchestrator when peers share a host. On 429 honor Retry-After and use bounded backoff; before repeating a write after a timeout, read back its result or use idempotency. Never blindly repeat a patch: read the failed hunk and current file/diff, then revise the patch or report the blocker.
+- Keep test-only instrumentation out of production state and public APIs unless justified by a real runtime requirement.
 - Unsure about a decision that matters (it changes the outcome, the scope, or another agent's work)? Don't
   guess: call `mantra_ask` — the orchestrator answers, or passes it further up. If you cannot continue without
   the answer, end your turn without a STATUS line; you'll be woken with the answer.
@@ -470,6 +496,9 @@ mantra-role: gate
 ## Mantra protocol
 - You work on the integrated result. You verify and report; you never fix it yourself.
 - Your prompt holds the check results, the diff and the reports so far: start there, read further only to settle a doubt.
+- Review the contract as well as its implementation: test abandoned/pending attempts, cancellation, retry and recovery against the user's intended outcome; passing tests can still encode a product mistake.
+- For security-sensitive protocols, build a checklist from the authoritative protocol/provider specification and map each required validation to code and a negative test. Check signed/covered fields, trusted issuer/endpoints, audience/recipient, nonce/state and replay protection, expiry and downgrade/error paths as applicable; do not infer correctness from a happy-path test.
+- Flag test-only hooks leaking into production structs or APIs without a runtime justification. Verify project and per-ticket rules, including language/order of status updates, and preservation of decision-log history.
 - When done, call `mantra_gate_report` with pass=true/false and a summary. Then end your turn.
 - On fail the summary is the work order for a fix worker: every finding with file, what is wrong, what to change.
   Set big=true only if the fixes span several files or need design work.
