@@ -2,7 +2,7 @@
 
 All notable changes to Mantra are recorded here.
 
-## Unreleased
+## v0.10.0 — 2026-10-27
 
 - **Per-model context ceilings.** Unset model windows inherit the configured default model;
   each Mandala agent uses the smaller of its own window and the run maximum. Model changes

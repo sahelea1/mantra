@@ -1,6 +1,6 @@
 [package]
 name = "bija"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Bija: Mantra's seed harness — a minimal, resilient coding agent for any OpenAI- or Anthropic-compatible API"
 license = "MIT"
