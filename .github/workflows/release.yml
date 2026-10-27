@@ -89,7 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}"
+            # cross mounts mantra_src at /project; the updater also embeds the repository's
+            # installer one directory above it. Keep this build input visible, read-only.
+            CROSS_CONTAINER_OPTS="--volume=$GITHUB_WORKSPACE/install.sh:/install.sh:ro" \
+              cross build --release --target "${{ matrix.target }}"
           else
             cargo build --release --target "${{ matrix.target }}"
           fi

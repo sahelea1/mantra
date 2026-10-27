@@ -1,4 +1,5 @@
 [package]
+# The updater embeds ../install.sh; container builds must also mount that repository file.
 name = "mantra"
 version = "0.10.0"
 edition = "2021"
