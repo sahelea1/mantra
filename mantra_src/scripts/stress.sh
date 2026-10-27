@@ -48,12 +48,12 @@ MANTRA_MOCK_BADMODEL=1 checked_snapshot $bin --demo --pattern stress-codex --sna
 echo "watchdog (WP7.2/WP7.6: idle-agent nudge, real wall-clock wait ~watchdog_seconds)…"
 MANTRA_MOCK_LAZY_ORCH=1 checked_snapshot $bin --demo --pattern stress-codex --snapshot "wait:0.5;until:plan review@60;key:a;until:Foundations@60;wait:1;until:watchdog@150;sweep:watchdog;snap:watchdog" run "build a todo API with auth"
 echo "zoom vs overview (WP8)…"
-out=$($bin --demo --pattern stress-codex --snapshot "until:zoomed@10;snap:start-zoomed;until:plan review@60;snap:review-in-zoom;key:a;wait:0.3;until:overview@10;snap:overview-after-approve" run "build a tiny CLI" 2>&1)
+out=$($bin --demo --pattern stress-codex --snapshot "until:zoomed@10;snap:start-zoomed;until:plan review@60;snap:review-in-zoom;key:a;wait:0.3;until:focus:agents@10;snap:overview-after-approve" run "build a tiny CLI" 2>&1)
 echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC during zoom-vs-overview snapshot"; exit 1; }
 echo "$out" | grep -q '!! timeout' && { echo "$out"; echo "TIMEOUT during zoom-vs-overview snapshot"; exit 1; }
 echo "$out" | grep -q 'zoomed' || { echo "$out"; echo "MISSING: run should start zoomed on the planner"; exit 1; }
 echo "$out" | grep -qi 'plan review' || { echo "$out"; echo "MISSING: plan review overlay should open while zoomed"; exit 1; }
-echo "$out" | grep -q 'overview' || { echo "$out"; echo "MISSING: approving the plan should land on the overview"; exit 1; }
+echo "$out" | grep -q 'focus:agents' || { echo "$out"; echo "MISSING: approving the plan should focus the overview's agent canvas"; exit 1; }
 echo "zoom vs overview ok"
 
 # v0.3.1: a hand stop sticks. ctrl+c on the (zoomed) planner must stop it and leave it stopped —

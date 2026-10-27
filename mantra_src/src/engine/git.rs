@@ -51,13 +51,26 @@ fn project_values(dir: &Path, key: &str) -> Result<Vec<String>, String> {
     Ok(String::from_utf8_lossy(&out.stdout).split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
 }
 
-fn commit(dir: &Path, args: &[&str]) -> Result<(), String> {
+/// Git also resolves the committer while preparing a merge with --no-commit.
+/// Use one identity policy for every command that can create or prepare a commit.
+fn identity_args(dir: &Path) -> Vec<String> {
     let mut owned: Vec<String> = vec![];
     for (key, fallback) in [("user.name", "Mantra"), ("user.email", "mantra@localhost")] {
         if git(dir, &["config", key]).map(|v| v.is_empty()).unwrap_or(true) {
             owned.extend(["-c".into(), format!("{key}={fallback}")]);
         }
     }
+    owned
+}
+
+fn git_with_identity(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut owned = identity_args(dir);
+    owned.extend(args.iter().map(|s| s.to_string()));
+    git(dir, &owned.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn commit(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let mut owned: Vec<String> = vec![];
     owned.push("commit".into());
     owned.extend(args.iter().map(|s| s.to_string()));
     for trailer in project_values(dir, "mantra.commitTrailer")? {
@@ -65,7 +78,7 @@ fn commit(dir: &Path, args: &[&str]) -> Result<(), String> {
         if !valid || trailer.chars().any(char::is_control) { return Err("invalid mantra.commitTrailer: use one Key: value per git config entry".into()); }
         owned.extend(["--trailer".into(), trailer]);
     }
-    git(dir, &owned.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
+    git_with_identity(dir, &owned.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
 }
 
 fn decision_logs(dir: &Path) -> Result<Vec<String>, String> {
@@ -134,7 +147,7 @@ fn protect_decisions(dir: &Path) -> Result<(), String> {
 }
 
 fn guarded_merge(dir: &Path, branch: &str) -> Result<(), String> {
-    if let Err(e) = git(dir, &["merge", "--no-ff", "--no-commit", "-q", branch]) {
+    if let Err(e) = git_with_identity(dir, &["merge", "--no-ff", "--no-commit", "-q", branch]) {
         let conflict = git(dir, &["ls-files", "-u"]).map(|s| !s.is_empty()).unwrap_or(false);
         let _ = git(dir, &["merge", "--abort"]);
         return Err(if conflict { format!("merge conflict: {e}") } else { e });
@@ -633,9 +646,40 @@ mod tests {
             assert!(message.contains("Claude-Session: configured-session"), "{message}");
             assert!(!message.contains("Claude Fable"), "{message}");
             assert_eq!(git(&dir, &["log", "-1", "--format=%an <%ae>", rev]).unwrap(), "Project Author <project@example.test>");
+            assert_eq!(git(&dir, &["log", "-1", "--format=%cn <%ce>", rev]).unwrap(), "Project Author <project@example.test>");
         }
         let _ = std::fs::remove_dir_all(worker);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_merge_and_land_work_without_an_effective_git_identity() {
+        for landing in [false, true] {
+            let tag = if landing { "fallback-land" } else { "fallback-merge" };
+            let dir = temp_repo(tag);
+            // Empty local entries override global configuration too, so a developer's configured
+            // identity cannot mask the merge preparation's need for the Mantra fallback.
+            git(&dir, &["config", "--local", "user.name", ""]).unwrap();
+            git(&dir, &["config", "--local", "user.email", ""]).unwrap();
+            let worker = worker_repo(&dir, tag);
+            std::fs::write(worker.join("worker.txt"), "worker contribution\n").unwrap();
+            let mut ws = test_ws(&dir, None);
+            if landing {
+                commit_all(&worker, "worker commit").unwrap();
+                ws.integ = worker.clone();
+                ws.branch = "test-worker".into();
+                land(&ws).unwrap();
+            } else {
+                let result = merge_workers(&ws, &[("task".into(), worker.clone(), "test-worker".into())]);
+                assert_eq!(result.merged, vec!["task"], "{}", result.log);
+                assert!(result.conflicts.is_empty() && result.blocked.is_empty(), "{}", result.log);
+            }
+            assert_eq!(git(&dir, &["show", "HEAD:worker.txt"]).unwrap(), "worker contribution");
+            assert_eq!(git(&dir, &["log", "-1", "--format=%an <%ae>|%cn <%ce>"]).unwrap(), "Mantra <mantra@localhost>|Mantra <mantra@localhost>");
+            assert_eq!(git(&dir, &["config", "--local", "user.name"]).unwrap(), "", "fallback is per-command; project config is unchanged");
+            let _ = std::fs::remove_dir_all(worker);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
