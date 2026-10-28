@@ -53,7 +53,7 @@ Already installed: `mantra update`.
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.10.1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.10.2 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80) — one build makes both binaries
@@ -688,7 +688,7 @@ On a phone the settings are a list of sections that open as pages, all of it fro
 - **Code + password** — the same session as a short code (grouped in dashes) typed in at remote.mantra.codes, plus the password. For reading aloud, or typing into a device you didn't get the link on.
 - **Password** — set your own, or let Mantra generate a four-word one the first time `--remote` runs (`amber-kite-river-nine`, from a fixed 256-word list) and show it in *Web & remote* in `/settings`. It also derives the link's key, so changing it — or rotating — invalidates old links and codes.
 - **What the relay can and cannot see.** Your host and the connecting browser derive a shared key from the password (PBKDF2, then a fresh HKDF key per connection) that never reaches the relay, and every message after that is AES-256-GCM end-to-end encrypted. The relay sees your IP, the browser's IP, and encrypted bytes — never the password, the key, or anything your agents say. A wrong password or code fails to decrypt the very first frame ("Wrong password or code") rather than quietly connecting into someone else's session.
-- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.10.1` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
+- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.10.2` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
 - **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `mantra --remote` session per IPv4 address at a time — a second one dialing in from behind the same address (the same office, the same home network) is refused until the first disconnects, and Mantra reports that plainly instead of silently taking over.
 - **Behind a proxy.** The relay is dialed through the usual variables: `https_proxy` / `HTTPS_PROXY` for a `wss://` relay, `http_proxy` / `HTTP_PROXY` for `ws://`, `all_proxy` for either (lowercase is read first), `user:pass@` credentials included. `no_proxy` / `NO_PROXY` exempts hosts (`*`, a host or domain suffix, an IPv4 CIDR); a relay on `localhost` or a loopback address is never proxied, whatever the variables say. Only `http://` proxies work — the relay is reached with HTTP `CONNECT`, TLS still runs end to end through the tunnel and the certificate is checked as usual; a `socks5://` or `https://` proxy URL is refused with a hint (an `http://` proxy, or `no_proxy` for the relay host). Behind a TLS-inspecting proxy, or with a self-hosted relay on a private CA, `SSL_CERT_FILE` adds a PEM bundle to the built-in roots, and an untrusted relay certificate points at it. Proxy failures are reported as the proxy's (*refused the CONNECT (HTTP 403)*, *cannot reach the proxy*), not as a dead relay.
 
@@ -929,6 +929,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.10.1** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.10.2** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>
