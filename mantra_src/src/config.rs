@@ -131,6 +131,8 @@ pub struct Settings {
     /// Command used to launch one `claude` process per Claude Code agent (WP10.3). A `--demo`
     /// override to a mock is WP10.6 territory, not wired up yet.
     pub claude_command: Vec<String>,
+    /// Command for the Antigravity subscription CLI (`agy`). Model IDs come from `agy models`.
+    pub antigravity_command: Vec<String>,
     /// Command used to launch one `bija` process per Bija agent. The default bare name is resolved
     /// at startup (`resolve_bija_command`): PATH, then the `bija` installed beside `mantra`, then
     /// `$MANTRA_BIJA` — the resolved path is used, never written back here.
@@ -333,6 +335,7 @@ impl Default for Settings {
         Self {
             codex_command: vec!["codex".into(), "app-server".into()],
             claude_command: vec!["claude".into()],
+            antigravity_command: vec!["agy".into()],
             bija_command: vec!["bija".into()],
             // Solo runs on bija (SPEC §9.1): it ships beside mantra, so it is always there. A 0.7
             // file's `sol-api` still resolves (`Registry::get` answers to both spellings).
@@ -523,6 +526,9 @@ pub enum ProviderKind {
     /// Written as `kind = "bija"` (`seed`, what the word means, is accepted too).
     #[serde(alias = "seed")]
     Bija,
+    /// Google subscription models through the official `agy` CLI.
+    #[serde(alias = "agy")]
+    Antigravity,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -599,7 +605,7 @@ impl ProviderEntry {
         match self.kind {
             ProviderKind::Codex => true,
             ProviderKind::ClaudeCode => self.auth == "api_key",
-            ProviderKind::Bija => false,
+            ProviderKind::Bija | ProviderKind::Antigravity => false,
         }
     }
     /// The `--wire` a Bija process is launched with: the Messages API for `anthropic`, else Chat
@@ -626,7 +632,11 @@ impl ProviderEntry {
     /// provider does; a ClaudeCode one only when a gateway `base_url` is set (otherwise discovery
     /// answers from the built-in catalog and needs no URL at all).
     pub fn needs_url(&self) -> bool {
-        self.kind != ProviderKind::ClaudeCode || !self.base_url.trim().is_empty()
+        match self.kind {
+            ProviderKind::Antigravity => false,
+            ProviderKind::ClaudeCode => !self.base_url.trim().is_empty(),
+            _ => true,
+        }
     }
     /// `host[:port]` a request to `base_url` goes to — shown next to Test / Discover so the user
     /// sees where the key is sent. `None` when the URL doesn't parse.
@@ -776,6 +786,26 @@ pub fn claude_available() -> bool {
 pub fn codex_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| on_path("codex"))
+}
+
+/// Resolve the official Antigravity CLI without persisting a machine-specific path.
+/// An explicitly configured command wins; MANTRA_AGY overrides only the default bare `agy`.
+pub fn resolve_antigravity_command(configured: &[String]) -> Vec<String> {
+    let mut command = if configured.is_empty() { vec!["agy".into()] } else { configured.to_vec() };
+    if command.first().is_some_and(|c| c == "agy") {
+        if let Some(path) = std::env::var("MANTRA_AGY").ok().filter(|p| !p.trim().is_empty()) {
+            command[0] = path;
+        }
+    }
+    command
+}
+
+pub fn antigravity_command_available(configured: &[String]) -> bool {
+    resolve_antigravity_command(configured).first().is_some_and(|name| on_path(name) || Path::new(name).is_file())
+}
+
+pub fn antigravity_available() -> bool {
+    antigravity_command_available(&Settings::load().antigravity_command)
 }
 
 /// The default Claude Code models: alias -> model id, context window and note. Every Opus,
@@ -1347,6 +1377,13 @@ impl Registry {
     pub fn preflight(&self, pattern: &crate::engine::pattern::Pattern) -> Vec<String> {
         let mut out = vec![];
         for (name, role) in pattern.ordered_roles() {
+            if role.sandbox == "read-only" && role.permission != BYPASS_SANDBOX_DANGER {
+                for (label, alias) in std::iter::once(("model", role.model.as_str())).chain(role.fallback.as_deref().filter(|f| !f.trim().is_empty()).map(|f| ("fallback", f))) {
+                    if self.get(alias).is_some_and(|m| self.backend_of(m) == ProviderKind::Antigravity) {
+                        out.push(format!("{name}: {label} '{alias}' uses Antigravity, which cannot enforce read-only; choose another backend or explicitly change the role sandbox"));
+                    }
+                }
+            }
             if let Some(why) = self.alias_problem(&role.model) {
                 out.push(format!("{name}: {why}"));
             }
@@ -2185,4 +2222,37 @@ mod tests {
         r.models[0].vision = false;
         assert!(!r.vision("eye"));
     }
+    #[test]
+    fn antigravity_subscription_config_needs_no_api_key_or_url() {
+        let provider: ProviderEntry = toml::from_str("id = 'agy'\nkind = 'antigravity'").unwrap();
+        assert_eq!(provider.kind, ProviderKind::Antigravity);
+        assert!(!provider.needs_key());
+        assert!(!provider.needs_url());
+        assert!(provider.draft_reason().is_none());
+        let r = Registry { providers: vec![provider], models: vec![ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model-slug".into(), ..Default::default() }] };
+        assert_eq!(r.backend_of(&r.resolve("google")), ProviderKind::Antigravity);
+        assert_eq!(r.alias_problem("google"), None);
+        assert!(r.provider_args().iter().all(|a| !a.contains("agy")), "subscription backend cannot become a Codex API provider");
+        let alias: ProviderEntry = toml::from_str("kind = 'agy'").unwrap();
+        assert_eq!(alias.kind, ProviderKind::Antigravity);
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.antigravity_command, ["agy"]);
+    }
+
+    #[test]
+    fn antigravity_read_only_roles_and_fallbacks_are_rejected_before_a_run() {
+        let reg = Registry { providers: vec![ProviderEntry { id: "agy".into(), kind: ProviderKind::Antigravity, ..Default::default() }], models: vec![ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model".into(), ..Default::default() }, ModelEntry { alias: "codex".into(), model: "account-codex".into(), ..Default::default() }] };
+        let mut pattern = crate::engine::pattern::Pattern::builtin();
+        for role in pattern.roles.values_mut() { role.model = "codex".into(); role.fallback = None; }
+        let role = pattern.roles.values_mut().next().unwrap();
+        role.model = "google".into(); role.sandbox = "read-only".into();
+        assert!(reg.preflight(&pattern).iter().any(|e| e.contains("model 'google'") && e.contains("cannot enforce read-only")));
+        let role = pattern.roles.values_mut().next().unwrap();
+        role.model = "codex".into(); role.fallback = Some("google".into());
+        assert!(reg.preflight(&pattern).iter().any(|e| e.contains("fallback 'google'") && e.contains("cannot enforce read-only")));
+        let role = pattern.roles.values_mut().next().unwrap();
+        role.sandbox = "workspace-write".into();
+        assert!(reg.preflight(&pattern).is_empty());
+    }
+
 }

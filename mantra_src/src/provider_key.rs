@@ -171,6 +171,9 @@ pub fn add_provider(reg: &mut Registry, draft: &ProviderDraft) -> Result<String,
 /// Blocks on the network: the UIs run it off their task. The errors a user can act on are said
 /// plainly: a refused key, a URL with no model list (add models by hand), the network's own words.
 pub fn probe(p: &ProviderEntry) -> Result<Vec<Found>, String> {
+    if p.kind == ProviderKind::Antigravity {
+        return Err("run `agy models`, then add an available model ID by hand".into());
+    }
     if let Some(why) = p.url_problem().or_else(|| p.wire_problem()) {
         return Err(why);
     }
@@ -222,6 +225,8 @@ pub enum Backend {
     Codex,
     /// The `claude` CLI: the `claude` provider and its default models.
     ClaudeCode,
+    /// Google subscription login held by `agy`. Models are entered from `agy models`.
+    Antigravity,
 }
 
 /// Adds the Claude Code backend's known models once its CLI is on PATH. Codex has no built-in
@@ -230,6 +235,7 @@ pub fn add_backend(reg: &mut Registry, backend: Backend) -> Result<usize, String
     let installed = match backend {
         Backend::Codex => crate::config::codex_available(),
         Backend::ClaudeCode => crate::config::claude_available(),
+        Backend::Antigravity => crate::config::antigravity_available(),
     };
     add_backend_with(reg, backend, installed)
 }
@@ -239,6 +245,17 @@ pub fn add_backend(reg: &mut Registry, backend: Backend) -> Result<usize, String
 /// backend is not added twice. Codex's catalogue is deliberately never guessed here.
 pub fn add_backend_with(reg: &mut Registry, backend: Backend, installed: bool) -> Result<usize, String> {
     let (models, tag) = match backend {
+        Backend::Antigravity => {
+            if !installed {
+                return Err("`agy` is not installed — install the official Antigravity CLI, sign in, and run `agy models`".into());
+            }
+            if !reg.providers.iter().any(|p| p.kind == ProviderKind::Antigravity) {
+                let id = unique_id(reg, "antigravity");
+                reg.providers.push(ProviderEntry { id, name: "Antigravity".into(), kind: ProviderKind::Antigravity, auth: "subscription".into(), ..Default::default() });
+            }
+            // The subscription catalogue is account-dependent. Never invent model IDs.
+            return Ok(0);
+        }
         Backend::Codex => {
             if !installed {
                 return Err("`codex` is not on PATH — install Codex and run `codex login`, then add it again".into());
@@ -477,4 +494,17 @@ mod tests {
         assert!(why.starts_with("the key was refused") && why.contains("bad key"), "{why}");
         assert_eq!(kept.as_deref(), Some("local"), "the provider stays for models by hand");
     }
+    #[test]
+    fn adding_antigravity_preserves_the_account_dependent_catalogue() {
+        let mut reg = Registry { models: vec![], providers: vec![] };
+        assert!(add_backend_with(&mut reg, Backend::Antigravity, false).unwrap_err().contains("agy"));
+        assert!(reg.providers.is_empty());
+        assert_eq!(add_backend_with(&mut reg, Backend::Antigravity, true), Ok(0));
+        assert_eq!(add_backend_with(&mut reg, Backend::Antigravity, true), Ok(0));
+        assert_eq!(reg.providers.len(), 1);
+        assert_eq!(reg.providers[0].kind, ProviderKind::Antigravity);
+        assert!(reg.models.is_empty(), "only actual model IDs from the user's account may be added");
+        assert!(probe(&reg.providers[0]).unwrap_err().contains("agy models"));
+    }
+
 }

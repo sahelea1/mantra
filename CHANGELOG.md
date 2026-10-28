@@ -2,6 +2,14 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.10.0b — 2026-10-28 (local tag; not published)
+
+- Add the official Antigravity CLI as a Google subscription backend, with model aliases selectable across Solo, patterns, Auto and Akasha.
+- Stream native agent activity and results, serialize turns, resume explicit conversation IDs, and isolate concurrent agents' Mantra tool routing.
+- Register an additive environment-routed MCP bridge without copying credentials or changing the process home directory.
+- Document native headless permission, sandbox, context-control and external MCP limitations; reject unsupported configurations clearly.
+- Keep the Cargo version at 0.10.0: this is a tag-only development revision and does not publish a release.
+
 ## v0.10.0 — 2026-10-27
 
 - **Per-model context ceilings.** Unset model windows inherit the configured default model;

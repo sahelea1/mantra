@@ -4,7 +4,7 @@
 
 **Run one coding agent — or a whole team of them — from a single terminal.**
 
-Runs on its own small harness, **Bija**, on any OpenAI- or Anthropic-compatible API — paste a key and go — with **Codex** and **Claude Code** as backends you can add, mixed freely.
+Runs on its own small harness, **Bija**, on any OpenAI- or Anthropic-compatible API — paste a key and go — with **Codex**, **Claude Code**, and **Antigravity CLI** as optional backends.
 Two Rust binaries, nothing written into your project — and, one flag away, an installable web UI and end-to-end encrypted remote access, no server of your own required.
 
 [Install](#install) · [Try it in one minute](#try-it-in-one-minute) · [Solo](#solo-one-agent-done-properly) · [Mandala](#mandala-a-team-that-plans-builds-and-checks) · [Anywhere](#anywhere-the-web-ui-and-remote-access) · [Under the hood](#under-the-hood)
@@ -369,6 +369,16 @@ A URL you type always wins over the guess (a `sk-` key for another OpenAI-compat
 </details>
 
 **Codex** uses the model IDs you add to `models.toml` in `/models`; Mantra no longer imports a fixed Codex catalogue. Choose *Codex account model*, type the ID, and edit its alias or capabilities in the grid; the Discover action can ask the running Codex app server for its current catalogue. The `openai · Codex (ChatGPT login)` row appears while at least one Codex model is configured. Delete it twice to remove all its models, including when it is the only backend. **Claude Code** offers separate subscription and API key choices; the latter opens the key field and can also read `$ANTHROPIC_API_KEY`.
+
+**Antigravity (Google subscription).** Install the official [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli), run `agy` once to sign in, and use `agy models` to find model IDs available to your account. In `/models`, add **Antigravity**, then enter a model ID and alias. Use that alias in Solo, Studio roles, Mandala patterns (including Auto), or Akasha. Mantra uses the CLI login; it does not ask for, copy, or extract Google credentials. Set `antigravity_command` in settings or `MANTRA_AGY` if `agy` is not on PATH.
+
+Each agent has a separate CLI process and explicit conversation ID. Resume and model changes use that ID, never the account's “most recent conversation.” Prompts within one agent are serialized; different agents can run concurrently, subject to your account's shared quota.
+
+Antigravity 1.4.9 has no per-process MCP configuration flag. On the first agent requiring Mantra tools, Mantra adds its `mantra` stdio bridge to `~/.gemini/config/mcp_config.json` and the scoped `mcp(mantra/*)` allow rule to CLI settings. Existing servers and permission rules are preserved; a conflicting registration or invalid configuration causes a clear error. Agent routing is inherited from each process's environment, never stored in shared configuration. Ordinary `agy` sessions expose no Mantra tools when that environment is absent. To remove the integration, remove this server and its scoped allow rule from Antigravity's configuration.
+
+Native CLI permissions still apply. Changing an Antigravity session’s approval policy is pending until `/new`, so the displayed live policy continues to match the running process. Headless `on-request`/`untrusted` sessions cannot show native tool approval prompts inside Mantra; agy may deny those tools. Configure scoped agy permissions or select `never ask` for automatic approval with the requested terminal sandbox. Explicit sandbox bypass also removes that sandbox request. A read-only workspace cannot be enforced by this backend and is rejected. Built-in QA roles and the Studio architect therefore need another backend while their read-only policy is retained; select agy for writable roles. The generic read-only model probe is unavailable for agy; use `agy models` and its interactive login to check account availability. Antigravity can ignore `--sandbox` on unsupported hosts; its sandbox is not equivalent to Bija's containment. Existing agy MCP servers remain active; Mantra's per-agent external MCP selection is unsupported and rejected rather than silently ignored.
+
+Context capacity and compaction remain controlled by agy: Mantra does not pass invented context-limit flags or display its model/run ceiling as an enforced agy limit. Role instructions accompany the first prompt because the CLI has no system-prompt flag. Integration tests use the documented stream protocol and isolated fake subprocesses; the official binary's flags and MCP registration have been checked, but an authenticated Google subscription run is still needed to verify your account end to end.
 
 Effort resolves per model → per role → per agent at runtime (`alt+↑/↓`), clamped to what the model actually supports. When a role asks for an effort its model does not offer (`max` on a model that stops at `high`), the agent's transcript says so once and the pattern overview shows requested→used.
 

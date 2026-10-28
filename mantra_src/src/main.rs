@@ -702,8 +702,8 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
     }
     // The MCP-bridge socket (WP10.4) is only worth opening when a Claude Code agent could actually
     // run — real or (in `--demo`) mocked.
-    let enable_bridge = registry.providers.iter().any(|p| p.kind == config::ProviderKind::ClaudeCode);
-    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), bija_cmd, hub_tx, enable_bridge);
+    let enable_bridge = registry.providers.iter().any(|p| matches!(p.kind, config::ProviderKind::ClaudeCode | config::ProviderKind::Antigravity));
+    let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), bija_cmd, config::resolve_antigravity_command(&settings.antigravity_command), hub_tx, enable_bridge);
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
     app.web = web.as_ref().map(|w| w.link());
     if let Some(p) = cli.pattern {
@@ -1266,6 +1266,9 @@ fn doctor() {
     if claude_used && crate::util::effective_uid_is_root() {
         println!("  IS_SANDBOX note: running as root — Mantra sets IS_SANDBOX=1 for claude agents (--dangerously-skip-permissions is otherwise refused for uid 0)");
     }
+    let agy_cmd = config::resolve_antigravity_command(&s.antigravity_command);
+    let (good, text) = probe_cli(agy_cmd.first().map(String::as_str).unwrap_or("agy"), " — install the official Antigravity CLI, sign in, then run `agy models`");
+    optional_backend_row("agy", good, &text, uses(config::ProviderKind::Antigravity));
     let git = std::process::Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     println!("{} git (needed for isolated worktrees)", ok(git));
     println!("  terminal: TERM={} COLORTERM={} TERM_PROGRAM={}", std::env::var("TERM").unwrap_or_default(), std::env::var("COLORTERM").unwrap_or_default(), std::env::var("TERM_PROGRAM").unwrap_or_default());
@@ -1319,6 +1322,8 @@ fn doctor() {
                     println!("{} provider {} (Bija, wire {}): {} · {key}", if p.resolve_key().is_some() { ok(true) } else { " " }, p.id, p.bija_wire().trim_end_matches("-chat"), p.base_url.trim());
                 }
             }
+        } else if p.kind == config::ProviderKind::Antigravity {
+            println!("  provider {} (Antigravity, subscription): agy holds the Google login; run `agy models` to check available model IDs", p.id);
         } else if p.kind == config::ProviderKind::ClaudeCode {
             if p.auth == "api_key" {
                 println!("{} provider {} (Claude Code, api_key): {}", ok(p.resolve_key().is_some()), p.id, key_src(p));
@@ -1475,6 +1480,9 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
     } else {
         format!("${} NOT set and no key stored (/models to fix)", p.env_var_name())
     };
+    if p.kind == config::ProviderKind::Antigravity {
+        return (None, format!("{name} (Antigravity, subscription) for `{alias}`: agy holds the Google login; run `agy models` to check availability"));
+    }
     if p.kind == config::ProviderKind::ClaudeCode {
         if p.auth != "api_key" {
             return (None, format!("{name} (Claude Code, subscription) for `{alias}`: `claude` holds the login — nothing to check here"));

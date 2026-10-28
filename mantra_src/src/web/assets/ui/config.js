@@ -404,7 +404,7 @@
                 m.default ? h('span', { class: 'mini-chip', title: 'Solo’s default model (Settings › Solo)' }, 'Solo') : null),
             h('div', { class: 'mt-cell', 'data-label': 'Provider', role: 'cell' }, select('provider', m.provider, provs, 'Provider')),
             h('div', { class: 'mt-cell c-model', 'data-label': 'Model', role: 'cell' }, cell(k('model'), m.model, m.model, modelSet(m.alias, 'model'), { label: 'Model id', mono: true })),
-            h('div', { class: 'mt-cell', 'data-label': 'Context', role: 'cell' }, cell(k('context'), m.context_window ? F.tokens(m.context_window) : '', m.context_window ? F.tokens(m.context_window) : '', modelSet(m.alias, 'context'), { label: 'Context window', empty: F.tokens(m.effective_context_window || 200000) + ' (default)', title: 'Tokens: 200000, 200k or 1m — empty inherits the configured default model window', placeholder: F.tokens(m.effective_context_window || 200000) })),
+            h('div', { class: 'mt-cell', 'data-label': 'Context', role: 'cell' }, m.backend === 'antigravity' ? h('span', { class: 'dim cell-none', title: 'Antigravity manages context in agy' }, 'agy managed') : cell(k('context'), m.context_window ? F.tokens(m.context_window) : '', m.context_window ? F.tokens(m.context_window) : '', modelSet(m.alias, 'context'), { label: 'Context window', empty: F.tokens(m.effective_context_window || 200000) + ' (default)', title: 'Tokens: 200000, 200k or 1m — empty inherits the configured default model window', placeholder: F.tokens(m.effective_context_window || 200000) })),
             h('div', { class: 'mt-cell', 'data-label': 'Effort', role: 'cell' }, m.efforts.length ? select('effort', m.default_effort, m.efforts, 'Effort') : h('span', { class: 'dim cell-none', title: 'No effort levels: set some under More' }, 'none')),
             h('div', { class: 'mt-cell c-vision', 'data-label': 'Vision', role: 'cell' }, h('input', { type: 'checkbox', class: 'switch', checked: !!m.vision, title: 'Takes images (screenshots)', 'aria-label': 'Vision for ' + m.alias, onchange: (e) => modelSet(m.alias, 'vision')(e.target.checked ? 'on' : 'off') })),
             h('div', { class: 'mt-cell c-acts', role: 'cell' },
@@ -415,7 +415,7 @@
                 status && (more || !/^ok\b/i.test(status)) ? h('span', { class: 'mt-status' + (/^ok/.test(status) ? ' ok' : /^error/.test(status) ? ' bad' : '') }, status) : null,
                 m.problem ? h('span', { class: 'mt-problem' }, m.problem) : null) : null,
             more ? h('div', { class: 'mt-more', key: 'more' },
-                labelled('Compacts at', cell(k('compact'), m.compact_percent ? m.compact_percent + '%' : '', m.compact_percent || '', modelSet(m.alias, 'compact'), { label: 'Compacts at', empty: '85%', placeholder: '85' })),
+                labelled('Compacts at', m.backend === 'antigravity' ? h('span', { class: 'cell-static' }, 'agy managed') : cell(k('compact'), m.compact_percent ? m.compact_percent + '%' : '', m.compact_percent || '', modelSet(m.alias, 'compact'), { label: 'Compacts at', empty: '85%', placeholder: '85' })),
                 labelled('Efforts', cell(k('efforts'), m.efforts.join(', '), m.efforts.join(', '), modelSet(m.alias, 'efforts'), { label: 'Efforts', empty: 'none', placeholder: 'low, medium, high' })),
                 labelled('Note', cell(k('note'), m.note, m.note, modelSet(m.alias, 'note'), { label: 'Note' })),
                 labelled('Backend', h('span', { class: 'cell-static' }, F.backend(m.backend) + ' · ' + m.provider_name))) : null,
@@ -443,6 +443,7 @@
                 h('select', { class: 'select', value: provider, 'aria-label': 'Provider of the new model', onchange: (e) => { A.provider = e.target.value; changed(); } }, provs.map((p) => h('option', { value: p, key: p, selected: p === provider }, p))),
                 h('input', { class: 'input mono', value: A.model, placeholder: 'model id, as the provider names it', 'aria-label': 'Model id', autocapitalize: 'off', spellcheck: 'false', oninput: (e) => { A.model = e.target.value; changed(); } }),
                 P.btn('Add model', null, { type: 'submit', icon: 'plus', disabled: !provider })),
+            R.providers.some((p) => p.id === provider && p.kind === 'antigravity') ? h('p', { class: 'sec-sub', key: 'agy-models' }, 'Antigravity: use an available model ID from agy models. Context and compaction follow the CLI settings.') : null,
             errLine('m-add'),
         ], { key: 'models', icon: 'model', right: savingBadge('models') });
     }
@@ -476,8 +477,8 @@
             h('div', { class: 'mt-cell c-alias', 'data-label': 'Id', role: 'cell' }, cell(k('id'), p.id, p.id, providerSet(p.id, 'id'), { label: 'Id', mono: true })),
             h('div', { class: 'mt-cell', 'data-label': 'Name', role: 'cell' }, cell(k('name'), p.name, p.name, providerSet(p.id, 'name'), { label: 'Name' })),
             h('div', { class: 'mt-cell c-model', 'data-label': 'Base URL', role: 'cell' }, cell(k('base_url'), p.base_url, p.base_url, providerSet(p.id, 'base_url'), { label: 'Base URL', mono: true, placeholder: 'https://…/v1' })),
-            h('div', { class: 'mt-cell', 'data-label': 'Key', role: 'cell' }, cell(k('api_key'), key, '', providerSet(p.id, 'api_key'), { label: 'API key', secret: true, mono: true, empty: p.kind === 'claude-code' && p.auth === 'subscription' ? 'login' : 'no key', placeholder: 'paste a new key', title: 'Paste a new key (it is never shown again)' })),
-            h('div', { class: 'mt-cell', 'data-label': 'Kind', role: 'cell' }, select('kind', p.kind, opts.kinds || ['bija', 'codex', 'claude-code'], 'Kind')),
+            h('div', { class: 'mt-cell', 'data-label': 'Key', role: 'cell' }, cell(k('api_key'), key, '', providerSet(p.id, 'api_key'), { label: 'API key', secret: true, mono: true, empty: (p.kind === 'claude-code' && p.auth === 'subscription') || p.kind === 'antigravity' ? 'login' : 'no key', placeholder: 'paste a new key', title: 'Paste a new key (it is never shown again)' })),
+            h('div', { class: 'mt-cell', 'data-label': 'Kind', role: 'cell' }, select('kind', p.kind, opts.kinds || ['bija', 'codex', 'claude-code', 'antigravity'], 'Kind')),
             h('div', { class: 'mt-cell', 'data-label': p.kind === 'claude-code' ? 'Auth' : 'Wire', role: 'cell' },
                 p.kind === 'bija' ? select('wire', p.wire || 'openai', opts.wires || ['openai', 'anthropic'], 'Wire')
                     : p.kind === 'claude-code' ? select('auth', p.auth, opts.auths || ['subscription', 'api_key'], 'Auth') : h('span', { class: 'dim cell-none' }, '—')),
@@ -511,6 +512,15 @@
                 M.act.flash('Claude Code uses your subscription login', 'ok');
             }
         };
+        const addAntigravity = async () => {
+            if (!await reg('add_backend', { kind: 'antigravity' }, 'backend')) return;
+            const p = C().models.providers.find((x) => x.kind === 'antigravity');
+            if (!p) return;
+            c.addModel.provider = p.id;
+            changed();
+            M.act.flash('Run agy models, then enter an available model ID above. agy uses your Google subscription login.', 'ok');
+            requestAnimationFrame(() => document.querySelector('input[aria-label="Model id"]')?.focus());
+        };
         const addCodex = () => {
             c.addModel.provider = 'openai';
             changed();
@@ -527,7 +537,8 @@
                 !R.providers.some((p) => p.kind === 'bija') ? P.btn('Bija · inactive', open, { key: 'bija-status', disabled: true, title: 'Choose Add API provider to configure Bija' }) : null,
                 P.btn('Add Codex model', addCodex, { icon: 'plus', key: 'codex', disabled: !(B.codex && B.codex.installed), title: 'Enter a Codex model id above; no model list is built into Mantra' }),
                 P.btn('Claude Code subscription', () => addClaude('subscription'), { icon: 'plus', key: 'claude-code', disabled: !(B.claude && B.claude.installed), title: 'Uses your Claude Code login' }),
-                P.btn('Claude Code API key', () => addClaude('api_key'), { icon: 'plus', key: 'claude-key', disabled: !(B.claude && B.claude.installed), title: 'Paste a key or set $ANTHROPIC_API_KEY' })),
+                P.btn('Claude Code API key', () => addClaude('api_key'), { icon: 'plus', key: 'claude-key', disabled: !(B.claude && B.claude.installed), title: 'Paste a key or set $ANTHROPIC_API_KEY' }),
+                P.btn('Antigravity subscription', addAntigravity, { icon: 'plus', key: 'antigravity', disabled: !(B.antigravity && B.antigravity.installed), title: 'Uses your Google login in agy; enter an ID from agy models' })),
             errLine('backend'),
         ], { key: 'providers', icon: 'globe' });
     }

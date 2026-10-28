@@ -1291,6 +1291,6 @@ mod tests {
         let (mut app, mut h, _rx) = wired();
         assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "codex".into() }).unwrap_err().contains("no preset models"));
         assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "claude-code".into() }).unwrap()["added"].as_u64().unwrap() > 0);
-        assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "vim".into() }).unwrap_err().contains("codex or claude-code"));
+        assert!(ask(&mut app, &mut h, Command::AddBackend { kind: "vim".into() }).unwrap_err().contains("codex, claude-code or antigravity"));
     }
 }

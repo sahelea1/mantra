@@ -1372,6 +1372,7 @@ done"#;
                 backend: crate::config::ProviderKind::Bija,
                 envs,
                 claude: None,
+                antigravity: None,
                 bija: Some(BijaSpawn { system_prompt: "You are the worker.".into(), ..spawn_cfg(&self.dir.join("home")) }),
                 mcp: vec![],
             }
@@ -1706,7 +1707,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$OPS_LOG"; case "$line" in
         let fake = Fake::new("quit");
         let finished = fake.dir.join("finished");
         let (ev, mut rx) = mpsc::unbounded_channel();
-        let mut hub = super::super::Hub::new(vec![], vec![], sh(FAKE_BIJA), ev, false);
+        let mut hub = super::super::Hub::new(vec![], vec![], sh(FAKE_BIJA), vec![], ev, false);
         let id = hub.alloc_id();
         hub.spawn(id, fake.spec(vec![("SHUTDOWN_DELAY".into(), "1".into()), ("FINISHED".into(), finished.to_string_lossy().into_owned())]));
         assert!(matches!(next(&mut rx).await, HubEvent::Ready { .. }));
@@ -1727,14 +1728,14 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$OPS_LOG"; case "$line" in
         let script = r#"printf '{"ev":"ready","session":"s1","dir":"x","model":"m","wire":"openai_chat","resumed":false,"pid":1,"pending":false}\n'
 while IFS= read -r line; do :; done; sleep 30"#;
         let (ev, mut rx) = mpsc::unbounded_channel();
-        let mut hub = super::super::Hub::new(vec![], vec![], sh(script), ev.clone(), false);
+        let mut hub = super::super::Hub::new(vec![], vec![], sh(script), vec![], ev.clone(), false);
         let id = hub.alloc_id();
         hub.spawn(id, fake.spec(vec![]));
         assert!(matches!(next(&mut rx).await, HubEvent::Ready { .. }));
         let asked = std::time::Instant::now();
         assert!(!hub.shutdown_all().wait_at_most(Duration::from_millis(300)).await, "still running");
         assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
-        let mut empty = super::super::Hub::new(vec![], vec![], sh(script), ev, false);
+        let mut empty = super::super::Hub::new(vec![], vec![], sh(script), vec![], ev, false);
         assert!(empty.shutdown_all().wait_at_most(Duration::ZERO).await);
     }
 }

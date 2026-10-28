@@ -14,7 +14,7 @@
     function effortColor(e) { const c = EFFORT_COLOR[e]; return c ? 'var(--' + c + ')' : 'var(--text)'; }
 
     // ── backends (snapshot.rs `backend_str`) ─────────────────────────────────────────────────────
-    const BACKEND = { codex: 'Codex', 'claude-code': 'Claude Code', bija: 'Bija' };
+    const BACKEND = { codex: 'Codex', 'claude-code': 'Claude Code', bija: 'Bija', antigravity: 'Antigravity' };
     function backend(b) { return BACKEND[b] || 'Codex'; }
 
     // ── numbers & time ───────────────────────────────────────────────────────────────────────────

@@ -408,6 +408,7 @@
             h('span', { class: 'fnum' }, h('span', { class: 'add' }, '+' + f.adds), ' ', h('span', { class: 'del' }, '−' + f.dels)))))];
     }
     function backendPolicyNote(a) {
+        if (a.backend === 'antigravity') return h('p', { class: 'sec-sub', key: 'policy' }, 'Antigravity headless mode soft-denies native permission requests instead of showing Mantra prompts. Never and BYPASS permissions enable unattended tools; context and compaction are managed by agy.');
         return a.backend === 'bija' || a.backend === 'claude-code'
             ? h('p', { class: 'sec-sub', key: 'policy' }, F.backend(a.backend) + ' runs its native tools unattended. Mantra approval and question requests still follow the approval mode; the sandbox setting still applies.')
             : null;

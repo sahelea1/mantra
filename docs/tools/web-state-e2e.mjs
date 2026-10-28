@@ -240,7 +240,56 @@ try {
     });
     assert.equal(auto.selected, 'auto');
     assert.match(auto.label, /Auto.*planner creates the pattern/);
-    console.log('web-state-e2e: transcript, completed worker, planner routing, respawn recovery and Auto picker passed');
+    // Account-dependent Antigravity setup: render the real config UI against a local
+    // command fixture, without launching agy or contacting a provider.
+    const configPage = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+    await configPage.setContent('<div id="root"></div>');
+    for (const name of ['dom.js', 'fmt.js', 'store.js', 'parts.js', 'screens.js', 'config.js']) await configPage.addScriptTag({ path: path.join(ui, name) });
+    await configPage.evaluate(() => {
+        const M = window.Mantra, s = M.store.S;
+        s.conn.state = 'open';
+        s.ui.route = { name: 'settings', section: 'models' };
+        const registry = { models: [{ alias: 'codex-main', provider: 'openai', provider_name: 'Codex', model: 'fixture-codex', backend: 'codex', efforts: ['medium'], default_effort: 'medium', note: '' }], providers: [{ id: 'openai', kind: 'codex', account: true, name: 'Codex', models: 1 }], backends: { antigravity: { installed: true, added: false } }, options: { kinds: ['codex', 'antigravity'] } };
+        window.configCalls = [];
+        window.renderConfig = () => M.patch(document.getElementById('root'), s.ui.route.name === 'pattern' ? M.config.patternEditor(s.ui.route) : M.config.settingsScreen(s.ui.route));
+        M.act = { wide: () => true, motion: () => false, flash: () => {}, changed: () => requestAnimationFrame(renderConfig), request: async (name, args) => {
+            configCalls.push({ name, ...args });
+            if (name === 'add_backend') {
+                registry.providers.push({ id: 'antigravity', kind: 'antigravity', auth: 'subscription', name: 'Antigravity', models: 0, base_url: '', env_key: '' });
+                registry.backends.antigravity.added = true;
+                return { added: 0, registry: structuredClone(registry) };
+            }
+            if (name === 'model_add') {
+                registry.models.push({ alias: 'google-main', provider: args.provider, provider_name: 'Antigravity', model: args.model, backend: 'antigravity', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], default_effort: 'medium', note: '', context_window: null, effective_context_window: null, compact_percent: null });
+                return { alias: 'google-main', registry: structuredClone(registry) };
+            }
+            throw Error('unexpected fixture command: ' + name);
+        } };
+        renderConfig();
+        s.ui.cfg.models = registry;
+        renderConfig();
+    });
+    await configPage.getByRole('button', { name: 'Antigravity subscription', exact: true }).click();
+    await configPage.waitForFunction(() => Mantra.store.S.ui.cfg.addModel.provider === 'antigravity');
+    await configPage.getByRole('textbox', { name: 'Model id', exact: true }).fill('account-model-slug');
+    await configPage.getByRole('button', { name: 'Add model', exact: true }).click();
+    await configPage.waitForSelector('[data-alias="google-main"]');
+    assert.match(await configPage.locator('[data-alias="google-main"]').textContent(), /agy managed/);
+    assert.deepEqual(await configPage.evaluate(() => configCalls.map((x) => x.name)), ['add_backend', 'model_add']);
+    assert.deepEqual(await configPage.evaluate(() => configCalls[1]), { name: 'model_add', provider: 'antigravity', model: 'account-model-slug' });
+    await configPage.evaluate(() => {
+        const s = Mantra.store.S, c = s.ui.cfg;
+        const work = { description: '', roles: { planner: { kind: 'planner', model: 'codex-main', effort: 'medium', permission: 'on-request', sandbox: 'workspace-write', mcp: [] } }, settings: {}, flow: {}, groups: [] };
+        c.editor = { name: 'fixture-pattern', data: { tag: 'yours', yours: true, options: { kinds: ['planner'], models: c.models.models, permissions: ['on-request', 'never'], sandboxes: ['workspace-write'], parallel: [1, 128] }, pattern: structuredClone(work) }, work, errors: [], dirty: false };
+        s.ui.route = { name: 'pattern', id: 'fixture-pattern' };
+        renderConfig();
+    });
+    await configPage.getByRole('combobox', { name: 'Model of planner', exact: true }).selectOption('google-main');
+    await configPage.getByRole('combobox', { name: 'Fallback of planner', exact: true }).selectOption('codex-main');
+    assert.deepEqual(await configPage.evaluate(() => ({ model: Mantra.store.S.ui.cfg.editor.work.roles.planner.model, fallback: Mantra.store.S.ui.cfg.editor.work.roles.planner.fallback })), { model: 'google-main', fallback: 'codex-main' });
+    assert.equal(await configPage.getByRole('combobox', { name: 'Effort of planner', exact: true }).locator('option[value="max"]').count(), 1);
+    await configPage.close();
+    console.log('web-state-e2e: transcript, completed worker, planner routing, respawn recovery, Auto picker and Antigravity setup/Studio selection passed');
 } finally {
     await browser.close();
 }

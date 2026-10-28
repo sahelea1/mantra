@@ -159,9 +159,41 @@ impl ToolServer for Bridge {
     }
 }
 
+// The shared Antigravity registration contains no run-specific state. Its child process
+// inherits routing only from the Mantra-owned agy process that launched it.
+fn environment_route(sock: Option<std::ffi::OsString>, agent: Option<std::ffi::OsString>) -> Result<Option<(PathBuf, u64)>, &'static str> {
+    match (sock, agent) {
+        (None, None) => Ok(None),
+        (Some(sock), Some(agent)) if !sock.is_empty() => {
+            let id = agent.to_str().and_then(|s| s.parse::<u64>().ok()).filter(|id| *id > 0)
+                .ok_or("invalid MANTRA_AGY_AGENT")?;
+            Ok(Some((PathBuf::from(sock), id)))
+        }
+        _ => Err("incomplete Antigravity bridge environment"),
+    }
+}
+
+struct InactiveBridge;
+impl ToolServer for InactiveBridge {
+    async fn list(&mut self) -> Value { json!([]) }
+    async fn call(&mut self, _name: &str, _args: Value) -> Value {
+        json!({"content": [text_content("No Mantra agent is attached to this session")], "isError": true})
+    }
+}
+
 pub async fn run() {
     let args: Vec<String> = std::env::args().skip(2).collect();
-    let Some((sock, agent)) = parse_args(&args) else {
+    let route = if args == ["--from-env"] {
+        match environment_route(std::env::var_os("MANTRA_AGY_SOCK"), std::env::var_os("MANTRA_AGY_AGENT")) {
+            Ok(Some(route)) => Some(route),
+            Ok(None) => {
+                serve(BufReader::new(tokio::io::stdin()), &mut tokio::io::stdout(), "mantra", false, &mut InactiveBridge).await;
+                return;
+            }
+            Err(reason) => { eprintln!("mantra mcp-bridge: {reason}"); std::process::exit(2); }
+        }
+    } else { parse_args(&args) };
+    let Some((sock, agent)) = route else {
         eprintln!("mantra mcp-bridge: usage: mantra mcp-bridge --sock <path> --agent <id>");
         std::process::exit(2);
     };
@@ -184,6 +216,16 @@ pub async fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_routing_is_explicit_and_unattached_sessions_are_inactive() {
+        assert_eq!(environment_route(None, None), Ok(None));
+        assert_eq!(environment_route(Some("/tmp/a.sock".into()), Some("7".into())), Ok(Some((PathBuf::from("/tmp/a.sock"), 7))));
+        assert!(environment_route(Some("/tmp/a.sock".into()), None).is_err());
+        assert!(environment_route(None, Some("7".into())).is_err());
+        for invalid in ["", "0", "other", "-1"] {
+            assert!(environment_route(Some("/tmp/a.sock".into()), Some(invalid.into())).is_err());
+        }
+    }
     #[test]
     fn parses_sock_and_agent_in_either_order() {
         let a = vec!["--sock".to_string(), "/tmp/x.sock".to_string(), "--agent".to_string(), "3".to_string()];
@@ -210,6 +252,17 @@ mod tests {
     }
 
     struct Echo;
+
+    #[tokio::test]
+    async fn unattached_antigravity_registration_serves_no_tools_and_refuses_calls() {
+        let input = [json!({"id":1,"method":"tools/list"}), json!({"id":2,"method":"tools/call","params":{"name":"mantra_spawn","arguments":{}}})]
+            .iter().map(|v| format!("{v}\n")).collect::<String>();
+        let mut output = Vec::new();
+        serve(input.as_bytes(), &mut output, "mantra", false, &mut InactiveBridge).await;
+        let replies: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(replies[0]["result"]["tools"], json!([]));
+        assert_eq!(replies[1]["result"]["isError"], true);
+    }
     impl ToolServer for Echo {
         async fn list(&mut self) -> Value {
             json!([{"name": "echo", "inputSchema": {"type": "object"}}])

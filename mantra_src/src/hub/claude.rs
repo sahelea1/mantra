@@ -369,7 +369,7 @@ async fn stop_child(stdin: &mut ChildStdin, child: &mut Child) {
 /// Silently dropped (logged) if the bridge connection isn't there right now — the restart race
 /// §10.4 calls out explicitly: the bridge subprocess sees its request time out and the agent gets
 /// re-prompted by the existing `CmdFailed` path once `claude` itself reports the tool call failed.
-async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str, ok: bool, text: &str, items: Option<&Value>, agent: AgentId) {
+pub(super) async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str, ok: bool, text: &str, items: Option<&Value>, agent: AgentId) {
     match bridge_write.as_mut() {
         Some(w) => {
             let mut line = json!({"call": call, "ok": ok, "text": text});
@@ -385,7 +385,7 @@ async fn reply_bridge_call(bridge_write: &mut Option<OwnedWriteHalf>, call: &str
 /// `bridge_rx.recv()` when there's a live connection, else pends forever so the `tokio::select!`
 /// arm polling it (guarded by `if bridge_rx.is_some()`) simply never fires — the same "optional
 /// branch" pattern `hub.rs` doesn't need because Codex has no equivalent side channel.
-async fn recv_bridge(rx: &mut Option<mpsc::UnboundedReceiver<LineIn>>) -> Option<LineIn> {
+pub(super) async fn recv_bridge(rx: &mut Option<mpsc::UnboundedReceiver<LineIn>>) -> Option<LineIn> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
@@ -395,7 +395,7 @@ async fn recv_bridge(rx: &mut Option<mpsc::UnboundedReceiver<LineIn>>) -> Option
 /// The role's tool array (already sitting in `SpawnSpec::dynamic_tools` — the same JSON schemas
 /// Codex's `dynamicTools` gets) reshaped into an MCP `tools/list` result: `{name, description,
 /// inputSchema}` per tool, dropping the Codex-only `type: "function"` wrapper (§10.4).
-fn mcp_tool_list(dynamic_tools: &[Value]) -> Value {
+pub(super) fn mcp_tool_list(dynamic_tools: &[Value]) -> Value {
     let tools: Vec<Value> = dynamic_tools
         .iter()
         .map(|t| {
@@ -1075,7 +1075,7 @@ mod tests {
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
             claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
-            bija: None, mcp: vec![],
+            bija: None, antigravity: None, mcp: vec![],
         };
         let script = r#"case "$*" in *'--resume saved-planner'*) ;; *) exit 4;; esac
 first=true
@@ -1136,7 +1136,7 @@ done"#;
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
             claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
-            bija: None, mcp: vec![],
+            bija: None, antigravity: None, mcp: vec![],
         };
         let (ev, mut events) = mpsc::unbounded_channel();
         let (tx, mut cmds) = mpsc::unbounded_channel();
@@ -1182,6 +1182,7 @@ done"#;
             envs: vec![],
             claude: None,
             bija: None,
+            antigravity: None,
             mcp: vec![],
         };
         let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
@@ -1224,6 +1225,7 @@ done"#;
             envs: vec![],
             claude: None,
             bija: None,
+            antigravity: None,
             mcp: vec![],
         };
         let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
@@ -1271,6 +1273,7 @@ done"#;
             envs: vec![],
             claude: None,
             bija: None,
+            antigravity: None,
             mcp: vec![("blender".into(), mcp_server("uvx", &["blender-mcp"], &[("BLENDER_TOKEN", "s3cret")]))],
         };
         let config_of = |args: &[String]| -> Value {

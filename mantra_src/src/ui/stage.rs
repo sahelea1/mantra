@@ -570,7 +570,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                         Some(WState::Retrying(at)) => format!("retrying in {}s", at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1),
                         // a process coming back says which one, not "retrying · restarting"
                         _ => match a {
-                            Some(a) if a.activity == "restarting" || a.activity == "relaunching" => format!("{} {}", match a.backend { crate::config::ProviderKind::ClaudeCode => "claude", crate::config::ProviderKind::Bija => "bija", crate::config::ProviderKind::Codex => "codex" }, a.activity),
+                            Some(a) if a.activity == "restarting" || a.activity == "relaunching" => format!("{} {}", match a.backend { crate::config::ProviderKind::ClaudeCode => "claude", crate::config::ProviderKind::Bija => "bija", crate::config::ProviderKind::Codex => "codex", crate::config::ProviderKind::Antigravity => "agy" }, a.activity),
                             _ => format!("retrying · {}", a.map(|a| a.activity.clone()).unwrap_or_default()),
                         },
                     };
@@ -1210,7 +1210,7 @@ mod tests {
     fn app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
     }
 

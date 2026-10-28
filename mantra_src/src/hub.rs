@@ -6,6 +6,7 @@
 
 mod bija;
 mod claude;
+mod antigravity;
 
 use crate::rpc::{self, Conn, Incoming};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ pub use crate::config::ProviderKind as Backend;
 use crate::config::McpServer;
 pub use bija::{sandbox_mode as bija_sandbox, BijaSpawn};
 pub use claude::ClaudeSpawn;
+pub use antigravity::AntigravitySpawn;
 
 pub type AgentId = u32;
 
@@ -52,6 +54,8 @@ pub struct SpawnSpec {
     pub claude: Option<ClaudeSpawn>,
     /// Bija-only spawn config; `None` for the other backends.
     pub bija: Option<BijaSpawn>,
+    /// Native Antigravity CLI streaming configuration.
+    pub antigravity: Option<AntigravitySpawn>,
     /// The MCP servers this agent gets, already resolved from settings (`Settings::mcp_for`) by
     /// `app::spawn_agent`'s callers; empty = none, which leaves every backend's launch as it was.
     /// Codex gets them as `-c mcp_servers.<name>…` (`codex_mcp_args`), Claude Code beside
@@ -142,6 +146,7 @@ pub struct Hub {
     /// Command used to launch one `bija` process per Bija agent, already resolved
     /// (`config::resolve_bija_command`).
     pub bija_cmd: Vec<String>,
+    pub antigravity_cmd: Vec<String>,
     /// When the last Codex process starts — after its stagger delay (`SPAWN_STAGGER`).
     last_spawn: Option<Instant>,
     /// Path of the Unix socket `mantra mcp-bridge` subprocesses connect to (WP10.4); `None` when no
@@ -163,7 +168,7 @@ impl Hub {
     /// `enable_bridge`: whether to open the MCP-bridge Unix socket at all — only worth doing when
     /// the registry has at least one `ClaudeCode`-kind provider (WP10.4); computed by the caller
     /// (`main.rs`) so `Hub` itself never has to know about `config::Registry`.
-    pub fn new(codex_cmd: Vec<String>, claude_cmd: Vec<String>, bija_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>, enable_bridge: bool) -> Hub {
+    pub fn new(codex_cmd: Vec<String>, claude_cmd: Vec<String>, bija_cmd: Vec<String>, antigravity_cmd: Vec<String>, ev: mpsc::UnboundedSender<HubEvent>, enable_bridge: bool) -> Hub {
         // No Claude Code provider is not a problem: nothing would have used the socket.
         let (bridge_sock, bridge_problem) = match enable_bridge.then(|| setup_bridge(ev.clone())) {
             Some(Ok(path)) => (Some(path), None),
@@ -171,7 +176,7 @@ impl Hub {
             None => (None, None),
         };
         let (alive, gone) = mpsc::channel(1);
-        Hub { ev, agents: HashMap::new(), tasks: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, last_spawn: None, bridge_sock, bridge_problem, bija_alive: Some(alive), bija_gone: Some(gone) }
+        Hub { ev, agents: HashMap::new(), tasks: HashMap::new(), next: 1, codex_cmd, claude_cmd, bija_cmd, antigravity_cmd, last_spawn: None, bridge_sock, bridge_problem, bija_alive: Some(alive), bija_gone: Some(gone) }
     }
 
     /// Why Claude Code agents have no bridge to Mantra's tools, if the socket was wanted and could
@@ -183,6 +188,21 @@ impl Hub {
     /// The bridge socket path a Claude agent's `--mcp-config` should point `mantra mcp-bridge` at,
     /// if the Hub has one (WP10.4).
     pub fn bridge_sock(&self) -> Option<PathBuf> {
+        self.bridge_sock.clone()
+    }
+
+    /// Start the dynamic-tool bridge lazily when a provider is added mid-session.
+    pub fn ensure_bridge(&mut self) -> Option<PathBuf> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.bridge_problem = Some("MCP bridge requires an active async runtime".into());
+            return None;
+        }
+        if self.bridge_sock.is_none() {
+            match setup_bridge(self.ev.clone()) {
+                Ok(path) => { self.bridge_sock = Some(path); self.bridge_problem = None; }
+                Err(error) => self.bridge_problem = Some(error),
+            }
+        }
         self.bridge_sock.clone()
     }
 
@@ -200,6 +220,7 @@ impl Hub {
             Backend::ClaudeCode => self.claude_cmd.clone(),
             Backend::Codex => self.codex_cmd.clone(),
             Backend::Bija => self.bija_cmd.clone(),
+            Backend::Antigravity => self.antigravity_cmd.clone(),
         };
         // Only Codex shares state between its processes (`CODEX_HOME`); a swarm of eighty bija
         // agents starts at once instead of over half a minute.
@@ -474,6 +495,7 @@ async fn agent_task(
                     Backend::Codex => run_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut approval, &mut replay, &mut last_turn).await,
                     Backend::ClaudeCode => claude::run_claude_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
                     Backend::Bija => bija::run_bija_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut vision, &mut replay, &mut last_turn, &mut turn_cut).await,
+                    Backend::Antigravity => antigravity::run_antigravity_process(id, &spec, &cmd, &attempt_ev, &mut cmds, &mut thread_id, &mut effort, &mut model, &mut replay, &mut last_turn).await,
                 }
             };
             tokio::pin!(process);
@@ -638,6 +660,7 @@ fn backend_name(backend: Backend) -> &'static str {
         Backend::Codex => "Codex",
         Backend::ClaudeCode => "Claude Code",
         Backend::Bija => "Bija",
+        Backend::Antigravity => "Antigravity",
     }
 }
 
@@ -1231,8 +1254,8 @@ mod tests {
             let home = std::env::var("MANTRA_HOME").unwrap();
             std::env::set_var("MANTRA_HOME", file.join("home"));
             let (ev, _rx) = mpsc::unbounded_channel();
-            let hub = Hub::new(vec![], vec![], vec![], ev.clone(), true);
-            let quiet = Hub::new(vec![], vec![], vec![], ev, false);
+            let hub = Hub::new(vec![], vec![], vec![], vec![], ev.clone(), true);
+            let quiet = Hub::new(vec![], vec![], vec![], vec![], ev, false);
             std::env::set_var("MANTRA_HOME", home);
             let why = hub.bridge_problem().expect("the socket could not be made");
             assert!(why.contains("couldn't create") && why.contains("not-a-dir"), "{why}");
@@ -1319,6 +1342,7 @@ for line in sys.stdin:
             envs: vec![("FAKE_BACKEND".into(), name.into()), ("TRACE".into(), dir.join("trace").to_string_lossy().into_owned())],
             claude: (backend == Backend::ClaudeCode).then(|| ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: "task handoff".into(), mcp_sock: None, strict_mcp: false }),
             bija: (backend == Backend::Bija).then(|| BijaSpawn { base_url: "http://unused".into(), wire: "openai-chat".into(), api_key_env: None, context_window: 1000, compact_pct: 85, system_prompt: "task handoff".into(), home: dir.clone(), sandbox: "none".into(), writable_roots: vec![], network: false, vision: false }),
+            antigravity: None,
             mcp: vec![],
         };
         let (ev, mut events) = mpsc::unbounded_channel();
@@ -1394,11 +1418,11 @@ for line in sys.stdin:
             cwd: dir.clone(), model: "m".into(), provider: "openai".into(), effort: String::new(),
             approval: "never".into(), sandbox: "read-only".into(), developer_instructions: String::new(),
             dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
-            thread_name: None, backend: Backend::Codex, envs: vec![], claude: None, bija: None, mcp: vec![],
+            thread_name: None, backend: Backend::Codex, envs: vec![], claude: None, bija: None, antigravity: None, mcp: vec![],
         };
         let cmd = vec!["sh".into(), "-c".into(), "echo $$ > pid; exec sleep 60".into()];
         let (ev, mut rx) = mpsc::unbounded_channel();
-        let mut hub = Hub::new(cmd, vec![], vec![], ev, false);
+        let mut hub = Hub::new(cmd, vec![], vec![], vec![], ev, false);
         hub.spawn(1, spec);
         tokio::time::timeout(Duration::from_secs(5), async {
             while !pid_file.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
@@ -1444,6 +1468,7 @@ for line in sys.stdin:
             envs: vec![],
             claude: None,
             bija: None,
+            antigravity: None,
             mcp: vec![],
         };
         let cmd: Vec<String> = ["sh", "-c", "echo 'ERROR codex_app_server: cannot read /proc/self/exe (simulated)' >&2; exit 3"].iter().map(|s| s.to_string()).collect();
@@ -1512,6 +1537,7 @@ done"#;
             envs: vec![("NAMES_LOG".into(), log.to_string_lossy().to_string())],
             claude: None,
             bija: None,
+            antigravity: None,
             mcp: vec![],
         };
         let cmd: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
@@ -1567,7 +1593,7 @@ done"#;
             dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
             thread_name: None, backend: Backend::Codex,
             envs: vec![("INTERRUPTS_LOG".into(), log.to_string_lossy().into_owned())],
-            claude: None, bija: None, mcp: vec![],
+            claude: None, bija: None, antigravity: None, mcp: vec![],
         };
         let (ev, mut events) = mpsc::unbounded_channel();
         let (ctl, cmds) = mpsc::unbounded_channel();
@@ -1618,7 +1644,7 @@ done"#;
             dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
             thread_name: None, backend: Backend::Codex,
             envs: vec![("INTERRUPTS_LOG".into(), log.to_string_lossy().into_owned())],
-            claude: None, bija: None, mcp: vec![],
+            claude: None, bija: None, antigravity: None, mcp: vec![],
         };
         let (ev, mut events) = mpsc::unbounded_channel();
         let (ctl, cmds) = mpsc::unbounded_channel();

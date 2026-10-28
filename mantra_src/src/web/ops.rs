@@ -159,7 +159,8 @@ fn parse_kind(v: &str) -> Result<ProviderKind, String> {
         "bija" | "seed" => Ok(ProviderKind::Bija),
         "codex" => Ok(ProviderKind::Codex),
         "claude-code" | "claudecode" | "claude" => Ok(ProviderKind::ClaudeCode),
-        _ => Err("kind: bija, codex or claude-code".into()),
+        "antigravity" | "agy" => Ok(ProviderKind::Antigravity),
+        _ => Err("kind: bija, codex, claude-code or antigravity".into()),
     }
 }
 
@@ -196,6 +197,9 @@ pub fn set_model_field(reg: &mut Registry, alias: &str, field: &str, value: &str
     let i = reg.models.iter().position(|m| m.alias == alias).ok_or_else(|| format!("no model named {alias}"))?;
     let v = value.trim();
     let m = &reg.models[i];
+    if matches!(field, "context" | "compact") && reg.backend_of(m) == ProviderKind::Antigravity {
+        return Err("Antigravity manages context and compaction in agy".into());
+    }
     let mut next = m.clone();
     match field {
         "alias" => {
@@ -338,7 +342,11 @@ fn add_model(reg: &mut Registry, provider: &str, model: Option<&str>, alias: Opt
         },
     };
     let model = model.unwrap_or("model-id").to_string();
-    reg.models.push(ModelEntry { vision: crate::config::takes_images(&model), alias: alias.clone(), provider: provider.to_string(), model, ..Default::default() });
+    let mut entry = ModelEntry { vision: crate::config::takes_images(&model), alias: alias.clone(), provider: provider.to_string(), model, ..Default::default() };
+    if reg.providers.iter().any(|p| p.id == provider && p.kind == ProviderKind::Antigravity) {
+        entry.efforts = ["low", "medium", "high", "xhigh", "max"].into_iter().map(String::from).collect();
+    }
+    reg.models.push(entry);
     Ok(alias)
 }
 
@@ -412,7 +420,7 @@ impl App {
             .map(|m| {
                 json!({
                     "alias": m.alias, "provider": if m.is_custom_provider() { m.provider.as_str() } else { CODEX_ACCOUNT }, "provider_name": reg.provider_name(&m.provider),
-                    "model": m.model, "backend": kind_str(reg.backend_of(m)), "context_window": m.context_window, "effective_context_window": reg.effective_context_window(&m.alias, &self.settings.default_model), "compact_percent": m.auto_compact_percent,
+                    "model": m.model, "backend": kind_str(reg.backend_of(m)), "context_window": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { m.context_window }, "effective_context_window": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { Some(reg.effective_context_window(&m.alias, &self.settings.default_model)) }, "compact_percent": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { m.auto_compact_percent },
                     "default_effort": m.default_effort, "efforts": m.efforts(), "vision": m.vision, "note": m.note,
                     "problem": reg.alias_problem(&m.alias), "test": self.models_ui.status.get(&m.alias), "default": m.alias == self.settings.default_model,
                 })
@@ -439,8 +447,9 @@ impl App {
             "backends": {
                 "codex": {"installed": installed(crate::config::codex_available()), "added": !codex.is_empty()},
                 "claude": {"installed": installed(crate::config::claude_available()), "added": reg.providers.iter().any(|p| p.kind == ProviderKind::ClaudeCode)},
+                "antigravity": {"installed": crate::config::antigravity_command_available(&self.settings.antigravity_command), "added": reg.providers.iter().any(|p| p.kind == ProviderKind::Antigravity)},
             },
-            "options": {"kinds": ["bija", "codex", "claude-code"], "wires": ["openai", "anthropic"], "auths": ["subscription", "api_key"], "efforts": ALL_EFFORTS},
+            "options": {"kinds": ["bija", "codex", "claude-code", "antigravity"], "wires": ["openai", "anthropic"], "auths": ["subscription", "api_key"], "efforts": ALL_EFFORTS},
         })
     }
 
@@ -561,12 +570,12 @@ impl App {
                 let backend = match kind.as_str() {
                     "codex" => Backend::Codex,
                     "claude-code" | "claude" => Backend::ClaudeCode,
-                    _ => return Err("kind: codex or claude-code".into()),
+                    "antigravity" | "agy" => Backend::Antigravity,
+                    _ => return Err("kind: codex, claude-code or antigravity".into()),
                 };
                 // the demo's backends are mocks: added whatever is installed, as main.rs does
-                let added = if self.demo { provider_key::add_backend_with(&mut self.registry, backend, true) } else { provider_key::add_backend(&mut self.registry, backend) }?;
+                let added = self.add_backend(backend)?;
                 if added > 0 {
-                    self.save_registry()?;
                     self.web_refresh_model_selection();
                 }
                 Ok(json!({"added": added, "registry": self.registry_view()}))
@@ -821,4 +830,19 @@ mod tests {
         assert!(mcp_set(&mut s, "x", Some("uvx 'open"), None, None, None).unwrap_err().contains("quote"));
         assert!(mcp_set(&mut s, "a b", Some("uvx"), None, None, None).unwrap_err().contains("letters"));
     }
+    #[test]
+    fn antigravity_models_use_account_ids_and_supported_efforts() {
+        let mut reg = Registry { models: vec![], providers: vec![crate::config::ProviderEntry { id: "google".into(), kind: ProviderKind::Antigravity, ..Default::default() }] };
+        let alias = add_model(&mut reg, "google", Some("account/model-slug"), Some("google-main")).unwrap();
+        let m = reg.get(&alias).unwrap();
+        assert_eq!(reg.backend_of(m), ProviderKind::Antigravity);
+        assert_eq!(m.model, "account/model-slug");
+        assert_eq!(m.efforts(), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(m.context_window, None);
+        assert_eq!(m.auto_compact_percent, None);
+        assert_eq!(parse_kind("agy"), Ok(ProviderKind::Antigravity));
+        assert!(set_model_field(&mut reg, &alias, "context", "1m").unwrap_err().contains("agy"));
+        assert!(set_model_field(&mut reg, &alias, "compact", "90").unwrap_err().contains("agy"));
+    }
+
 }

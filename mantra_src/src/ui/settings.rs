@@ -689,7 +689,7 @@ mod tests {
     fn real_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = crate::hub::Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let hub = crate::hub::Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         // These UI tests exercise settings against the established model fixture. A fresh
         // production registry is intentionally empty.
         let mut registry = crate::config::Registry::defaults();

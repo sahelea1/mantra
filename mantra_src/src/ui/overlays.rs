@@ -89,7 +89,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         h("config screens (/models, /studio, /settings)"),
         k("type · ⏎", "type over the selected field, or ⏎ to edit it; ⏎ again saves the file, esc puts it back"),
         k("←→ · space", "change a choice, flip an on/off (in the models grid ←→ move: +/- and space change)"),
-        k("ctrl+n", "add: a provider from its key, a model, Codex or Claude Code · a role · an MCP server"),
+        k("ctrl+n", "add: a provider from its key, a model, Codex, Claude Code or Antigravity · a role · an MCP server"),
         k("del del", "delete the row (press twice)"),
         k("ctrl+t · ctrl+d", "test a model or an MCP server · ask a provider for its models"),
         k("tab · esc", "the next pane or grid · back to where you came from"),
@@ -117,6 +117,7 @@ fn backend_glyph(reg: &crate::config::Registry, provider: &str) -> &'static str 
     match reg.providers.iter().find(|p| p.id == provider).map(|p| p.kind) {
         Some(crate::config::ProviderKind::ClaudeCode) => "✧ claude",
         Some(crate::config::ProviderKind::Bija) => "• bija",
+        Some(crate::config::ProviderKind::Antigravity) => "✦ agy",
         _ => "◌ codex",
     }
 }
@@ -147,7 +148,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
         if i == sel {
             band = Some(l.len());
         }
-        let ctx = m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into());
+        let ctx = if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { "agy context".into() } else { m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into()) };
         let via = if narrow { app.registry.provider_name(&m.provider) } else { format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider)) };
         // Two aliases can point at the same model id through different providers — the provider
         // column above already distinguishes them; call it out too so it isn't missed.

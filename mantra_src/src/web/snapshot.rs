@@ -785,6 +785,7 @@ pub(crate) fn backend_str(k: crate::config::ProviderKind) -> &'static str {
         crate::config::ProviderKind::Codex => "codex",
         crate::config::ProviderKind::ClaudeCode => "claude-code",
         crate::config::ProviderKind::Bija => "bija",
+        crate::config::ProviderKind::Antigravity => "antigravity",
     }
 }
 
@@ -1225,9 +1226,9 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 backend: backend_str(app.registry.backend_of(m)).into(),
                 efforts: m.efforts(),
                 default_effort: m.default_effort.clone(),
-                context_window: m.context_window,
-                effective_context_window: app.registry.effective_context_window(&m.alias, &app.settings.default_model),
-                compact_percent: m.effective_compact_percent(),
+                context_window: if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { None } else { m.context_window },
+                effective_context_window: if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { 0 } else { app.registry.effective_context_window(&m.alias, &app.settings.default_model) },
+                compact_percent: if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { 0 } else { m.effective_compact_percent() },
                 note: m.note.clone(),
                 problem: app.registry.alias_problem(&m.alias),
             })
@@ -1570,7 +1571,7 @@ pub(crate) mod tests {
     pub(crate) fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         // Tests of the existing demo flows need explicit fixture models. Production defaults
         // remain empty, so fresh installs never inherit a Bija provider or model catalogue.
         let mut registry = Registry::defaults();

@@ -163,6 +163,7 @@ pub enum SelectThen {
 pub const ADD_KEY: &str = "key";
 pub const ADD_MODEL: &str = "model";
 pub const ADD_CODEX: &str = "codex";
+pub const ADD_ANTIGRAVITY: &str = "antigravity";
 pub const ADD_CLAUDE: &str = "claude";
 pub const ADD_CLAUDE_KEY: &str = "claude-api-key";
 
@@ -459,12 +460,12 @@ fn mcp_missing_lines(settings: &Settings, pattern: &Pattern) -> Vec<String> {
 /// What every Claude Code agent goes without when the Hub's MCP-bridge socket could not be made
 /// (`Hub::bridge_problem`): the toast at startup, the journal line of a run that has one.
 fn bridge_problem_line(why: &str) -> String {
-    format!("Claude Code agents have no Mantra tools: {why}")
+    format!("Claude Code / Antigravity agents have no Mantra tools: {why}")
 }
 
 /// Whether any role of `pattern` runs on Claude Code — its model, or the fallback it may switch to.
-fn pattern_uses_claude_code(registry: &Registry, pattern: &Pattern) -> bool {
-    let on_claude = |alias: &str| registry.backend_of(&registry.resolve(alias)) == crate::config::ProviderKind::ClaudeCode;
+fn pattern_uses_cli_bridge(registry: &Registry, pattern: &Pattern) -> bool {
+    let on_claude = |alias: &str| matches!(registry.backend_of(&registry.resolve(alias)), crate::config::ProviderKind::ClaudeCode | crate::config::ProviderKind::Antigravity);
     pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback.as_deref().is_some_and(|f| !f.trim().is_empty() && on_claude(f)))
 }
 
@@ -661,7 +662,7 @@ fn bija_spawn(reg: &Registry, m: &crate::config::ModelEntry, o: &AgentOpts, cw: 
     (spawn, envs)
 }
 
-fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, bool) {
+fn agent_spec(hub: &mut Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, bool) {
     let m = reg.resolve(&o.model_alias);
     let wanted = o.effort.as_deref().filter(|e| !e.is_empty()).unwrap_or(&m.default_effort).to_string();
     let (effort, lowered) = m.resolve_effort_lowered(&wanted);
@@ -672,7 +673,7 @@ fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, b
     // bija: `--context-window`/`--compact-at`).
     let cw = o.context_override.unwrap_or_else(|| m.effective_context());
     let compact_pct = m.effective_compact_percent();
-    let (extra, envs, claude, bija) = if backend == crate::hub::Backend::ClaudeCode {
+    let (extra, envs, claude, bija, antigravity) = if backend == crate::hub::Backend::ClaudeCode {
         // WP10: no Codex `-c` args at all; auth/base_url/key come from the model's own provider
         // entry, resolved here (not in `hub::claude`, which stays decoupled from `config::Registry`
         // — see `SpawnSpec::claude`/`SpawnSpec::envs`).
@@ -686,10 +687,12 @@ fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, b
             }
         }
         let strict_mcp = claude_strict_mcp(&o);
-        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.bridge_sock(), strict_mcp }), None)
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge(), strict_mcp }), None, None)
     } else if backend == crate::hub::Backend::Bija {
         let (spawn, envs) = bija_spawn(reg, &m, &o, cw, compact_pct);
-        (vec![], envs, None, Some(spawn))
+        (vec![], envs, None, Some(spawn), None)
+    } else if backend == crate::hub::Backend::Antigravity {
+        (vec![], vec![], None, None, Some(crate::hub::AntigravitySpawn { system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge() }))
     } else {
         let mut extra = reg.provider_args();
         extra.extend(codex_mcp_overrides(&crate::config::codex_user_mcp_server_names(), &o.mcp));
@@ -721,7 +724,7 @@ fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, b
             .and_then(|p| p.resolve_key().map(|k| (p.env_var_name(), k)))
             .into_iter()
             .collect();
-        (extra, envs, None, None)
+        (extra, envs, None, None, None)
     };
     let spec = SpawnSpec {
         cwd: o.cwd.clone(),
@@ -740,6 +743,7 @@ fn agent_spec(hub: &Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, String, b
         envs,
         claude,
         bija,
+        antigravity,
         mcp: o.mcp.clone(),
     };
     (spec, wanted, lowered)
@@ -767,9 +771,12 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.provider = m.provider.clone();
     a.backend = backend;
     a.effort = effort.clone();
-    a.ctx_window = Some(cw);
+    a.ctx_window = (backend != crate::config::ProviderKind::Antigravity).then_some(cw);
     a.approval = o.approval.clone();
     a.sandbox = o.sandbox.clone();
+    if backend == crate::config::ProviderKind::Antigravity {
+        a.notice(Level::Info, "Antigravity headless mode soft-denies native permission requests instead of showing Mantra prompts; explicit Never or BYPASS permissions enable unattended tools. Context and compaction are managed by agy.");
+    }
     if lowered {
         // The clamp is right (the model has no such setting) — but say so once, or a role
         // configured for max quietly runs at high.
@@ -1204,7 +1211,7 @@ impl App {
             }
         }
         // the startup toast goes away; Solo's own log keeps it where its missing tools show
-        if let Some(why) = self.hub.bridge_problem().filter(|_| backend == crate::config::ProviderKind::ClaudeCode) {
+        if let Some(why) = self.hub.bridge_problem().filter(|_| matches!(backend, crate::config::ProviderKind::ClaudeCode | crate::config::ProviderKind::Antigravity)) {
             if let Some(a) = self.agents.get_mut(&id) {
                 a.notice(Level::Warn, bridge_problem_line(&why));
             }
@@ -1213,7 +1220,7 @@ impl App {
 
     /// The run's journal line for a lost bridge, when one of its roles runs on Claude Code.
     fn journal_bridge_problem(&self, run: &mut Run) {
-        if let Some(why) = self.hub.bridge_problem().filter(|_| pattern_uses_claude_code(&self.registry, &run.pattern)) {
+        if let Some(why) = self.hub.bridge_problem().filter(|_| pattern_uses_cli_bridge(&self.registry, &run.pattern)) {
             run.log("⚠", "amber", bridge_problem_line(&why));
         }
     }
@@ -1463,7 +1470,7 @@ impl App {
         let context_window = context_window.min(cap.unwrap_or(u64::MAX));
         // Context limits are launch flags on each backend, so a change must reach the process
         // as well as its gauge. Reuse the fresh-session handoff for that model configuration.
-        let incompatible = old.provider != new.provider || new_backend != ag.backend || ag.ctx_window != Some(context_window);
+        let incompatible = old.provider != new.provider || new_backend != ag.backend || (new_backend != crate::hub::Backend::Antigravity && ag.ctx_window != Some(context_window));
         if incompatible {
             let mut options = ag.launch_options.as_deref().cloned().ok_or_else(|| "agent launch policy is unavailable; respawn it before changing providers".to_string())?;
             options.model_alias = new.alias.clone();
@@ -1472,15 +1479,17 @@ impl App {
             options.sandbox = ag.sandbox.clone();
             options.resume_thread = None;
             options.context_override = Some(context_window);
-            let (mut spec, _, _) = agent_spec(&self.hub, &self.registry, &options);
+            let (mut spec, _, _) = agent_spec(&mut self.hub, &self.registry, &options);
             let handoff = ag.handoff_context();
             spec.developer_instructions.push_str(&format!("\n\n{handoff}"));
             if let Some(c) = spec.claude.as_mut() { c.system_prompt = spec.developer_instructions.clone(); }
             if let Some(b) = spec.bija.as_mut() { b.system_prompt = spec.developer_instructions.clone(); }
+            if let Some(a) = spec.antigravity.as_mut() { a.system_prompt = spec.developer_instructions.clone(); }
             let command = match new_backend {
                 crate::hub::Backend::Codex => self.hub.codex_cmd.clone(),
                 crate::hub::Backend::ClaudeCode => self.hub.claude_cmd.clone(),
                 crate::hub::Backend::Bija => self.hub.bija_cmd.clone(),
+                crate::hub::Backend::Antigravity => self.hub.antigravity_cmd.clone(),
             };
             let continuing = ag.busy() && !ag.stopped_by_user;
             let resume_text = continuing.then(|| "[mantra:backend-switch] Continue the active task using the handoff in your instructions. Preserve completed work and pending user requests.".to_string());
@@ -1500,7 +1509,7 @@ impl App {
                 ag.compacting = false;
                 ag.compact_pending = false;
                 ag.ctx_used = 0;
-                ag.ctx_window = Some(context_window);
+                ag.ctx_window = (new_backend != crate::hub::Backend::Antigravity).then_some(context_window);
                 ag.ctx_warned = false;
                 ag.retry_note = None;
                 ag.status = Status::relaunching();
@@ -1523,7 +1532,7 @@ impl App {
                 options.approval = ag.approval.clone();
                 options.sandbox = ag.sandbox.clone();
             }
-            ag.ctx_window = Some(context_window);
+            ag.ctx_window = (new_backend != crate::hub::Backend::Antigravity).then_some(context_window);
             ag.notice(Level::Info, format!("model → {} ({})", new.alias, new.model));
         }
         if Some(a) == self.solo {
@@ -1832,11 +1841,15 @@ impl App {
         true
     }
 
-    fn start_architect(&mut self) -> AgentId {
+    fn start_architect(&mut self) -> Option<AgentId> {
         if let Some(a) = self.studio.architect {
-            return a;
+            return Some(a);
         }
         let model = if self.registry.get("astra").is_some() { "astra".to_string() } else { self.settings.default_model.clone() };
+        if self.registry.get(&model).is_some_and(|m| self.registry.backend_of(m) == crate::config::ProviderKind::Antigravity) {
+            self.toast("Studio's architect requires read-only access, which Antigravity cannot enforce. Choose another backend for astra or the default model; Antigravity remains available for writable pattern roles.", Level::Warn);
+            return None;
+        }
         let id = spawn_agent(
             &mut self.hub,
             &mut self.agents,
@@ -1863,13 +1876,19 @@ impl App {
             },
         );
         self.studio.architect = Some(id);
-        id
+        Some(id)
     }
 
     /// The `/models` `t` live test. Dispatched per backend so a provider that can't actually run a
     /// role (F4: a model rejecting Codex's `developer` role) fails here, before a real run — not the
     /// job the user is running it for.
     pub fn probe_model(&mut self, alias: &str) {
+        if self.registry.get(alias).is_some_and(|m| self.registry.backend_of(m) == crate::config::ProviderKind::Antigravity) {
+            let why = "Mantra model tests require read-only access, which Antigravity cannot enforce; check the account with `agy models` and use an available model in a writable role";
+            self.models_ui.status.insert(alias.to_string(), format!("error: {why}"));
+            self.toast(format!("not tested — {why}"), Level::Warn);
+            return;
+        }
         // A draft provider (placeholder URL, no credential — `Registry::probe_problem`) never
         // gets a request: the row says why instead of a Codex process failing with a key that
         // isn't there (or, worse, succeeding against the placeholder). Not in demo mode: the
@@ -1940,7 +1959,8 @@ impl App {
         let (drafts, net_provs): (Vec<_>, Vec<_>) = provs.iter().filter(|p| p.needs_url()).cloned().partition(|p| p.draft_reason().is_some());
         sources.extend(net_provs.iter().map(|p| p.id.clone()));
         let hosts = net_provs.iter().filter_map(|p| p.host().map(|h| (p.id.clone(), h))).collect();
-        let skipped = drafts.iter().map(|p| format!("{}: skipped (draft) — {}", p.id, p.draft_reason().unwrap_or_default())).collect();
+        let mut skipped: Vec<String> = drafts.iter().map(|p| format!("{}: skipped (draft) — {}", p.id, p.draft_reason().unwrap_or_default())).collect();
+        skipped.extend(provs.iter().filter(|p| p.kind == crate::config::ProviderKind::Antigravity).map(|p| format!("{}: run `agy models`, then add an available model ID by hand", p.id)));
         self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default(), origin: None }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
             self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
@@ -2018,6 +2038,10 @@ impl App {
         self.save_settings();
         if let Some(s) = self.solo {
             let live = self.agents.get(&s).map(|a| a.approval.as_str()).unwrap_or("");
+            if self.agents.get(&s).is_some_and(|a| a.backend == crate::config::ProviderKind::Antigravity && mode != live) {
+                self.toast(format!("permission saved: {mode} · /new applies Antigravity's native permission flags; this session keeps {live}"), Level::Warn);
+                return;
+            }
             if (mode == crate::config::BYPASS_SANDBOX_DANGER) != (live == crate::config::BYPASS_SANDBOX_DANGER) {
                 self.toast(format!("permission saved: {mode} · /new applies the sandbox change; this session keeps {live}"), Level::Warn);
                 return;
@@ -2213,10 +2237,11 @@ impl App {
     /// Codex or Claude Code as an add-on backend: its default models, once its CLI is on PATH (in
     /// the demo the mocks stand in for both). Saved; returns how many models it added.
     pub fn add_backend(&mut self, backend: crate::provider_key::Backend) -> Result<usize, String> {
-        let added = if self.demo { crate::provider_key::add_backend_with(&mut self.registry, backend, true)? } else { crate::provider_key::add_backend(&mut self.registry, backend)? };
-        if added > 0 {
-            self.save_registry()?;
-        }
+        let added = if backend == crate::provider_key::Backend::Antigravity {
+            crate::provider_key::add_backend_with(&mut self.registry, backend, crate::config::antigravity_command_available(&self.settings.antigravity_command))?
+        } else if self.demo { crate::provider_key::add_backend_with(&mut self.registry, backend, true)? } else { crate::provider_key::add_backend(&mut self.registry, backend)? };
+        // A subscription backend can add its provider before any model is chosen.
+        self.save_registry()?;
         Ok(added)
     }
 
@@ -2488,6 +2513,7 @@ impl App {
                         crate::config::ProviderKind::ClaudeCode => "claude process",
                         crate::config::ProviderKind::Bija => "bija process",
                         crate::config::ProviderKind::Codex => "codex process",
+                        crate::config::ProviderKind::Antigravity => "agy process",
                     };
                     if relaunch {
                         // A model/effort change waits for the turn to end and the hub replays any
@@ -3704,7 +3730,7 @@ impl App {
     }
 
     pub fn studio_architect_send(&mut self, text: String) {
-        let a = self.start_architect();
+        let Some(a) = self.start_architect() else { return };
         prompt_agent(&self.hub, &mut self.agents, a, text, true, Send::Auto);
     }
 
@@ -3735,7 +3761,7 @@ mod tests {
             let mut reg = Registry::defaults();
             reg.add_codex_model("my-codex", "model-chosen-by-user").unwrap();
             let settings = Settings { default_model: "my-codex".into(), ..Settings::default() };
-            let mut app = App::new(settings, reg, project, Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut app = App::new(settings, reg, project, Hub::new(vec![], vec![], vec![], vec![], ev_tx, false), tx, false);
             app.start_run("check the repository");
             let run = app.run.as_ref().expect("one configured model suffices for a built-in run");
             assert!(run.pattern.roles.values().all(|role| role.model == "my-codex"));
@@ -3850,7 +3876,7 @@ mod tests {
             let app_with = |default_pattern: &str| {
                 let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
                 let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-                let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+                let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
                 App::new(Settings { default_pattern: default_pattern.into(), ..Settings::default() }, configured_fixture(), project.clone(), hub, tx, true)
             };
             for old in RETIRED {
@@ -3900,7 +3926,7 @@ mod tests {
             assert!(!path.exists(), "the demo saved {:?}", std::fs::read_to_string(&path));
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut real = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut real = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], vec![], ev_tx, false), tx, false);
             real.set_approval_mode("on-request");
             let saved = Settings::load();
             assert_eq!(saved.approval_mode, "on-request");
@@ -3924,7 +3950,7 @@ mod tests {
             assert!(!crate::config::home().join("settings.toml").exists(), "the demo saves nothing");
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], vec![], ev_tx, false), tx, false);
             app.set_setting("experimental.akasha", "on").unwrap();
             assert!(app.settings.experimental_on("akasha") && Settings::load().experimental_on("akasha"));
             app.set_setting("experimental.akasha", "off").unwrap();
@@ -3988,7 +4014,7 @@ mod tests {
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("/nonexistent"), Hub::new(vec![], vec![], vec![], ev_tx, false), tx, false);
+            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("/nonexistent"), Hub::new(vec![], vec![], vec![], vec![], ev_tx, false), tx, false);
             assert_eq!(app.set_setting("default_model", "luna"), Ok("Solo's next session (/new) uses it"));
             assert_eq!(app.set_setting("approval_mode", "never"), Ok(""));
             assert_eq!(app.set_setting("default_pattern", "mantra-lean"), Ok(""));
@@ -4075,7 +4101,7 @@ mod tests {
 
     fn test_hub_with(id: AgentId) -> (Hub, tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let mut hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         let rx = hub.test_register(id);
         (hub, rx)
     }
@@ -4217,7 +4243,7 @@ mod tests {
   esac
 done"#;
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec!["sh".into(), "-c".into(), script.into(), "test".into(), log.to_string_lossy().into_owned()], vec![], vec![], ev_tx, false);
+        let mut hub = Hub::new(vec!["sh".into(), "-c".into(), script.into(), "test".into(), log.to_string_lossy().into_owned()], vec![], vec![], vec![], ev_tx, false);
         let mut agents = BTreeMap::new();
         let mut reg = Registry::defaults();
         reg.add_codex_model("test-codex", "test").unwrap();
@@ -4253,7 +4279,7 @@ done"#;
     #[tokio::test]
     async fn a_spawned_agent_shows_its_resolved_effort_never_auto() {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
+        let mut hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
         let mut agents = BTreeMap::new();
         let reg = Registry::defaults();
         let opts = |effort: Option<&str>| AgentOpts {
@@ -4301,7 +4327,7 @@ done"#;
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let dir = std::env::temp_dir().join(format!("mantra-demo-keys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mk = |demo| App::new(settings.clone(), reg.clone(), dir.clone(), Hub::new(vec![], vec![], vec![], ev_tx.clone(), false), tx.clone(), demo);
+        let mk = |demo| App::new(settings.clone(), reg.clone(), dir.clone(), Hub::new(vec![], vec![], vec![], vec![], ev_tx.clone(), false), tx.clone(), demo);
         let real = mk(false);
         assert!(real.model_problem("testing").is_some(), "sanity: the key really is missing");
         assert!(!real.preflight(&pattern).is_empty());
@@ -4324,11 +4350,14 @@ done"#;
 
     #[test]
     fn cross_backend_switch_keeps_agent_task_queue_tools_and_permissions() {
+        for backend in [crate::config::ProviderKind::ClaudeCode, crate::config::ProviderKind::Antigravity] {
         let mut reg = Registry::defaults();
-        reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude".into(), kind: crate::config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
+        reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude".into(), kind: backend, auth: "subscription".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "claude-model".into(), model: "claude-model".into(), provider: "cc".into(), ..Default::default() });
         let id = 1;
-        let (hub, mut commands) = test_hub_with(id);
+        let (mut hub, mut commands) = test_hub_with(id);
+        hub.claude_cmd = vec!["mock-claude".into()];
+        hub.antigravity_cmd = vec!["mock-agy".into()];
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(Settings::default(), reg, PathBuf::from("."), hub, tx, true);
         let mut a = Agent::new(id, "worker", "worker", PathBuf::from("."));
@@ -4351,7 +4380,7 @@ done"#;
         assert!(commands.try_recv().is_err());
         assert_eq!(app.set_model(id, "claude-model"), Ok(()));
         assert_eq!(app.agents.len(), 1);
-        assert_eq!(app.agents[&id].backend, crate::config::ProviderKind::ClaudeCode);
+        assert_eq!(app.agents[&id].backend, backend);
         assert_eq!(app.agents[&id].queued, ["also check tests"]);
         assert!(app.agents[&id].thread_id.is_none());
         assert!(app.agents[&id].awaiting_start, "messages arriving during the switch must queue for the continued turn");
@@ -4366,14 +4395,21 @@ done"#;
         assert!(app.agents[&id].retry_note.is_none());
 
         match commands.try_recv().unwrap() {
-            Cmd::Reconfigure { spec, resume_text, .. } => {
+            Cmd::Reconfigure { spec, command, resume_text } => {
+                assert_eq!(command, if backend == crate::config::ProviderKind::Antigravity { vec!["mock-agy"] } else { vec!["mock-claude"] });
                 assert!(spec.resume_thread.is_none());
                 assert_eq!(spec.approval, "never");
                 assert_eq!(spec.sandbox, "workspace-write");
                 assert_eq!(spec.dynamic_tools, vec![json!({"name":"mantra_status"})]);
                 assert!(spec.developer_instructions.contains("Keep the public API stable"));
                 assert!(spec.developer_instructions.contains("Build the parser without changing the wire format"));
-                assert_eq!(spec.claude.unwrap().system_prompt, spec.developer_instructions);
+                if backend == crate::config::ProviderKind::Antigravity {
+                    assert_eq!(spec.antigravity.unwrap().system_prompt, spec.developer_instructions);
+                    assert!(spec.extra_args.is_empty());
+                    assert_eq!(app.agents[&id].ctx_window, None);
+                } else {
+                    assert_eq!(spec.claude.unwrap().system_prompt, spec.developer_instructions);
+                }
                 assert!(resume_text.unwrap().contains("Continue the active task"));
             }
             other => panic!("expected backend reconfiguration, got {other:?}"),
@@ -4383,16 +4419,24 @@ done"#;
         // must update its actual launch configuration as well as the displayed gauge.
         app.registry.models.push(crate::config::ModelEntry { alias: "claude-small".into(), model: "small".into(), provider: "cc".into(), context_window: Some(16_000), ..Default::default() });
         assert_eq!(app.set_model(id, "claude-small"), Ok(()));
-        match commands.try_recv().unwrap() {
-            Cmd::Reconfigure { spec, resume_text, .. } => {
-                assert_eq!(spec.backend, crate::hub::Backend::ClaudeCode);
-                assert_eq!(spec.claude.unwrap().autocompact, 16_000);
-                assert!(resume_text.is_none(), "an idle agent must stay idle");
+        if backend == crate::config::ProviderKind::Antigravity {
+            assert!(matches!(commands.try_recv(), Ok(Cmd::SetModel(model)) if model == "small"));
+            assert!(matches!(commands.try_recv(), Ok(Cmd::SetEffort(_))));
+            assert!(matches!(commands.try_recv(), Ok(Cmd::SetVision(_))));
+            assert_eq!(app.agents[&id].ctx_window, None, "unsupported context overrides must never populate the gauge");
+        } else {
+            match commands.try_recv().unwrap() {
+                Cmd::Reconfigure { spec, resume_text, .. } => {
+                    assert_eq!(spec.backend, crate::hub::Backend::ClaudeCode);
+                    assert_eq!(spec.claude.unwrap().autocompact, 16_000);
+                    assert!(resume_text.is_none(), "an idle agent must stay idle");
+                }
+                other => panic!("expected context limit relaunch, got {other:?}"),
             }
-            other => panic!("expected context limit relaunch, got {other:?}"),
+            assert_eq!(app.agents[&id].ctx_window, Some(16_000));
         }
-        assert_eq!(app.agents[&id].ctx_window, Some(16_000));
         assert_eq!(app.agents[&id].launch_options.as_ref().unwrap().model_alias, "claude-small");
+        }
     }
 
     /// Solo keeps its logical identity and transcript when the backend changes.
@@ -4401,7 +4445,7 @@ done"#;
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+            let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
             let mut reg = Registry::defaults();
             reg.providers.push(crate::config::bija_default_provider());
             reg.models.extend(crate::config::bija_default_model_entries("bija"));
@@ -4452,7 +4496,7 @@ done"#;
     fn sandbox_warning_downgrades_codex_to_danger_full_access_only() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         let mut app = App::new(Settings::default(), Registry::defaults(), PathBuf::from("."), hub, tx, true);
         app.set_sandbox_warning("bwrap: setting up uid map: Permission denied".into());
         assert_eq!(role_sandbox("workspace-write", crate::config::ProviderKind::Codex), "danger-full-access");
@@ -4594,7 +4638,7 @@ done"#;
     fn screen_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec![], vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, false);
         App::new(Settings::default(), Registry::default(), PathBuf::from("."), hub, tx, true)
     }
 
@@ -5036,7 +5080,7 @@ done"#;
             let script = format!("n=1; while [ -e '{0}/argv-'$n ]; do n=$((n+1)); done; printf '%s\\n' \"$@\" > '{0}/argv-'$n; exec sleep 30", dir.display());
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let hub = Hub::new(vec!["sh".into(), "-c".into(), script, "sh".into()], vec![], vec![], ev_tx, false);
+            let hub = Hub::new(vec!["sh".into(), "-c".into(), script, "sh".into()], vec![], vec![], vec![], ev_tx, false);
             let mut settings = Settings { default_model: "sol-codex".into(), ..Settings::default() };
             settings.mcp_servers.insert("blender".into(), mcp_server("uvx", &["blender-mcp"], true));
             settings.mcp_servers.insert("off".into(), mcp_server("x", &[], false));
@@ -5092,7 +5136,7 @@ done"#;
         crate::web::snapshot::tests::with_mantra_home(|| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
+            let hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
             Settings::default().save().unwrap();
             let mut app = App::new(Settings::load_on_disk().unwrap(), configured_fixture(), PathBuf::from("."), hub, tx, false);
             let listed = |app: &App| crate::ui::settings::rows(app).into_iter().filter_map(|(_, r)| match r { crate::ui::settings::Row::Mcp { name, .. } => Some(name), _ => None }).collect::<Vec<_>>();
@@ -5129,7 +5173,7 @@ done"#;
         std::fs::write(dir.join("pic.png"), crate::util::tests::tiny_png(2, 2)).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = Hub::new(vec!["true".into()], vec![], vec![], ev_tx, false);
+        let hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
         let mut reg = Registry::defaults();
         reg.providers.push(crate::config::bija_default_provider());
         reg.models.extend(crate::config::bija_default_model_entries("bija"));
@@ -5251,7 +5295,7 @@ done"#;
             let home = std::env::var("MANTRA_HOME").unwrap();
             std::env::set_var("MANTRA_HOME", file.join("home"));
             let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let hub = Hub::new(vec![], vec![], vec![], ev_tx, true);
+            let hub = Hub::new(vec![], vec![], vec![], vec![], ev_tx, true);
             std::env::set_var("MANTRA_HOME", home);
             let mut reg = Registry::defaults();
             reg.providers.push(crate::config::ProviderEntry { id: "cc".into(), name: "Claude Code".into(), kind: crate::config::ProviderKind::ClaudeCode, auth: "subscription".into(), ..Default::default() });
@@ -5259,8 +5303,8 @@ done"#;
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut app = App::new(Settings::default(), reg, project.clone(), hub, tx, true);
             let toast = app.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-            assert!(toast.starts_with("Claude Code agents have no Mantra tools: couldn't create") && toast.contains("not-a-dir"), "{toast}");
-            let journaled = |app: &App| app.run.as_ref().expect("the run started").pulse.iter().filter(|l| l.text.starts_with("Claude Code agents have no Mantra tools")).count();
+            assert!(toast.starts_with("Claude Code / Antigravity agents have no Mantra tools: couldn't create") && toast.contains("not-a-dir"), "{toast}");
+            let journaled = |app: &App| app.run.as_ref().expect("the run started").pulse.iter().filter(|l| l.text.starts_with("Claude Code / Antigravity agents have no Mantra tools")).count();
             let mut p = Pattern::builtin();
             p.name = "no-claude".into();
             p.save().unwrap();
@@ -5277,4 +5321,58 @@ done"#;
             let _ = std::fs::remove_dir_all(&project);
         });
     }
+    #[tokio::test]
+    async fn antigravity_spec_keeps_subscription_credentials_and_context_flags_out_of_codex() {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "agy".into(), kind: crate::config::ProviderKind::Antigravity, api_key: Some("must-not-leak".into()), ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model".into(), efforts: vec!["low".into(), "medium".into(), "high".into()], ..Default::default() });
+        let (mut hub, _commands) = test_hub_with(1);
+        let opts = AgentOpts {
+            name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "google".into(), effort: Some("max".into()), cwd: PathBuf::from("."), approval: "on-request".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(), tools: vec![json!({"name":"mantra_status"})], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(123456), resume_thread: None, thread_name: None, mcp: vec![],
+        };
+        let (spec, _, lowered) = agent_spec(&mut hub, &reg, &opts);
+        assert_eq!(spec.backend, crate::config::ProviderKind::Antigravity);
+        assert_eq!(spec.model, "account-model");
+        assert_eq!(spec.effort, "high");
+        assert!(lowered);
+        assert!(spec.extra_args.is_empty());
+        assert!(spec.envs.is_empty());
+        assert!(spec.claude.is_none() && spec.bija.is_none());
+        assert_eq!(spec.antigravity.unwrap().system_prompt, opts.instructions);
+    }
+
+    #[test]
+    fn antigravity_permission_changes_wait_for_a_new_native_process() {
+        for (live, requested) in [("never", "on-request"), ("on-request", "never")] {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let mut agent = Agent::new(1, "solo", "solo", PathBuf::new());
+            agent.backend = crate::config::ProviderKind::Antigravity;
+            agent.approval = live.into();
+            app.agents.insert(1, agent);
+            app.solo = Some(1);
+            let mut rx = app.hub.test_register(1);
+            app.approvals.push(Approval { agent: 1, id: json!("pending"), method: "item/commandExecution/requestApproval".into(), title: "test".into(), detail: "test".into(), params: json!({}), at: Instant::now() });
+            app.set_approval_mode(requested);
+            assert_eq!(app.settings.approval_mode, requested);
+            assert_eq!(app.agents[&1].approval, live, "display must describe the process that is actually running");
+            assert!(rx.try_recv().is_err(), "no unsupported control message or premature auto-approval");
+            assert_eq!(app.approvals.len(), 1);
+            assert!(app.toast.as_ref().unwrap().0.contains("/new"));
+        }
+    }
+
+    #[test]
+    fn antigravity_read_only_probe_and_architect_refuse_before_spawning() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry = Registry { providers: vec![crate::config::ProviderEntry { id: "agy".into(), kind: crate::config::ProviderKind::Antigravity, ..Default::default() }], models: vec![crate::config::ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model".into(), ..Default::default() }] };
+        app.settings.default_model = "google".into();
+        app.probe_model("google");
+        assert!(app.probes.is_empty() && app.agents.is_empty());
+        assert!(app.models_ui.status["google"].contains("read-only"));
+        app.studio_architect_send("Create a pattern".into());
+        assert!(app.studio.architect.is_none() && app.agents.is_empty());
+        assert!(app.toast.as_ref().unwrap().0.contains("Choose another backend"));
+        assert!(app.registry.alias_problem("google").is_none(), "the model remains selectable for supported roles");
+    }
+
 }

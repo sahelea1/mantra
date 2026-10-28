@@ -4,7 +4,7 @@
 //! ctrl+d discovers provider models.
 
 use super::{theme, *};
-use crate::app::{App, Choice, EditTarget, KeyFlow, Overlay, Select, SelectThen, ADD_CLAUDE, ADD_CLAUDE_KEY, ADD_CODEX, ADD_KEY, ADD_MODEL};
+use crate::app::{App, Choice, EditTarget, KeyFlow, Overlay, Select, SelectThen, ADD_ANTIGRAVITY, ADD_CLAUDE, ADD_CLAUDE_KEY, ADD_CODEX, ADD_KEY, ADD_MODEL};
 use crate::config::{ModelEntry, ProviderEntry, ProviderKind, Registry};
 use crate::ui::form::{self, Edit, Outcome, Start};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -39,7 +39,7 @@ pub(crate) const PROV_AUTH_COL: usize = 6;
 pub(crate) const PROV_WIRE_COL: usize = 7;
 /// Display strings for `ProviderEntry.kind` — cycled with +/- like any choice. Kept here rather
 /// than a `Display` impl on `ProviderKind` since it's presentation-only.
-const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode", "Bija"];
+const PROV_KINDS: &[&str] = &["Codex", "ClaudeCode", "Bija", "Antigravity"];
 /// `ProviderEntry.auth` (ClaudeCode only, but editable on any row so a provider can be flipped to
 /// `ClaudeCode` and given `auth` in one place).
 const PROV_AUTHS: &[&str] = &["subscription", "api_key"];
@@ -122,6 +122,9 @@ fn sel_kind(app: &App) -> Kind {
     if ui.providers {
         prov_rows(&app.registry).get(ui.row).map(|r| prov_kind(*r, ui.col)).unwrap_or(Kind::Fixed)
     } else {
+        if matches!(ui.col, CONTEXT_COL | COMPACT_COL) && app.registry.models.get(ui.row).is_some_and(|m| app.registry.backend_of(m) == ProviderKind::Antigravity) {
+            return Kind::Fixed;
+        }
         model_kind(ui.col)
     }
 }
@@ -131,6 +134,7 @@ fn kind_str(k: ProviderKind) -> &'static str {
         ProviderKind::Codex => "Codex",
         ProviderKind::ClaudeCode => "ClaudeCode",
         ProviderKind::Bija => "Bija",
+        ProviderKind::Antigravity => "Antigravity",
     }
 }
 
@@ -139,6 +143,7 @@ fn parse_kind(t: &str) -> ProviderKind {
     match t.as_str() {
         "claudecode" | "claude" => ProviderKind::ClaudeCode,
         "bija" | "seed" => ProviderKind::Bija,
+        "antigravity" | "agy" => ProviderKind::Antigravity,
         _ => ProviderKind::Codex,
     }
 }
@@ -220,6 +225,9 @@ fn prov_value(p: &ProviderEntry, col: usize) -> String {
 /// A typed model cell into the registry, or why not (nothing changes then).
 fn set_model_cell(reg: &mut Registry, row: usize, col: usize, text: &str) -> Result<(), String> {
     let t = text.trim();
+    if matches!(col, CONTEXT_COL | COMPACT_COL) && reg.models.get(row).is_some_and(|m| reg.backend_of(m) == ProviderKind::Antigravity) {
+        return Err("Antigravity manages context and compaction in agy".into());
+    }
     if col == ALIAS_COL {
         let alias = crate::util::slug(t);
         if alias.is_empty() {
@@ -301,8 +309,8 @@ fn set_prov_cell(reg: &mut Registry, idx: usize, col: usize, text: &str) -> Resu
         PROV_KEY_COL => p.api_key = if t.is_empty() { None } else { Some(t) },
         PROV_KIND_COL => {
             let normalized = t.to_ascii_lowercase().replace(['_', '-', ' '], "");
-            if !matches!(normalized.as_str(), "codex" | "claude" | "claudecode" | "bija" | "seed") {
-                return Err("provider kind: Codex, ClaudeCode or Bija".into());
+            if !matches!(normalized.as_str(), "codex" | "claude" | "claudecode" | "bija" | "seed" | "antigravity" | "agy") {
+                return Err("provider kind: Codex, ClaudeCode, Bija or Antigravity".into());
             }
             p.kind = parse_kind(&t)
         }
@@ -443,6 +451,7 @@ pub fn edit_model_cell(app: &mut App, row: usize, col: usize) {
 /// The add menu's rows (`SelectThen::AddMenu`).
 pub fn add_menu(app: &App) -> Select {
     let codex = if app.demo || crate::config::codex_available() { "" } else { " · codex is not on PATH" };
+    let agy = if crate::config::antigravity_command_available(&app.settings.antigravity_command) { "" } else { " · agy is not installed" };
     let claude = if app.demo || crate::config::claude_available() { "" } else { " · claude is not on PATH" };
     let row = |key: &str, label: &str, detail: String| Choice { key: key.into(), label: label.into(), detail, on: false };
     Select {
@@ -452,6 +461,7 @@ pub fn add_menu(app: &App) -> Select {
             row(ADD_MODEL, "Add a model", "enter an alias, provider and model ID".into()),
             row(ADD_CODEX, "Codex account model", format!("add a model ID for your ChatGPT login{codex}")),
             row(ADD_CLAUDE, "Claude Code subscription", format!("connect its subscription login{claude}")),
+            row(ADD_ANTIGRAVITY, "Antigravity subscription", format!("use your Google login; enter a model ID from `agy models`{agy}")),
             row(ADD_CLAUDE_KEY, "Claude Code API key", format!("paste an API key or use $ANTHROPIC_API_KEY{claude}")),
         ],
         sel: 0,
@@ -486,6 +496,17 @@ pub fn add_chosen(app: &mut App, key: &str) {
                 0 => app.toast("add a provider first — from its API key", crate::agent::Level::Info),
                 1 => add_model_on(app, &items[0].key),
                 _ => app.overlays.push(Overlay::Select(Select { title: "a model on which provider".into(), items, sel: 0, multi: false, then: SelectThen::AddModelOn })),
+            }
+        }
+        ADD_ANTIGRAVITY => {
+            match app.add_backend(Backend::Antigravity) {
+                Ok(_) => {
+                    if let Some(id) = app.registry.providers.iter().find(|p| p.kind == ProviderKind::Antigravity).map(|p| p.id.clone()) {
+                        add_model_on(app, &id);
+                        app.toast("Enter an available model ID from `agy models`; agy holds your subscription login", crate::agent::Level::Info);
+                    }
+                }
+                Err(e) => app.toast(e, crate::agent::Level::Warn),
             }
         }
         ADD_CODEX | ADD_CLAUDE | ADD_CLAUDE_KEY => {
@@ -547,7 +568,11 @@ pub fn provider_preset_chosen(app: &mut App, key: &str) {
 pub fn add_model_on(app: &mut App, provider: &str) {
     let n = app.registry.models.len();
     let alias = (n + 1..).map(|i| format!("model{i}")).find(|a| app.registry.get(a).is_none()).unwrap_or_default();
-    app.registry.models.push(ModelEntry { alias, provider: provider.to_string(), ..Default::default() });
+    let mut model = ModelEntry { alias, provider: provider.to_string(), ..Default::default() };
+    if app.registry.providers.iter().any(|p| p.id == provider && p.kind == ProviderKind::Antigravity) {
+        model.efforts = ["low", "medium", "high", "xhigh", "max"].into_iter().map(String::from).collect();
+    }
+    app.registry.models.push(model);
     if provider != "openai" {
         save(app);
     }
@@ -913,7 +938,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     let minner = mblk.inner(rows[1]);
     f.render_widget(mblk, rows[1]);
     let hints = [
-        " context + compact % are always passed to each agent (model_context_window, model_auto_compact_token_limit)",
+        " context + compact % are passed to Codex, Claude Code and Bija; Antigravity manages its own",
         " dim \"(default)\" = not set here; context inherits the default model, compact uses 85% · +/- steps values",
         " vision = the model takes images: its agents get the screenshot and view-image tools · space flips it",
     ];
@@ -932,14 +957,14 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             m.alias.clone(),
             m.provider.clone(),
             m.model.clone(),
-            match m.context_window {
+            if app.registry.backend_of(m) == ProviderKind::Antigravity { "agy managed".into() } else { match m.context_window {
                 Some(cw) => short_tokens(cw),
                 None => format!("{} (default)", short_tokens(app.registry.effective_context_window(&m.alias, &app.settings.default_model))),
-            },
-            match m.auto_compact_percent {
+            } },
+            if app.registry.backend_of(m) == ProviderKind::Antigravity { "agy managed".into() } else { match m.auto_compact_percent {
                 Some(p) => format!("{p}%"),
                 None => format!("{}% (default)", m.effective_compact_percent()),
-            },
+            } },
             if m.efforts().is_empty() { "—".into() } else { m.default_effort.clone() },
             if m.efforts().is_empty() { "none (not sent)".into() } else { m.efforts().join(" ") },
             theme::g(if m.vision { "◉" } else { "·" }, if m.vision { "y" } else { "-" }).to_string(),
@@ -1197,12 +1222,12 @@ fn provider_hints(w: usize, enums: bool) -> [&'static str; 4] {
         return [
             " base_url = the API root: Codex adds /responses, Bija /chat/completions or /messages, ClaudeCode wants it without /v1",
             " env_key = an env var holding the key · api_key = paste one (stored 0600) · either works · ctrl+d discovers …/models",
-            " ctrl+n chooses an API endpoint or local URL, a Codex model, or Claude Code auth",
-            " kind = Codex | ClaudeCode | Bija · auth (ClaudeCode) = subscription | api_key · wire (Bija) = openai | anthropic",
+            " ctrl+n chooses an API endpoint or local URL, a Codex model, Claude Code auth, or Antigravity",
+            " kind = Codex | ClaudeCode | Bija | Antigravity · auth (ClaudeCode) = subscription | api_key · wire (Bija) = openai | anthropic",
         ];
     }
     if enums {
-        [" kind = Codex | ClaudeCode | Bija · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " ctrl+n chooses an API, Codex model or Claude Code auth"]
+        [" kind = Codex | ClaudeCode | Bija | Antigravity · +/- cycles kind, auth and wire", " auth (ClaudeCode only) = subscription | api_key", " wire (Bija only) = openai (…/chat/completions) | anthropic (…/messages)", " ctrl+n chooses an API, Codex model or Claude Code auth"]
     } else {
         [" base_url = the API root (Codex …/v1/responses · Bija …/chat/completions)", " env_key = an env var holding the key · api_key = paste one (0600)", " ctrl+d discovers …/models · → reaches kind, auth and wire", " ctrl+n chooses an API, Codex model or Claude Code auth"]
     }
@@ -1405,7 +1430,7 @@ mod tests {
             app.registry = Registry::defaults();
             ctrl(&mut app, 'n');
             let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("the add menu") };
-            assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![ADD_KEY, ADD_MODEL, ADD_CODEX, ADD_CLAUDE, ADD_CLAUDE_KEY]);
+            assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![ADD_KEY, ADD_MODEL, ADD_CODEX, ADD_CLAUDE, ADD_ANTIGRAVITY, ADD_CLAUDE_KEY]);
             app.overlays.clear();
             add_chosen(&mut app, ADD_MODEL);
             let n = app.registry.models.len();
@@ -1516,7 +1541,7 @@ mod tests {
             app.models_ui.providers = true;
             app.models_ui.row = 0;
             app.models_ui.col = PROV_KIND_COL;
-            for want in [ProviderKind::ClaudeCode, ProviderKind::Bija, ProviderKind::Codex] {
+            for want in [ProviderKind::ClaudeCode, ProviderKind::Bija, ProviderKind::Antigravity, ProviderKind::Codex] {
                 press(&mut app, KeyCode::Char('+'));
                 assert_eq!(app.registry.providers[0].kind, want);
             }
@@ -1597,4 +1622,23 @@ mod tests {
         assert!(buf[(2, y)].modifier.contains(Modifier::BOLD), "the selected cell is bold on top of the band");
         assert!(!buf[(30, y)].modifier.contains(Modifier::BOLD), "the rest of the row is not");
     }
+    #[test]
+    fn antigravity_setup_opens_manual_model_entry_without_inventing_a_catalogue() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.settings.antigravity_command = vec!["/bin/true".into()];
+        let old_models = app.registry.models.len();
+        add_chosen(&mut app, ADD_ANTIGRAVITY);
+        let provider = app.registry.providers.iter().find(|p| p.kind == ProviderKind::Antigravity).expect("subscription provider");
+        assert!(!provider.needs_key() && !provider.needs_url());
+        assert_eq!(app.registry.models.len(), old_models + 1);
+        let m = &app.registry.models[old_models];
+        assert_eq!(m.provider, provider.id);
+        assert!(m.model.is_empty(), "the account's model slug must be entered");
+        assert_eq!(m.efforts(), ["low", "medium", "high", "xhigh", "max"]);
+        assert!(matches!(app.edit.as_ref().map(|e| &e.target), Some(EditTarget::ModelCell(row, MODEL_COL)) if *row == old_models));
+        set_model_cell(&mut app.registry, old_models, MODEL_COL, "account-model-id").unwrap();
+        assert!(app.registry.alias_problem(&app.registry.models[old_models].alias).is_none());
+        assert!(set_model_cell(&mut app.registry, old_models, CONTEXT_COL, "1m").unwrap_err().contains("agy"));
+    }
+
 }
