@@ -789,6 +789,7 @@ async fn run_process(
     }
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut turn_epoch = 0_u64;
+    let mut start_generation = 0_u64;
     let mut steers: VecDeque<(String, bool)> = VecDeque::new();
     let mut steering = false;
     // Deliver anything held across the relaunch (a crash-backoff wait, or a Claude restart_pending
@@ -799,7 +800,8 @@ async fn run_process(
         let p = turn_params(&tid, &text, effort, model, approval);
         *last_turn = Some(text.clone());
         awaiting_turn_start = true;
-        codex_input(&conn, &input_tx, CodexInput::Start { text, epoch: turn_epoch }, "turn/start", p);
+        start_generation += 1;
+        codex_input(&conn, &input_tx, CodexInput::Start { text, generation: start_generation }, "turn/start", p);
     }
 
     let mut current_turn: Option<String> = None;
@@ -818,7 +820,8 @@ async fn run_process(
                     interrupt_on_start = false;
                     awaiting_turn_start = true;
                     *last_turn = Some(text.clone());
-                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), epoch: turn_epoch }, "turn/start", turn_params(&tid, &text, effort, model, approval));
+                    start_generation += 1;
+                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), generation: start_generation }, "turn/start", turn_params(&tid, &text, effort, model, approval));
                     // Waiting for turn/started keeps the remaining queue ordered.
                     steering = false;
                 }
@@ -844,7 +847,8 @@ async fn run_process(
                         // interrupt for that failed start must not stop this new turn.
                         interrupt_on_start = false;
                         awaiting_turn_start = true;
-                        codex_input(&conn, &input_tx, CodexInput::Start { text, epoch: turn_epoch }, "turn/start", p);
+                        start_generation += 1;
+                        codex_input(&conn, &input_tx, CodexInput::Start { text, generation: start_generation }, "turn/start", p);
                     }
                     Some(Cmd::Steer { text }) => steers.push_back((text, false)),
                     Some(Cmd::Interrupt) => {
@@ -907,11 +911,22 @@ async fn run_process(
                                 }
                             }
                             "turn/completed" => {
-                                // A delayed completion for an earlier turn must not clear a newer id.
+                                // A delayed completion for an earlier turn must not clear either
+                                // our cache or the app's busy state/queued input.
                                 let completed = params.pointer("/turn/id").and_then(Value::as_str);
+                                if completed.is_some() && current_turn.is_some() && current_turn.as_deref() != completed {
+                                    continue;
+                                }
                                 if completed.is_none() || current_turn.as_deref() == completed {
                                     turn_epoch += 1;
+                                    let newer_start_pending = awaiting_turn_start && current_turn.is_some();
                                     current_turn = None;
+                                    if newer_start_pending {
+                                        // A new turn/start was dispatched before the old turn's
+                                        // completion arrived. Its start/interrupt latch still belongs
+                                        // to the new turn; the app must keep waiting for that turn.
+                                        continue;
+                                    }
                                     awaiting_turn_start = false;
                                     interrupt_on_start = false;
                                 }
@@ -943,9 +958,9 @@ async fn run_process(
             }
             Some((input, result)) = input_rx.recv() => {
                 match input {
-                    CodexInput::Start { text, epoch } => {
+                    CodexInput::Start { text, generation } => {
                         if let Err(error) = result {
-                            if error.code != -1 && error.code != -2 && epoch == turn_epoch {
+                            if error.code != -1 && error.code != -2 && generation == start_generation {
                                 awaiting_turn_start = false;
                                 interrupt_on_start = false;
                             }
@@ -990,7 +1005,8 @@ async fn run_process(
                                     interrupt_on_start = false;
                                     awaiting_turn_start = true;
                                     *last_turn = Some(text.clone());
-                                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), epoch: turn_epoch }, "turn/start", turn_params(&tid, &text, effort, model, approval));
+                                    start_generation += 1;
+                                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), generation: start_generation }, "turn/start", turn_params(&tid, &text, effort, model, approval));
                                 }
                             }
                             Err(error) => {
@@ -1058,7 +1074,7 @@ fn turn_params(tid: &str, text: &str, effort: &str, model: &str, approval: &str)
 
 // Input replies return to the owning loop so its active-turn cache follows recovery too.
 enum CodexInput {
-    Start { text: String, epoch: u64 },
+    Start { text: String, generation: u64 },
     Steer { text: String, turn: String, retried: bool },
     Refresh { text: String, epoch: u64 },
 }
@@ -1764,6 +1780,12 @@ for line in sys.stdin:
   if mode=='pending-start-race' and starts==2:
    emit({'id':read_id,'result':{'thread':{'status':{'type':'idle'},'turns':[]}}})
    time.sleep(0.1)
+  if mode in ('pending-old-completion','pending-rejected-start') and starts==2:
+   notify('turn/completed',{'turn':{'id':'old'}})
+   if mode=='pending-rejected-start':
+    emit({'id':v['id'],'error':{'code':-32600,'message':'new start rejected'}})
+    continue
+   time.sleep(0.1)
   active='old' if starts==1 else 'fresh'
   emit({'id':v['id'],'result':{'turn':{'id':active}}})
   notify('turn/started',{'turn':{'id':active}})
@@ -1775,6 +1797,7 @@ for line in sys.stdin:
   elif mode=='bounded' or expected=='old': emit({'id':v['id'],'error':{'code':-32600,'message':'no matching active turn'}})
   elif expected==active:
    emit({'id':v['id'],'result':{'turnId':active}})
+   if mode=='late-completion': notify('turn/completed',{'turn':{'id':'old'}})
    notify('test/delivered',{'text':v['params']['input'][0]['text']})
   else: emit({'id':v['id'],'error':{'code':-32600,'message':'wrong refreshed turn'}})
  elif method=='thread/read':
@@ -1786,7 +1809,7 @@ for line in sys.stdin:
   elif mode=='idle': emit({'id':v['id'],'result':{'thread':{'status':{'type':'idle'},'turns':[]}}})
   elif mode=='malformed': emit({'id':v['id'],'result':{'thread':{'status':{'type':'active'},'turns':[]}}})
   else:
-   if mode=='notification-race':
+   if mode in ('notification-race','late-completion'):
     active='newest'
     notify('turn/started',{'turn':{'id':active}})
    emit({'id':v['id'],'result':{'thread':{'status':{'type':'active'},'turns':[{'id':'fresh','status':'inProgress'}]}}})
@@ -1923,6 +1946,48 @@ for line in sys.stdin:
         ctl.send(Cmd::Shutdown).unwrap();
         task.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_old_completions_do_not_finish_a_newer_turn_or_pending_start() {
+        for mode in ["late-completion", "pending-old-completion", "pending-rejected-start"] {
+            let (ctl, mut events, dir, task) = codex_protocol_fixture(mode, false).await;
+            let mut agent = crate::agent::Agent::new(93, "test", "solo", dir.clone());
+            ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+            match codex_protocol_event(&mut events).await {
+                HubEvent::Notif { method, params, .. } => { assert_eq!(method, "turn/started"); agent.apply(&method, &params); }
+                other => panic!("{mode}: unexpected event: {other:?}"),
+            }
+            if mode != "late-completion" {
+                ctl.send(Cmd::Turn { text: "new turn".into() }).unwrap();
+            }
+            ctl.send(Cmd::Steer { text: "follow-up".into() }).unwrap();
+            let mut rejected = false;
+            loop {
+                match codex_protocol_event(&mut events).await {
+                    HubEvent::Notif { method, params, .. } => {
+                        assert_ne!(method, "turn/completed", "{mode}: old completion reached the app");
+                        agent.apply(&method, &params);
+                        if method == "test/delivered" && params["text"] == "follow-up" { break; }
+                    }
+                    HubEvent::CmdFailed { what: "turn", text, .. } if mode == "pending-rejected-start" => {
+                        assert_eq!(text.as_deref(), Some("new turn"));
+                        rejected = true;
+                    }
+                    HubEvent::CmdFailed { error, .. } | HubEvent::Crashed { reason: error, .. } => panic!("{mode}: {error}"),
+                    _ => {}
+                }
+            }
+            assert!(agent.turn_active, "{mode}: newer turn remains busy");
+            assert_eq!(rejected, mode == "pending-rejected-start");
+            let trace: Vec<Value> = std::fs::read_to_string(dir.join("trace")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let expected_starts = match mode { "late-completion" => 1, "pending-rejected-start" => 3, _ => 2 };
+            assert_eq!(trace.iter().filter(|v| v["method"] == "turn/start").count(), expected_starts, "{mode}: {trace:?}");
+            ctl.send(Cmd::Shutdown).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[cfg(unix)]

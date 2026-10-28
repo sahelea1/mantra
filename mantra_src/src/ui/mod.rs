@@ -128,8 +128,7 @@ pub fn block(title: &str, color: (u8, u8, u8)) -> Block<'static> {
     if title.is_empty() {
         b
     } else {
-        let title_color = if color == theme::SIGNAL_RED { theme::ACCENT } else { color };
-        b.title(Span::styled(format!(" {title} "), theme::bold(theme::fg(title_color))))
+        b.title(Span::styled(format!(" {title} "), theme::bold(if color == theme::SIGNAL_RED { theme::accent() } else { theme::fg(color) })))
     }
 }
 
@@ -331,8 +330,9 @@ pub fn input_height(app: &App, width: u16) -> u16 {
 
 pub fn draw_input(f: &mut Frame, area: Rect, app: &App, placeholder: &str, color: (u8, u8, u8), focused: bool) {
     let border = if focused { theme::SIGNAL_RED } else { theme::FAINT };
-    let blk = Block::default().style(theme::surface()).borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border))
-        .title(if focused { " input · FOCUSED " } else { " input · tab to focus " });
+    let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border))
+        .title(if focused { " input · FOCUSED " } else { " input · tab to focus " })
+        .title_style(if focused { theme::accent() } else { theme::muted() });
     let inner = blk.inner(area);
     f.render_widget(blk, area);
     let prompt = Span::styled(format!("{} ", theme::g("›", ">")), theme::bold(theme::fg(color)));
@@ -397,7 +397,7 @@ pub fn draw_screen_flash(f: &mut Frame, area: Rect, app: &App, color: (u8, u8, u
     if k <= 0.0 {
         return;
     }
-    let bg = theme::mix(theme::GRAPHITE, color, k * 0.2);
+    let bg = theme::mix(theme::FAINT, color, k);
     let buf = f.buffer_mut();
     for x in area.x..area.x + area.width {
         if let Some(cell) = buf.cell_mut((x, area.y)) {

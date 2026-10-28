@@ -529,7 +529,7 @@ fn point_bija_at_mock(reg: &mut config::Registry, port: u16) {
 }
 
 fn demo_project() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("mantra-demo-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mantra-demo-{}", util::uuid_v4()));
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")?;
     std::fs::write(dir.join("README.md"), "# demo\nA small demo project for Mantra.\n")?;
