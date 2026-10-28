@@ -339,7 +339,7 @@ An alias maps to a model **and the runtime it goes through**, and every picker s
 
 In Solo, the agent can list configured model aliases and start a separate subagent on any usable alias, including one on a different backend. It can message, inspect, await, and stop each subagent through its tools. Each child is a separate process in the same project; starting a new Solo session shuts down that session's children.
 
-Use the **Codex** backend for a ChatGPT subscription and **Claude Code** for its CLI login. **Bija** uses configured API endpoints and keys; it does not reuse a ChatGPT subscription.
+Use the **Codex** backend for a ChatGPT subscription and **Claude Code** for its CLI login. **Antigravity** uses its Google CLI login. **Bija** uses configured API endpoints and keys; it does not reuse a ChatGPT subscription.
 
 Drafts stay with each conversation while the terminal or browser page remains open. Navigation, overlay dismissal, and browser reconnects preserve them; a full browser reload starts fresh. Long remote transcripts use a bounded visible window, with earlier history and full message text available on demand.
 
@@ -347,7 +347,7 @@ Drafts stay with each conversation while the terminal or browser page remains op
 
 The parent uses `mantra_swarm_start`, `mantra_swarm_status`, `mantra_swarm_wait`, `mantra_swarm_message`, `mantra_swarm_note`, and `mantra_swarm_stop`. Members coordinate through the Akasha note tools. `/akasha` shows their notes in the terminal; remote agent pages show the group, member links and folded shared notes. Ending the parent or replacing a Solo session ends its members too. Delegated groups are session-local; normal run Akasha groups retain their existing persistence.
 
-To add an API provider, press `ctrl+n` in `/models` and pick a known API (OpenAI, Anthropic, OpenRouter, Groq, xAI, Gemini, Cerebras or Fireworks), or *Local / custom API*. The choice fills in the endpoint; you can edit it before saving. Paste its key, or leave the key empty for a local server. Mantra then lists the provider's models for you to select. The key is stored in `models.toml` (`0600`). A refused key or a URL without a model list keeps the provider so you can add models by hand. Key prefixes can still suggest an endpoint in the custom flow.
+To add an API provider, press `ctrl+n` in `/models` and pick a known API (OpenAI, Anthropic, OpenRouter, Groq, xAI, Gemini, Cerebras or Fireworks), or *Local / custom API*. The choice fills in the endpoint; you can edit it before saving. Paste its key, or leave the key empty for a local server. Mantra then lists the provider's models for you to select. The key is stored in owner-only `secrets.toml`; `models.toml` keeps the provider and model settings. A refused key or a URL without a model list keeps the provider so you can add models by hand. Key prefixes can still suggest an endpoint in the custom flow.
 
 <details>
 <summary>Which key prefix goes where</summary>
@@ -364,7 +364,7 @@ To add an API provider, press `ctrl+n` in `/models` and pick a known API (OpenAI
 | `sk-`, `sk-proj-` | `api.openai.com` | Chat Completions |
 | anything else | no guess — you give the URL | Chat Completions |
 
-A URL you type always wins over the guess (a `sk-` key for another OpenAI-compatible host keeps that host). A key for an endpoint already configured updates that provider instead of adding a second one. No Bija endpoint is preconfigured on a fresh install.
+A URL you type always wins over the guess (a `sk-` key for another OpenAI-compatible host keeps that host). Startup and `mantra doctor` warn when a recognizable model ID belongs to a different vendor than the configured official endpoint; custom gateways and display aliases are left alone. A key for an endpoint already configured updates that provider instead of adding a second one. No Bija endpoint is preconfigured on a fresh install.
 
 </details>
 
@@ -374,7 +374,7 @@ A URL you type always wins over the guess (a `sk-` key for another OpenAI-compat
 
 Each agent has a separate CLI process and explicit conversation ID. Resume and model changes use that ID, never the account's “most recent conversation.” Prompts within one agent are serialized; different agents can run concurrently, subject to your account's shared quota.
 
-Antigravity 1.4.9 has no per-process MCP configuration flag. On the first agent requiring Mantra tools, Mantra adds its `mantra` stdio bridge to `~/.gemini/config/mcp_config.json` and the scoped `mcp(mantra/*)` allow rule to CLI settings. Existing servers and permission rules are preserved; a conflicting registration or invalid configuration causes a clear error. Agent routing is inherited from each process's environment, never stored in shared configuration. Ordinary `agy` sessions expose no Mantra tools when that environment is absent. To remove the integration, remove this server and its scoped allow rule from Antigravity's configuration.
+Antigravity 1.4.9 has no per-process MCP configuration flag. On the first agent requiring Mantra tools, Mantra adds its `mantra` stdio bridge to `~/.gemini/config/mcp_config.json` and the scoped `mcp(mantra/*)` allow rule to CLI settings. Existing servers and permission rules are preserved. An unchanged Mantra bridge registration follows a moved Mantra executable automatically; a customized registration or invalid configuration causes a clear error. Agent routing is inherited from each process's environment, never stored in shared configuration. Ordinary `agy` sessions expose no Mantra tools when that environment is absent. To remove the integration, remove this server and its scoped allow rule from Antigravity's configuration.
 
 Native CLI permissions still apply. Changing an Antigravity session’s approval policy is pending until `/new`, so the displayed live policy continues to match the running process. Headless `on-request`/`untrusted` sessions cannot show native tool approval prompts inside Mantra; agy may deny those tools. Configure scoped agy permissions or select `never ask` for automatic approval with the requested terminal sandbox. Explicit sandbox bypass also removes that sandbox request. A read-only workspace cannot be enforced by this backend and is rejected. Built-in QA roles and the Studio architect therefore need another backend while their read-only policy is retained; select agy for writable roles. The generic read-only model probe is unavailable for agy; use `agy models` and its interactive login to check account availability. Antigravity can ignore `--sandbox` on unsupported hosts; its sandbox is not equivalent to Bija's containment. Existing agy MCP servers remain active; Mantra's per-agent external MCP selection is unsupported and rejected rather than silently ignored.
 

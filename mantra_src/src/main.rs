@@ -704,6 +704,7 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
     // run — real or (in `--demo`) mocked.
     let enable_bridge = registry.providers.iter().any(|p| matches!(p.kind, config::ProviderKind::ClaudeCode | config::ProviderKind::Antigravity));
     let hub = hub::Hub::new(settings.codex_command.clone(), settings.claude_command.clone(), bija_cmd, config::resolve_antigravity_command(&settings.antigravity_command), hub_tx, enable_bridge);
+    let provider_warnings = registry.provider_model_warnings();
     let mut app = App::new(settings, registry, project, hub, tx.clone(), demo);
     app.web = web.as_ref().map(|w| w.link());
     if let Some(p) = cli.pattern {
@@ -718,6 +719,13 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
     if let Some(w) = web.as_ref().map(|w| w.cfg.warnings()).filter(|w| !w.is_empty()) {
         let said = app.toast.take().map(|(t, _, _)| t);
         app.toast(said.into_iter().chain(w).collect::<Vec<_>>().join(" · "), crate::agent::Level::Warn);
+    }
+    if !provider_warnings.is_empty() {
+        for warning in &provider_warnings {
+            crate::mlog!("provider warning: {warning}");
+        }
+        let said = app.toast.take().map(|(text, _, _)| text);
+        app.toast(said.into_iter().chain(provider_warnings).collect::<Vec<_>>().join(" · "), crate::agent::Level::Warn);
     }
     if let Some(goal) = &cli.run_goal {
         app.start_run_with(goal, None, cli.parallel);
@@ -1204,6 +1212,9 @@ fn doctor() {
     let s = config::Settings::load();
     let r = config::Registry::load();
     println!("mantra {} doctor\n", env!("CARGO_PKG_VERSION"));
+    for warning in r.provider_model_warnings() {
+        println!("  warning: {warning}");
+    }
     // Bija is required only when a configured model uses it.
     let (bija_cmd, found) = config::resolve_bija_command(&s.bija_command);
     let (good, text) = probe_cli(bija_cmd.first().map(String::as_str).unwrap_or("bija"), " — it ships beside mantra: reinstall, or set bija_command / $MANTRA_BIJA");

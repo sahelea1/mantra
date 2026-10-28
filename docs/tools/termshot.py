@@ -26,10 +26,10 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 # ── palette (mirrors mantra_src/src/ui/theme.rs) ────────────────────────────────
-BG = (13, 15, 20)
-CHROME = (23, 26, 33)
-CHROME_LINE = (38, 42, 52)
-DEFAULT_FG = (226, 230, 236)
+BG = (45, 46, 41)
+CHROME = (50, 51, 46)
+CHROME_LINE = (74, 75, 67)
+DEFAULT_FG = (239, 239, 235)
 DOTS = [(242, 104, 138), (232, 197, 71), (110, 214, 138)]  # rose / amber / green
 
 ANSI16 = [

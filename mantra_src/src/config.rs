@@ -1023,6 +1023,36 @@ pub(crate) fn codex_default_models() -> Vec<ModelEntry> {
 }
 
 impl Registry {
+    /// Advisory only: official endpoints cannot route another vendor's recognizable model IDs.
+    /// Check the wire model, never its display alias, and leave gateways and unknown IDs alone.
+    pub fn provider_model_warnings(&self) -> Vec<String> {
+        self.models.iter().filter_map(|model| {
+            let provider = self.providers.iter().find(|p| p.id == model.provider)?;
+            if provider.kind == ProviderKind::Antigravity {
+                return None;
+            }
+            let host = parse_base_url(&provider.base_url)?.host;
+            let vendor = match host.as_str() {
+                "api.anthropic.com" => "Anthropic",
+                "api.openai.com" => "OpenAI",
+                "generativelanguage.googleapis.com" => "Google",
+                _ => return None,
+            };
+            let id = model.model.trim();
+            let family = if id.strip_prefix("gpt-").is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+                || ["o1", "o3", "o4"].iter().any(|p| id == *p || id.starts_with(&format!("{p}-"))) {
+                "OpenAI"
+            } else if id.starts_with("claude-") {
+                "Anthropic"
+            } else if id.strip_prefix("gemini-").is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())) {
+                "Google"
+            } else {
+                return None;
+            };
+            (family != vendor).then(|| format!("model '{}' ({}) uses provider '{}' at {host}, an official {vendor} endpoint; check the model ID or provider URL", crate::util::trunc(&model.alias, 40), crate::util::trunc(id, 80), crate::util::trunc(&provider.id, 40)))
+        }).collect()
+    }
+
     /// A fresh install has no model backends configured. Codex and Bija models are explicit
     /// entries added by the user; Claude Code remains an optional backend.
     pub fn defaults() -> Registry {
@@ -2255,4 +2285,38 @@ mod tests {
         assert!(reg.preflight(&pattern).is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod provider_model_warning_tests {
+    use super::*;
+
+    #[test]
+    fn official_endpoint_warns_on_foreign_wire_model_but_not_aliases_or_proxies() {
+        let mut registry = Registry {
+            models: vec![ModelEntry { alias: "claude-friendly".into(), provider: "custom".into(), model: "gpt-5.6-sol".into(), ..Default::default() }],
+            providers: vec![ProviderEntry { id: "custom".into(), base_url: "https://API.ANTHROPIC.COM:443/v1".into(), kind: ProviderKind::Bija, ..Default::default() }],
+        };
+        let warnings = registry.provider_model_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("gpt-5.6-sol"));
+        assert!(warnings[0].contains("official Anthropic endpoint"));
+        for url in ["https://anthropic.proxy.test/v1", "https://api.anthropic.com.proxy.test/v1", "https://gateway.test/anthropic", "malformed"] {
+            registry.providers[0].base_url = url.into();
+            assert!(registry.provider_model_warnings().is_empty(), "{url}");
+        }
+        registry.providers[0].base_url = "https://api.anthropic.com/v1".into();
+        for model in ["claude-sonnet-4-6", "opus", "my-model", "openai/gpt-5.6-sol", "gpt-custom", "gemini-custom"] {
+            registry.models[0].model = model.into();
+            assert!(registry.provider_model_warnings().is_empty(), "{model}");
+        }
+        registry.models[0].model = "claude-sonnet-4-6".into();
+        registry.models[0].alias = "gpt-5.6-sol".into();
+        assert!(registry.provider_model_warnings().is_empty());
+        registry.providers[0].base_url = "https://api.openai.com/v1".into();
+        assert_eq!(registry.provider_model_warnings().len(), 1);
+        registry.providers[0].base_url = "https://generativelanguage.googleapis.com/v1beta".into();
+        registry.models[0].model = "gemini-3-pro".into();
+        assert!(registry.provider_model_warnings().is_empty());
+    }
 }

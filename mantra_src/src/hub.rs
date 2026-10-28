@@ -7,6 +7,7 @@
 mod bija;
 mod claude;
 mod antigravity;
+mod socket_cleanup;
 
 use crate::rpc::{self, Conn, Incoming};
 use serde_json::{json, Value};
@@ -339,10 +340,13 @@ fn setup_bridge(ev: mpsc::UnboundedSender<HubEvent>) -> Result<PathBuf, String> 
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return fail(format!("couldn't create {}: {e}", dir.display()));
     }
+    socket_cleanup::clean_dead_sockets(&dir);
     let Some(path) = bridge_sock_path(&dir, std::process::id()) else {
         return fail(format!("{} is too long for a socket path, and no short directory of our own in /tmp", dir.display()));
     };
-    let _ = std::fs::remove_file(&path); // stale socket from an unclean exit; pid-scoped so this is rare
+    if let Some(parent) = path.parent().filter(|parent| *parent != dir) {
+        socket_cleanup::clean_dead_sockets(parent);
+    }
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => return fail(format!("couldn't open the socket {}: {e}", path.display())),
@@ -734,10 +738,11 @@ async fn run_process(
     if !spec.config.is_empty() {
         params["config"] = Value::Object(spec.config.clone());
     }
+    let mut resumed = false;
     let result = if let Some(tid) = thread_id.clone() {
         params["threadId"] = json!(tid);
         match conn.request("thread/resume", params.clone()).await {
-            Ok(v) => Ok(v),
+            Ok(v) => { resumed = true; Ok(v) },
             Err(e) => {
                 crate::mlog!("agent {id}: resume failed ({e}); starting fresh thread");
                 if let Some(o) = params.as_object_mut() {
@@ -773,17 +778,28 @@ async fn run_process(
     }
     *thread_id = Some(tid.clone());
     let _ = ev.send(HubEvent::Ready { agent: id, thread_id: tid.clone(), model: model.clone(), resumed: is_restart });
-    if let Some(name) = &spec.thread_name {
-        fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": name}), "name", None);
+    // A fresh Codex thread has no rollout to rename until its first turn starts. A successful
+    // resume already has one; a failed resume that fell back to thread/start does not.
+    let mut name_ready = resumed;
+    let mut pending_name = spec.thread_name.clone();
+    if name_ready {
+        if let Some(name) = pending_name.take() {
+            fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": name}), "name", None);
+        }
     }
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+    let mut turn_epoch = 0_u64;
+    let mut steers: VecDeque<(String, bool)> = VecDeque::new();
+    let mut steering = false;
     // Deliver anything held across the relaunch (a crash-backoff wait, or a Claude restart_pending
     // hold) now that there's a process again to send it to.
     let mut awaiting_turn_start = false;
+    prepare_switch_replay(replay, None);
     for text in replay.drain(..) {
         let p = turn_params(&tid, &text, effort, model, approval);
         *last_turn = Some(text.clone());
         awaiting_turn_start = true;
-        fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
+        codex_input(&conn, &input_tx, CodexInput::Start { text, epoch: turn_epoch }, "turn/start", p);
     }
 
     let mut current_turn: Option<String> = None;
@@ -791,7 +807,27 @@ async fn run_process(
     // and interrupt that exact turn once its id arrives, instead of silently dropping the stop.
     let mut interrupt_on_start = false;
     loop {
+        // Serialize steers, including recovery. Two rejected steers must not both observe an
+        // idle thread and start separate replacement turns with the same intent.
+        if !steering && !awaiting_turn_start {
+            if let Some((text, retried)) = steers.pop_front() {
+                steering = true;
+                if let Some(turn) = &current_turn {
+                    codex_input(&conn, &input_tx, CodexInput::Steer { text: text.clone(), turn: turn.clone(), retried }, "turn/steer", steer_params(&tid, turn, &text));
+                } else {
+                    interrupt_on_start = false;
+                    awaiting_turn_start = true;
+                    *last_turn = Some(text.clone());
+                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), epoch: turn_epoch }, "turn/start", turn_params(&tid, &text, effort, model, approval));
+                    // Waiting for turn/started keeps the remaining queue ordered.
+                    steering = false;
+                }
+            }
+        }
         tokio::select! {
+            // Drain queued notifications before applying a read snapshot/reply from another
+            // channel. The RPC reader queued those events before it resolved that reply.
+            biased;
             c = cmds.recv() => {
                 match c {
                     None | Some(Cmd::Shutdown) => {
@@ -808,24 +844,9 @@ async fn run_process(
                         // interrupt for that failed start must not stop this new turn.
                         interrupt_on_start = false;
                         awaiting_turn_start = true;
-                        fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
+                        codex_input(&conn, &input_tx, CodexInput::Start { text, epoch: turn_epoch }, "turn/start", p);
                     }
-                    Some(Cmd::Steer { text }) => {
-                        if let Some(t) = &current_turn {
-                            let p = json!({
-                                "threadId": tid,
-                                "input": [{ "type": "text", "text": text, "text_elements": [] }],
-                                "expectedTurnId": t,
-                            });
-                            fire(&conn, ev, id, "turn/steer", p, "steer", Some(text));
-                        } else {
-                            // The turn ended just before this steer: start a new one, with the *current* policy.
-                            let p = turn_params(&tid, &text, effort, model, approval);
-                            interrupt_on_start = false;
-                            awaiting_turn_start = true;
-                            fire(&conn, ev, id, "turn/start", p, "turn", Some(text));
-                        }
-                    }
+                    Some(Cmd::Steer { text }) => steers.push_back((text, false)),
                     Some(Cmd::Interrupt) => {
                         if let Some(t) = &current_turn {
                             fire(&conn, ev, id, "turn/interrupt", json!({"threadId": tid, "turnId": t}), "interrupt", None);
@@ -841,7 +862,13 @@ async fn run_process(
                     Some(Cmd::SetEffort(e)) => *effort = e,
                     Some(Cmd::SetModel(m)) => *model = m,
                     Some(Cmd::SetVision(_)) => {}
-                    Some(Cmd::SetName(n)) => fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": n}), "name", None),
+                    Some(Cmd::SetName(n)) => {
+                        if name_ready {
+                            fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": n}), "name", None);
+                        } else {
+                            pending_name = Some(n);
+                        }
+                    }
                     Some(Cmd::SetApproval(a)) => {
                         // Apply to the live thread now (not just the next turn/start we send).
                         fire(&conn, ev, id, "thread/settings/update", json!({"threadId": tid, "approvalPolicy": crate::config::approval_policy(&a)}), "settings", None);
@@ -849,10 +876,12 @@ async fn run_process(
                     }
                     Some(Cmd::Reconfigure { spec, command, resume_text }) => {
                         let _ = child.kill().await;
+                        replay.extend(steers.drain(..).map(|(text, _)| text));
                         return Exit::Reconfigure { spec, command, resume_text };
                     }
                     Some(Cmd::Restart) => {
                         let _ = child.kill().await;
+                        replay.extend(steers.drain(..).map(|(text, _)| text));
                         return Exit::Restarting { reason: "restart requested".into(), fresh: false };
                     }
                     Some(Cmd::Bridge(_)) => {} // WP10.4 is Claude-only; a stray one here is a bug elsewhere, not fatal
@@ -863,6 +892,11 @@ async fn run_process(
                     Some(Incoming::Notification { method, params }) => {
                         match method.as_str() {
                             "turn/started" => {
+                                turn_epoch += 1;
+                                name_ready = true;
+                                if let Some(name) = pending_name.take() {
+                                    fire(&conn, ev, id, "thread/name/set", json!({"threadId": tid, "name": name}), "name", None);
+                                }
                                 current_turn = params.pointer("/turn/id").and_then(|t| t.as_str()).map(str::to_string);
                                 awaiting_turn_start = false;
                                 if interrupt_on_start {
@@ -872,7 +906,16 @@ async fn run_process(
                                     }
                                 }
                             }
-                            "turn/completed" => { current_turn = None; awaiting_turn_start = false; interrupt_on_start = false; }
+                            "turn/completed" => {
+                                // A delayed completion for an earlier turn must not clear a newer id.
+                                let completed = params.pointer("/turn/id").and_then(Value::as_str);
+                                if completed.is_none() || current_turn.as_deref() == completed {
+                                    turn_epoch += 1;
+                                    current_turn = None;
+                                    awaiting_turn_start = false;
+                                    interrupt_on_start = false;
+                                }
+                            }
                             _ => {}
                         }
                         let _ = ev.send(HubEvent::Notif { agent: id, method, params });
@@ -884,6 +927,7 @@ async fn run_process(
                         let code = reap_exit_code(&mut child).await;
                         let code_s = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
                         let last = last_significant_stderr_line(&stderr_tail);
+                        replay.extend(steers.drain(..).map(|(text, _)| text));
                         return Exit::Crashed(if last.is_empty() {
                             format!("codex exited (code {code_s})")
                         } else {
@@ -892,7 +936,68 @@ async fn run_process(
                     }
                     None => {
                         let _ = child.kill().await;
+                        replay.extend(steers.drain(..).map(|(text, _)| text));
                         return Exit::Crashed("codex connection lost".into());
+                    }
+                }
+            }
+            Some((input, result)) = input_rx.recv() => {
+                match input {
+                    CodexInput::Start { text, epoch } => {
+                        if let Err(error) = result {
+                            if error.code != -1 && error.code != -2 && epoch == turn_epoch {
+                                awaiting_turn_start = false;
+                                interrupt_on_start = false;
+                            }
+                            let _ = ev.send(codex_input_failure(id, "turn", error, text));
+                        }
+                    }
+                    CodexInput::Steer { text, turn, retried } => {
+                        match result {
+                            Err(error) if error.code == -32600 && !retried => {
+                                // The expected id is only a cache. Refresh after a definite rejection;
+                                // never replay a timeout, whose input may already have been accepted.
+                                codex_input(&conn, &input_tx, CodexInput::Refresh { text, epoch: turn_epoch }, "thread/read", json!({"threadId": tid, "includeTurns": true}));
+                            }
+                            result => {
+                                steering = false;
+                                if let Err(error) = result {
+                                    crate::mlog!("agent {id}: turn/steer for {turn} failed: {error}");
+                                    let _ = ev.send(codex_input_failure(id, "steer", error, text));
+                                }
+                            }
+                        }
+                    }
+                    CodexInput::Refresh { text, epoch } => {
+                        let refreshed = result.and_then(active_codex_turn);
+                        match refreshed {
+                            Ok(turn) => {
+                                // A newer start may have been dispatched while the read was in
+                                // flight. Wait for its id; this idle snapshot cannot start another
+                                // turn. Keep the retry budget when returning to the queue.
+                                if awaiting_turn_start {
+                                    steering = false;
+                                    steers.push_front((text, true));
+                                    continue;
+                                }
+                                // Notifications that arrived during the read are newer than its
+                                // snapshot; an old read must not resurrect a completed turn.
+                                if epoch == turn_epoch { current_turn = turn; }
+                                if let Some(turn) = &current_turn {
+                                    codex_input(&conn, &input_tx, CodexInput::Steer { text: text.clone(), turn: turn.clone(), retried: true }, "turn/steer", steer_params(&tid, turn, &text));
+                                } else {
+                                    steering = false;
+                                    interrupt_on_start = false;
+                                    awaiting_turn_start = true;
+                                    *last_turn = Some(text.clone());
+                                    codex_input(&conn, &input_tx, CodexInput::Start { text: text.clone(), epoch: turn_epoch }, "turn/start", turn_params(&tid, &text, effort, model, approval));
+                                }
+                            }
+                            Err(error) => {
+                                steering = false;
+                                let _ = ev.send(HubEvent::CmdFailed { agent: id, what: "steer", error: format!("could not refresh the active turn: {}", error.message), text: Some(text) });
+                            }
+                        }
                     }
                 }
             }
@@ -949,6 +1054,56 @@ fn turn_params(tid: &str, text: &str, effort: &str, model: &str, approval: &str)
         p["effort"] = json!(effort);
     }
     p
+}
+
+// Input replies return to the owning loop so its active-turn cache follows recovery too.
+enum CodexInput {
+    Start { text: String, epoch: u64 },
+    Steer { text: String, turn: String, retried: bool },
+    Refresh { text: String, epoch: u64 },
+}
+
+type CodexInputReply = (CodexInput, Result<Value, rpc::RpcError>);
+
+fn codex_input_failure(id: AgentId, what: &'static str, error: rpc::RpcError, text: String) -> HubEvent {
+    // A transport failure does not establish whether Codex accepted the prompt. The app
+    // automatically queues failed steers and retries failed turns, so use its ordinary notice
+    // path for uncertain delivery instead of handing it text to replay.
+    if error.code == -1 || error.code == -2 {
+        HubEvent::CmdFailed {
+            agent: id,
+            what: if what == "turn" { "turn delivery" } else { "steer delivery" },
+            error: format!("{}; delivery is uncertain, so this input was not retried", error.message),
+            text: None,
+        }
+    } else {
+        HubEvent::CmdFailed { agent: id, what, error: error.message, text: Some(text) }
+    }
+}
+
+fn codex_input(conn: &Conn, replies: &mpsc::UnboundedSender<CodexInputReply>, input: CodexInput, method: &'static str, params: Value) {
+    let conn = conn.clone();
+    let replies = replies.clone();
+    tokio::spawn(async move {
+        let result = conn.request_timeout(method, params, Duration::from_secs(60)).await;
+        let _ = replies.send((input, result));
+    });
+}
+
+fn steer_params(tid: &str, turn: &str, text: &str) -> Value {
+    json!({"threadId": tid, "expectedTurnId": turn, "input": [{"type": "text", "text": text, "text_elements": []}]})
+}
+
+fn active_codex_turn(snapshot: Value) -> Result<Option<String>, rpc::RpcError> {
+    let invalid = || rpc::RpcError { code: -32600, message: "thread/read did not identify the active turn".into() };
+    let turns = snapshot.pointer("/thread/turns").and_then(Value::as_array).ok_or_else(invalid)?;
+    if let Some(turn) = turns.iter().rev().find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress")) {
+        return turn.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(|id| Some(id.to_string())).ok_or_else(invalid);
+    }
+    if snapshot.pointer("/thread/status/type").and_then(Value::as_str) == Some("active") {
+        return Err(invalid());
+    }
+    Ok(None)
 }
 
 fn fire(conn: &Conn, ev: &mpsc::UnboundedSender<HubEvent>, id: AgentId, method: &'static str, params: Value, what: &'static str, text: Option<String>) {
@@ -1502,22 +1657,25 @@ for line in sys.stdin:
         assert!(matches!(next(&mut rx).await, HubEvent::Exited { agent: 7 }));
     }
 
-    /// A thread is given its name (`<run title> · <role>`) as soon as it is ready, and a later
-    /// `Cmd::SetName` renames it — both through the app-server's `thread/name/set`.
+    /// Fresh threads wait for their rollout before naming; renames before then coalesce.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_codex_thread_is_named_when_ready_and_renamed_on_request() {
+    async fn a_codex_thread_is_named_after_its_first_turn_and_renamed_on_request() {
         let dir = std::env::temp_dir().join(format!("mantra-hub-name-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("names.log");
-        // a minimal app-server: answers the handshake and thread/start, records thread/name/set
-        let script = r#"while IFS= read -r line; do
+        // Reject early names just like Codex does before the first rollout exists.
+        let script = r#"started=0
+while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id";;
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr-1"},"model":"m"}}\n' "$id";;
-    *'"method":"thread/name/set"'*) printf '%s\n' "$line" >> "$NAMES_LOG"; printf '{"id":%s,"result":{}}\n' "$id";;
+    *'"method":"turn/start"'*) started=1; printf '{"id":%s,"result":{}}\n' "$id"; printf '{"method":"turn/started","params":{"turn":{"id":"t1"}}}\n';;
+    *'"method":"thread/name/set"'*)
+      if [ "$started" -eq 0 ]; then printf '{"id":%s,"error":{"code":-32600,"message":"no rollout"}}\n' "$id"
+      else printf '%s\n' "$line" >> "$NAMES_LOG"; printf '{"id":%s,"result":{}}\n' "$id"; fi;;
   esac
 done"#;
         let spec = SpawnSpec {
@@ -1554,20 +1712,246 @@ done"#;
                 _ => {}
             }
         }
-        ctl.send(Cmd::SetName("Notes sync · qa".into())).unwrap();
-        let mut lines = vec![];
-        for _ in 0..100 {
-            lines = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
-            if lines.len() >= 2 {
-                break;
+        ctl.send(Cmd::SetName("Notes sync · revised planner".into())).unwrap();
+        ctl.send(Cmd::Turn { text: "hello".into() }).unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap() {
+                HubEvent::Notif { method, .. } if method == "turn/started" => break,
+                HubEvent::CmdFailed { error, .. } => panic!("{error}"),
+                _ => {}
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        ctl.send(Cmd::SetName("Notes sync · qa".into())).unwrap();
+        let lines = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let lines: Vec<String> = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+                if lines.len() >= 2 { break lines; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("\"threadId\":\"thr-1\"") && l.contains("Notes sync · planner")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("\"threadId\":\"thr-1\"") && l.contains("Notes sync · qa")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Notes sync · revised planner")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Notes sync · qa")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("Notes sync · planner")), "{lines:?}");
         drop(ctl);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    async fn codex_protocol_fixture(mode: &str, resume: bool) -> (mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<HubEvent>, PathBuf, tokio::task::JoinHandle<()>) {
+        let dir = std::env::temp_dir().join(format!("mantra-codex-protocol-{}", crate::util::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = r#"import sys,json,os,time
+mode=os.environ['MODE']
+starts=0
+active='old'
+def emit(v): print(json.dumps(v),flush=True)
+def notify(method,params): emit({'method':method,'params':params})
+for line in sys.stdin:
+ v=json.loads(line)
+ with open('trace','a') as f: f.write(line)
+ method=v.get('method')
+ if method=='initialize': emit({'id':v['id'],'result':{}})
+ elif method=='thread/resume':
+  if mode=='resume-fails': emit({'id':v['id'],'error':{'code':-32600,'message':'not found'}})
+  else: emit({'id':v['id'],'result':{'thread':{'id':'thr'},'model':'m'}})
+ elif method=='thread/start': emit({'id':v['id'],'result':{'thread':{'id':'thr'},'model':'m'}})
+ elif method=='turn/start':
+  starts+=1
+  if mode in ('start-timeout','start-closed'):
+   emit({'id':v['id'],'error':{'code':-2 if mode=='start-timeout' else -1,'message':'delivery interrupted'}})
+   continue
+  if mode=='pending-start-race' and starts==2:
+   emit({'id':read_id,'result':{'thread':{'status':{'type':'idle'},'turns':[]}}})
+   time.sleep(0.1)
+  active='old' if starts==1 else 'fresh'
+  emit({'id':v['id'],'result':{'turn':{'id':active}}})
+  notify('turn/started',{'turn':{'id':active}})
+  if starts>1: notify('test/delivered',{'text':v['params']['input'][0]['text']})
+ elif method=='turn/steer':
+  expected=v['params']['expectedTurnId']
+  if mode in ('steer-timeout','steer-closed'): emit({'id':v['id'],'error':{'code':-2 if mode=='steer-timeout' else -1,'message':'delivery interrupted'}})
+  elif mode=='other-error': emit({'id':v['id'],'error':{'code':-32000,'message':'denied'}})
+  elif mode=='bounded' or expected=='old': emit({'id':v['id'],'error':{'code':-32600,'message':'no matching active turn'}})
+  elif expected==active:
+   emit({'id':v['id'],'result':{'turnId':active}})
+   notify('test/delivered',{'text':v['params']['input'][0]['text']})
+  else: emit({'id':v['id'],'error':{'code':-32600,'message':'wrong refreshed turn'}})
+ elif method=='thread/read':
+  active='fresh'
+  if mode=='pending-start-race':
+   read_id=v['id']
+   notify('turn/completed',{'turn':{'id':'old'}})
+  elif mode=='refresh-fails': emit({'id':v['id'],'error':{'code':-32601,'message':'unsupported'}})
+  elif mode=='idle': emit({'id':v['id'],'result':{'thread':{'status':{'type':'idle'},'turns':[]}}})
+  elif mode=='malformed': emit({'id':v['id'],'result':{'thread':{'status':{'type':'active'},'turns':[]}}})
+  else:
+   if mode=='notification-race':
+    active='newest'
+    notify('turn/started',{'turn':{'id':active}})
+   emit({'id':v['id'],'result':{'thread':{'status':{'type':'active'},'turns':[{'id':'fresh','status':'inProgress'}]}}})
+ elif method=='thread/name/set':
+  emit({'id':v['id'],'result':{}})
+  notify('test/named',{'name':v['params']['name']})
+ elif method=='turn/interrupt': emit({'id':v['id'],'result':{}})
+"#;
+        let spec = SpawnSpec {
+            cwd: dir.clone(), model: "m".into(), provider: "openai".into(), effort: String::new(),
+            approval: "never".into(), sandbox: "read-only".into(), developer_instructions: String::new(),
+            dynamic_tools: vec![], config: Default::default(), extra_args: vec![],
+            resume_thread: resume.then(|| "thr".into()), thread_name: resume.then(|| "resumed name".into()), backend: Backend::Codex,
+            envs: vec![("MODE".into(), mode.into())], claude: None, bija: None, antigravity: None, mcp: vec![],
+        };
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let (ctl, cmds) = mpsc::unbounded_channel();
+        let task = tokio::spawn(agent_task(93, spec, vec!["python3".into(), "-u".into(), "-c".into(), script.into()], ev, cmds, Duration::ZERO));
+        assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Ready { .. }));
+        (ctl, events, dir, task)
+    }
+
+    #[cfg(unix)]
+    async fn codex_protocol_event(events: &mut mpsc::UnboundedReceiver<HubEvent>) -> HubEvent {
+        tokio::time::timeout(Duration::from_secs(5), events.recv()).await.expect("mock server answers").expect("agent remains alive")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_steer_refreshes_the_turn_and_delivers_queued_text_once() {
+        for mode in ["active", "idle", "notification-race"] {
+            let (ctl, mut events, dir, task) = codex_protocol_fixture(mode, false).await;
+            ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+            assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/started"));
+            ctl.send(Cmd::Steer { text: "first follow-up".into() }).unwrap();
+            ctl.send(Cmd::Steer { text: "second follow-up".into() }).unwrap();
+            let mut delivered = vec![];
+            while delivered.len() < 2 {
+                match codex_protocol_event(&mut events).await {
+                    HubEvent::Notif { method, params, .. } if method == "test/delivered" => delivered.push(params["text"].as_str().unwrap().to_string()),
+                    HubEvent::CmdFailed { error, .. } | HubEvent::Crashed { reason: error, .. } => panic!("{mode}: {error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(delivered, ["first follow-up", "second follow-up"], "{mode}");
+            let trace: Vec<Value> = std::fs::read_to_string(dir.join("trace")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let count = |method| trace.iter().filter(|v| v["method"] == method).count();
+            assert_eq!(count("thread/read"), 1, "{mode}: {trace:?}");
+            assert_eq!(count("turn/start"), if mode == "idle" { 2 } else { 1 }, "{mode}: {trace:?}");
+            assert!(trace.iter().filter(|v| v["method"] == "thread/read").all(|v| v["params"]["includeTurns"] == true));
+            ctl.send(Cmd::Shutdown).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_steer_recovery_is_bounded_and_keeps_failed_text() {
+        for mode in ["bounded", "other-error", "refresh-fails", "malformed"] {
+            let (ctl, mut events, dir, task) = codex_protocol_fixture(mode, false).await;
+            ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+            assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/started"));
+            ctl.send(Cmd::Steer { text: "keep this prompt".into() }).unwrap();
+            loop {
+                match codex_protocol_event(&mut events).await {
+                    HubEvent::CmdFailed { what: "steer", text, .. } => { assert_eq!(text.as_deref(), Some("keep this prompt")); break; }
+                    HubEvent::Crashed { reason, .. } => panic!("{mode}: {reason}"),
+                    _ => {}
+                }
+            }
+            let trace: Vec<Value> = std::fs::read_to_string(dir.join("trace")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let count = |method| trace.iter().filter(|v| v["method"] == method).count();
+            assert_eq!(count("turn/steer"), if mode == "bounded" { 2 } else { 1 }, "{mode}: {trace:?}");
+            assert_eq!(count("thread/read"), if mode == "other-error" { 0 } else { 1 }, "{mode}: {trace:?}");
+            assert_eq!(count("turn/start"), 1, "{mode}: {trace:?}");
+            ctl.send(Cmd::Shutdown).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_names_resumed_rollouts_immediately_but_waits_after_failed_resume() {
+        for mode in ["resumed", "resume-fails"] {
+            let (ctl, mut events, dir, task) = codex_protocol_fixture(mode, true).await;
+            if mode == "resume-fails" {
+                ctl.send(Cmd::SetName("latest name".into())).unwrap();
+                ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+                assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/started"));
+            }
+            match codex_protocol_event(&mut events).await {
+                HubEvent::Notif { method, params, .. } => {
+                    assert_eq!(method, "test/named");
+                    assert_eq!(params["name"], if mode == "resumed" { "resumed name" } else { "latest name" });
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            let trace = std::fs::read_to_string(dir.join("trace")).unwrap();
+            assert_eq!(trace.matches("thread/name/set").count(), 1, "{trace}");
+            if mode == "resume-fails" { assert!(trace.find("turn/start").unwrap() < trace.find("thread/name/set").unwrap(), "{trace}"); }
+            ctl.send(Cmd::Shutdown).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_steer_refresh_waits_for_a_newer_pending_start() {
+        let (ctl, mut events, dir, task) = codex_protocol_fixture("pending-start-race", false).await;
+        ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+        assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/started"));
+        ctl.send(Cmd::Steer { text: "follow-up".into() }).unwrap();
+        assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/completed"));
+        // The mock holds the idle read snapshot until this new start reaches it, then
+        // returns the snapshot before announcing the new turn's id.
+        ctl.send(Cmd::Turn { text: "new turn".into() }).unwrap();
+        let mut delivered = vec![];
+        while delivered.len() < 2 {
+            match codex_protocol_event(&mut events).await {
+                HubEvent::Notif { method, params, .. } if method == "test/delivered" => delivered.push(params["text"].as_str().unwrap().to_string()),
+                HubEvent::CmdFailed { error, .. } | HubEvent::Crashed { reason: error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(delivered, ["new turn", "follow-up"]);
+        let trace: Vec<Value> = std::fs::read_to_string(dir.join("trace")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(trace.iter().filter(|v| v["method"] == "turn/start").count(), 2, "{trace:?}");
+        let steers: Vec<_> = trace.iter().filter(|v| v["method"] == "turn/steer").collect();
+        assert_eq!(steers.len(), 2, "{trace:?}");
+        assert_eq!(steers[1]["params"]["expectedTurnId"], "fresh");
+        ctl.send(Cmd::Shutdown).unwrap();
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_uncertain_input_delivery_cannot_trigger_app_replay() {
+        for mode in ["start-timeout", "start-closed", "steer-timeout", "steer-closed"] {
+            let (ctl, mut events, dir, task) = codex_protocol_fixture(mode, false).await;
+            ctl.send(Cmd::Turn { text: "initial".into() }).unwrap();
+            let steering = mode.starts_with("steer-");
+            if steering {
+                assert!(matches!(codex_protocol_event(&mut events).await, HubEvent::Notif { method, .. } if method == "turn/started"));
+                ctl.send(Cmd::Steer { text: "follow-up".into() }).unwrap();
+            }
+            match codex_protocol_event(&mut events).await {
+                HubEvent::CmdFailed { what, error, text, .. } => {
+                    // Neither app.rs's failed-turn retry nor its failed-steer queue sees
+                    // this uncertain delivery as a definite rejection.
+                    assert_eq!(what, if steering { "steer delivery" } else { "turn delivery" }, "{mode}");
+                    assert!(text.is_none(), "{mode}");
+                    assert!(error.contains("delivery is uncertain"), "{mode}: {error}");
+                }
+                other => panic!("{mode}: unexpected event: {other:?}"),
+            }
+            let trace = std::fs::read_to_string(dir.join("trace")).unwrap();
+            assert!(!trace.contains("thread/read"), "{mode}: {trace}");
+            ctl.send(Cmd::Shutdown).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// A stray stop while idle must not interrupt the next unrelated turn. A stop while the
@@ -1633,7 +2017,7 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr"}}}\n' "$id";;
     *'"method":"turn/start"'*)
       turns=$((turns + 1))
-      if [ "$turns" -eq 1 ]; then printf '{"id":%s,"error":{"code":-1,"message":"rejected"}}\n' "$id"
+      if [ "$turns" -eq 1 ]; then printf '{"id":%s,"error":{"code":-32600,"message":"rejected"}}\n' "$id"
       else printf '{"id":%s,"result":{}}\n' "$id"; printf '{"method":"turn/started","params":{"turn":{"id":"t2"}}}\n'; fi;;
     *'"method":"turn/interrupt"'*) printf '%s\n' "$line" >> "$INTERRUPTS_LOG"; printf '{"id":%s,"result":{}}\n' "$id";;
   esac

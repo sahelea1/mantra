@@ -131,16 +131,21 @@ pub enum Signal {
     EnvironmentBroken(String),
 }
 
-/// True when `text` names a sandbox that failed to start at all — bubblewrap, user namespaces,
-/// AppArmor's restriction knob, or "sandbox" paired with a failure word — as opposed to a role's
-/// own read-only limit refusing a write ("failed to write file"), which is not a broken
-/// environment but the role's own scope. Shared by the `EnvironmentBroken` signal below and by
-/// `ask_up`'s pre-routing check, so both halt on the same, single definition of "broken".
+/// Recognize diagnostics that the sandbox itself could not start. Mere mentions of bubblewrap,
+/// namespace support, or sysctl settings are ordinary output. Also used for `ask_up`, where an
+/// agent can quote a launch failure without a command item/exit code.
 pub fn looks_like_broken_sandbox(text: &str) -> bool {
-    let hay = text.to_lowercase();
-    // Only the sandbox's own failure markers count: an agent that merely says "I cannot do X in
-    // this sandbox" is asking a question, not reporting a machine that cannot run commands.
-    hay.contains("bwrap") || hay.contains("user namespace") || hay.contains("unprivileged_userns") || hay.contains("apparmor_restrict")
+    text.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        let diagnostic = line.strip_prefix("bwrap:").or_else(|| line.strip_prefix("bubblewrap:"));
+        if let Some(detail) = diagnostic {
+            return ["operation not permitted", "permission denied", "failed", "no permissions to create new namespace"]
+                .iter().any(|marker| detail.contains(marker));
+        }
+        (line.contains("user namespace") || line.contains("userns"))
+            && ["failed to create", "cannot create", "unable to create", "creation failed", "no permissions to create", "are not enabled", "are disabled"]
+                .iter().any(|marker| line.contains(marker))
+    })
 }
 
 pub struct Agent {
@@ -770,6 +775,7 @@ impl Agent {
                 // Codex sends 0 for commands it didn't time.)
                 let dur = dur.filter(|d| *d > 0).or_else(|| if done { it.started.map(|t| t.elapsed().as_millis() as u64) } else { None });
                 let mut out_for_probe = String::new();
+                let mut failed = false;
                 if let Kind::Command { cmd: c, output, exit: e, status: st, dur_ms } = &mut it.kind {
                     if !cmd.is_empty() {
                         *c = cmd;
@@ -784,6 +790,7 @@ impl Agent {
                     *st = status;
                     *dur_ms = dur.or(*dur_ms);
                     out_for_probe = output.clone();
+                    failed = e.map_or(st == "failed", |code| code != 0);
                 }
                 it.done = done;
                 it.touch();
@@ -792,7 +799,7 @@ impl Agent {
                 } else {
                     // WP12.4/L1: a broken sandbox means every agent's shell commands are dead on
                     // this host — surface it once as a run-level signal.
-                    if looks_like_broken_sandbox(&out_for_probe) {
+                    if failed && looks_like_broken_sandbox(&out_for_probe) {
                         signal = Some(Signal::EnvironmentBroken(crate::util::trunc(&out_for_probe, 300)));
                     }
                 }
@@ -1614,14 +1621,36 @@ mod tests {
     #[test]
     fn broken_sandbox_detection_is_specific() {
         assert!(super::looks_like_broken_sandbox("bwrap: loopback: Failed RTM_NEWADDR"));
-        assert!(super::looks_like_broken_sandbox("Codex's Linux sandbox uses bubblewrap and needs access to create USER NAMESPACES."));
-        assert!(super::looks_like_broken_sandbox("kernel.unprivileged_userns_clone = 0"));
-        assert!(super::looks_like_broken_sandbox("kernel.apparmor_restrict_unprivileged_userns = 1"));
+        assert!(super::looks_like_broken_sandbox("bwrap: Creating new namespace failed: Operation not permitted"));
+        assert!(super::looks_like_broken_sandbox("Failed to create user namespace: permission denied"));
+        assert!(!super::looks_like_broken_sandbox("Codex's Linux sandbox uses bubblewrap and needs access to create USER NAMESPACES."));
+        assert!(!super::looks_like_broken_sandbox("kernel.unprivileged_userns_clone = 0"));
+        assert!(!super::looks_like_broken_sandbox("kernel.apparmor_restrict_unprivileged_userns = 1"));
+        assert!(!super::looks_like_broken_sandbox("user namespaces are supported; bwrap version 0.11"));
         // an agent saying it cannot do something in its sandbox is asking, not reporting a dead machine
         assert!(!super::looks_like_broken_sandbox("I cannot resolve finding #1 myself: the sandbox denied writing .git/index"));
         // a read-only role refusing a write is its own scope, not a broken environment
         assert!(!super::looks_like_broken_sandbox("Failed to write file: README.md"));
         assert!(!super::looks_like_broken_sandbox("tests failed: 2 assertions"));
+    }
+
+    #[test]
+    fn only_failed_commands_with_sandbox_launch_diagnostics_break_the_environment() {
+        let mut a = Agent::new(1, "t", "solo", PathBuf::from("/p"));
+        for (i, exit, status, output, broken) in [
+            (1, Some(0), "completed", "bwrap: Creating new namespace failed: Operation not permitted", false),
+            (2, Some(1), "completed", "bwrap version 0.11; user namespaces supported", false),
+            (3, Some(1), "completed", "bwrap: loopback: Failed RTM_NEWADDR", true),
+            (4, None, "failed", "bwrap: Creating new namespace failed: Operation not permitted", true),
+            (5, None, "completed", "bwrap: loopback: Failed RTM_NEWADDR", false),
+            (6, Some(0), "failed", "bwrap: loopback: Failed RTM_NEWADDR", false),
+        ] {
+            let signal = a.apply("item/completed", &json!({"item": {
+                "type": "commandExecution", "id": format!("c{i}"), "command": "probe",
+                "status": status, "exitCode": exit, "aggregatedOutput": output,
+            }}));
+            assert_eq!(signal.iter().any(|s| matches!(s, Signal::EnvironmentBroken(_))), broken, "case {i}");
+        }
     }
 
     /// A tool item whose result carried an image keeps that it did and where the image is, from

@@ -2,6 +2,18 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.10.2 — 2026-10-28
+
+- **Sandbox and Codex recovery.** Successful command output mentioning sandbox tools no longer
+  halts a run. Failed commands require a real sandbox startup diagnostic. Codex session names
+  wait for the first turn, and rejected steers refresh the active turn before a bounded retry.
+- **Configuration maintenance.** Warn about recognizable model IDs paired with another
+  vendor's official API endpoint. Clean confirmed abandoned MCP sockets when the bridge starts,
+  preserve live endpoints, and refresh an unchanged Antigravity bridge after moving Mantra.
+- **Code organization.** Move the run engine's parsing helpers and existing regression suite
+  into submodules, keeping its behavior and test coverage.
+- Preserve the Antigravity integration and brand palette published in v0.10.1.
+
 ## v0.10.1 — 2026-10-28
 
 - **Antigravity subscriptions.** Publish the Antigravity integration from the local `v0.10.0b`

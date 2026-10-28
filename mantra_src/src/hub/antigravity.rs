@@ -654,6 +654,7 @@ fn register_bridge(home: &std::path::Path, executable: &std::path::Path) -> Resu
     let mut config_changed = false;
     match servers.get("mantra") {
         Some(existing) if existing == &entry => {}
+        Some(existing) if managed_bridge_entry(existing) => { servers.insert("mantra".into(), entry); config_changed = true; }
         Some(_) => return Err("MCP server 'mantra' already exists with a different configuration; rename or remove that entry before enabling Mantra tools".into()),
         None => { servers.insert("mantra".into(), entry); config_changed = true; }
     }
@@ -682,6 +683,18 @@ fn register_bridge(home: &std::path::Path, executable: &std::path::Path) -> Resu
     }
     Ok(config_changed || settings_changed)
 }
+// Older installs wrote only these two fields. Treat that exact signature and a Mantra
+// executable basename as ours; extra env, args, or options are the user's configuration.
+fn managed_bridge_entry(entry: &Value) -> bool {
+    let Some(object) = entry.as_object() else { return false; };
+    let Some(command) = object.get("command").and_then(Value::as_str) else { return false; };
+    let path = std::path::Path::new(command);
+    object.len() == 2
+        && path.is_absolute()
+        && path.file_name().is_some_and(|name| name == "mantra")
+        && object.get("args") == Some(&json!(["mcp-bridge", "--from-env"]))
+}
+
 fn ensure_directory(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::symlink_metadata(path) {
@@ -985,6 +998,32 @@ for line in sys.stdin:
             0o600
         );
     }
+    #[test]
+    fn registration_relocates_only_the_exact_managed_bridge() {
+        let fixture = Fixture::new();
+        register_bridge(&fixture.0, Path::new("/old/bin/mantra")).unwrap();
+        let path = fixture.0.join(".gemini/config/mcp_config.json");
+        let settings = fixture.0.join(".gemini/antigravity-cli/settings.json");
+        let original_settings = std::fs::read(&settings).unwrap();
+        assert!(register_bridge(&fixture.0, Path::new("/new/bin/mantra")).unwrap());
+        assert_eq!(read_json_object(&path).unwrap()["mcpServers"]["mantra"]["command"], "/new/bin/mantra");
+        assert_eq!(std::fs::read(&settings).unwrap(), original_settings);
+        assert!(!register_bridge(&fixture.0, Path::new("/new/bin/mantra")).unwrap());
+
+        for entry in [
+            json!({"command":"/old/bin/mantra","args":["mcp-bridge","--from-env"],"env":{"CUSTOM":"yes"}}),
+            json!({"command":"/old/bin/mantra","args":["mcp-bridge","--from-env","extra"]}),
+            json!({"command":"/old/bin/other","args":["mcp-bridge","--from-env"]}),
+            json!({"command":"mantra","args":["mcp-bridge","--from-env"]}),
+        ] {
+            let contents = json!({"mcpServers":{"mantra":entry}}).to_string();
+            std::fs::write(&path, &contents).unwrap();
+            assert!(register_bridge(&fixture.0, Path::new("/new/bin/mantra")).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(std::fs::read(&settings).unwrap(), original_settings);
+        }
+    }
+
     #[test]
     fn registration_refuses_collision_malformed_and_symlink_without_overwriting() {
         use std::os::unix::fs::symlink;
