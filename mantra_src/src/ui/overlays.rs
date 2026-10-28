@@ -24,7 +24,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn clear(f: &mut Frame, area: Rect, r: Rect) {
     let x0 = r.x.saturating_sub(3).max(area.x);
     let x1 = (r.x + r.width + 3).min(area.x + area.width);
-    f.render_widget(Clear, Rect { x: x0, width: x1.saturating_sub(x0), ..r });
+    let gutter = Rect { x: x0, width: x1.saturating_sub(x0), ..r };
+    f.render_widget(Clear, gutter);
+    f.render_widget(Block::default().style(theme::surface()), gutter);
 }
 
 /// Draws overlay `i`; a scrolling one returns its largest useful scroll offset.
@@ -97,7 +99,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
     .concat();
     let r = centered(area, w, l.len() as u16 + 3);
     clear(f, area, r);
-    let blk = block("keys", theme::SAFFRON);
+    let blk = block("keys", theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     // the list outgrows a 36-row terminal: it scrolls, the footer stays put
@@ -194,7 +196,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
     l.push(Line::default());
     let keys = if narrow { "  ↑↓ model · ←→ effort · ⏎ switch · +/- c ctx · e edit models · esc" } else { "  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc" };
     l.push(Line::from(Span::styled(keys, theme::faint())));
-    let blk = block("model & effort", theme::SAFFRON);
+    let blk = block("model & effort", theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(Paragraph::new(l).block(blk), r);
     if let Some(y) = band {
@@ -213,7 +215,7 @@ fn new_run(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[PatternChoi
     let r = centered(area, w, h);
     clear(f, area, r);
     let title = if goal.is_some() { "new run" } else { "pattern for new runs" };
-    let blk = block(title, theme::VIOLET);
+    let blk = block(title, theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let nw = list.iter().map(|p| w_of(&p.name)).max().unwrap_or(0).max(14) + 2;
@@ -281,7 +283,7 @@ fn select(f: &mut Frame, area: Rect, s: &Select) {
     let w = ((2 + tick + lw + dw + 4) as u16).clamp(44, 100);
     let r = centered(area, w, s.items.len() as u16 + 4);
     clear(f, area, r);
-    let blk = block(&s.title, theme::VIOLET);
+    let blk = block(&s.title, theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let room = (inner.width as usize).saturating_sub(2 + tick + lw);
@@ -323,7 +325,7 @@ fn diff(f: &mut Frame, area: Rect, app: &App, agent: crate::hub::AgentId, file: 
         .iter()
         .enumerate()
         .map(|(i, (p, s))| {
-            let st = if i == file { Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD) } else { theme::text() };
+            let st = if i == file { theme::bold(theme::accent()) } else { theme::text() };
             Line::from(vec![Span::styled(format!(" {:<w$}", trunc(p, (list_w as usize).saturating_sub(12)), w = (list_w as usize).saturating_sub(11)), st), Span::styled(format!("+{}", s.adds), theme::fg(theme::GREEN)), Span::styled(format!(" -{}", s.dels), theme::fg(theme::RED))])
         })
         .collect();
@@ -409,7 +411,7 @@ fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> usize {
     clear(f, area, r);
     let review = app.run.as_ref().map(|x| x.stage == Stage::Review).unwrap_or(false);
     let title = if review { "plan review" } else { "plan" };
-    let blk = block(title, theme::SAFFRON);
+    let blk = block(title, theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let body = match app.run.as_ref().and_then(|x| x.plan.as_ref()) {
@@ -476,7 +478,7 @@ fn halt(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> Option<usize> {
 fn akasha(f: &mut Frame, area: Rect, app: &App, group: Option<&str>, scroll: usize) -> usize {
     let r = Rect { x: area.x + 3, y: area.y + 1, width: area.width.saturating_sub(6), height: area.height.saturating_sub(2) };
     clear(f, area, r);
-    let blk = block(&group.map(|g| format!("akasha · {g}")).unwrap_or_else(|| "akasha".into()), theme::VIOLET);
+    let blk = block(&group.map(|g| format!("akasha · {g}")).unwrap_or_else(|| "akasha".into()), theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let width = inner.width.saturating_sub(2) as usize;
@@ -572,7 +574,7 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     clear(f, area, r);
     let title = st.origin.as_ref().map(|h| format!("models of {h}")).unwrap_or_else(|| "discover models".into());
-    let blk = block(&title, theme::SAFFRON);
+    let blk = block(&title, theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
     let w = inner.width as usize;
@@ -699,7 +701,7 @@ fn runs(f: &mut Frame, area: Rect, app: &App, sel: usize, list: &[crate::engine:
         }
         l.push(Line::from(Span::styled(hint, theme::faint())));
     }
-    let blk = block("runs", theme::VIOLET);
+    let blk = block("runs", theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(Paragraph::new(l).block(blk), r);
     if !list.is_empty() {

@@ -630,7 +630,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let new_role = app.edit.as_ref().filter(|e| e.target == EditTarget::NewRole);
     let mut cursor = None;
     // list: the selected entry is the band while the list has the focus, bold and accent always
-    let lblk = block(if app.studio.focus == 0 { "roles · FOCUSED" } else { "roles" }, if flash > 0.0 { theme::SAFFRON } else if app.studio.focus == 0 { theme::VIOLET } else { theme::FAINT });
+    let lblk = block(if app.studio.focus == 0 { "roles · FOCUSED" } else { "roles" }, if flash > 0.0 { theme::ACCENT } else if app.studio.focus == 0 { theme::SIGNAL_RED } else { theme::FAINT });
     let linner = lblk.inner(cols[0]);
     f.render_widget(lblk, cols[0]);
     let mut l = vec![];
@@ -674,7 +674,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     let entry = es[sel].clone();
     let fs = fields(app, &entry);
     let fsel = app.studio.field.min(fs.len().saturating_sub(1));
-    let fcol = if app.studio.focus == 1 { theme::VIOLET } else { theme::FAINT };
+    let fcol = if app.studio.focus == 1 { theme::SIGNAL_RED } else { theme::FAINT };
     let field_title = if app.studio.focus == 1 { format!("{entry} · FOCUSED") } else { entry.clone() };
     let fblk = block(&field_title, fcol);
     let finner = fblk.inner(cols[1]);
@@ -855,7 +855,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     }
 
     // architect
-    let acol = if app.studio.focus == 2 { theme::SAFFRON } else { theme::FAINT };
+    let acol = if app.studio.focus == 2 { theme::SIGNAL_RED } else { theme::FAINT };
     let blk = block(&format!("{} architect{} — describe a change, it edits the pattern live", theme::g("★", "*"), if app.studio.focus == 2 { " · FOCUSED" } else { "" }), acol);
     let inner = blk.inner(rows[2]);
     f.render_widget(blk, rows[2]);

@@ -473,7 +473,7 @@ pub fn draw_settings(f: &mut Frame, app: &mut App) {
         let c = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(6), Constraint::Length(5)]).split(rows_v[1]);
         (c[0], c[1])
     };
-    let blk = block("settings", theme::VIOLET);
+    let blk = block("settings", theme::SIGNAL_RED);
     let inner = blk.inner(form_area);
     f.render_widget(blk, form_area);
     let lw = all.iter().map(|(_, r)| w_of(&label(r))).max().unwrap_or(0).clamp(14, 22) + 2;
@@ -486,7 +486,7 @@ pub fn draw_settings(f: &mut Frame, app: &mut App) {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            lines.push(Line::from(Span::styled(format!(" {sec}"), theme::bold(theme::fg(theme::VIOLET)))));
+            lines.push(Line::from(Span::styled(format!(" {sec}"), theme::bold(theme::accent()))));
             section = sec;
         }
         let is = i == si;
@@ -660,7 +660,7 @@ pub fn draw_qr(f: &mut Frame, area: Rect, app: &App) {
     let h = (l.len() as u16 + 2).min(area.height);
     let r = Rect { x: area.x, y: area.y + (area.height - h) / 2, width: area.width, height: h };
     f.render_widget(Clear, r);
-    f.render_widget(Paragraph::new(l).block(block("remote link", theme::VIOLET)), r);
+    f.render_widget(Paragraph::new(l).block(block("remote link", theme::SIGNAL_RED)), r);
 }
 
 #[cfg(test)]

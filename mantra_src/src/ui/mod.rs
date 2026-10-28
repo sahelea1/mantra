@@ -25,6 +25,7 @@ use std::time::Duration;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    f.render_widget(Block::default().style(theme::surface()), area);
     if area.width < 40 || area.height < 12 {
         f.render_widget(Paragraph::new(format!("Mantra needs at least 40×12 (now {}×{})", area.width, area.height)), area);
         return;
@@ -123,11 +124,12 @@ pub fn border_type() -> BorderType {
 }
 
 pub fn block(title: &str, color: (u8, u8, u8)) -> Block<'static> {
-    let b = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(color));
+    let b = Block::default().style(theme::surface()).borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(color));
     if title.is_empty() {
         b
     } else {
-        b.title(Span::styled(format!(" {title} "), theme::bold(theme::fg(color))))
+        let title_color = if color == theme::SIGNAL_RED { theme::ACCENT } else { color };
+        b.title(Span::styled(format!(" {title} "), theme::bold(theme::fg(title_color))))
     }
 }
 
@@ -328,8 +330,8 @@ pub fn input_height(app: &App, width: u16) -> u16 {
 }
 
 pub fn draw_input(f: &mut Frame, area: Rect, app: &App, placeholder: &str, color: (u8, u8, u8), focused: bool) {
-    let border = if focused { color } else { theme::FAINT };
-    let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border))
+    let border = if focused { theme::SIGNAL_RED } else { theme::FAINT };
+    let blk = Block::default().style(theme::surface()).borders(Borders::ALL).border_type(border_type()).border_style(theme::fg(border))
         .title(if focused { " input · FOCUSED " } else { " input · tab to focus " });
     let inner = blk.inner(area);
     f.render_widget(blk, area);
@@ -395,7 +397,7 @@ pub fn draw_screen_flash(f: &mut Frame, area: Rect, app: &App, color: (u8, u8, u
     if k <= 0.0 {
         return;
     }
-    let bg = theme::mix(theme::FAINT, color, k);
+    let bg = theme::mix(theme::GRAPHITE, color, k * 0.2);
     let buf = f.buffer_mut();
     for x in area.x..area.x + area.width {
         if let Some(cell) = buf.cell_mut((x, area.y)) {
@@ -504,7 +506,7 @@ fn draw_toast(f: &mut Frame, app: &App) {
     let c = theme::mix(col, theme::FAINT, fade);
     let r = Rect { x: area.x + area.width.saturating_sub(w + 1), y: area.y + 1, width: w.min(area.width), height: 3 };
     f.render_widget(Clear, r);
-    let blk = Block::default().borders(Borders::ALL).border_type(border_type()).border_style(Style::default().fg(c));
+    let blk = Block::default().style(theme::surface()).borders(Borders::ALL).border_type(border_type()).border_style(Style::default().fg(c));
     f.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(c).add_modifier(Modifier::BOLD))).block(blk), r);
 }
 

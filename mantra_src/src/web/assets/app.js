@@ -125,7 +125,7 @@
         // The status-bar colour follows a manual theme; with "system" each meta keeps its media query.
         for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
             const forDark = (m.getAttribute('media') || '').includes('dark');
-            m.content = t === 'dark' ? '#0F1116' : t === 'light' ? '#F7F8FA' : forDark ? '#0F1116' : '#F7F8FA';
+            m.content = t === 'dark' ? '#2D2E29' : t === 'light' ? '#EFEFEB' : forDark ? '#2D2E29' : '#EFEFEB';
         }
         changed();
     }

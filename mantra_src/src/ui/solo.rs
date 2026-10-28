@@ -224,7 +224,7 @@ mod status_tests {
 /// for and says when that run is halted or paused: the band that explains it is on the overview.
 fn zoomed_header(f: &mut Frame, area: Rect, app: &App, a: &Agent) {
     let base = theme::named(&a.color);
-    let band = Style::default().bg(theme::mix(theme::FAINT, base, 0.25));
+    let band = Style::default().bg(theme::mix(theme::GRAPHITE, base, 0.25));
     let text_st = band.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
     let dim_st = band.fg(theme::c(theme::MUTED));
     let mut left = format!(" {} {}", theme::role_glyph(&a.glyph), a.name);
@@ -287,7 +287,7 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
     let m = app.registry.resolve(&app.settings.default_model);
     let eff = m.default_effort.clone();
     let b = anim::breath(2600);
-    let star = Style::default().fg(theme::mix(theme::SAFFRON, theme::TEXT, b * 0.35)).add_modifier(Modifier::BOLD);
+    let star = Style::default().fg(theme::mix(theme::ACCENT, theme::TEXT, b * 0.35)).add_modifier(Modifier::BOLD);
     let key = |k: &str, d: &str| -> Line<'static> { Line::from(vec![Span::styled(format!("    {k:<18}"), theme::muted()), Span::styled(d.to_string(), theme::dim())]) };
     let mut lines = vec![
         Line::from(vec![Span::styled(format!("  {}  ", theme::g("✦", "*")), star), Span::styled("M A N T R A", theme::bold(theme::accent()))]),

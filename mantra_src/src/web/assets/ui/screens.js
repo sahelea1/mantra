@@ -433,7 +433,7 @@
         const ctx = canvas.getContext('2d');
         ctx.scale(dpr, dpr);
         ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, size, size);
-        ctx.fillStyle = '#0F1116';
+        ctx.fillStyle = '#2D2E29';
         for (let y = 0; y < n; y++) for (let x = 0; x < rows[y].length; x++) if (rows[y][x] === '1') ctx.fillRect((x + quiet) * px, (y + quiet) * px, px, px);
     }
 

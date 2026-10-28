@@ -2,6 +2,24 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.10.1 — 2026-10-28
+
+- **Antigravity subscriptions.** Publish the Antigravity integration from the local `v0.10.0b`
+  development revision. Google account model aliases work in Solo, writable pattern and Auto
+  roles, and Akasha. Each agent has an independent process and explicit conversation ID;
+  queued prompts, resume, model changes, backend switching and native Mantra tool routing
+  retain agent isolation during parallel work.
+- **Brand colors.** Apply Mantra Red, Graphite, Canvas and Signal Red to terminal and web
+  surfaces, selections, primary actions and focus indicators. Preserve the existing layout,
+  role/status distinctions and terminal color fallbacks; add no logo.
+- **Current release.** Bump both Mantra and Bija to 0.10.1 and publish the paired binaries and
+  checksums for Linux and macOS. `mantra update` installs this release through GitHub's latest
+  release endpoint; settings and sessions remain in place.
+- **Antigravity limits.** Google account authentication is still owned by `agy`; live Google
+  subscription inference has not been verified here. Native headless permissions, sandboxing
+  and context compaction remain subject to the CLI's documented limits. Unsupported read-only
+  roles and per-agent external MCP configuration are refused with an explanation.
+
 ## v0.10.0b — 2026-10-28 (local tag; not published)
 
 - Add the official Antigravity CLI as a Google subscription backend, with model aliases selectable across Solo, patterns, Auto and Akasha.

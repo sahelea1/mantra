@@ -4,7 +4,7 @@ use super::{anim, md, theme};
 use crate::agent::{Agent, Item, Kind, Level};
 use crate::util::{trunc, width as w_of};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -291,7 +291,7 @@ pub fn draw(f: &mut Frame, area: Rect, agent: &mut Agent, verbose: bool, footer:
         let tag = format!(" {} {} lines below ", theme::g("↓", "v"), agent.scroll);
         let tw = w_of(&tag) as u16;
         if area.width > tw + 2 {
-            f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::REVERSED))), Rect { x: area.x + area.width.saturating_sub(tw + 1), y: area.y + area.height.saturating_sub(1), width: tw, height: 1 });
+            f.render_widget(Paragraph::new(Span::styled(tag, theme::action())), Rect { x: area.x + area.width.saturating_sub(tw + 1), y: area.y + area.height.saturating_sub(1), width: tw, height: 1 });
         }
     }
 }

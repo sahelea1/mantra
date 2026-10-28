@@ -199,7 +199,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     crumbs.push(Span::styled(format!("  {} overview", theme::g("›", ">")), theme::faint()));
     let mut right = web_badges(app);
     if area.width >= 100 {
-        right.push(Span::styled(if app.canvas_focus { "  focus:agents " } else { "  focus:input " }, theme::bold(theme::fg(theme::VIOLET))));
+        right.push(Span::styled(if app.canvas_focus { "  focus:agents " } else { "  focus:input " }, theme::bold(theme::accent())));
     }
     if let Some(b) = app.inbox_badge() {
         right.push(Span::styled(b, theme::bold(theme::fg(theme::AMBER))));
@@ -295,7 +295,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         // The planner is asking the user something: the run keeps going, the band stays until
         // the next typed message answers it.
         let text = format!(" {} the planner asks ({}): {} · type your answer below", theme::g("?", "?"), fmt_dur(q.since.elapsed()), q.text);
-        let st = Style::default().fg(theme::c(theme::SAFFRON)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let st = theme::bold(theme::action());
         let line = Line::from(Span::styled(format!("{:<w$}", trunc(&text, area.width as usize), w = area.width as usize), st));
         f.render_widget(Paragraph::new(vec![line]), area);
         return;
@@ -506,7 +506,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
         dotted = true;
     }
     if selected {
-        st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
+        st = st.fg(theme::c(theme::SIGNAL_RED)).add_modifier(Modifier::BOLD);
     }
     cv.boxed(r, st, selected, dotted && !selected);
     let (x, y, iw) = (r.x as i32 + 2, r.y as i32, r.width as i32 - 4);
@@ -680,7 +680,7 @@ fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, gl
         dotted = true;
     }
     if selected {
-        st = st.fg(theme::c(theme::TEXT)).add_modifier(Modifier::BOLD);
+        st = st.fg(theme::c(theme::SIGNAL_RED)).add_modifier(Modifier::BOLD);
     }
     cv.boxed(r, st, selected, dotted && !selected);
     let (x, y, iw) = (r.x as i32 + 2, r.y as i32, r.width as i32 - 4);

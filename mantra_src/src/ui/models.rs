@@ -934,7 +934,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     let mk_head = |cols: &[&str], ws: &[usize], show: &[usize]| Line::from(show.iter().map(|&i| Span::styled(format!(" {:<w$}", cols[i], w = ws[i]), theme::bold(theme::muted()))).collect::<Vec<_>>());
 
     // ── models ──
-    let mblk = block("models", if ui.providers { theme::FAINT } else { theme::SAFFRON });
+    let mblk = block("models", if ui.providers { theme::FAINT } else { theme::SIGNAL_RED });
     let minner = mblk.inner(rows[1]);
     f.render_widget(mblk, rows[1]);
     let hints = [
@@ -1005,7 +1005,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
     }
 
     // ── providers ──
-    let pblk = block("providers", if ui.providers { theme::SAFFRON } else { theme::FAINT });
+    let pblk = block("providers", if ui.providers { theme::SIGNAL_RED } else { theme::FAINT });
     let pinner = pblk.inner(rows[2]);
     f.render_widget(pblk, rows[2]);
     let pw = PROV_WIDTHS;
