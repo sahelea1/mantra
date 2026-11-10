@@ -3,7 +3,6 @@
 import hashlib
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,10 +57,11 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(list(self.install.glob(".mantra-install.*")), [])
 
     def test_running_executable_can_be_replaced_atomically(self):
-        shutil.copyfile(shutil.which("sleep"), self.install / "mantra")
-        (self.install / "mantra").chmod(0o755)
-        # Some systems ship sleep as a multicall binary that selects its command from argv[0].
-        child = subprocess.Popen(["sleep", "30"], executable=self.install / "mantra")
+        source = self.root / "wait.c"
+        source.write_text("#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n")
+        installed = self.install / "mantra"
+        subprocess.run(["cc", str(source), "-o", str(installed)], check=True)
+        child = subprocess.Popen([str(installed)])
         try:
             result = self.run_installer(update=True)
             self.assertEqual(result.returncode, 0, result.stderr)
