@@ -2983,7 +2983,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         // Global keys
-        if k.code == KeyCode::F(3) && self.overlays.is_empty() && !self.screen.is_config() {
+        if k.code == KeyCode::F(3) && !self.screen.is_config() && matches!(self.overlays.last(), None | Some(Overlay::Plan { .. })) {
             self.toggle_workflow_changes();
             return;
         }

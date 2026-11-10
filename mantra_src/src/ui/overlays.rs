@@ -423,7 +423,11 @@ fn plan(f: &mut Frame, area: Rect, app: &App, scroll: usize) -> usize {
     let max = lines.len().saturating_sub(h);
     let view: Vec<Line> = lines.into_iter().skip(scroll.min(max)).take(h).collect();
     f.render_widget(Paragraph::new(view), Rect { x: inner.x + 1, width: inner.width.saturating_sub(1), height: h as u16, ..inner });
-    let hint = if review { " a approve & build · f give feedback · ↑↓ scroll · esc " } else { " ↑↓ scroll · esc " };
+    let workflow = app.run.as_ref().filter(|r| r.is_active() && !r.pattern.is_auto()).map(|r| {
+        if r.pattern.settings.allow_pattern_changes { " F3 workflow: allowed ·" } else { " F3 workflow: locked ·" }
+    }).unwrap_or("");
+    let controls = if review { " a approve & build · f give feedback · ↑↓ scroll · esc " } else { " ↑↓ scroll · esc " };
+    let hint = format!("{workflow}{controls}");
     f.render_widget(Paragraph::new(Span::styled(hint, theme::bold(theme::accent()))), Rect { x: inner.x + 1, y: inner.y + inner.height.saturating_sub(1), width: inner.width.saturating_sub(1), height: 1 });
     max
 }
