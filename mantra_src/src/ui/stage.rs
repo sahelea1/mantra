@@ -181,7 +181,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     draw_input(f, rows[5], app, &placeholder, theme::VIOLET, !app.canvas_focus);
     draw_suggestions(f, rows[5], app);
-    let hints: Vec<(&str, &str)> = if app.canvas_focus {
+    let mut hints: Vec<(&str, &str)> = if app.canvas_focus {
         vec![("←→ 1-9", "select"), ("⏎", "zoom"), ("space", "pause/resume"), ("r", "retry"), ("m", "model"), ("x", "interrupt"), ("p", "plan"), ("tab", "type")]
     } else {
         let mode: &'static str = match app.settings.approval_mode.as_str() {
@@ -191,6 +191,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         };
         vec![("⏎", "queue"), ("ctrl+f", "send now"), ("⇧⇥", mode), ("tab", "navigate"), ("ctrl+t", "pulse"), ("ctrl+o", "solo"), ("?", "help")]
     };
+    if let Some(run) = app.run.as_ref().filter(|r| r.is_active() && !r.pattern.is_auto()) {
+        hints.insert(0, ("F3", if run.pattern.settings.allow_pattern_changes { "workflow: allowed" } else { "workflow: locked" }));
+    }
     footer(f, rows[6], &hints);
 }
 
@@ -365,6 +368,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from(spans)];
     if let Stage::Phase { step, .. } = &r.stage {
         let s = match step {
+            PhaseStep::Orchestrating if r.pattern.settings.planner_loop => "planner-led execution · Akasha".into(),
             PhaseStep::Orchestrating => {
                 let done = r.workers.iter().filter(|w| w.state == WState::Done).count();
                 let total = r.current_phase().map(|p| p.tasks.len()).unwrap_or(0);
@@ -376,6 +380,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
             // named like the worker on the canvas (`fix-<round>`) and the web's "fix r<round>"
             PhaseStep::Fix { round: 0 } => "merge fix · fix-0 merges the conflicting branches".into(),
             PhaseStep::Fix { round } => format!("QA gate · fix r{round} · fix-{round} repairs what QA round {round} found"),
+            PhaseStep::Handoff if r.pattern.settings.planner_loop => "saving the verified result".into(),
             PhaseStep::Handoff => "handoff → next phase".into(),
         };
         lines.push(Line::from(Span::styled(format!("   {s}"), theme::faint())));
@@ -398,12 +403,37 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &mut App) {
             let t = format!("{} preparing workspace…", anim::spinner());
             cv.put(area.x as i32 + (area.width as i32 - w_of(&t) as i32) / 2, y, &t, theme::muted());
         }
+        Stage::Planning | Stage::Phase { .. } if run.pattern.settings.planner_loop => akasha_phase(&mut cv, area, app, run, &nodes),
         Stage::Planning | Stage::Review => planning(&mut cv, area, app, run, &nodes),
         Stage::Phase { .. } => phase(&mut cv, area, app, run, &nodes),
         Stage::Finale { idx } => finale(&mut cv, area, app, run, *idx, &nodes),
         Stage::Done | Stage::Failed(_) => done(&mut cv, area, app, run),
     }
     app.stage_nav = cv.nodes;
+}
+
+fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
+    let Some(planner) = run.planner.and_then(|p| app.agents.get(&p)) else { return };
+    if area.height < 3 || area.width < 6 { return; }
+    let selected = nodes.get(app.sel).copied();
+    let width = area.width.saturating_sub(2).min(68);
+    let x = area.x + (area.width - width) / 2;
+    let top = Rect::new(x, area.y, width, area.height.min(4));
+    agent_card(cv, top, run, Some(planner), "planner", &planner.glyph, theme::named(&planner.color), vec![], selected == Some(planner.id));
+    if area.height < 6 { return; }
+    let children: Vec<_> = nodes.iter().filter(|id| **id != planner.id).filter_map(|id| app.agents.get(id)).collect();
+    if children.is_empty() {
+        cv.put(x as i32 + 1, area.y as i32 + 5, "Advisor and swarm agents appear here when called.", theme::muted());
+        return;
+    }
+    let columns = (area.width / 32).clamp(1, 3);
+    let column_width = area.width / columns;
+    for (i, agent) in children.iter().enumerate() {
+        let y = area.y + 5 + (i as u16 / columns) * 4;
+        if y + 3 > area.bottom() { break; }
+        let rect = Rect::new(area.x + (i as u16 % columns) * column_width, y, column_width.saturating_sub(1), (area.bottom() - y).min(4));
+        agent_card(cv, rect, run, Some(agent), &agent.name, &agent.glyph, theme::named(&agent.color), vec![], selected == Some(agent.id));
+    }
 }
 
 fn welcome(f: &mut Frame, area: Rect, app: &App) {
@@ -1111,6 +1141,10 @@ fn done(cv: &mut Cv, area: Rect, app: &App, run: &Run) {
             }
             y += 2;
         }
+    }
+    if run.pattern.settings.planner_loop && run.stage == Stage::Done && !run.handoff.is_empty() {
+        cv.put(x, y, &trunc(run.handoff.lines().next().unwrap_or_default(), (area.width as usize).saturating_sub(6)), theme::text());
+        y += 2;
     }
     for (i, p) in run.history.iter().enumerate() {
         let glyphs: String = p.workers.iter().map(|w| theme::role_glyph(&w.2)).collect::<Vec<_>>().join(" ");

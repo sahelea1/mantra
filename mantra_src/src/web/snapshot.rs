@@ -479,6 +479,12 @@ pub struct RunView {
     pub want_review: bool,
     #[serde(default)]
     pub pattern_review: bool,
+    #[serde(default)]
+    pub workflow_changes: Option<bool>,
+    #[serde(default)]
+    pub planner_loop: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_wait: Option<PlannerWaitView>,
     pub plan_version: u32,
@@ -509,7 +515,7 @@ pub struct RunView {
     pub branch: String,
     pub landable: bool,
     pub pulse_seq: u64,
-    /// Akasha's shared notes, one block per group (experimental; empty when the run has none).
+    /// Akasha's shared notes, one block per configured group.
     #[serde(default)]
     pub akasha: Vec<AkashaView>,
 }
@@ -1081,6 +1087,9 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         question,
         want_review: r.want_review || r.stage == Stage::Review,
         pattern_review: r.pending_pattern_review(),
+        workflow_changes: (!r.pattern.is_auto()).then_some(r.pattern.settings.allow_pattern_changes),
+        planner_loop: r.pattern.settings.planner_loop,
+        completion_summary: (r.pattern.settings.planner_loop && !r.handoff.is_empty() && r.stage == Stage::Done).then(|| r.handoff.clone()),
         planner_wait: r.planner_wait_info().map(|w| PlannerWaitView { due_at: w.due_unix.saturating_mul(1000), condition: w.condition.clone() }),
         plan_version: r.plan_version,
         planner: r.planner,
@@ -1883,7 +1892,7 @@ pub(crate) mod tests {
     #[test]
     fn the_run_view_carries_akasha_blocks_and_none_when_there_are_none() {
         let app = test_app();
-        let run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        let run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin_auto(), "goal".into());
         let v = run_view(&app, &run);
         assert!(v.akasha.is_empty());
         let mut json = serde_json::to_value(&v).unwrap();

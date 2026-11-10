@@ -288,6 +288,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/stop", "stop the active run (/runs keeps it)"),
     ("/pause", "pause / resume the run"),
     ("/plan", "show the run's plan"),
+    ("/workflow", "toggle live workflow changes (F3)"),
     ("/land", "merge the finished run into your branch"),
     ("/respawn", "respawn a run agent in place: /respawn [agent]"),
     ("/akasha", "shared run / swarm notes: /akasha [group]"),
@@ -308,7 +309,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// so (for one release) instead of "unknown command".
 pub const MOVED: &[(&str, &str)] = &[
     ("/swarm", "/swarm is gone: worker-swarm is a class of every pattern (/studio)"),
-    ("/experimental", "experimental features are in /settings (Features)"),
+    ("/experimental", "Akasha is configured in /settings (Solo) or /studio (patterns)"),
     ("/mcp", "MCP servers are in /settings"),
     ("/web", "the web UI's address and security are in /settings (Web & remote)"),
     ("/remote", "the remote link, code and QR are in /settings (Web & remote)"),
@@ -629,7 +630,7 @@ fn bija_writable_roots(sandbox: &str, extra: &[PathBuf], pattern: &[String], hom
 /// with a toolset of Mantra's beyond Solo's delegation and vision tools (a run's agents, the
 /// architect) or with servers of Mantra's. Solo keeps the user's own `claude mcp` servers.
 fn claude_strict_mcp(o: &AgentOpts) -> bool {
-    !o.mcp.is_empty() || o.tools.iter().any(|t| {
+    o.role == "advisor" || !o.mcp.is_empty() || o.tools.iter().any(|t| {
         !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| {
             tools::VISION_TOOLS.contains(&n) || n.starts_with("mantra_subagent_") || n.starts_with("mantra_swarm_") || n.starts_with("mantra_akasha_")
         })
@@ -1111,12 +1112,29 @@ impl App {
 
     pub(crate) fn with_run<R>(&mut self, f: impl FnOnce(&mut Run, &mut Ctxt) -> R) -> Option<R> {
         let mut run = self.run.take()?;
+        let planner = run.planner;
+        let was_halted = run.halted();
         let r = {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             f(&mut run, &mut ctx)
         };
+        let retired_planner = planner.filter(|p| run.planner != Some(*p) || (run.pattern.settings.planner_loop && (!run.is_active() || (!was_halted && run.halted()))));
         self.run = Some(run);
+        if let Some(p) = retired_planner { self.stop_swarm_children(p); }
         Some(r)
+    }
+
+    pub fn set_workflow_changes(&mut self, enabled: bool) -> Result<(), String> {
+        self.with_run(|run, ctx| run.set_pattern_changes(ctx, enabled))
+            .unwrap_or_else(|| Err("Start a run to change its workflow permission.".into()))
+    }
+
+    fn toggle_workflow_changes(&mut self) {
+        let enabled = self.run.as_ref().is_some_and(|r| !r.pattern.settings.allow_pattern_changes);
+        match self.set_workflow_changes(enabled) {
+            Ok(()) => self.toast(if enabled { "Live workflow changes allowed" } else { "Live workflow changes locked" }, Level::Info),
+            Err(e) => self.toast(e, Level::Warn),
+        }
     }
 
     pub(crate) fn in_run(&self, a: AgentId) -> bool {
@@ -1173,12 +1191,14 @@ impl App {
                 cwd: self.project.clone(),
                 approval: self.settings.approval_mode.clone(),
                 sandbox,
-                instructions: tools::SWARM_OWNER_PROTOCOL.into(),
+                instructions: if self.settings.solo_swarm { tools::SWARM_OWNER_PROTOCOL.into() } else { String::new() },
                 // the vision tools when Solo's model takes images (`on_request` runs them)
                 tools: {
                     let mut t = tools::solo_tools();
-                    t.extend(tools::swarm_tools());
-                    t.extend(tools::akasha_tools());
+                    if self.settings.solo_swarm {
+                        t.extend(tools::swarm_tools());
+                        t.extend(tools::akasha_tools());
+                    }
                     if self.registry.vision(&chosen) { t.extend(tools::vision_tools()); }
                     t
                 },
@@ -1236,8 +1256,7 @@ impl App {
     }
 
     /// Saves the session's settings to settings.toml — except in demo mode, whose settings point
-    /// at its mocks and have Akasha switched on in memory: a shift+tab or a model pick in the demo
-    /// must not leave `mock-codex` or `experimental = ["akasha"]` behind for every real session.
+    /// at its mocks: a shift+tab or a model pick in the demo must not save them to disk.
     ///
     /// `[mcp_servers]` is written as the file has it now, not as this session read it: `mantra mcp
     /// add` from another terminal while the app is open must survive the next model pick.
@@ -1382,6 +1401,9 @@ impl App {
         let Some(r) = &self.run else { return vec![] };
         let mut v = vec![];
         v.extend(r.planner);
+        if r.pattern.settings.planner_loop {
+            if let Some(group) = r.planner.and_then(|p| self.swarms.get(&p)) { v.extend(&group.children); }
+        }
         v.extend(r.manager);
         v.extend(r.orchestrator);
         let mut tasks: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
@@ -1684,7 +1706,7 @@ impl App {
             // Every demo role gets the stand-in server (`mantra mock-mcp`, registered by main.rs)
             // and nothing else — a pattern of the user's that names a real one never starts it.
             for role in pattern.roles.values_mut() {
-                role.mcp = vec![DEMO_MCP.to_string()];
+                if role.kind != "advisor" { role.mcp = vec![DEMO_MCP.to_string()]; }
             }
         }
         let problems = self.preflight(&pattern);
@@ -1706,7 +1728,6 @@ impl App {
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
-        run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.start(&mut ctx);
@@ -1802,8 +1823,6 @@ impl App {
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
-        // before the boot too: the members it re-attaches get the akasha tools back
-        run.enable_akasha(self.settings.experimental_on(crate::config::EXPERIMENTAL_AKASHA));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
@@ -2580,12 +2599,14 @@ impl App {
             // A worker's workspace can be merged immediately after its final turn. Hold that
             // completion while delegated members write; wake the owner to review all results.
             let short_lived = self.run.as_ref().and_then(|r| r.role_name_of(agent).and_then(|n| r.pattern.role(&n).map(|role| role.kind == "worker" || role.kind == "gate"))).unwrap_or(false);
-            if short_lived && status == "completed" && self.swarm_pending(agent) {
+            let loop_parent = self.run.as_ref().is_some_and(|r| r.planner == Some(agent) && r.loop_executing());
+            if (short_lived || loop_parent) && status == "completed" && self.swarm_pending(agent) {
                 self.swarm_deferred.insert(agent);
                 if let Some(a) = self.agents.get_mut(&agent) { a.swarm_waiting = true; a.activity = "waiting for Akasha swarm".into(); }
                 return;
             }
-            if short_lived && self.swarms.contains_key(&agent) { self.stop_swarm_children(agent); }
+            let completing_loop = loop_parent && self.run.as_ref().is_some_and(|r| !r.handoff.is_empty());
+            if (short_lived || completing_loop) && self.swarms.contains_key(&agent) { self.stop_swarm_children(agent); }
             let st = status.to_string();
             self.with_run(|r, c| r.on_turn_done(c, agent, &st, error.clone(), kind));
             if self.run.as_ref().is_some_and(|r| !r.is_active()) {
@@ -2741,8 +2762,8 @@ impl App {
             "item/tool/call" => {
                 let tool = params.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                if tool == "mantra_gate_report" && self.swarm_pending(agent) {
-                    self.respond_tool_text(agent, id, "Wait for all Akasha swarm members with mantra_swarm_wait, review their work, then report the gate verdict.", false);
+                if matches!(tool.as_str(), "mantra_gate_report" | "mantra_finish_plan") && self.swarm_pending(agent) {
+                    self.respond_tool_text(agent, id, "Wait for all Akasha swarm members with mantra_swarm_wait and review their work before reporting completion.", false);
                 } else if self.swarm_tool_call(agent, id.clone(), &tool, &args) {
                     // A group tool is always checked against its owner, including stale calls.
                 } else if Some(agent) == self.solo && self.solo_tool_call(agent, id.clone(), &tool, &args) {
@@ -2962,6 +2983,10 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         // Global keys
+        if k.code == KeyCode::F(3) && self.overlays.is_empty() && !self.screen.is_config() {
+            self.toggle_workflow_changes();
+            return;
+        }
         if ctrl && k.code == KeyCode::Char('c') {
             self.ctrl_c_press();
             return;
@@ -3635,6 +3660,7 @@ impl App {
             }
             "/plan" => self.overlays.push(Overlay::Plan { scroll: 0 }),
             "/akasha" => self.open_akasha(arg),
+            "/workflow" => self.toggle_workflow_changes(),
             "/pause" => {
                 self.with_run(|r, c| r.toggle_pause(c));
             }
@@ -3934,43 +3960,21 @@ mod tests {
         });
     }
 
-    /// An experimental feature is switched in `/settings` (Features): the session and
-    /// settings.toml both — the demo's session only, its settings point at its mocks. `/experimental`
-    /// says where the switch went. `mantra experimental` (`save_experimental`) leaves a settings.toml
-    /// that does not parse alone rather than replacing it with the defaults.
     #[test]
-    fn experimental_switches_save_the_file_and_the_session() {
+    fn solo_akasha_setting_is_saved() {
         crate::web::snapshot::tests::with_mantra_home(|| {
-            let mut demo = crate::web::snapshot::tests::test_app();
-            demo.command("/experimental akasha on");
-            assert_eq!(demo.toast.as_ref().map(|t| t.0.as_str()), Some("experimental features are in /settings (Features)"));
-            assert!(!demo.settings.experimental_on("akasha"), "typed by hand, it switches nothing");
-            assert_eq!(demo.set_setting("experimental.akasha", "on"), Ok("new runs use it"));
-            assert!(demo.settings.experimental_on("akasha"));
-            assert!(!crate::config::home().join("settings.toml").exists(), "the demo saves nothing");
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut app = App::new(Settings::default(), configured_fixture(), PathBuf::from("."), Hub::new(vec![], vec![], vec![], vec![], ev_tx, false), tx, false);
-            app.set_setting("experimental.akasha", "on").unwrap();
-            assert!(app.settings.experimental_on("akasha") && Settings::load().experimental_on("akasha"));
-            app.set_setting("experimental.akasha", "off").unwrap();
-            assert!(!app.settings.experimental_on("akasha") && !Settings::load().experimental_on("akasha"));
-            let e = app.set_setting("experimental.warp", "on").unwrap_err();
-            assert!(e.contains("unknown experimental feature 'warp'") && e.contains("akasha"), "{e}");
-            // a settings.toml that does not parse is left alone, not replaced by the defaults
-            let path = crate::config::home().join("settings.toml");
-            std::fs::write(&path, "default_model = [broken").unwrap();
-            assert!(save_experimental("akasha", true).unwrap_err().contains("does not parse"));
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "default_model = [broken");
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.demo = false;
+            assert!(app.settings.solo_swarm);
+            assert!(app.set_setting("solo_swarm", "off").is_ok());
+            assert!(!app.settings.solo_swarm && !Settings::load().solo_swarm);
         });
     }
 
-    /// The command table: the 19 commands of 0.8, each with its line; the ones folded into
-    /// `/settings` and keys say where they went when typed, and are not offered.
     #[test]
     fn the_command_table_is_the_nineteen_and_the_moved_say_where() {
         let names: Vec<&str> = COMMANDS.iter().map(|(c, _)| *c).collect();
-        assert_eq!(names, vec!["/run", "/runs", "/stop", "/pause", "/plan", "/land", "/respawn", "/akasha", "/inbox", "/pattern", "/studio", "/models", "/settings", "/model", "/new", "/compact", "/diff", "/help", "/quit"]);
+        assert_eq!(names, vec!["/run", "/runs", "/stop", "/pause", "/plan", "/workflow", "/land", "/respawn", "/akasha", "/inbox", "/pattern", "/studio", "/models", "/settings", "/model", "/new", "/compact", "/diff", "/help", "/quit"]);
         assert!(COMMANDS.iter().all(|(_, d)| !d.is_empty() && crate::util::width(d) <= 48), "each line fits the suggestions");
         let mut app = crate::web::snapshot::tests::test_app();
         for (cmd, there) in MOVED {

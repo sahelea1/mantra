@@ -416,13 +416,8 @@ pub struct PhaseRecord {
 }
 
 pub struct Run {
-    /// Akasha blocks by group name (experimental; empty unless the feature is on and the pattern has
-    /// `[[groups]]`). See `engine::akasha`.
+    /// Akasha notebooks by group name, configured by the pattern.
     pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
-    /// `experimental = ["akasha"]` was on when the app made this run (`enable_akasha`). Off, a
-    /// pattern's groups are inert: no tools, no notes in prompts, no pushes, no entries.
-    pub akasha_enabled: bool,
-    /// Pushes waiting for their member and the Conductor's own bookkeeping. Runtime-only.
     pub(super) akasha_live: super::akasha::Live,
     pub id: String,
     /// What the run is called for people: the plan's title once the plan is submitted, the goal's
@@ -604,9 +599,8 @@ impl Run {
         let id = format!("{}-{}", crate::util::unix_secs() % 1_000_000, crate::util::slug(&brief).chars().take(24).collect::<String>().trim_matches('-'));
         let dir = crate::config::runs_dir(&project).join(&id);
         let title = title_from_goal(&brief);
-        Run {
+        let mut run = Run {
             akasha: std::collections::BTreeMap::new(),
-            akasha_enabled: false,
             akasha_live: Default::default(),
             id,
             title,
@@ -694,7 +688,9 @@ impl Run {
             known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
             owner: super::state::Owner::this_process(),
-        }
+        };
+        run.sync_akasha_groups();
+        run
     }
 
     // ───────────────────────────── bookkeeping ─────────────────────────────
@@ -1091,9 +1087,19 @@ impl Run {
         } else if let Stage::Phase { idx, step } = self.stage.clone() {
             match step {
                 PhaseStep::Orchestrating => {
-                    self.fill_slots(ctx);
-                    self.check_phase_done(ctx);
-                    self.kick_orchestrator(ctx, &paused);
+                    if self.pattern.settings.planner_loop {
+                        self.loop_progress();
+                        if !self.handoff.is_empty() {
+                            self.begin_handoff(ctx, idx);
+                        } else if self.planner_wait.is_none() && self.question.is_none() {
+                            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
+                            self.prompt_loop_planner(ctx, p, "The phase resumed. Check the workspace and continue from the saved plan.");
+                        }
+                    } else {
+                        self.fill_slots(ctx);
+                        self.check_phase_done(ctx);
+                        self.kick_orchestrator(ctx, &paused);
+                    }
                 }
                 PhaseStep::Gate { .. } | PhaseStep::Checks { .. } => {
                     let has_checks = self.current_phase().map(|p| !p.gate.checks.is_empty()).unwrap_or(false);
@@ -1653,6 +1659,11 @@ Then summarize in 2-4 lines.",
             }
             Stage::Phase { step, .. } => match step {
                 PhaseStep::Orchestrating => {
+                    if self.pattern.settings.planner_loop {
+                        if let Some(p) = self.planner.filter(|p| !asking(*p)) {
+                            v.push((p, Expect::Orchestrating));
+                        }
+                    }
                     for w in &self.workers {
                         if w.state == WState::Running {
                             if let Some(a) = w.agent.filter(|a| !asking(*a)) {
@@ -1753,7 +1764,6 @@ Then summarize in 2-4 lines.",
         // the run is ours from here: another Mantra must not resume it while this one lives
         self.owner.write(&self.dir);
         self.log("◈", "saffron", format!("run {} started with pattern {}", self.id, self.pattern.name));
-        self.akasha_start_note();
         let project = self.project.clone();
         let id = self.id.clone();
         let iso = self.pattern.settings.isolation.clone();
@@ -1775,9 +1785,9 @@ Then summarize in 2-4 lines.",
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
             role_name: name,
-            instructions: format!("{}\n{}", role.instructions, tools::PLANNER_PROTOCOL),
+            instructions: format!("{}\n{}", role.instructions, if self.pattern.settings.planner_loop { tools::LOOP_PLANNER_PROTOCOL } else { tools::PLANNER_PROTOCOL }),
             cwd: self.workspace_dir(),
-            tools: tools::planner_tools(&wr),
+            tools: if self.pattern.settings.planner_loop { tools::loop_planner_tools() } else { tools::planner_tools(&wr) },
             extra_writable: vec![],
             context_override: self.context_for(&role.model, None),
             network: self.pattern.settings.network,
@@ -1805,6 +1815,9 @@ Then summarize in 2-4 lines.",
                 if !self.known_models.is_empty() && !self.known_models.contains_key(&role.model) { role.model = model.clone(); }
             }
             return format!("[mantra:auto]\nUSER REQUEST:\n{}\n\nProject directory: {}\nAuto has no fixed workflow yet. Work with the user to choose a proportional topology and roles, then call mantra_revise_pattern with full valid TOML and your rationale. Wait for approval before planning work. Configured model aliases: {}. Use only these when the list is supplied. Here is a valid starting schema (adapt it, including its name, to the task):\n```toml\n{}\n```", self.brief, self.workspace_dir().display(), available.join(", "), sample.to_toml());
+        }
+        if self.pattern.settings.planner_loop {
+            return format!("[mantra:plan] [akasha-loop]\nUSER REQUEST:\n{}\n\nProject directory: {}\nSubmit one phase. Include a checklist in the plan summary. Tasks are delegated to Akasha after approval; the phase has no gate.", self.brief, self.workspace_dir().display());
         }
         let s = &self.pattern.settings;
         let workers = self.pattern.worker_roles();
@@ -1884,6 +1897,14 @@ Then summarize in 2-4 lines.",
         self.handoff_note_done = false;
         self.cleanup_done = false;
         self.log("◆", "saffron", format!("phase {}/{} — {}", idx + 1, plan.phases.len(), phase.name));
+
+        if self.pattern.settings.planner_loop {
+            self.planner_nudges = 0;
+            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
+            self.prompt_loop_planner(ctx, p, "The plan is ready. Begin the single execution phase.");
+            self.save_state();
+            return;
+        }
 
         if idx == 0 {
             // The manager watches the whole build: it comes in with the first phase, briefed
@@ -2105,6 +2126,7 @@ Then summarize in 2-4 lines.",
     }
 
     pub(super) fn check_phase_done(&mut self, ctx: &mut dyn Ctx) {
+        if self.pattern.settings.planner_loop { return; }
         let Some(idx) = self.phase_idx() else { return };
         if !matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) || self.halted() {
             return;
@@ -2381,7 +2403,7 @@ Then summarize in 2-4 lines.",
         }
     }
 
-    fn begin_handoff(&mut self, ctx: &mut dyn Ctx, idx: usize) {
+    pub(super) fn begin_handoff(&mut self, ctx: &mut dyn Ctx, idx: usize) {
         if matches!(self.stage, Stage::Phase { idx: i, step: PhaseStep::Handoff } if i == idx) {
             return; // already handing off (a second verify result for the same round)
         }
@@ -2390,7 +2412,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
-        self.log("✓", "green", "gate passed — archiving workers, writing handoff");
+        self.log("✓", "green", if self.pattern.settings.planner_loop { "planner verified the goal — saving the phase" } else { "gate passed — archiving workers, writing handoff" });
         // archive workers + gate agent
         self.completed_agents.extend(self.workers.iter().filter(|w| w.state == WState::Done).filter_map(|w| w.agent));
         let agents: Vec<AgentId> = self.workers.iter().filter_map(|w| w.agent).chain(self.gate_agent).collect();
@@ -2551,7 +2573,9 @@ Then summarize in 2-4 lines.",
         self.finished_unix = Some(crate::util::unix_secs());
         self.clock_stop();
         let ws = self.ws.clone();
-        ctx.job(JobTag::Finish, Box::new(move || JobOut::Text(ws.map(|w| git::phase_commit(&w, "mantra: finale").map(|_| "ok".to_string())).unwrap_or(Ok(String::new())))));
+        if !self.pattern.settings.planner_loop {
+            ctx.job(JobTag::Finish, Box::new(move || JobOut::Text(ws.map(|w| git::phase_commit(&w, "mantra: finale").map(|_| "ok".to_string())).unwrap_or(Ok(String::new())))));
+        }
         for a in self.all_agents() {
             ctx.stop(a, false);
         }
@@ -3048,6 +3072,19 @@ Then summarize in 2-4 lines.",
                     self.mark_edge(a);
                     ctx.prompt(a, self.with_akasha(a, "[mantra] You haven't submitted a valid plan yet. Call mantra_submit_plan with the full plan now.".into()));
                 }
+            }
+            return;
+        }
+
+        if Some(a) == self.planner && self.loop_executing() {
+            if self.question.is_some() || self.halted() || status != "completed" { return; }
+            if !self.handoff.is_empty() {
+                self.begin_handoff(ctx, 0);
+            } else if self.planner_nudges < 3 {
+                self.planner_nudges += 1;
+                self.prompt_loop_planner(ctx, a, "Continue with the next unchecked item. Once the goal is verified, call mantra_finish_plan.");
+            } else {
+                self.halt_turn_failed_full(ctx, Some(a), "planner repeatedly ended its turn without advancing the plan".into(), "The planner stopped making progress in the Akasha phase. Resume with feedback or respawn the planner.".into());
             }
             return;
         }
@@ -3972,6 +4009,32 @@ Then summarize in 2-4 lines.",
         self.save_state();
     }
 
+    pub fn set_pattern_changes(&mut self, ctx: &mut dyn Ctx, enabled: bool) -> Result<(), String> {
+        if !self.is_active() { return Err("Start a run to change its workflow permission.".into()); }
+        if self.pattern.is_auto() { return Err("Auto needs its first workflow proposal before this can be changed.".into()); }
+        self.pattern.settings.allow_pattern_changes = enabled;
+        if !enabled && self.pending_pattern.is_some() {
+            self.user_input(ctx, "The user turned off live workflow changes.");
+        }
+        self.save_state();
+        Ok(())
+    }
+
+    pub(crate) fn loop_executing(&self) -> bool {
+        self.pattern.settings.planner_loop && matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. })
+    }
+
+    pub(crate) fn loop_progress(&mut self) {
+        self.planner_nudges = 0;
+    }
+
+    pub(super) fn prompt_loop_planner(&mut self, ctx: &mut dyn Ctx, planner: AgentId, message: &str) {
+        let plan = self.plan.as_ref().map(Plan::to_markdown).unwrap_or_default();
+        self.mark_edge(planner);
+        let changes = if self.pattern.settings.allow_pattern_changes { "Live plan and workflow changes are allowed." } else { "Live plan and workflow changes are locked." };
+        ctx.prompt(planner, self.with_akasha(planner, format!("[mantra:akasha] {message}\n{changes}\n\nUser goal: {}\n\n{plan}", self.brief)));
+    }
+
     /// User typed into the Mandala prompt (not addressed to a specific agent).
     pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str) {
         self.planner_wait = None;
@@ -4645,6 +4708,9 @@ Then summarize in 2-4 lines.",
         match tool {
             "mantra_read_pattern" => (self.pattern.to_toml(), true),
             "mantra_revise_pattern" => {
+                if !self.pattern.settings.allow_pattern_changes && !self.pattern.is_auto() {
+                    return ("REFUSED: the user disabled live workflow changes. Continue with the active pattern.".into(), false);
+                }
                 if self.pending_pattern.is_some() || self.question.is_some() { return ("REFUSED: wait for the open user decision first".into(), false); }
                 let reason = s("reason");
                 if reason.trim().is_empty() { return ("REJECTED: give the reason and impact of changing the workflow".into(), false); }
@@ -4731,9 +4797,26 @@ Then summarize in 2-4 lines.",
                 self.save_state();
                 ("ACCEPTED: live plan and worker scopes updated; matching tripwires cleared, QA still required".into(), true)
             }
+            "mantra_finish_plan" => {
+                if Some(a) != self.planner || !self.loop_executing() || self.question.is_some() || self.halted() {
+                    return ("REFUSED: the planner can finish only during active Akasha execution without an open decision.".into(), false);
+                }
+                let summary = s("summary");
+                if summary.trim().is_empty() { return ("REJECTED: give the result and how you verified it.".into(), false); }
+                self.handoff = summary;
+                self.log("✓", "green", format!("planner result: {}", trunc(&self.handoff, 120)));
+                self.save_state();
+                ("Completion recorded. End your turn to save the phase.".into(), true)
+            }
             "mantra_submit_plan" | "mantra_revise_plan" => {
                 if Some(a) != self.planner { return ("REFUSED: only the planner may submit or revise the plan".into(), false); }
                 if self.pattern.is_auto() { return ("REJECTED: Auto needs a concrete approved workflow first; use mantra_revise_pattern".into(), false); }
+                if self.pattern.settings.planner_loop && !(self.stage == Stage::Planning || (self.loop_executing() && tool == "mantra_revise_plan" && self.handoff.is_empty())) {
+                    return ("REFUSED: use mantra_submit_plan while planning and mantra_revise_plan during execution.".into(), false);
+                }
+                if self.loop_executing() && !self.pattern.settings.allow_pattern_changes {
+                    return ("REFUSED: the user locked the live plan. Continue with the approved plan or ask the user to enable changes.".into(), false);
+                }
                 let mut plan = match Plan::from_value(args) {
                     Ok(p) => p,
                     Err(e) => return (format!("REJECTED: {e}"), false),
@@ -4760,6 +4843,12 @@ Then summarize in 2-4 lines.",
                 self.plan_version += 1;
                 self.save_plan();
                 self.retitle(ctx, &plan.title);
+                if self.pattern.settings.planner_loop {
+                    self.loop_progress();
+                    self.log("☰", "saffron", format!("plan v{} · one phase — {}", self.plan_version, trunc(&plan.title, 50)));
+                    self.save_state();
+                    return (if revising { "ACCEPTED. Continue the single phase using the revised plan." } else { "ACCEPTED. Summarize the plan and end your turn." }.into(), true);
+                }
                 let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
                 self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
                 if revising {
@@ -5077,6 +5166,9 @@ Then summarize in 2-4 lines.",
     fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
         pattern.validate().map_err(|e| e.join("; "))?;
         if pattern.is_auto() { return Err("a running workflow cannot be replaced with the Auto bootstrap".into()); }
+        if pattern.settings.planner_loop != self.pattern.settings.planner_loop && !self.pattern.is_auto() {
+            return Err("the planner-led execution mode cannot change within a concrete run".into());
+        }
         if !self.known_models.is_empty() {
             for (name, role) in &pattern.roles {
                 if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}'", role.model)); }
@@ -5109,6 +5201,8 @@ Then summarize in 2-4 lines.",
         }
         let previous = self.pattern.clone();
         self.pattern = proposal.pattern;
+        self.sync_akasha_groups();
+        self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
         // Existing workers keep their live process, scope and worktree. New spawns use the new
         // role definitions; fixed supervisors are refreshed only when their definition changed.
         if previous.flow.manager != self.pattern.flow.manager || previous.roles.get(&previous.flow.manager) != self.pattern.roles.get(&self.pattern.flow.manager) {
@@ -5128,14 +5222,15 @@ Then summarize in 2-4 lines.",
         self.log("✦", "saffron", format!("workflow {} → {}: {}", previous.name, self.pattern.name, proposal.reason));
         self.save_state();
         if let Some(p) = self.planner {
-            let changed = previous.flow.planner != self.pattern.flow.planner || previous.roles.get(&previous.flow.planner) != self.pattern.roles.get(&self.pattern.flow.planner) || previous.worker_roles() != self.pattern.worker_roles();
+            let changed = previous.flow.planner != self.pattern.flow.planner || previous.roles.get(&previous.flow.planner) != self.pattern.roles.get(&self.pattern.flow.planner) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
             if changed {
                 if ctx.agent(p).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
                 else { self.respawn_planner(ctx, Some("Workflow approved; use the updated role instructions and tools.".into())); }
                 return;
             }
             self.mark_edge(p);
-            ctx.prompt(p, format!("[mantra:pattern] Workflow {} is now active. Read mantra_read_pattern; use its current roles for all future plan changes. {}", self.pattern.name, if self.plan.is_none() { "Submit the phased plan now." } else { "Brief the orchestrator with any resulting change." }));
+            let next = if self.plan.is_none() { "Submit the phased plan now." } else if self.pattern.settings.planner_loop { "Continue the single phase." } else { "Brief the orchestrator with any resulting change." };
+            ctx.prompt(p, format!("[mantra:pattern] Workflow {} is now active. Read mantra_read_pattern; use its current roles for all future plan changes. {next}", self.pattern.name));
         }
     }
 

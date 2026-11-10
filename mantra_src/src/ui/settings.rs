@@ -5,14 +5,14 @@
 
 use super::{theme, *};
 use crate::app::{App, Choice, EditTarget, Overlay, Select, SelectThen};
-use crate::settings_ops::{Field, FieldKind, SECTION_APPEARANCE, SECTION_FEATURES, SECTION_RUNS, SECTION_SOLO, SECTION_WEB};
+use crate::settings_ops::{Field, FieldKind, SECTION_APPEARANCE, SECTION_RUNS, SECTION_SOLO, SECTION_WEB};
 use crate::ui::form::{self, Edit, Outcome, Start};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 
 const SECTION_MCP: &str = "MCP servers";
 /// The order the sections are drawn in.
-const SECTIONS: &[&str] = &[SECTION_SOLO, SECTION_RUNS, SECTION_FEATURES, SECTION_MCP, SECTION_WEB, SECTION_APPEARANCE];
+const SECTIONS: &[&str] = &[SECTION_SOLO, SECTION_RUNS, SECTION_MCP, SECTION_WEB, SECTION_APPEARANCE];
 
 /// One row of the form.
 #[derive(Clone, Debug)]

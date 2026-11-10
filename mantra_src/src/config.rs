@@ -166,6 +166,8 @@ pub struct Settings {
     pub mcp_servers: BTreeMap<String, McpServer>,
     /// Which configured servers Solo agents get: `["*"]` every enabled one (the default), names, or none.
     pub solo_mcp: Vec<String>,
+    /// New Solo sessions can delegate to an Akasha swarm.
+    pub solo_swarm: bool,
 }
 
 /// One stdio MCP server as `settings.toml` configures it.
@@ -188,7 +190,7 @@ impl Default for McpServer {
 /// Akasha: shared notes for agent groups (`engine::akasha`).
 pub const EXPERIMENTAL_AKASHA: &str = "akasha";
 /// Every experimental feature there is, with one line each — what `mantra experimental` lists.
-pub const EXPERIMENTAL: &[(&str, &str)] = &[(EXPERIMENTAL_AKASHA, "shared notes for agent groups (`[[groups]]` in a pattern)")];
+pub const EXPERIMENTAL: &[(&str, &str)] = &[];
 
 impl Settings {
     pub fn experimental_on(&self, name: &str) -> bool {
@@ -354,6 +356,7 @@ impl Default for Settings {
             experimental: vec![],
             mcp_servers: BTreeMap::new(),
             solo_mcp: vec!["*".into()],
+            solo_swarm: true,
         }
     }
 }

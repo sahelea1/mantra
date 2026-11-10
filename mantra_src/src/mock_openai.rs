@@ -297,6 +297,7 @@ fn script(turn: &Turn) -> Reply {
     }
     let reply = match turn.role.as_str() {
         "planner" => planner(turn),
+        "advisor" | "swarm-member" => Reply::say(crate::mock::mock_akasha_member(&turn.role)),
         "orchestrator" => orchestrator(turn),
         "worker" => worker(turn),
         "gate" => gate(turn),
@@ -323,6 +324,10 @@ fn summary(turn: &Turn) -> Reply {
 
 fn planner(turn: &Turn) -> Reply {
     let p = &turn.prompt;
+    if let Some(calls) = crate::mock::mock_akasha_calls(p) {
+        let calls = calls.into_iter().map(|(tool, args)| Reply::call(tool, args)).collect();
+        return sequence(turn, calls, Reply::say("Akasha run updated."));
+    }
     if let Some((who, message)) = crate::mock::mock_user_answer(p) {
         return sequence(turn, vec![Reply::call("mantra_prompt", json!({"agent": who, "message": message}))], Reply::say("The user decided; the answer has been passed to the supervisor who asked."));
     }

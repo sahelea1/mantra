@@ -2,6 +2,15 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.11.0 — 2026-11-10
+
+- **Mantra Akasha.** Run a single phase with a planner, a configurable read-only advisor and
+  Akasha batches. The planner verifies the result and completes the run after saving the phase.
+- **Akasha settings.** Configure shared groups in patterns and delegation per role or for Solo.
+- **Live workflow changes.** Control the current run with F3, `/workflow`, or the web Run switch.
+- **Claude Code context.** Accept shorthand pattern limits in Studio and pass supported
+  auto-compact arguments such as `200k` and `1M` to Claude Code.
+
 ## v0.10.2 — 2026-10-28
 
 - **Sandbox recovery.** Successful command output mentioning sandbox tools no longer halts a

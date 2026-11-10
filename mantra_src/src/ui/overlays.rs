@@ -1222,7 +1222,8 @@ mod tests {
         app.command("/akasha");
         assert!(app.overlays.is_empty());
         assert_eq!(toast(&app), "no akasha groups in this run", "no run");
-        let pattern = crate::engine::pattern::Pattern::builtin();
+        let mut pattern = crate::engine::pattern::Pattern::builtin();
+        pattern.groups.clear();
         app.run = Some(crate::engine::run::Run::new(std::path::PathBuf::from("."), pattern, "goal".into()));
         app.toast = None;
         app.command("/akasha");
@@ -1298,7 +1299,7 @@ mod tests {
         app.run = Some(run);
         app.command("/akasha");
         let Some(Overlay::Select(s)) = app.overlays.last() else { panic!("run and swarm groups need a selector") };
-        assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["research", "swarm:101"]);
+        assert_eq!(s.items.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["builders", "research", "swarm:101"]);
         app.run.as_mut().unwrap().akasha.insert("swarm:101".into(), crate::engine::akasha::Block::new("swarm:101", 8_192));
         let keys: Vec<_> = app.akasha_choices().into_iter().map(|c| c.key).collect();
         assert!(keys.contains(&"run:swarm:101".to_string()) && keys.contains(&"swarm:101".to_string()));

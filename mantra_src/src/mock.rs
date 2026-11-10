@@ -539,6 +539,10 @@ macro_rules! step {
 async fn script(e: &Em, text: &str) -> Outcome {
     match e.role().as_str() {
         "planner" => planner(e, text).await,
+        "advisor" | "swarm-member" => {
+            step!(e.say(mock_akasha_member(&e.role())).await);
+            Outcome::Done
+        }
         "orchestrator" => orchestrator(e, text).await,
         "worker" => worker(e, text).await,
         "gate" => gate(e, text).await,
@@ -716,7 +720,45 @@ pub(crate) fn mock_plan(first: bool, swarm: bool) -> Value {
     }})
 }
 
+pub(crate) fn mock_akasha_member(role: &str) -> &'static str {
+    if role == "advisor" { "Keep the change small, and review the implementation against the requested behavior." }
+    else { "The scoped demo task is complete. Its focused check passes." }
+}
+
+pub(crate) fn mock_akasha_calls(text: &str) -> Option<Vec<(&'static str, Value)>> {
+    let plan = json!({"plan": {
+        "title": "Akasha demo", "summary": "Consult the advisor, delegate a scoped change, then verify the result.",
+        "phases": [{"name": "Build and verify", "goal": "Implement the requested behavior", "tasks": []}]
+    }});
+    if text.contains("[akasha-loop]") {
+        return Some(vec![("mantra_submit_plan", plan)]);
+    }
+    if !text.contains("[mantra:akasha]") { return None; }
+    let mut calls = vec![
+        ("mantra_consult_advisor", json!({"question": "What should we verify first?"})),
+        ("mantra_swarm_stop", json!({})),
+        ("mantra_swarm_start", json!({"tasks": [
+            {"task": "Implement the focused change in the demo module.", "scope": ["src/demo.rs"]},
+            {"task": "Document the changed behavior in the demo README.", "scope": ["README.md"]}
+        ]})),
+        ("mantra_swarm_wait", json!({})),
+    ];
+    if text.contains("Live plan and workflow changes are allowed.") {
+        let mut revised = plan;
+        revised["plan"]["summary"] = json!("Advisor consulted, scope delegated, and focused verification completed.");
+        calls.push(("mantra_revise_plan", revised));
+    }
+    calls.push(("mantra_swarm_stop", json!({})));
+    calls.push(("mantra_finish_plan", json!({"summary": "Both scoped tasks completed. The planner reviewed the results and the focused checks passed."})));
+    Some(calls)
+}
+
 async fn planner(e: &Em, text: &str) -> Outcome {
+    if let Some(calls) = mock_akasha_calls(text) {
+        for (tool, args) in calls { let _ = e.tool(tool, args).await; }
+        step!(e.say("Akasha run updated.").await);
+        return Outcome::Done;
+    }
     if let Some((who, message)) = mock_user_answer(text) {
         let _ = e.tool("mantra_prompt", json!({"agent": who, "message": message})).await;
         step!(e.say("The user decided; I passed the answer to the supervisor who asked, so it can brief the waiting worker.").await);

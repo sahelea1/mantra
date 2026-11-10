@@ -69,7 +69,7 @@ fn one_of(key: &str, v: &str, allowed: &[&str]) -> Result<String, String> {
 /// When a change made through `set_field` reaches the app: "" now, else when — for the toast.
 pub fn takes_effect(key: &str) -> &'static str {
     match key {
-        "default_model" | "sandbox" | "solo_mcp" => "Solo's next session (/new) uses it",
+        "default_model" | "sandbox" | "solo_mcp" | "solo_swarm" => "Solo's next session (/new) uses it",
         "glyphs" | "colors" | "reduce_motion" | "mouse" | "fps" => "applies at the next start",
         k if k.starts_with("web.") => "applies at the next start",
         k if k.starts_with("experimental.") => "new runs use it",
@@ -96,6 +96,7 @@ impl Settings {
             f(SECTION_SOLO, "approval_mode", "Approvals", options(APPROVAL_MODES), self.approval_mode.clone(), "never skips prompts but keeps the Sandbox setting. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox; entering or leaving it needs /new. Shift+tab cycles the ordinary approval modes. Codex applies these to native tools; Bija and Claude Code run native tools unattended and apply these modes to Mantra requests only."),
             f(SECTION_SOLO, "sandbox", "Sandbox", options(SANDBOXES), self.sandbox.clone(), "What Solo's commands may touch: read-only, the project (workspace-write), or everything."),
             f(SECTION_SOLO, "solo_mcp", "MCP servers", FieldKind::Enum(servers), solo_mcp, "Which MCP servers Solo agents get: all enabled ones, none, or the ones named."),
+            f(SECTION_SOLO, "solo_swarm", "Akasha swarm", FieldKind::Bool, on_off(self.solo_swarm), "Allow a new Solo agent to delegate to a temporary Akasha swarm."),
             f(SECTION_RUNS, "default_pattern", "Pattern", FieldKind::Enum(patterns.to_vec()), self.default_pattern.clone(), "The pattern new runs use: its roles, models and flow (/studio edits them)."),
             f(SECTION_RUNS, "notify", "Notifications", FieldKind::Bool, on_off(self.notify), "A desktop notification (or the bell) when a run needs you or finishes."),
         ];
@@ -138,6 +139,7 @@ impl Settings {
             "glyphs" => self.glyphs = one_of(key, v, GLYPHS)?,
             "colors" => self.colors = one_of(key, v, COLORS)?,
             "solo_mcp" => self.solo_mcp = self.parse_solo_mcp(v)?,
+            "solo_swarm" => self.solo_swarm = parse_bool(key, v)?,
             "notify" => self.notify = parse_bool(key, v)?,
             "reduce_motion" => self.reduce_motion = parse_bool(key, v)?,
             "mouse" => self.mouse = parse_bool(key, v)?,
@@ -291,7 +293,7 @@ mod tests {
         let n = keys.len();
         keys.dedup();
         assert_eq!(keys.len(), n, "each key once");
-        for section in [SECTION_SOLO, SECTION_RUNS, SECTION_FEATURES, SECTION_WEB, SECTION_APPEARANCE] {
+        for section in [SECTION_SOLO, SECTION_RUNS, SECTION_WEB, SECTION_APPEARANCE] {
             assert!(fields.iter().any(|f| f.section == section), "{section}");
         }
         for f in fields.iter().filter(|f| f.kind != FieldKind::Secret) {
@@ -305,7 +307,7 @@ mod tests {
         }
         let model = fields.iter().find(|f| f.key == "default_model").unwrap();
         assert_eq!(model.kind, FieldKind::Enum(vec!["astra".into(), "sol".into(), "terra".into(), "luna".into()]));
-        assert_eq!(fields.iter().find(|f| f.key == "experimental.akasha").map(|f| (f.label.as_str(), f.value.as_str())), Some(("Akasha", "off")));
+        assert_eq!(fields.iter().find(|f| f.key == "solo_swarm").map(|f| (f.label.as_str(), f.value.as_str())), Some(("Akasha swarm", "on")));
     }
 
     #[test]
@@ -333,11 +335,11 @@ mod tests {
         s.set_field("fps", "30").unwrap();
         s.set_field("web.listen", "0.0.0.0:7777").unwrap();
         s.set_field("web.tls", "yes").unwrap();
-        s.set_field("experimental.akasha", "on").unwrap();
+        s.set_field("solo_swarm", "off").unwrap();
         assert_eq!((s.approval_mode.as_str(), s.fps, s.web.listen.as_str(), s.web.tls), ("never", 30, "0.0.0.0:7777", true));
-        assert!(s.experimental_on("akasha"));
-        s.set_field("experimental.akasha", "off").unwrap();
-        assert!(s.experimental.is_empty());
+        assert!(!s.solo_swarm);
+        s.set_field("solo_swarm", "on").unwrap();
+        assert!(s.solo_swarm);
         // the password: kept as typed, shown only as "set", cleared by an empty one
         s.set_field("web.password", " pw with spaces ").unwrap();
         assert_eq!(s.web.password, " pw with spaces ");

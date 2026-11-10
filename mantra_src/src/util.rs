@@ -70,6 +70,20 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// A token count as typed: `200000`, `200k`, `1.5m`; nothing / `none` / `default` is none.
+pub fn parse_tokens(t: &str) -> Option<u64> {
+    let t = t.trim().to_ascii_lowercase().replace([',', '_'], "");
+    let (number, scale) = if let Some(k) = t.strip_suffix('k') {
+        (k, 1_000.0)
+    } else if let Some(m) = t.strip_suffix('m') {
+        (m, 1_000_000.0)
+    } else {
+        return t.parse().ok();
+    };
+    let tokens = number.parse::<f64>().ok()? * scale;
+    (0.0..u64::MAX as f64).contains(&tokens).then_some(tokens as u64)
+}
+
 /// Truncate to a display width, adding an ellipsis.
 pub fn trunc(s: &str, width: usize) -> String {
     use unicode_width::UnicodeWidthChar;

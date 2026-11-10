@@ -237,7 +237,10 @@ impl Mock {
 }
 
 async fn planner_turn(m: &mut Mock, text: &str) {
-    if let Some((who, message)) = crate::mock::mock_user_answer(text) {
+    if let Some(calls) = crate::mock::mock_akasha_calls(text) {
+        for (tool, args) in calls { let _ = m.tool_use(tool, args).await; }
+        m.say("Akasha run updated.").await;
+    } else if let Some((who, message)) = crate::mock::mock_user_answer(text) {
         let _ = m.tool_use("mantra_prompt", json!({"agent": who, "message": message})).await;
         m.say("The user decided; the answer has been passed to the supervisor who asked.").await;
     } else if text.contains("[mantra:auto]") {
@@ -374,6 +377,7 @@ pub async fn run() {
                 turn_n += 1;
                 match role.as_str() {
                     "planner" => planner_turn(&mut m, &text).await,
+                    "advisor" | "swarm-member" => m.say(crate::mock::mock_akasha_member(&role)).await,
                     "orchestrator" => orchestrator_turn(&mut m, &text).await,
                     "worker" => worker_turn(&mut m).await,
                     "gate" => gate_turn(&mut m).await,

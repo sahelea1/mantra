@@ -88,6 +88,12 @@ impl Plan {
     }
 
     pub fn validate(&self, pattern: &Pattern) -> Result<(), Vec<String>> {
+        if pattern.settings.planner_loop {
+            return match self.phases.as_slice() {
+                [phase] if phase.tasks.is_empty() && phase.gate == Gate::default() && self.final_checks.is_empty() => Ok(()),
+                _ => Err(vec!["the Akasha loop needs one phase with no worker tasks, gate or automatic checks".into()]),
+            };
+        }
         let mut errs = vec![];
         if self.phases.is_empty() {
             errs.push("plan needs at least one phase".into());
@@ -176,6 +182,9 @@ impl Plan {
                     s.push_str(&format!("Acceptance: {}\n\n", t.acceptance));
                 }
             }
+            if ph.gate == Gate::default() {
+                continue;
+            }
             s.push_str("Gate:\n");
             for c in &ph.gate.checks {
                 s.push_str(&format!("- `{c}`\n"));
@@ -198,7 +207,7 @@ impl Plan {
     }
 }
 
-fn scopes_overlap(a: &str, b: &str) -> bool {
+pub(crate) fn scopes_overlap(a: &str, b: &str) -> bool {
     let root = |s: &str| -> String {
         s.split('/').take_while(|seg| !seg.contains('*') && !seg.contains('?')).collect::<Vec<_>>().join("/")
     };

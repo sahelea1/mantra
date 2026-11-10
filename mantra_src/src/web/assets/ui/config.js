@@ -70,7 +70,6 @@
     const SECTIONS = [
         { id: 'solo', title: 'Solo', icon: 'agent', server: 'Solo' },
         { id: 'runs', title: 'Runs', icon: 'run', server: 'Runs' },
-        { id: 'features', title: 'Features', icon: 'spark', server: 'Features' },
         { id: 'mcp', title: 'MCP servers', icon: 'tool' },
         { id: 'models', title: 'Models & providers', icon: 'model' },
         { id: 'patterns', title: 'Patterns', icon: 'plan' },
@@ -93,7 +92,6 @@
         switch (x.id) {
             case 'solo': return c.settings ? value('default_model') + ' · approvals ' + value('approval_mode') + ' · ' + value('sandbox') : 'model, approvals, sandbox';
             case 'runs': return c.settings ? 'new runs use ' + value('default_pattern') : 'the pattern for new runs, role models';
-            case 'features': return c.settings ? 'Akasha ' + value('experimental.akasha') : 'experimental features';
             case 'mcp': return c.settings ? (c.settings.mcp.length ? F.plural(c.settings.mcp.length, 'server') + ': ' + c.settings.mcp.map((m) => m.name).join(', ') : 'none yet — tools for your agents') : 'tools for your agents';
             case 'models': return c.models ? F.plural(c.models.models.length, 'model') + ' · ' + F.plural(c.models.providers.length, 'provider') : 'aliases, providers, keys';
             case 'patterns': return c.patterns ? F.plural(c.patterns.patterns.length, 'pattern') + ' · new runs use ' + c.patterns.current : 'roles, models and flow of a run';
@@ -116,7 +114,7 @@
     function sectionBody(x, alone) {
         const title = alone ? null : x.title;
         switch (x.id) {
-            case 'solo': case 'features': return [fieldsCard(x, title)];
+            case 'solo': return [fieldsCard(x, title)];
             case 'runs': return [fieldsCard(x, title), SC.rolesCard()];
             case 'mcp': return [mcpCard()];
             case 'models': return [modelsCard(), providersCard()];
@@ -824,6 +822,7 @@
         ['max_parallel', 'Workers at once', 'the shared pool; a role with its own number is apart', 'num'],
         ['worker_retries', 'Retries per task', '', 'num'],
         ['review_plan', 'Review the plan', 'show the plan for approval before building', 'bool'],
+        ['allow_pattern_changes', 'Live workflow changes', 'Let the planner propose changes to this run’s workflow', 'bool'],
         ['max_tasks_per_phase', 'Tasks per phase', 'at most (a swarm phase may hold twice its width)', 'num'],
         ['isolation', 'Isolation', 'worktree per worker, or shared', 'isolation'],
     ];
@@ -832,7 +831,7 @@
         ['stall_minutes', 'Stall after (min)', '', 'num'], ['check_timeout_secs', 'Check timeout (s)', '', 'num'],
         ['watchdog_seconds', 'Watchdog (s)', '', 'num'], ['watchdog_escalate_seconds', 'Escalate after (s)', '', 'num'],
         ['review_minutes', 'Coherence review (min)', '0 is off', 'num'], ['manager_minutes', 'Manager digest (min)', '0 is off', 'num'],
-        ['first_token_minutes', 'First token within (min)', '0 is off', 'num'], ['context_cap', 'Run context ceiling (tokens)', 'Each model keeps its smaller window; 0 removes the ceiling', 'num'],
+        ['first_token_minutes', 'First token within (min)', '0 is off', 'num'], ['context_cap', 'Run context ceiling (tokens)', 'Examples are 200k and 1M. Each model keeps its smaller window. 0 removes the ceiling.', 'text'],
         ['network', 'Network for workers', '', 'bool'], ['writable_roots', 'Extra writable dirs', 'comma-separated', 'list'],
     ];
     function settingCtl(S_, [key, label, hint, kind], O) {
@@ -841,17 +840,22 @@
         if (kind === 'bool') ctl = toggleCtl(S_[key], set, label);
         else if (kind === 'list') ctl = txt((S_[key] || []).join(', '), (v) => set(v.split(',').map((x) => x.trim()).filter(Boolean)), { label, mono: true, placeholder: 'none' });
         else if (kind === 'num') ctl = txt(S_[key], (v) => set(nums(v)), { num: true, min: 0, label });
+        else if (kind === 'text') ctl = txt(S_[key], set, { label });
         else ctl = sel(S_[key], O[kind] || [], set, label);
         return pf(label, ctl, hint || null);
     }
     function settingsCardP(W, O) {
         const S_ = W.settings || (W.settings = {});
+        const hidden = S_.planner_loop ? new Set(['worker_retries', 'max_tasks_per_phase', 'gate_max_rounds', 'orchestrator_context', 'check_timeout_secs', 'review_minutes', 'manager_minutes']) : new Set();
         return SC.card('Settings', [
-            h('div', { class: 'pe-grid', key: 'g' }, P_SETTINGS.map((x) => settingCtl(S_, x, O))),
-            h('details', { class: 'pe-more', key: 'm' }, h('summary', null, 'More settings'), h('div', { class: 'pe-grid' }, P_MORE.map((x) => settingCtl(S_, x, O)))),
+            h('div', { class: 'pe-grid', key: 'g' }, P_SETTINGS.filter(([key]) => !hidden.has(key)).map((x) => settingCtl(S_, x, O))),
+            h('details', { class: 'pe-more', key: 'm' }, h('summary', null, 'More settings'), h('div', { class: 'pe-grid' }, P_MORE.filter(([key]) => !hidden.has(key)).map((x) => settingCtl(S_, x, O)))),
         ], { key: 'p-settings', icon: 'settings' });
     }
     function flowCard(W, roles) {
+        if (W.settings && W.settings.planner_loop) return SC.card('Flow', [
+            h('p', { class: 'sec-sub' }, 'The planner works through one phase with an advisor and Akasha swarms.'),
+        ], { key: 'p-flow', icon: 'run' });
         const fl = W.flow || (W.flow = {});
         const of = (kind) => roles.filter((n) => W.roles[n].kind === kind);
         const set = (k) => (v) => { fl[k] = v; touch(); };
@@ -874,7 +878,7 @@
     function groupsCard(W, roles) {
         const gs = W.groups || (W.groups = []);
         return SC.card('Akasha groups', [
-            h('p', { class: 'sec-sub', key: 's' }, 'Roles that share one block of notes. Inert unless Settings › Features › Akasha is on.'),
+            h('p', { class: 'sec-sub', key: 's' }, 'Roles in each group share one notebook during the run.'),
             gs.map((g, i) => h('div', { class: 'group-edit', key: 'g' + i },
                 h('div', { class: 'pe-grid' },
                     pf('Name', txt(g.name, (v) => { g.name = v; touch(); }, { label: 'Group name' })),

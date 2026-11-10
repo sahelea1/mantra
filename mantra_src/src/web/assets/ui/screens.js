@@ -134,7 +134,7 @@
         const md = s.ui.planMd;
         const head = h('div', { class: 'plan-head' },
             h('div', null, h('h2', null, plan.title || 'Plan'), plan.summary ? h('p', { class: 'sec-sub' }, plan.summary) : null),
-            P.segmented(md ? 'md' : 'st', [['st', 'Tasks'], ['md', 'Markdown']], (v) => { s.ui.planMd = v === 'md'; M.act.changed(); }, 'Plan view'));
+            P.segmented(md ? 'md' : 'st', [['st', s.run && s.run.planner_loop ? 'Phase' : 'Tasks'], ['md', 'Markdown']], (v) => { s.ui.planMd = v === 'md'; M.act.changed(); }, 'Plan view'));
         if (md) return card(null, [head, h('div', { class: 'md plan-md' }, F.markdown(plan.markdown || ''))], { key: 'plan', cls: 'plan' });
         const run = s.run;
         const curPh = run && run.stage && run.stage.kind === 'phase' ? run.stage.phase : run && run.stage && (run.stage.kind === 'finale' || run.stage.kind === 'done') ? 1e9 : -1;
@@ -180,6 +180,10 @@
                 over ? P.btn('Delete', () => deleteRun(run.id, run.title, () => M.act.nav('/')), { sm: true, icon: 'trash', kind: 'danger-ghost', key: 'delete' })
                     : P.btn('Stop', stopRun, { sm: true, icon: 'stop', kind: 'danger-ghost', key: 'stop' })),
             h('h1', { class: 'run-title' }, run.title || run.brief),
+            !over && typeof run.workflow_changes === 'boolean' ? h('label', { class: 'form-row start' },
+                h('input', { type: 'checkbox', class: 'switch', checked: run.workflow_changes,
+                    onchange: (e) => { const input = e.target; M.act.cmd('workflow_changes', { enabled: input.checked }).catch(() => { input.checked = run.workflow_changes; }); } }),
+                'Live workflow changes') : null,
             run.title && run.title !== run.brief ? h('div', { class: 'run-brief dim' }, F.trunc(run.brief, 200)) : null,
             P.stageRail(run, plan, true),
             h('div', { class: 'run-stats' },
@@ -187,6 +191,7 @@
             run.branch ? h('div', { class: 'run-branch mono dim' }, '⎇ ' + run.branch) : null,
             st.stopped ? h('div', { class: 'run-stopped' }, '■ You stopped this run. ' + (run.landable ? 'Land merges what it built; ' : '') + 'Delete removes it, branches and all.')
                 : st.error ? h('div', { class: 'errbox' }, icon('alert'), h('span', null, st.error)) : null));
+        if (run.completion_summary) kids.push(card('Planner result', F.markdown(run.completion_summary), { key: 'completion', icon: 'check' }));
         if (over) kids.push(startRunCard({ title: 'Start a new run', key: 'startnew' }));
         // The review card below replaces the review band here.
         kids.push(P.haltBand(run), P.questionBand(run));
@@ -220,12 +225,12 @@
         if ((run.alerts || []).length) kids.push(card('Alerts', h('ul', { class: 'plain' }, run.alerts.map((c, i) => h('li', { key: i }, c))), { key: 'alerts', icon: 'alert', cls: 'warn' }));
         if ((run.history || []).length) {
             kids.push(card('Phase history', h('div', { class: 'list' }, run.history.map((r, i) => h('div', { class: 'hist', key: i },
-                h('div', { class: 'hist-top' }, h('b', null, r.phase), h('span', { class: 'dim' }, r.tasks_done + '/' + r.tasks_total + ' tasks' + (r.rounds ? ' · ' + F.plural(r.rounds, 'gate round') : ''))),
+                h('div', { class: 'hist-top' }, h('b', null, r.phase), h('span', { class: 'dim' }, run.planner_loop ? 'verified by planner' : r.tasks_done + '/' + r.tasks_total + ' tasks' + (r.rounds ? ' · ' + F.plural(r.rounds, 'gate round') : ''))),
                 r.summary ? h('div', { class: 'hist-sum' }, F.trunc(r.summary, 400)) : null))), { key: 'hist', icon: 'runs' }));
         }
         return page('run', kids);
     }
-    // Akasha (experimental): what each agent group shares, read-only. Folded by default — it is
+    // Akasha: what each agent group shares, read-only. Folded by default — it is
     // the agents' notebook, not the run's state — with the count and the urgent ones on its head.
     function kChars(n) {
         if (n < 1000) return String(n);

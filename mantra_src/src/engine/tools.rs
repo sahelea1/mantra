@@ -61,7 +61,8 @@ pub fn swarm_tools() -> Vec<Value> {
     vec![
         tool("mantra_swarm_start", "Start up to eight independent agents sharing one Akasha notebook. Validate all tasks before starting. Models are configured /models aliases; omit model to use your own. Each task needs a concrete, independent goal.", json!({
             "tasks": {"type": "array", "items": {"type": "object", "properties": {
-                "task": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}
+                "task": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"},
+                "scope": {"type": "array", "items": {"type": "string"}, "description": "File globs this member may change. Required in the single-phase Akasha pattern."}
             }, "required": ["task"]}},
             "shared_chars": {"type": "integer", "description": "Akasha notebook capacity, 1024..16384 characters (default 8192)"}
         }), &["tasks"]),
@@ -142,6 +143,17 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
     }
     v
 }
+
+pub fn loop_planner_tools() -> Vec<Value> {
+    let mut tools = planner_tools(&[]);
+    tools.retain(|t| !matches!(t["name"].as_str().unwrap_or(""),
+        "mantra_set_task_scope" | "mantra_brief_orchestrator" | "mantra_spawn_adhoc" | "mantra_gate_report" | "mantra_wait"));
+    tools.push(tool("mantra_consult_advisor", "Ask the independent read-only advisor a focused question. Returns its advice when ready.", json!({"question": {"type": "string"}}), &["question"]));
+    tools.push(tool("mantra_finish_plan", "Complete the run after reviewing all swarm results and verifying the user's goal.", json!({"summary": {"type": "string"}}), &["summary"]));
+    tools
+}
+
+pub const LOOP_PLANNER_PROTOCOL: &str = "\nmantra-role: planner\nSubmit one phase with name and goal, an empty tasks array and no gate. Put a short checklist and the verification approach in the plan summary. End the planning turn after submitting; execution starts when the plan is approved. You may consult the read-only advisor during planning and execution. In execution, delegate implementation to Akasha in batches with disjoint file scopes. Wait for the results, review the actual changes, then stop the completed swarm before starting another batch. If the user enabled live changes, update the single-phase plan as needed. Run the relevant checks yourself. When the user goal is met, call mantra_finish_plan with the result and evidence, then end your turn. Use mantra_ask_user only for a decision the user must make, or mantra_wait_for_external_condition for bounded re-entry. Use mantra_read_pattern to see whether the user allows workflow changes.\n";
 
 fn spawner_tools(worker_roles: &[String]) -> Vec<Value> {
     vec![
@@ -251,8 +263,7 @@ pub fn gate_tools(may_spawn: bool, worker_roles: &[String]) -> Vec<Value> {
     v
 }
 
-/// Akasha (experimental): the tools of an agent whose role is in one of the pattern's `[[groups]]`,
-/// added to its role's own when the feature is on (`Run::akasha_req`). They act on the group's block.
+/// Akasha tools for roles listed in the pattern's `[[groups]]` (`Run::akasha_req`). They act on the group's block.
 pub fn akasha_tools() -> Vec<Value> {
     vec![
         tool("mantra_akasha_read", "Read your group's shared notes: what the agents working beside you chose to share, and what Mantra noted for them (tasks done or failed, files changed).", json!({}), &[]),
@@ -533,7 +544,7 @@ A role may also set fallback = alias: the model that takes over when an agent of
 settings.first_token_minutes (default 4; 0 = off) twice with no output at all.
 A role may also set mcp = ["name", …]: the MCP servers (from the user's settings.toml [mcp_servers]) its
 agents get, e.g. mcp = ["blender"] for a role that drives Blender; ["*"] = every enabled server; unset = none.
-Optional [[groups]] (Akasha, experimental: roles that share one block of notes) have name, roles (each role in
+Optional [[groups]] (Akasha: roles that share one notebook) have name, roles (each role in
 one group at most), shared_chars (1024-262144, default 16384), push = none|urgent|all (default urgent), auto (default true).
 Always call mantra_read_pattern first, then mantra_write_pattern with the complete updated TOML.
 If validation fails, fix and retry. Finally explain the change in 1-3 sentences.

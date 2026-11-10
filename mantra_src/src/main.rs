@@ -65,8 +65,7 @@ USAGE
   mantra doctor                          check bija, the providers, the optional backends, the terminal
   mantra update                          install the latest mantra + bija release
   mantra experimental                    list experimental features, on or off
-  mantra experimental enable|disable <name>   switch one in settings.toml (akasha: shared notes
-                                         for agent groups)
+  mantra experimental enable|disable <name>   switch an experimental feature
   mantra mcp                             list the MCP servers agents can be given (settings.toml)
   mantra mcp add <name> [--env K=V]… -- <command> [args…]
                                          add one, e.g. mantra mcp add blender -- uvx blender-mcp
@@ -273,11 +272,15 @@ fn experimental_cmd(args: &[String]) -> std::result::Result<String, (i32, String
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let (name, on) = match words.as_slice() {
+        [] | ["list"] if config::EXPERIMENTAL.is_empty() => return Ok("No experimental features. Akasha is configured per pattern and in Solo settings.\n".into()),
         [] | ["list"] => return Ok(format!("experimental features (mantra experimental enable|disable <name>):\n{}", list())),
         ["enable", name] => (*name, true),
         ["disable", name] => (*name, false),
         _ => return Err((2, "usage: mantra experimental [list | enable <name> | disable <name>]".into())),
     };
+    if name == config::EXPERIMENTAL_AKASHA {
+        return Ok("Akasha is stable. Configure groups and role delegation in the pattern, or use the Akasha swarm toggle under Solo settings.\n".into());
+    }
     if !app::is_experimental(name) {
         return Err((2, format!("unknown experimental feature '{name}'; there is:\n{}", list().trim_end())));
     }
@@ -646,11 +649,6 @@ async fn async_main(mut cli: Cli, env_pw: Option<String>) -> Result<()> {
             }
         }
         let _ = provider_key::add_backend_with(&mut registry, provider_key::Backend::ClaudeCode, true);
-        // The demo shows what there is to see, the experiments included — in memory, like the
-        // mocks: settings.toml is not touched.
-        if !settings.experimental_on(config::EXPERIMENTAL_AKASHA) {
-            settings.experimental.push(config::EXPERIMENTAL_AKASHA.to_string());
-        }
         // MCP and images too: the stand-in server (`mantra mock-mcp`) for Solo and, through
         // `App::start_run_with`, every pattern role — and every model taking images, so the
         // screenshot tools are offered. A real server of the user's never starts in the demo.
@@ -1158,6 +1156,7 @@ async fn snapshot(mut app: App, mut rx: mpsc::UnboundedReceiver<AppEvent>, scrip
                     "home" => KeyCode::Home,
                     "end" => KeyCode::End,
                     "f1" => KeyCode::F(1),
+                    "f3" => KeyCode::F(3),
                     s => KeyCode::Char(s.chars().next().unwrap_or(' ')),
                 };
                 app.on_event(AppEvent::Term(Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE })));
@@ -1883,30 +1882,15 @@ mod cli_tests {
         assert!(c.run_goal.is_none() && c.parallel.is_none() && c.demo);
     }
 
-    /// `mantra experimental` lists, enables and disables in settings.toml; an unknown name or a
-    /// bad subcommand is exit 2, with the list.
     #[test]
-    fn experimental_enable_disable_and_list() {
-        crate::web::snapshot::tests::with_mantra_home(|| {
-            let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-            let out = experimental_cmd(&s(&[])).unwrap();
-            assert!(out.contains("akasha") && out.contains("off") && out.contains("shared notes"), "{out}");
-            assert_eq!(experimental_cmd(&s(&["list"])).unwrap(), out);
-            let on = experimental_cmd(&s(&["enable", "akasha"])).unwrap();
-            assert!(on.contains("akasha on") && on.contains("settings.toml"), "{on}");
-            assert!(config::Settings::load().experimental_on(config::EXPERIMENTAL_AKASHA));
-            assert!(experimental_cmd(&s(&["list"])).unwrap().lines().any(|l| l.contains("akasha") && l.contains(" on ")));
-            // enabling twice keeps one entry
-            experimental_cmd(&s(&["enable", "akasha"])).unwrap();
-            assert_eq!(config::Settings::load().experimental, vec!["akasha".to_string()]);
-            experimental_cmd(&s(&["disable", "akasha"])).unwrap();
-            assert!(!config::Settings::load().experimental_on(config::EXPERIMENTAL_AKASHA));
-            let (code, e) = experimental_cmd(&s(&["enable", "warp"])).unwrap_err();
-            assert!(code == 2 && e.contains("'warp'") && e.contains("akasha"), "{code} {e}");
-            for bad in [&["enable"][..], &["toggle", "akasha"], &["enable", "akasha", "now"]] {
-                assert_eq!(experimental_cmd(&s(bad)).unwrap_err().0, 2, "{bad:?}");
-            }
-        });
+    fn legacy_akasha_command_explains_the_stable_controls() {
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(experimental_cmd(&[]).unwrap().contains("No experimental features"));
+        for action in ["enable", "disable"] {
+            let reply = experimental_cmd(&s(&[action, "akasha"])).unwrap();
+            assert!(reply.contains("Akasha is stable") && reply.contains("Solo settings"));
+        }
+        assert_eq!(experimental_cmd(&s(&["enable", "warp"])).unwrap_err().0, 2);
     }
 
     /// The web password leaves the environment as it is read, so no agent, shell command or MCP

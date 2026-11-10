@@ -1,4 +1,4 @@
-//! Akasha (experimental): one bounded block of shared notes per agent group — what an agent chooses
+//! Akasha: one bounded block of shared notes per agent group — what an agent chooses
 //! to share of its thinking (a fact about the codebase, a decision, an interface, a pitfall) and what
 //! the Conductor shares for it (what it finished, what it changed). Every agent keeps its own context;
 //! the block is the part that is common to the group. Small by design (a cap in characters, explicit
@@ -215,40 +215,22 @@ fn report_head(report: &str) -> String {
 }
 
 impl Run {
-    /// Akasha on or off for this run (`settings.experimental`), from the app right after the `Run`
-    /// is made and before it starts or resumes: on, every group of the pattern gets its block —
-    /// a resumed run keeps the ones `state.json` brought back. Off, the blocks a resume restored
-    /// stay as they are (saved again, shown, never used), so turning it back on finds them intact.
-    pub fn enable_akasha(&mut self, on: bool) {
-        self.akasha_enabled = on;
-        if !on {
-            return;
-        }
+    /// Keep saved notebooks for groups still in this pattern and initialize new groups.
+    pub(super) fn sync_akasha_groups(&mut self) {
+        self.akasha.retain(|name, _| self.pattern.groups.iter().any(|g| g.name == *name));
         for g in &self.pattern.groups {
             self.akasha.entry(g.name.clone()).or_insert_with(|| Block::new(&g.name, g.shared_chars));
         }
     }
 
-    /// The group an agent shares notes with, from its role. `None` while the feature is off.
+    /// The group an agent shares notes with, from its role.
     pub fn group_of(&self, a: AgentId) -> Option<&str> {
         let role = self.role_name_of(a)?;
         self.group_of_role(&role)
     }
 
     pub(super) fn group_of_role(&self, role: &str) -> Option<&str> {
-        if !self.akasha_enabled {
-            return None;
-        }
         self.pattern.groups.iter().find(|g| g.roles.iter().any(|r| r == role) && self.akasha.contains_key(&g.name)).map(|g| g.name.as_str())
-    }
-
-    /// Run start with groups but the feature off: say so once, with the way to turn it on.
-    pub(super) fn akasha_start_note(&mut self) {
-        let n = self.pattern.groups.len();
-        if self.akasha_enabled || n == 0 {
-            return;
-        }
-        self.log("◌", "gray", format!("akasha: {n} group{} configured but the feature is off — `mantra experimental enable akasha`", if n == 1 { "" } else { "s" }));
     }
 
     /// A spawn of a member gets the four tools and the paragraph that introduces them. Done on the

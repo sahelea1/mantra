@@ -42,9 +42,8 @@ impl Run {
         run.plan = plan;
         run.plan_version = st.plan_version;
         run.handoff = st.handoff.clone();
-        // the notes are what the group shared so far: they come back whole (`enable_akasha`
-        // then adds a block for any group that has none yet)
         run.akasha = st.akasha.clone();
+        run.sync_akasha_groups();
         run.started_unix = st.started_unix;
         // a finished run written before `finished_unix` existed: its last save is the closest
         run.finished_unix = st.finished_unix.or_else(|| st.finished().then_some(st.updated_unix));
@@ -120,7 +119,7 @@ impl Run {
                             PhaseStep::Handoff => {
                                 self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
                                 self.handoff_note_done = true;
-                                if st.halted.as_deref().map(|h| h.starts_with(&format!("phase {} commit failed:", idx + 1))).unwrap_or(false) {
+                                if self.pattern.settings.planner_loop || st.halted.as_deref().map(|h| h.starts_with(&format!("phase {} commit failed:", idx + 1))).unwrap_or(false) {
                                     self.cleanup_done = false;
                                     self.launch_phase_commit(ctx, idx);
                                 } else {
@@ -241,6 +240,18 @@ impl Run {
     fn resume_orchestrating(&mut self, ctx: &mut dyn Ctx, idx: usize, st: &RunState) {
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
         self.phase_started = Instant::now();
+        if self.pattern.settings.planner_loop {
+            if !self.handoff.is_empty() {
+                self.begin_handoff(ctx, idx);
+                return;
+            }
+            let thread = st.agents.iter().find(|a| a.slot == "planner").and_then(|a| a.thread_id.clone());
+            let p = self.spawn_planner_with(ctx, thread);
+            if self.pending_pattern.is_none() && self.planner_wait.is_none() {
+                self.prompt_loop_planner(ctx, p, "Mantra restarted. Inspect the workspace and verify any interrupted swarm work before starting a new batch.");
+            }
+            return;
+        }
         // The orchestrator's old process (and its context) is gone: always a fresh one, briefed
         // with the current state below.
         let o = self.spawn_orchestrator(ctx);
@@ -554,7 +565,6 @@ mod tests {
         block.note("a", "models live in src/models", false, 60).unwrap();
         st.akasha.insert("builders".into(), block);
         let mut run = Run::from_state(&st, pattern, Some(plan()), dir.join("run"));
-        run.enable_akasha(true);
         let mut ctx = Fake::new();
         run.resume_boot(&mut ctx, &st);
         assert_eq!(run.akasha, st.akasha, "the notes are intact");

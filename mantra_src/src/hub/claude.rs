@@ -45,7 +45,7 @@ pub struct ClaudeSpawn {
     /// Normalized to drop a trailing `/v1` before use (Claude wants the bare host, unlike Codex's
     /// custom providers which include it).
     pub base_url: String,
-    /// Effective context window (WP2) passed as `--autocompact`.
+    /// Requested context window in tokens, before applying the Claude CLI's range.
     pub autocompact: u64,
     /// Role instructions, passed via `--append-system-prompt`.
     pub system_prompt: String,
@@ -431,8 +431,15 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
         a.push(effort.to_string());
     }
     if cs.autocompact > 0 {
+        // Claude rejects the launch if the flag falls outside its 100k–1M range.
+        // The CLI can further limit this window based on the selected model.
+        let window = cs.autocompact.clamp(100_000, 1_000_000);
         a.push("--autocompact".into());
-        a.push(cs.autocompact.to_string());
+        a.push(match window {
+            1_000_000 => "1M".into(),
+            n if n % 1_000 == 0 => format!("{}k", n / 1_000),
+            n => n.to_string(),
+        });
     }
     let bridge = cs.mcp_sock.as_deref().filter(|_| !spec.dynamic_tools.is_empty());
     if !cs.system_prompt.is_empty() || bridge.is_some() {
@@ -449,7 +456,7 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
     // `--strict-mcp-config` keeps every other server the user has set up for `claude` away — but
     // not from a Solo agent bridged only for its vision tools: `claude` merges the config with
     // the user's own servers, as Solo always had them (`ClaudeSpawn::strict_mcp`).
-    if bridge.is_some() || !spec.mcp.is_empty() {
+    if bridge.is_some() || !spec.mcp.is_empty() || cs.strict_mcp {
         if cs.strict_mcp || !spec.mcp.is_empty() {
             a.push("--strict-mcp-config".into());
         }
@@ -569,7 +576,7 @@ struct Translator {
     /// *completed* event's own `changes` array is non-empty, so the path must be resent, not just
     /// implied by what `item/started` already told the item.
     open_tools: HashMap<String, ToolOpen>,
-    /// The context window Mantra configured for this agent (passed as `--autocompact`).
+    /// The context window Mantra configured for this agent, in tokens.
     autocompact: u64,
     /// On a subscription login, the CLI's reported account window can lower the configured
     /// ceiling (`autocompact_state` at spawn, then `result.modelUsage.*.contextWindow`). A custom
@@ -1191,11 +1198,15 @@ done"#;
         assert!(!args.contains(&"--session-id".to_string()));
         assert!(args.windows(2).any(|w| w == ["--model".to_string(), "sonnet5".to_string()]));
         assert!(args.windows(2).any(|w| w == ["--effort".to_string(), "high".to_string()]));
-        assert!(args.windows(2).any(|w| w == ["--autocompact".to_string(), "200000".to_string()]));
+        assert!(args.windows(2).any(|w| w == ["--autocompact", "200k"]));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--bare".to_string()));
         assert!(args.windows(2).any(|w| w == ["--tools".to_string(), "Read,Glob,Grep,WebFetch".to_string()]));
-        assert!(!args.contains(&"--mcp-config".to_string()), "no bridge socket configured (mcp_sock: None) — must never add --mcp-config to a socket nothing listens on");
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#]), "a strict agent with no servers must receive an empty config");
+        let solo = ClaudeSpawn { strict_mcp: false, ..cs.clone() };
+        let args_solo = build_args(1, &spec, &solo, "sonnet5", "", "abc-123", false, &[]);
+        assert!(!args_solo.contains(&"--mcp-config".to_string()), "ordinary Solo keeps its MCP settings");
         assert!(!args.contains(&"--settings".to_string()), "ordinary permissions preserve Claude's settings");
         let mut bypass = spec.clone();
         bypass.approval = crate::config::BYPASS_SANDBOX_DANGER.into();
@@ -1204,6 +1215,20 @@ done"#;
         assert!(args.windows(2).any(|w| w == ["--settings", r#"{"sandbox":{"enabled":false}}"#]));
         assert!(args.windows(2).any(|w| w == ["--add-dir", "/"]));
         assert!(!args.contains(&"--disallowedTools".to_string()));
+
+        for (tokens, expected) in [
+            (0, None),
+            (16_000, Some("100k")),
+            (100_000, Some("100k")),
+            (200_501, Some("200501")),
+            (1_000_000, Some("1M")),
+            (4_000_000, Some("1M")),
+        ] {
+            let cs = ClaudeSpawn { autocompact: tokens, ..cs.clone() };
+            let args = build_args(1, &spec, &cs, "sonnet5", "", "abc-123", false, &[]);
+            let window = args.windows(2).find(|w| w[0] == "--autocompact").map(|w| w[1].as_str());
+            assert_eq!(window, expected, "configured window {tokens}");
+        }
     }
 
     #[test]
@@ -1244,7 +1269,7 @@ done"#;
         let mut no_tools = spec.clone();
         no_tools.dynamic_tools = vec![];
         let args2 = build_args(7, &no_tools, &cs, "sonnet5", "high", "abc-123", false, &[]);
-        assert!(!args2.contains(&"--mcp-config".to_string()), "an empty tool list must not wire up a bridge either");
+        assert!(args2.windows(2).any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#]), "an empty tool list must not wire up a bridge");
     }
 
     fn mcp_server(command: &str, args: &[&str], env: &[(&str, &str)]) -> crate::config::McpServer {

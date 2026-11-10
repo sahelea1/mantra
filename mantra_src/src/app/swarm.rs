@@ -21,11 +21,25 @@ struct Task {
     text: String,
     model: String,
     effort: Option<String>,
+    scope: Vec<String>,
 }
 
 impl App {
     /// Return true for any swarm call, including unauthorized or stale calls.
     pub(super) fn swarm_tool_call(&mut self, caller: AgentId, request: Value, tool: &str, args: &Value) -> bool {
+        if tool == "mantra_consult_advisor" {
+            let role = self.run.as_ref().filter(|r| r.planner == Some(caller) && r.pattern.settings.planner_loop && r.is_active() && !r.halted() && r.handoff.is_empty() && (r.stage == Stage::Planning || r.loop_executing())).and_then(|r| r.pattern.role("advisor")).cloned();
+            let result = match role {
+                Some(role) => self.swarm_start(caller, &json!({"tasks": [{"task": args.get("question")}]}), Some(&role)),
+                None => ("The advisor is available to the planner during planning and execution of an Akasha run.".into(), false),
+            };
+            if result.1 {
+                self.wait_for_swarm(caller, request);
+            } else {
+                self.respond_tool_text(caller, request, &result.0, false);
+            }
+            return true;
+        }
         let is_swarm = matches!(tool, "mantra_swarm_start" | "mantra_swarm_status" | "mantra_swarm_wait" | "mantra_swarm_note" | "mantra_swarm_message" | "mantra_swarm_stop");
         let is_note = matches!(tool, "mantra_akasha_read" | "mantra_akasha_note" | "mantra_akasha_amend" | "mantra_akasha_forget");
         if !is_swarm && !is_note { return false; }
@@ -33,8 +47,7 @@ impl App {
             return false; // Existing pattern Akasha group remains the run engine's responsibility.
         }
         if tool == "mantra_swarm_wait" && self.swarm_authorized(caller) && self.swarm_pending(caller) {
-            self.swarm_waiters.entry(caller).or_default().push(request);
-            if let Some(a) = self.agents.get_mut(&caller) { a.swarm_waiting = true; a.activity = "waiting for Akasha swarm".into(); }
+            self.wait_for_swarm(caller, request);
             return true;
         }
         let result = if is_note {
@@ -43,7 +56,7 @@ impl App {
             ("Swarm spawning is available to Solo and pattern roles with can_spawn_swarm enabled. Swarm members cannot spawn another swarm.".into(), false)
         } else {
             match tool {
-                "mantra_swarm_start" => self.swarm_start(caller, args),
+                "mantra_swarm_start" => self.swarm_start(caller, args, None),
                 "mantra_swarm_status" => self.swarm_status(caller),
                 "mantra_swarm_wait" => self.swarm_status(caller),
                 "mantra_swarm_note" => self.swarm_note(caller, "mantra_akasha_note", args),
@@ -56,9 +69,20 @@ impl App {
         true
     }
 
+    fn wait_for_swarm(&mut self, owner: AgentId, request: Value) {
+        self.swarm_waiters.entry(owner).or_default().push(request);
+        if let Some(a) = self.agents.get_mut(&owner) {
+            a.swarm_waiting = true;
+            a.activity = "waiting for Akasha swarm".into();
+        }
+    }
+
     fn swarm_authorized(&self, parent: AgentId) -> bool {
         if self.swarm_owners.contains_key(&parent) || !self.hub.has_agent(parent) || self.agents.get(&parent).is_none_or(|a| a.stopped_by_user || a.status == Status::Stopped) { return false; }
-        if Some(parent) == self.solo { return true; }
+        if Some(parent) == self.solo {
+            return self.agents.get(&parent).and_then(|a| a.launch_options.as_ref())
+                .map_or(self.settings.solo_swarm, |opts| opts.tools.iter().any(|t| t["name"] == "mantra_swarm_start"));
+        }
         self.run.as_ref().filter(|r| r.is_active()).and_then(|r| r.role_name_of(parent).and_then(|name| r.pattern.role(&name).map(|role| role.can_spawn_swarm))).unwrap_or(false)
     }
 
@@ -70,12 +94,22 @@ impl App {
         })))
     }
 
-    fn swarm_start(&mut self, owner: AgentId, args: &Value) -> (String, bool) {
+    fn swarm_start(&mut self, owner: AgentId, args: &Value, advisor: Option<&crate::engine::pattern::Role>) -> (String, bool) {
         let Some(parent) = self.agents.get(&owner) else { return ("Parent agent is no longer available.".into(), false) };
         let Some(input) = args.get("tasks").and_then(Value::as_array) else { return ("Provide a tasks array of one to eight independent tasks.".into(), false) };
         let prior = self.swarms.get(&owner).map(|g| g.children.len()).unwrap_or(0);
-        if input.is_empty() || prior + input.len() > MAX_MEMBERS {
-            return (format!("A swarm holds one to {MAX_MEMBERS} members total; this group has {prior}. Stop the group to start a new one."), false);
+        let loop_run = self.run.as_ref().filter(|r| r.planner == Some(owner) && r.pattern.settings.planner_loop);
+        if let Some(run) = loop_run {
+            if run.halted() || !run.handoff.is_empty() || (advisor.is_none() && !run.loop_executing()) {
+                return ("Implementation swarms start only during active execution of the approved phase.".into(), false);
+            }
+            if prior != 0 {
+                return ("Review the current group and stop it with mantra_swarm_stop before starting another batch or consulting the advisor.".into(), false);
+            }
+        }
+        let limit = loop_run.map_or(MAX_MEMBERS, |r| r.pattern.settings.max_parallel.min(MAX_MEMBERS));
+        if input.is_empty() || prior + input.len() > limit {
+            return (format!("A swarm holds one to {limit} members total; this group has {prior}. Stop the group to start a new one."), false);
         }
         let active = self.swarm_owners.keys().filter(|id| self.hub.has_agent(**id)).count();
         if active + input.len() > MAX_LIVE_MEMBERS {
@@ -89,18 +123,41 @@ impl App {
             return ("shared_chars must be 1024..16384, and can only be set when starting a group.".into(), false);
         }
         // Validate the entire batch before starting any process.
-        let mut tasks = Vec::with_capacity(input.len());
+        let mut tasks: Vec<Task> = Vec::with_capacity(input.len());
         for (i, item) in input.iter().enumerate() {
             let task = item.get("task").and_then(Value::as_str).unwrap_or("").trim();
-            let alias = item.get("model").and_then(Value::as_str).unwrap_or(&parent.model_alias).trim();
+            let alias = advisor.map(|r| r.model.as_str()).unwrap_or_else(|| item.get("model").and_then(Value::as_str).unwrap_or(&parent.model_alias)).trim();
             if task.is_empty() || task.chars().count() > 12_000 {
                 return (format!("Task {} needs a nonempty goal of at most 12000 characters; no members started.", i + 1), false);
             }
             if self.registry.get(alias).is_none() || (!self.demo && self.registry.alias_problem(alias).is_some()) {
                 return (format!("Task {} uses unavailable model alias '{alias}'; no members started. Choose a configured /models alias.", i + 1), false);
             }
-            let effort = item.get("effort").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-            tasks.push(Task { text: task.to_string(), model: alias.to_string(), effort });
+            if advisor.is_some() {
+                let backend = self.registry.backend_of(&self.registry.resolve(alias));
+                if backend == crate::config::ProviderKind::Antigravity || role_sandbox("read-only", backend) != "read-only" {
+                    return (format!("The advisor model '{alias}' needs a backend that can enforce read-only access."), false);
+                }
+            }
+            let effort = advisor.map(|r| r.effort.as_str()).or_else(|| item.get("effort").and_then(Value::as_str)).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let scope = if loop_run.is_some() && advisor.is_none() {
+                let parsed = item.get("scope").and_then(Value::as_array).and_then(|paths| {
+                    paths.iter().map(|path| {
+                        let path = path.as_str()?.trim();
+                        let base = path.strip_suffix("/**").unwrap_or(path);
+                        (!base.is_empty() && !base.contains(['*', '?', '\\'])
+                            && base.split('/').all(|part| !matches!(part, "" | "." | ".." | ".git"))).then(|| path.to_string())
+                    }).collect::<Option<Vec<_>>>()
+                });
+                let Some(scope) = parsed.filter(|paths| !paths.is_empty()) else {
+                    return (format!("Task {} needs a scope of project-relative file paths or recursive directory globs (dir/**).", i + 1), false);
+                };
+                if tasks.iter().any(|prior| prior.scope.iter().any(|a| scope.iter().any(|b| crate::engine::plan::scopes_overlap(a, b)))) {
+                    return (format!("Task {} overlaps another member's scope. Give each parallel member disjoint files.", i + 1), false);
+                }
+                scope
+            } else { vec![] };
+            tasks.push(Task { text: task.to_string(), model: alias.to_string(), effort, scope });
         }
         let (cwd, approval, parent_model, sandbox) = (parent.cwd.clone(), parent.approval.clone(), parent.model_alias.clone(), parent.sandbox.clone());
         let in_run = Some(owner) != self.solo && self.in_run(owner);
@@ -117,21 +174,39 @@ impl App {
         for task in tasks {
             let model = self.registry.resolve(&task.model);
             let backend = self.registry.backend_of(&model);
+            let (name, role_name, glyph, color, sandbox, approval, instructions, child_mcp) = match advisor {
+                Some(role) => (
+                    format!("advisor · {}", task.model), "advisor", role.glyph.clone(), role.color.clone(),
+                    "read-only".to_string(), role.permission.clone(), format!("{}\nmantra-role: advisor", role.instructions), vec![],
+                ),
+                None => (
+                    format!("akasha · {}", task.model), "swarm-member", "◇".into(), "violet".into(),
+                    role_sandbox(&sandbox, backend), approval.clone(),
+                    format!("mantra-role: swarm-member\nYou are one member of a bounded Akasha swarm. Complete your assigned task, coordinate through the shared notes, stay within the parent's working directory, and return a concise result. You cannot delegate or spawn other agents.\n{MEMBER_PROTOCOL}"),
+                    mcp.clone(),
+                ),
+            };
             let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
-                name: format!("akasha · {}", task.model), role: "swarm-member".into(), glyph: "◇".into(), color: "violet".into(),
-                model_alias: task.model.clone(), effort: task.effort, cwd: cwd.clone(), approval: approval.clone(),
-                sandbox: role_sandbox(&sandbox, backend),
-                instructions: "You are one member of a bounded Akasha swarm. Complete your assigned task, coordinate through the shared notes, stay within the parent's working directory, and return a concise result. You cannot delegate or spawn other agents.\n".to_string() + MEMBER_PROTOCOL,
-                tools: { let mut t = tools::swarm_member_note_tools(); if model.vision { t.extend(tools::vision_tools()); } t },
-                extra_writable: vec![], network, writable_roots: writable_roots.clone(),
+                name, role: role_name.into(), glyph, color, model_alias: task.model.clone(), effort: task.effort,
+                cwd: cwd.clone(), approval, sandbox, instructions,
+                tools: { let mut t = if advisor.is_some() { vec![] } else { tools::swarm_member_note_tools() }; if model.vision { t.extend(tools::vision_tools()); } t },
+                extra_writable: vec![], network: advisor.is_none() && network, writable_roots: if advisor.is_some() { vec![] } else { writable_roots.clone() },
                 context_override: Some(self.registry.effective_context_window(&task.model, &self.settings.default_model).min(self.run.as_ref().filter(|_| in_run).map(|r| r.pattern.settings.context_cap).filter(|n| *n > 0).unwrap_or(u64::MAX))),
-                resume_thread: None, thread_name: Some(format!("Akasha swarm · {}", task.model)), mcp: mcp.clone(),
+                resume_thread: None, thread_name: Some(format!("{role_name} · {}", task.model)), mcp: child_mcp,
             });
             self.swarms.get_mut(&owner).unwrap().children.push(child);
             self.swarm_owners.insert(child, owner);
-            let brief = format!("Your task: {}\n\nShared Akasha notes (read again with mantra_akasha_read):\n{}", task.text, notes);
+            let scope = if task.scope.is_empty() { String::new() } else { format!("\nOnly modify these paths: {}", task.scope.join(", ")) };
+            let brief = if advisor.is_some() {
+                format!("Question from the planner: {}", task.text)
+            } else {
+                format!("Your task: {}{scope}\n\nShared Akasha notes (read again with mantra_akasha_read):\n{notes}", task.text)
+            };
             prompt_agent(&self.hub, &mut self.agents, child, brief, true, Send::Auto);
             ids.push(format!("{child} ({})", task.model));
+        }
+        if let Some(run) = self.run.as_mut().filter(|r| r.planner == Some(owner) && r.loop_executing()) {
+            run.loop_progress();
         }
         (format!("Akasha {} started {} member{}: {}. Use mantra_swarm_status for progress and shared notes, then mantra_swarm_wait before reporting completion. Parent model: {parent_model}.", self.swarms[&owner].name, ids.len(), if ids.len() == 1 { "" } else { "s" }, ids.join(", ")), true)
     }
@@ -142,7 +217,9 @@ impl App {
         for id in &group.children {
             if let Some(a) = self.agents.get(id) {
                 let answer = a.final_message.as_deref().unwrap_or("").trim();
-                lines.push(format!("{id} · {} · {:?}{}", a.model_alias, a.status, if answer.is_empty() { String::new() } else { format!(" · {}", crate::util::trunc(answer, 500)) }));
+                let name = if a.role == "advisor" { &a.name } else { &a.model_alias };
+                let limit = if a.role == "advisor" { 4_000 } else { 500 };
+                lines.push(format!("{id} · {name} · {:?}{}", a.status, if answer.is_empty() { String::new() } else { format!(" · {}", crate::util::trunc(answer, limit)) }));
             }
         }
         lines.push(group.notes.render());
@@ -291,7 +368,7 @@ mod tests {
         app.solo = Some(1);
         let (text, ok) = app.swarm_start(1, &json!({"tasks": [
             {"task": "good", "model": "sol"}, {"task": "bad", "model": "does-not-exist"}
-        ]}));
+        ]}), None);
         assert!(!ok && text.contains("no members started"));
         assert!(app.swarms.is_empty() && app.swarm_owners.is_empty());
         app.swarms.insert(1, SwarmGroup { owner: 1, name: "swarm-1".into(), notes: Block::new("swarm-1", 8_192), children: vec![3] });

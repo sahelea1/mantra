@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const KINDS: &[&str] = &["planner", "manager", "orchestrator", "worker", "gate"];
+pub const KINDS: &[&str] = &["planner", "advisor", "manager", "orchestrator", "worker", "gate"];
 pub const COLORS: &[&str] = &["saffron", "violet", "teal", "cyan", "green", "rose", "red", "amber", "blue", "gray"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,6 +118,11 @@ pub fn parse_parallel(s: &str) -> std::result::Result<usize, String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PatternSettings {
+    /// The planner runs a single phase directly with Akasha and a read-only advisor.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub planner_loop: bool,
+    /// Whether the user lets the planner propose changes to this workflow.
+    pub allow_pattern_changes: bool,
     /// auto | worktree | shared
     pub isolation: String,
     pub max_parallel: usize,
@@ -155,7 +160,33 @@ pub struct PatternSettings {
     /// effective window is `min(model window, context_cap)`, so the backend compacts there. A
     /// 500k-token context let a worker cycle tools for hours (6.8M tokens, mostly cached input,
     /// on one task); 200k keeps it honest. 0 = the model's full window.
+    #[serde(deserialize_with = "deserialize_context_cap")]
     pub context_cap: u64,
+}
+
+pub(crate) fn parse_context_cap(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("off") || text.eq_ignore_ascii_case("full") {
+        Some(0)
+    } else {
+        crate::util::parse_tokens(text)
+    }
+}
+
+fn deserialize_context_cap<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ContextCap {
+        Tokens(u64),
+        Text(String),
+    }
+
+    match ContextCap::deserialize(deserializer)? {
+        ContextCap::Tokens(tokens) => Ok(tokens),
+        ContextCap::Text(text) => parse_context_cap(&text).ok_or_else(|| {
+            serde::de::Error::custom("context_cap must be a token count such as 200k or 1M, or 0 for no cap")
+        }),
+    }
 }
 
 fn default_true() -> bool {
@@ -165,6 +196,8 @@ fn default_true() -> bool {
 impl Default for PatternSettings {
     fn default() -> Self {
         PatternSettings {
+            planner_loop: false,
+            allow_pattern_changes: true,
             isolation: "auto".into(),
             max_parallel: 4,
             worker_retries: 2,
@@ -230,8 +263,7 @@ pub struct Pattern {
     /// file `load()` will read next time, instead of always landing in `$MANTRA_HOME`.
     #[serde(skip)]
     pub source_dir: Option<PathBuf>,
-    /// Akasha groups (experimental, `[[groups]]`): agents that share one block of notes. Empty for
-    /// every pattern written before them, and inert until `mantra experimental enable akasha`.
+    /// Akasha groups (`[[groups]]`): agents that share one block of notes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Group>,
 }
@@ -288,7 +320,7 @@ impl Pattern {
 
     /// The names of the patterns that ship inside the binary (`load` finds them without a file).
     pub fn names() -> Vec<&'static str> {
-        vec![NAME_DEFAULT, NAME_LEAN, NAME_THOROUGH, NAME_AUTO]
+        vec![NAME_DEFAULT, NAME_LEAN, NAME_AKASHA, NAME_THOROUGH, NAME_AUTO]
     }
 
     /// A built-in pattern by name (slug-insensitive), if `name` is one of `names()`.
@@ -297,6 +329,7 @@ impl Pattern {
             NAME_AUTO => Some(Pattern::builtin_auto()),
             NAME_DEFAULT => Some(Pattern::builtin()),
             NAME_LEAN => Some(Pattern::builtin_lean()),
+            NAME_AKASHA => Some(builtin_akasha()),
             NAME_THOROUGH => Some(Pattern::builtin_thorough()),
             _ => None,
         }
@@ -417,7 +450,18 @@ impl Pattern {
         if !self.flow.manager.trim().is_empty() {
             need(&self.flow.manager, "manager", "manager", &mut errs);
         }
-        if !self.is_auto() {
+        if self.settings.planner_loop && !self.is_auto() {
+            need("advisor", "advisor", "advisor", &mut errs);
+            if self.roles.len() != 2 || !self.flow.orchestrator.is_empty() || !self.flow.phase_gate.is_empty() || !self.flow.manager.is_empty() || !self.flow.finale.is_empty() {
+                errs.push("the Akasha loop uses only the planner and advisor, with no orchestrator, manager, gate or finale".into());
+            }
+            if !self.roles.get(&self.flow.planner).is_some_and(|r| r.can_spawn_swarm && r.sandbox == "workspace-write" && r.permission != crate::config::BYPASS_SANDBOX_DANGER) {
+                errs.push("the Akasha loop planner must allow swarm delegation with a workspace-write sandbox".into());
+            }
+            if self.roles.get("advisor").is_some_and(|r| r.sandbox != "read-only" || r.can_spawn_swarm || r.permission == crate::config::BYPASS_SANDBOX_DANGER || !r.mcp.is_empty()) {
+                errs.push("the advisor must be read-only and may not use external MCP servers or delegate".into());
+            }
+        } else if !self.is_auto() {
             need(&self.flow.orchestrator, "orchestrator", "orchestrator", &mut errs);
             need(&self.flow.phase_gate, "gate", "phase_gate", &mut errs);
         } else if self.roles.len() != 1 || !self.flow.orchestrator.is_empty() || !self.flow.phase_gate.is_empty() || !self.flow.manager.is_empty() || !self.flow.finale.is_empty() || !self.groups.is_empty() {
@@ -431,7 +475,10 @@ impl Pattern {
                 errs.push(format!("flow.finale[{i}] role '{}' is not defined", s.role));
             }
         }
-        if !self.is_auto() && self.worker_roles().is_empty() {
+        if !self.settings.planner_loop && self.roles.values().any(|r| r.kind == "advisor") {
+            errs.push("advisor roles belong to the Akasha loop".into());
+        }
+        if !self.is_auto() && !self.settings.planner_loop && self.worker_roles().is_empty() {
             errs.push("pattern needs at least one role with kind = \"worker\"".into());
         }
         if self.settings.max_parallel == 0 {
@@ -673,6 +720,7 @@ pub struct RoleSummary {
 pub const NAME_DEFAULT: &str = "mantra-default";
 pub const NAME_AUTO: &str = "auto";
 pub const NAME_LEAN: &str = "mantra-lean";
+pub const NAME_AKASHA: &str = "mantra-akasha";
 pub const NAME_THOROUGH: &str = "mantra-thorough";
 
 /// Built-ins 0.8 retired. The swarm became a worker class of every pattern (`worker-swarm`), and
@@ -878,8 +926,7 @@ fn base_pattern(name: &str, description: &str) -> Pattern {
     p.flow = Flow { planner: "planner".into(), manager: String::new(), orchestrator: "orchestrator".into(), phase_gate: "qa".into(), on_reprompt: "planner".into(), finale: vec![] };
     // 200k is plenty for any one task; a bigger window only lets an agent cycle tools for hours.
     p.settings.context_cap = 200_000;
-    // The workers share one Akasha block — inert until akasha is switched on, and then it works
-    // out of the box.
+    // The workers share one Akasha notebook.
     p.groups = vec![Group { name: "builders".into(), roles: p.worker_roles(), ..Group::default() }];
     p
 }
@@ -917,6 +964,38 @@ fn builtin_lean() -> Pattern {
     p.settings.gate_max_rounds = 2;
     p.settings.review_minutes = 0;
     p.flow.finale = vec![finale("planner", PLANNER_FINALE_TASK, true)];
+    p
+}
+
+fn builtin_akasha() -> Pattern {
+    let mut p = builtin_lean();
+    p.name = NAME_AKASHA.into();
+    p.description = "One phase led by the planner with a read-only advisor and Akasha swarms".into();
+    p.settings.planner_loop = true;
+    p.settings.allow_pattern_changes = false;
+    p.flow.orchestrator.clear();
+    p.flow.phase_gate.clear();
+    p.flow.finale.clear();
+    p.groups.clear();
+    let mut planner = planner_role();
+    planner.sandbox = "workspace-write".into();
+    planner.can_spawn_swarm = true;
+    planner.description = "Owns the plan, delegates work to Akasha, and verifies the result".into();
+    planner.instructions = with_budget("Lead the run through one evolving phase. Use the advisor for design advice and Akasha swarms for implementation. Verify the result against the user's goal.");
+    p.roles = BTreeMap::from([
+        ("planner".into(), planner),
+        ("advisor".into(), Role {
+            kind: "advisor".into(),
+            glyph: "◇".into(),
+            color: "teal".into(),
+            model: "sol".into(),
+            effort: "medium".into(),
+            sandbox: "read-only".into(),
+            description: "Independent advice on the planner's design and decisions".into(),
+            instructions: with_budget("Advise the planner on the question it gives you. Read only what you need. Explain concrete trade-offs and suggest the next step. Do not edit files or make decisions for the planner."),
+            ..Role::default()
+        }),
+    ]);
     p
 }
 
@@ -999,7 +1078,7 @@ mod tests {
 
     #[test]
     fn names_list_every_builtin_and_each_loads_by_name() {
-        assert_eq!(Pattern::names(), vec!["mantra-default", "mantra-lean", "mantra-thorough", "auto"]);
+        assert_eq!(Pattern::names(), vec!["mantra-default", "mantra-lean", "mantra-akasha", "mantra-thorough", "auto"]);
         for n in Pattern::names() {
             let p = Pattern::load(n, Path::new("/nonexistent")).unwrap_or_else(|e| panic!("{n}: {e}"));
             assert_eq!(p.name, n);
@@ -1170,6 +1249,12 @@ mod tests {
         assert_eq!(Pattern::from_toml(&old).unwrap().settings.context_cap, 0, "missing = 0 = the model's full window");
         let custom = toml.replace("context_cap = 200000", "context_cap = 64000");
         assert_eq!(Pattern::from_toml(&custom).unwrap().settings.context_cap, 64_000);
+        for (text, tokens) in [("200k", 200_000), ("1M", 1_000_000), ("off", 0)] {
+            let custom = toml.replace("context_cap = 200000", &format!("context_cap = {text:?}"));
+            assert_eq!(Pattern::from_toml(&custom).unwrap().settings.context_cap, tokens);
+        }
+        let invalid = toml.replace("context_cap = 200000", "context_cap = \"NaNk\"");
+        assert!(Pattern::from_toml(&invalid).is_err());
     }
 
     #[test]
@@ -1199,9 +1284,10 @@ mod tests {
                 assert!(r.instructions.contains("full test suite more than once per turn unless it failed"), "{}: role '{n}'", p.name);
                 assert!(r.instructions.chars().count() < 2000, "{}: role '{n}' is {} chars — keep it lean", p.name, r.instructions.chars().count());
             }
-            let qa = &p.roles[&p.flow.phase_gate];
-            assert_eq!(qa.sandbox, "read-only", "{}: the phase gate never writes", p.name);
-            assert!(qa.instructions.contains("never fix"), "{}", p.name);
+            if let Some(qa) = p.role(&p.flow.phase_gate) {
+                assert_eq!(qa.sandbox, "read-only", "{}: the phase gate never writes", p.name);
+                assert!(qa.instructions.contains("never fix"), "{}", p.name);
+            }
         }
         let d = Pattern::builtin();
         assert!(d.roles["worker-small"].instructions.contains("only the build, tests or lint that cover your scope"));
@@ -1234,13 +1320,13 @@ mod tests {
         assert_eq!(back.roles["worker-big"].effort, "auto");
     }
 
-    /// Every built-in has the swarm class: `worker-swarm` beside the small and big workers — on
+    /// Every built-in that uses workers has the swarm class: `worker-swarm` beside the small and big workers — on
     /// `luna`, low effort (explicit in the heavy flow, `auto` → low elsewhere), 16 at once of its
-    /// own — all three workers in one `builders` Akasha group (inert until akasha is on), and a
+    /// own — all three workers in one `builders` Akasha group, and a
     /// planner told when the class fits and when it does not.
     #[test]
     fn every_builtin_has_the_swarm_class_the_builders_group_and_the_planner_paragraph() {
-        for p in all_builtins() {
+        for p in all_builtins().into_iter().filter(|p| !p.settings.planner_loop) {
             let s = &p.roles["worker-swarm"];
             assert_eq!((s.kind.as_str(), s.glyph.as_str(), s.color.as_str(), s.model.as_str(), s.parallel), ("worker", "∴", "amber", "luna", Some(16)), "{}", p.name);
             assert_eq!(s.description, "Many tiny, independent tasks at once");

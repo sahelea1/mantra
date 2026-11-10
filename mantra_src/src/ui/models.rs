@@ -179,21 +179,6 @@ fn parse_auth(t: &str) -> String {
     }
 }
 
-/// A token count as typed: `200000`, `200k`, `1.5m`; nothing / `none` / `default` is none.
-pub(crate) fn parse_tokens(t: &str) -> Option<u64> {
-    let t = t.trim().to_lowercase().replace([',', '_'], "");
-    if t.is_empty() || t == "none" || t == "default" {
-        return None;
-    }
-    if let Some(k) = t.strip_suffix('k') {
-        return k.parse::<f64>().ok().map(|v| (v * 1000.0) as u64);
-    }
-    if let Some(m) = t.strip_suffix('m') {
-        return m.parse::<f64>().ok().map(|v| (v * 1_000_000.0) as u64);
-    }
-    t.parse().ok()
-}
-
 /// A model cell's value as an edit starts from it.
 fn model_value(m: &ModelEntry, col: usize) -> String {
     match col {
@@ -257,7 +242,7 @@ fn set_model_cell(reg: &mut Registry, row: usize, col: usize, text: &str) -> Res
             }
         }
         CONTEXT_COL => {
-            let n = parse_tokens(t);
+            let n = crate::util::parse_tokens(t);
             if n.is_none() && !t.is_empty() && !["none", "default"].contains(&t.to_ascii_lowercase().as_str()) {
                 return Err("context: a number of tokens — 200000, 400k or 1m (empty: inherit the default model window)".into());
             }

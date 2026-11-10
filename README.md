@@ -132,12 +132,11 @@ mantra doctor                                   # what's installed, what's missi
 |---|---|
 | **Solo** | the default model (an alias from `/models`), approvals, sandbox, and which MCP servers Solo gets: all, none, or the ones you pick |
 | **Runs** | the pattern new runs use; notifications (a desktop notification, or the bell, when a run needs you or finishes) |
-| **Features** | Akasha, the experimental shared notes for agent groups |
 | **MCP servers** | one row per server — name, command, on or off. `ctrl+n` adds one (a name, then its command line), `ctrl+t` tests it, `space` on its row enables or disables it, `Delete` (twice) removes it |
 | **Web & remote** | the listen address, the password (write-only: it reads *set*), HTTPS and push; the URLs and certificate the web UI is served on; and the remote link, QR code, short code and password, with the identity rotatable |
 | **Appearance** | glyphs, colours, reduce motion, mouse, frames a second, the side panel |
 
-Most changes apply at once; a few say when they will (the toast tells you): the default model, sandbox and MCP choice reach Solo's next session (`/new`), Akasha reaches new runs, and the appearance and web settings apply at the next start. The web UI renders the same fields from the same code, so it accepts exactly what the terminal does. `mantra experimental` and `mantra mcp` stay for scripting.
+Most changes apply at once; a few say when they will (the toast tells you): the default model, sandbox, MCP choice and Akasha swarm toggle reach Solo's next session (`/new`), and the appearance and web settings apply at the next start. The web UI renders the same fields from the same code, so it accepts exactly what the terminal does. `mantra experimental` and `mantra mcp` stay for scripting.
 
 </details>
 
@@ -297,20 +296,11 @@ The same chain carries halts: **manager → planner → you**. *Gate exhausted* 
 </details>
 
 <details>
-<summary>Experimental: Akasha, shared notes for agent groups</summary>
+<summary>Akasha shared notes for agent groups</summary>
 
-*Ākāśa* is the space that holds everything. Agents in a **group** share one small block of notes: a fact about the codebase, a decision, an interface one of them created, a pitfall — what an agent working beside them would want to know. Each agent keeps its own context and its own reasoning; the block is the part it chooses to share, plus what Mantra shares for it (a task done or failed, the files it changed). It is experimental: the file format and the tools may change.
+*Ākāśa* is the space that holds everything. Agents in a **group** share one small block of notes: a fact about the codebase, a decision, an interface one of them created, a pitfall — what an agent working beside them would want to know. Each agent keeps its own context and its own reasoning; the block is the part it chooses to share, plus what Mantra shares for it (a task done or failed, the files it changed).
 
-**Turning it on.** It is off until you switch it on, and while it is off a pattern with groups runs exactly as if it had none (the journal says so once, at run start):
-
-```bash
-mantra experimental                  # every experimental feature, on or off
-mantra experimental enable akasha    # saved in settings.toml; disable turns it off again
-```
-
-In the app, *Features* in `/settings` lists the same and switches it (a run already open keeps what it started with). `mantra --demo` has it on, and a demo run whose goal says "swarm" — `mantra --demo run "build a tiny todo CLI, its tests written by a swarm"` — shows notes being shared.
-
-**The pattern** names its groups; every built-in ships with one, `builders`, of all three worker roles (it does nothing while Akasha is off):
+A pattern enables shared notes by listing its groups. Default, Lean and Thorough ship with a `builders` group for their worker roles:
 
 ```toml
 [[groups]]
@@ -321,7 +311,7 @@ push = "urgent"                          # which new notes reach busy members mi
 auto = true                              # Mantra adds a line when a member's task ends, and the files it changed
 ```
 
-The Studio shows a pattern's groups in its overview, read-only; they are edited in the file, or by the architect.
+The web Pattern editor can edit groups. In the terminal, Studio shows them in the overview. Edit them in TOML or through the architect.
 
 **What the agents get.** Members have four tools: `mantra_akasha_read`, `mantra_akasha_note` (`text`, `urgent`), `mantra_akasha_amend` (`id`, `text`) and `mantra_akasha_forget` (`id`). Every prompt Mantra sends a member — the spawn brief, a retry, a nudge, a resume — ends with the block as it stands. A note marked urgent goes to every other member that is busy right then, as a steer between its tool calls (at most one every 20 s per agent, the waiting ones joined); a member that is idle is never woken for it and reads it with its next prompt. The block has a hard size: a note that would overflow it is refused with how much is over, and the agent is told to forget what went stale. Mantra's own lines give way first — when the block is full they are dropped, and the journal says so.
 
@@ -343,7 +333,7 @@ Use the **Codex** backend for a ChatGPT subscription and **Claude Code** for its
 
 Drafts stay with each conversation while the terminal or browser page remains open. Navigation, overlay dismissal, and browser reconnects preserve them; a full browser reload starts fresh. Long remote transcripts use a bounded visible window, with earlier history and full message text available on demand.
 
-**Akasha swarms.** Solo can start a small group of independent agents with a shared notebook. For a team role, enable **Can spawn swarm** in `/studio` (or the remote pattern editor); it is off by default for roles. Each group has up to eight members, with at most sixteen live swarm members across the app. Members use configured model aliases, can mix backends, and inherit the parent’s active permission and working directory. They cannot spawn more swarms. Split work by file or responsibility: members share the parent’s workspace rather than getting separate worktrees.
+**Akasha swarms.** Solo can start a small group of independent agents with a shared notebook. The Akasha swarm switch is under Solo settings and applies to the next Solo session. For a team role, enable **Can spawn swarm** in `/studio` (or the remote pattern editor); it is off by default for roles. Each group has up to eight members, with at most sixteen live swarm members across the app. Members use configured model aliases, can mix backends, and inherit the parent’s active permission and working directory. They cannot spawn more swarms. Split work by file or responsibility: members share the parent’s workspace rather than getting separate worktrees.
 
 The parent uses `mantra_swarm_start`, `mantra_swarm_status`, `mantra_swarm_wait`, `mantra_swarm_message`, `mantra_swarm_note`, and `mantra_swarm_stop`. Members coordinate through the Akasha note tools. `/akasha` shows their notes in the terminal; remote agent pages show the group, member links and folded shared notes. Ending the parent or replacing a Solo session ends its members too. Delegated groups are session-local; normal run Akasha groups retain their existing persistence.
 
@@ -610,7 +600,11 @@ Each has the same three worker classes, and the planner assigns every task to on
 
 Every built-in role prompt is short and says what it owns, what it never does, when to stop — and not to re-read files it already read or run the full suite more than once a turn unless it failed.
 
-Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap. A model without its own window inherits the configured default model's window (200k only when neither specifies one). For example, a 1M run ceiling keeps models configured for 250k, 500k and 1M at those respective limits. `0` removes the run ceiling; the Studio edits it (`200k`, `off`) under settings. A live model change applies the new effective window to the backend as well as the gauge.
+Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap. A model without its own window inherits the configured default model's window (200k only when neither specifies one). For example, a 1M run ceiling keeps models configured for 250k, 500k and 1M at those respective limits. `0` removes the run ceiling; the Studio edits it (`200k`, `off`) under settings. A live model change applies the new effective window to the backend as well as the gauge. Claude Code accepts auto-compact windows from 100k to 1M, so Mantra bounds its launch argument to that range. The selected model can impose a smaller window.
+
+Choose **Mantra Akasha** (`mantra-akasha`) for one execution phase led by the planner. The planner consults a separate read-only advisor, delegates implementation in Akasha batches with disjoint scopes, and verifies the result before completing the run. Set the advisor's model in Studio. The planner can update the live plan and propose workflow changes when enabled. A batch shares the run workspace and is recreated if needed after a restart.
+
+**Live workflow changes** can be set for new runs in Studio. Press **F3**, type `/workflow`, or use the switch on the web Run page to change the permission for the current run. Mantra Akasha starts with this permission locked. Enabling the switch leaves the run's approval policy in effect for workflow proposals.
 
 Choose **Auto** in the pattern picker, or use `mantra run "your goal" --pattern auto`, to start with a planner that designs a workflow for the task. It proposes a validated pattern before submitting a plan. User messages in Mandala enter through the planner, which normally briefs the orchestrator and can directly steer or stop another agent in an emergency. A workflow proposal asks for approval unless the planner's active permission mode is **never ask** or **BYPASS-SANDBOX-DANGER**. Pending approval survives a restart. Existing worktrees and required active task roles are preserved when the workflow changes.
 
@@ -644,7 +638,7 @@ It does what the terminal does. Beyond the Team, Run, Pulse, Inbox and Runs scre
 |---|---|
 | **Start a run** | the goal, a **pattern** select (each with its one-line description) and an optional **workers at once** (`--parallel`) |
 | **Run**, **Runs** | **Stop run** and **Delete run**, each behind a confirmation, wherever a run is shown; once a run is stopped, *Start a new run* is offered right there |
-| **Settings → Solo, Runs, Features** | the same fields as `/settings`: model, approvals, sandbox, MCP servers for Solo, default pattern, notifications, Akasha |
+| **Settings → Solo, Runs** | the same fields as `/settings`: model, approvals, sandbox, MCP servers and Akasha for Solo, default pattern and notifications |
 | **Settings → MCP servers** | add a server (a name and a command line), enable or disable it, test it, remove it |
 | **Settings → Models & providers** | the aliases as a table (provider, model, context, effort, vision) edited cell by cell, with delete, add and *Test*; the providers likewise; **Add provider** — paste the key, confirm the URL, *Probe*, tick the models, add — and *Add Codex* / *Add Claude Code* |
 | **Settings → Patterns** | the patterns with their tags; an editor with a card per role (model, effort, sandbox, permission, parallel, fallback, MCP, instructions), the settings, the flow and the groups; *Save* (the errors shown), *Save as copy*, *Delete* (yours only), *Use for new runs* |

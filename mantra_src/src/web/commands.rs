@@ -161,6 +161,10 @@ impl App {
                     _ => Err(self.toast.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| "the run could not start".into())),
                 }
             }
+            Command::WorkflowChanges { enabled } => {
+                self.set_workflow_changes(enabled)?;
+                Ok(json!({"enabled": enabled}))
+            }
             Command::PlanApprove => {
                 if self.run.as_ref().map(|r| r.stage != Stage::Review).unwrap_or(true) {
                     return Err("no plan to approve".into());

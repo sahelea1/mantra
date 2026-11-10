@@ -386,6 +386,8 @@ async function main() {
             await nav(driver, '/patterns/mantra-default');
             await driver.waitForSelector('#pe-desc', { timeout: 8000 });
             await driver.fill('#pe-desc', 'my e2e take on the default');
+            await driver.getByText('More settings', { exact: true }).click();
+            await driver.getByRole('textbox', { name: 'Run context ceiling (tokens)', exact: true }).fill('1M');
             await driver.click('button:has-text("Save as copy")');
             await driver.fill('.sheet input[aria-label="Name of the copy"]', 'e2e-pattern');
             await driver.click('.sheet button:has-text("Save copy")');
@@ -398,6 +400,7 @@ async function main() {
             await driver.locator('.pe-acts button:has-text("Save")').first().click();
             await driver.waitForTimeout(400);
             const swarmPattern = await must(driver, 'pattern_get', { name: 'e2e-pattern' });
+            if (swarmPattern.pattern.settings.context_cap !== 1000000) throw new Error('the shorthand context cap did not persist');
             if (!swarmPattern.pattern.roles['worker-small'].can_spawn_swarm) throw new Error('swarm role toggle did not persist');
             // invalid: refused with every reason, in the editor too
             const bad = JSON.parse(JSON.stringify((await must(driver, 'pattern_get', { name: 'e2e-pattern' })).pattern));
@@ -548,6 +551,34 @@ async function main() {
             await refused(driver, 'send', { agent: fresh.agent, text: 'must not restart' }, 'process has ended');
             await driver.click('.agent-trouble button:has-text("New Solo session")');
             await waitForState(driver, (old) => location.pathname.startsWith('/agent/') && !location.pathname.endsWith('/' + old), fresh.agent);
+        });
+        await step('main', driver, 'Akasha: live permission, advisor, swarm and single-phase completion', async () => {
+            await must(driver, 'start_run', { goal: 'Build a focused Akasha demo', pattern: 'mantra-akasha' });
+            await nav(driver, '/run');
+            await nav(phone, '/run');
+            const ready = () => window.Mantra.store.S.run?.stage.kind === 'review';
+            await waitForState(driver, ready, null, { timeout: 60000 });
+            await waitForState(phone, ready, null, { timeout: 10000 });
+            const toggle = phone.getByRole('checkbox', { name: 'Live workflow changes' });
+            if (await toggle.isChecked()) throw new Error('live changes should start locked');
+            await toggle.click();
+            await waitForState(driver, () => window.Mantra.store.S.run?.workflow_changes === true);
+            await waitForState(phone, () => window.Mantra.store.S.run?.workflow_changes === true);
+            if (!await toggle.isChecked()) throw new Error('the mobile switch did not reflect the enabled permission');
+            if (await driver.locator('.rail .seg[title="Finale"]').count()) throw new Error('Akasha has no finale');
+            await shot(phone, 'web-akasha-review-phone.png');
+            await driver.getByRole('button', { name: 'Approve plan', exact: true }).click();
+            await waitForState(driver, () => window.Mantra.store.S.run?.stage.kind === 'done', null, { timeout: 60000 });
+            const result = await driver.evaluate(() => {
+                const s = window.Mantra.store.S;
+                return { phases: s.plan.phases.length, version: s.run.plan_version, history: s.run.history.length,
+                    summary: s.run.completion_summary, advisor: [...s.agents.values()].some(a => a.role === 'advisor'),
+                    swarm: [...s.agents.values()].filter(a => a.role === 'swarm-member').length };
+            });
+            if (result.phases !== 1 || result.version !== 2 || result.history !== 1 || !result.advisor || result.swarm !== 2 || !result.summary?.includes('focused checks passed')) {
+                throw new Error('unexpected Akasha result: ' + JSON.stringify(result));
+            }
+            await shot(driver, 'web-akasha-complete.png');
         });
         // Only close a server this test itself launched, never a caller-owned remote instance.
         if (server) await step('main', driver, 'host shutdown: cancel keeps it alive → confirm exits cleanly', async () => {

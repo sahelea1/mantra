@@ -23,7 +23,7 @@ const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
-const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "allow_pattern_changes"];
 const ADD_STEP: &str = "+ add finale step";
 
 /// How a field takes keys (`ui::form`'s rules).
@@ -48,7 +48,7 @@ fn field_kind(entry: &str, field: &str) -> Kind {
         "⚙ settings" => match field {
             "name" | "description" | "writable_roots" => Kind::Text,
             "isolation" | "orchestrator_context" => Kind::Choice,
-            "network" | "review_plan" => Kind::Toggle,
+            "network" | "review_plan" | "allow_pattern_changes" => Kind::Toggle,
             _ => Kind::Step,
         },
         "⇢ flow" => match field {
@@ -106,6 +106,7 @@ fn select_by_index(app: &mut App, i: usize) {
 }
 
 fn flow_fields(app: &App) -> Vec<String> {
+    if app.studio.pattern.settings.planner_loop { return vec!["planner".into()]; }
     let mut v = vec!["planner".to_string(), "manager".into(), "orchestrator".into(), "phase_gate".into(), "on_reprompt".into()];
     for i in 0..app.studio.pattern.flow.finale.len() {
         v.push(format!("finale[{i}].role"));
@@ -118,7 +119,9 @@ fn flow_fields(app: &App) -> Vec<String> {
 
 fn fields(app: &App, entry: &str) -> Vec<String> {
     match entry {
-        "⚙ settings" => PATTERN_FIELDS.iter().chain(SETTING_FIELDS).map(|s| s.to_string()).collect(),
+        "⚙ settings" => PATTERN_FIELDS.iter().chain(SETTING_FIELDS)
+            .filter(|f| !app.studio.pattern.settings.planner_loop || !matches!(**f, "worker_retries" | "orchestrator_context" | "gate_max_rounds" | "check_timeout_secs" | "max_tasks_per_phase" | "review_minutes" | "manager_minutes"))
+            .map(|s| s.to_string()).collect(),
         "⇢ flow" => flow_fields(app),
         role => {
             // only workers run many at a time: on any other kind `parallel` would be a dead row
@@ -146,6 +149,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "writable_roots" => if s.writable_roots.is_empty() { "none".into() } else { s.writable_roots.join(", ") },
                 "max_parallel" => s.max_parallel.to_string(),
                 "worker_retries" => s.worker_retries.to_string(),
+                "allow_pattern_changes" => if s.allow_pattern_changes { "on".into() } else { "off".into() },
                 "review_plan" => if s.review_plan { "on".into() } else { "off".into() },
                 "orchestrator_context" => s.orchestrator_context.clone(),
                 "stall_minutes" => s.stall_minutes.to_string(),
@@ -347,6 +351,7 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                 "max_parallel" => step_u(&mut s.max_parallel, 1),
                 "worker_retries" => s.worker_retries = (s.worker_retries as i32 + d).max(0) as u32,
                 "review_plan" => s.review_plan = !s.review_plan,
+                "allow_pattern_changes" => s.allow_pattern_changes = !s.allow_pattern_changes,
                 "stall_minutes" => s.stall_minutes = (s.stall_minutes as i64 + d as i64).max(1) as u64,
                 "gate_max_rounds" => s.gate_max_rounds = (s.gate_max_rounds as i32 + d).max(1) as u32,
                 "check_timeout_secs" => s.check_timeout_secs = (s.check_timeout_secs as i64 + 60 * d as i64).max(60) as u64,
@@ -453,10 +458,7 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                 ("first_token_minutes", None) if text.trim().eq_ignore_ascii_case("off") => s.first_token_minutes = 0,
                 // `200000`, `200k`, `1m` (the role field's token syntax); off / full = no cap
                 ("context_cap", _) => {
-                    let t = text.trim();
-                    if t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("full") {
-                        s.context_cap = 0;
-                    } else if let Some(v) = super::models::parse_tokens(text) {
+                    if let Some(v) = crate::engine::pattern::parse_context_cap(text) {
                         s.context_cap = v;
                     }
                 }
@@ -944,6 +946,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
+        "allow_pattern_changes" => "Let the planner propose workflow edits. F3 toggles this permission for the active run.",
         "context_cap" => "Run context ceiling: each agent keeps its model's configured window up to this cap. A smaller model window stays smaller. 0 = the model's full window; 200k is the built-in default.",
         _ => return None,
     })

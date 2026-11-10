@@ -274,6 +274,8 @@ define_commands! {
     /// list to land or delete, and the way clear for `start_run`. → `{}`.
     RunStop => "run_stop",
 
+    WorkflowChanges { enabled: bool } => "workflow_changes",
+
     /// Every pattern as a list shows it (`Pattern::summaries`). → `{patterns, current, default}`.
     PatternsList => "patterns_list",
 

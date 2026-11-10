@@ -105,6 +105,34 @@ fn planner_feature_run(name: &str, pattern: Pattern) -> (Run, TestCtx, AgentId) 
 }
 
 #[test]
+fn akasha_loop_revises_one_phase_and_completes_only_after_saving() {
+    let pattern = Pattern::builtin_named("mantra-akasha").unwrap();
+    let (mut run, mut ctx, p) = planner_feature_run("akasha-loop", pattern);
+    let plan = json!({"plan": {"title": "Loop", "phases": [{"name": "Implement", "tasks": []}]}});
+    assert!(run.handle_tool(&mut ctx, p, "mantra_submit_plan", &plan).1);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert_eq!(run.stage, Stage::Review);
+    run.approve_plan(&mut ctx);
+    assert!(run.loop_executing());
+    assert!(run.orchestrator.is_none() && run.gate_agent.is_none());
+    assert!(!run.handle_tool(&mut ctx, p, "mantra_revise_plan", &plan).1);
+    assert!(!run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &json!({})).1);
+    run.set_pattern_changes(&mut ctx, true).unwrap();
+    assert!(Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap().settings.allow_pattern_changes);
+    assert!(run.handle_tool(&mut ctx, p, "mantra_revise_plan", &plan).1);
+    assert_eq!(run.plan_version, 2);
+    assert!(run.handle_tool(&mut ctx, p, "mantra_finish_plan", &json!({"summary": "Focused checks passed."})).1);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff });
+    assert_eq!(run.history.len(), 1);
+    assert!(ctx.jobs.iter().any(|j| j.contains("Cleanup")));
+    run.on_job(&mut ctx, JobTag::Cleanup { phase: 0 }, JobOut::Cleanup(Ok(String::new()), git::ReviewDiff::default()));
+    assert_eq!(run.stage, Stage::Done);
+    assert!(run.workers.is_empty());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
 fn auto_workflow_requires_user_approval_and_survives_resume() {
     let (mut run, mut ctx, p) = planner_feature_run("auto-approval", Pattern::builtin_auto());
     assert!(run.planning_prompt().contains("[mantra:auto]"));
@@ -377,7 +405,7 @@ impl Ctx for TestCtx {
     }
 }
 
-/// Akasha (experimental) in the Conductor: the block table, tool dispatch, what members are
+/// Akasha in the Conductor: the block table, tool dispatch, what members are
 /// told, pushes to busy members, the Conductor's own entries, and the feature switched off.
 mod akasha {
     use super::*;
@@ -396,10 +424,9 @@ mod akasha {
     }
 
     /// A run of `pattern` in its first phase, Akasha `on`, writing into a scratch dir of its own.
-    fn run_of(pattern: Pattern, on: bool, tag: &str) -> Run {
+    fn run_of(pattern: Pattern, tag: &str) -> Run {
         let mut run = Run::new(PathBuf::from("."), pattern, "build it".into());
         run.dir = scratch_dir(&format!("akasha-{tag}"));
-        run.enable_akasha(on);
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
         run
     }
@@ -444,11 +471,11 @@ mod akasha {
     #[test]
     fn blocks_come_from_the_groups_and_only_members_are_in_one() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 4096), true, "table");
+        let mut run = run_of(grouped("urgent", true, 4096), "table");
         assert_eq!(run.akasha.keys().map(String::as_str).collect::<Vec<_>>(), vec!["builders"]);
         assert_eq!((run.akasha["builders"].cap, run.akasha["builders"].entries.len()), (4096, 0));
         run.akasha.get_mut("builders").unwrap().note("p1-a", "kept", false, 0).unwrap();
-        run.enable_akasha(true);
+        run.sync_akasha_groups();
         assert_eq!(run.akasha["builders"].entries.len(), 1, "turning it on again keeps what is there");
         let w = member(&mut ctx, &mut run, "p1-a");
         let o = ctx.add_idle();
@@ -456,21 +483,22 @@ mod akasha {
         assert_eq!(run.group_of(w), Some("builders"));
         assert_eq!(run.group_of(o), None, "the orchestrator's role is in no group");
         assert_eq!(run.group_of(999), None, "nor is an agent outside the run");
-        run.enable_akasha(false);
-        assert_eq!(run.group_of(w), None, "off, nobody is in a group");
-        assert_eq!(run.akasha["builders"].entries.len(), 1, "but the notes are kept for when it is back on");
-        assert!(run_of(ungrouped(), true, "table-plain").akasha.is_empty(), "no groups, no blocks");
+        run.pattern.groups.clear();
+        run.sync_akasha_groups();
+        assert_eq!(run.group_of(w), None);
+        assert!(run.akasha.is_empty());
+        assert!(run_of(ungrouped(), "table-plain").akasha.is_empty(), "no groups, no blocks");
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
     #[test]
-    fn with_the_feature_off_a_grouped_pattern_runs_as_if_it_had_none() {
+    fn a_pattern_without_groups_exposes_no_akasha_tools() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 4096), false, "off");
+        let mut run = run_of(ungrouped(), "ungrouped");
         run.stage = Stage::Setup;
         run.start(&mut ctx);
         let said: Vec<String> = pulse_texts(&run).into_iter().filter(|l| l.starts_with("akasha")).collect();
-        assert_eq!(said, vec!["akasha: 1 group configured but the feature is off — `mantra experimental enable akasha`".to_string()]);
+        assert!(said.is_empty());
         assert!(run.akasha.is_empty(), "no blocks");
         run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
         let a = spawn_member(&mut ctx, &mut run, "p1-a");
@@ -478,21 +506,13 @@ mod akasha {
         assert!(!instructions_of(&ctx, a).contains("Shared notes"));
         let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "x"}));
         assert!(!ok && r.contains("not in a group"), "{r}");
-        // on, or without groups, the start says nothing about it
-        for (pattern, on, tag) in [(grouped("urgent", true, 4096), true, "off-on"), (ungrouped(), false, "off-plain")] {
-            let mut other = run_of(pattern, on, tag);
-            other.stage = Stage::Setup;
-            other.start(&mut TestCtx::new());
-            assert!(!pulse_texts(&other).iter().any(|l| l.starts_with("akasha")), "{tag}");
-            let _ = std::fs::remove_dir_all(&other.dir);
-        }
         let _ = std::fs::remove_dir_all(&run.dir);
     }
 
     #[test]
     fn members_get_the_tools_and_their_prompts_end_with_the_notes() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "inject");
+        let mut run = run_of(grouped("urgent", true, 16_384), "inject");
         let a = spawn_member(&mut ctx, &mut run, "p1-a");
         let tools = ctx.spawned("p1-a")[0].tools.clone();
         for t in ["mantra_akasha_read", "mantra_akasha_note", "mantra_akasha_amend", "mantra_akasha_forget", "mantra_ask"] {
@@ -522,7 +542,7 @@ mod akasha {
     #[test]
     fn the_tools_act_on_the_members_block_and_refuse_everyone_else() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("none", true, 16_384), true, "tools");
+        let mut run = run_of(grouped("none", true, 16_384), "tools");
         let a = member(&mut ctx, &mut run, "p1-a");
         let (r, ok) = call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "  the config loader lives in src/config.rs ", "urgent": true}));
         assert!(ok && r.starts_with("noted #1 (") && r.ends_with("/16k)"), "{r}");
@@ -557,7 +577,7 @@ mod akasha {
     #[test]
     fn urgent_notes_reach_busy_members_only_one_delivery_per_window() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "push");
+        let mut run = run_of(grouped("urgent", true, 16_384), "push");
         let a = member(&mut ctx, &mut run, "p1-a");
         let b = member(&mut ctx, &mut run, "p1-b");
         let c = member(&mut ctx, &mut run, "p1-c");
@@ -601,7 +621,7 @@ mod akasha {
     #[test]
     fn a_member_being_stopped_or_paused_gets_no_push() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "stopping");
+        let mut run = run_of(grouped("urgent", true, 16_384), "stopping");
         let a = member(&mut ctx, &mut run, "p1-a");
         let b = member(&mut ctx, &mut run, "p1-b");
         let c = member(&mut ctx, &mut run, "p1-c");
@@ -631,7 +651,7 @@ mod akasha {
     #[test]
     fn a_push_goes_as_the_note_reads_at_delivery() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "push-now");
+        let mut run = run_of(grouped("urgent", true, 16_384), "push-now");
         let a = member(&mut ctx, &mut run, "p1-a");
         let b = member(&mut ctx, &mut run, "p1-b");
         call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "first", "urgent": true}));
@@ -660,7 +680,7 @@ mod akasha {
     #[test]
     fn a_push_into_a_follow_up_does_not_pass_for_the_users_message() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "follow-up");
+        let mut run = run_of(grouped("urgent", true, 16_384), "follow-up");
         let o = ctx.add_idle();
         run.orchestrator = Some(o);
         let a = member(&mut ctx, &mut run, "p1-a");
@@ -691,7 +711,7 @@ mod akasha {
         let mut ctx = TestCtx::new();
         let mut pattern = grouped("urgent", true, 16_384);
         pattern.groups[0].roles.push("manager".into());
-        let mut run = run_of(pattern, true, "manager");
+        let mut run = run_of(pattern, "manager");
         let m = ctx.add_idle();
         run.manager = Some(m);
         assert_eq!(run.group_of(m), Some("builders"));
@@ -707,7 +727,7 @@ mod akasha {
     fn push_all_sends_every_note_and_push_none_sends_none() {
         for (push, urgent, expect) in [("all", false, 1), ("none", true, 0), ("urgent", false, 0)] {
             let mut ctx = TestCtx::new();
-            let mut run = run_of(grouped(push, true, 16_384), true, &format!("push-{push}"));
+            let mut run = run_of(grouped(push, true, 16_384), &format!("push-{push}"));
             let a = member(&mut ctx, &mut run, "p1-a");
             let b = member(&mut ctx, &mut run, "p1-b");
             call(&mut ctx, &mut run, a, "mantra_akasha_note", json!({"text": "a fact", "urgent": urgent}));
@@ -720,7 +740,7 @@ mod akasha {
     #[test]
     fn the_conductor_notes_what_members_finished_failed_and_changed() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("all", true, 16_384), true, "auto");
+        let mut run = run_of(grouped("all", true, 16_384), "auto");
         let o = ctx.add_idle();
         run.orchestrator = Some(o);
         let a = member(&mut ctx, &mut run, "p1-a");
@@ -760,7 +780,7 @@ mod akasha {
     #[test]
     fn a_full_block_drops_the_conductors_entries_and_says_so_once() {
         let mut ctx = TestCtx::new();
-        let mut run = run_of(grouped("urgent", true, 1024), true, "full");
+        let mut run = run_of(grouped("urgent", true, 1024), "full");
         let o = ctx.add_idle();
         run.orchestrator = Some(o);
         let a = member(&mut ctx, &mut run, "p1-a");
@@ -788,15 +808,12 @@ mod akasha {
 
     #[test]
     fn the_blocks_survive_a_save_and_a_resume() {
-        let mut run = run_of(grouped("urgent", true, 16_384), true, "state");
+        let mut run = run_of(grouped("urgent", true, 16_384), "state");
         run.akasha.get_mut("builders").unwrap().note("p1-a", "kept across a restart", true, 7).unwrap();
         run.save_state();
         let st = RunState::load(&run.dir).unwrap();
         assert_eq!(st.akasha, run.akasha);
-        let mut back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
-        assert_eq!(back.akasha, run.akasha);
-        assert_eq!(back.group_of_role("worker-small"), None, "off until the app says otherwise");
-        back.enable_akasha(true);
+        let back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
         assert_eq!(back.akasha, run.akasha, "the restored block is kept, not rebuilt empty");
         assert_eq!(back.group_of_role("worker-small"), Some("builders"));
         let _ = std::fs::remove_dir_all(&run.dir);
