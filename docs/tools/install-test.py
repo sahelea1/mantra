@@ -60,7 +60,8 @@ class InstallerTests(unittest.TestCase):
     def test_running_executable_can_be_replaced_atomically(self):
         shutil.copyfile(shutil.which("sleep"), self.install / "mantra")
         (self.install / "mantra").chmod(0o755)
-        child = subprocess.Popen([str(self.install / "mantra"), "30"])
+        # Some systems ship sleep as a multicall binary that selects its command from argv[0].
+        child = subprocess.Popen(["sleep", "30"], executable=self.install / "mantra")
         try:
             result = self.run_installer(update=True)
             self.assertEqual(result.returncode, 0, result.stderr)

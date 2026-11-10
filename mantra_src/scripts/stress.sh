@@ -26,7 +26,7 @@ checked_snapshot $bin --demo --snapshot "wait:1;sweep:welcome;type:add a helper;
 echo "mandala…"
 checked_snapshot $bin --demo --snapshot "wait:0.5;sweep:planning;until:plan review@60;sweep:review;key:a;until:Foundations@60;sweep:phase1;until:Features@90;wait:1;sweep:phase2;key:right;key:enter;sweep:zoom;key:esc;key:space;sweep:paused;key:space;until:finale 2/2@150;sweep:finale;until:run complete@150;sweep:done;type:/stop;key:enter;type:/runs;key:enter;sweep:runs-after" run "build a todo API with auth"
 echo "akasha planner and live workflow switch…"
-checked_snapshot $bin --demo --pattern mantra-akasha --snapshot "until:plan review@60;sweep:akasha-review;key:f3;until:workflow: allowed@10;key:a;until:run complete@60;sweep:akasha-done;snap:akasha-done" run "build a focused Akasha demo"
+MANTRA_HOME="$(mktemp -d)" checked_snapshot $bin --demo --pattern mantra-akasha --snapshot "until:plan review@60;sweep:akasha-review;key:f3;until:workflow: allowed@10;key:a;until:run complete@60;sweep:akasha-done;snap:akasha-done" run "build a focused Akasha demo"
 # BADMODEL, LAZY_ORCH and ASK are Codex mock scenarios. Built-ins intentionally run Bija,
 # so save a copy of the just-tested default pattern with explicit demo Codex model aliases.
 # Keep this template outside MANTRA_HOME: later scenarios deliberately create a fresh home.
