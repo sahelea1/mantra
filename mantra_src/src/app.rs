@@ -5940,7 +5940,7 @@ done"#;
             run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
             run.plan = Some(one_task_plan());
             let agent = |app: &mut App, name: &str, role: &str| {
-                let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts {
+                let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts { claude_user_config: String::new(),
                     name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(), model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
                     approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture".into(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
                     context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
