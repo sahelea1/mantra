@@ -111,6 +111,7 @@ impl Run {
                 self.restore_workers(st);
                 match pending {
                     Some(p @ (Pending::Phase { .. } | Pending::Finale { .. } | Pending::Handoff { .. })) => self.perform_pending(ctx, p),
+                    // gate, fix and gate-checks pendings: re-running merge/checks reaches them instead
                     other => {
                         if let Some(p) = other {
                             self.log("‖", "amber", format!("{} was due at the pause — re-running merge/checks reaches it instead", p.label()));

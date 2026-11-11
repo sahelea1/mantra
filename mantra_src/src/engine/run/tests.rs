@@ -3214,6 +3214,30 @@ fn only_the_newest_checks_run_counts() {
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }));
 }
 
+/// A halt by hand, the way a stage-level test needs one.
+fn halt_by_hand(run: &mut Run) {
+    run.halt = Some(Halt { reason: HaltReason::GateExhausted, agent: None, message: "test halt".into(), full: "test halt".into(), since: Instant::now() });
+}
+
+#[test]
+fn a_fix_worker_finishing_during_a_halt_defers_the_checks_until_the_resume() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    halt_by_hand(&mut run);
+    finish_fix(&mut ctx, &mut run, 1);
+    assert!(ctx.jobs.is_empty(), "nothing starts while halted: {:?}", ctx.jobs);
+    assert_eq!(run.pending, Some(Pending::Checks { idx: 0, round: 1, after_fix: true }));
+    run.resume(&mut ctx);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("FixChecks"), "{:?}", ctx.jobs);
+    assert!(run.pending.is_none());
+}
+
 // Pause boundary --------------------------------------------------------------------------
 
 fn two_phase_plan() -> Plan {

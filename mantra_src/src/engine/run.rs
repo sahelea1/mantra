@@ -205,6 +205,13 @@ pub enum Pending {
         #[serde(default)]
         big: bool,
     },
+    /// The gate checks of phase `idx` (`after_fix`: the run that follows a fix worker).
+    Checks {
+        idx: usize,
+        round: u32,
+        #[serde(default)]
+        after_fix: bool,
+    },
 }
 
 /// Why a run the user stopped (`Run::stop`) is `Failed` — `state::stage_label` shows exactly this
@@ -223,6 +230,7 @@ impl Pending {
             Pending::Gate { idx, round, .. } => format!("phase {} gate round {round}", idx + 1),
             Pending::Handoff { idx } => format!("phase {} handoff", idx + 1),
             Pending::Fix { idx, round, .. } => format!("phase {} fix for gate round {round}", idx + 1),
+            Pending::Checks { idx, .. } => format!("phase {} gate checks", idx + 1),
         }
     }
 }
@@ -1223,7 +1231,7 @@ impl Run {
             self.respawn_after_outage(ctx);
         }
         let pending = self.pending.take();
-        if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. }))) = (pickup, &pending) {
+        if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. } | Pending::Checks { .. }))) = (pickup, &pending) {
             // the restart that follows replaces the very agent this was waiting to start
             self.log("‖", "amber", format!("{} was due — superseded by the restart", p.label()));
         } else if let Some(p) = pending {
@@ -1317,6 +1325,7 @@ impl Run {
                 }
             }
             Pending::Fix { idx, round, findings, big } => self.start_fix(ctx, idx, round, findings, big),
+            Pending::Checks { idx, round, after_fix } => self.launch_checks(ctx, idx, round, after_fix),
         }
     }
 
@@ -2336,6 +2345,11 @@ Then summarize in 2-4 lines.",
             } else {
                 self.begin_handoff(ctx, idx);
             }
+            return;
+        }
+        // (the branch above starts no job itself; what it calls defers on its own while halted)
+        if self.halted() {
+            self.defer(Pending::Checks { idx, round, after_fix });
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Checks { round } };
