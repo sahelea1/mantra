@@ -642,6 +642,8 @@ mod tests {
             transient: false,
             model: None,
             status_asked: false,
+            active: std::time::Duration::ZERO,
+            superseded: false,
         });
         app.run = Some(run_);
         assert_eq!(app.auto_effort_for(1), "low", "a small worker");

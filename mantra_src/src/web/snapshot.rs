@@ -1613,6 +1613,8 @@ pub(crate) mod tests {
             transient: false,
             model: None,
             status_asked: false,
+            active: std::time::Duration::ZERO,
+            superseded: false,
         }
     }
 

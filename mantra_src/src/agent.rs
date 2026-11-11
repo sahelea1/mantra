@@ -1029,7 +1029,7 @@ impl Agent {
                 Kind::Command { cmd, output, exit, .. } => {
                     let mut o = output.clone();
                     crate::util::tail_bytes(&mut o, 1200);
-                    s.push_str(&format!("[cmd] $ {cmd} (exit {:?})\n{o}\n", exit));
+                    s.push_str(&format!("[cmd] $ {cmd} ({})\n{o}\n", crate::util::exit_label(*exit)));
                 }
                 Kind::Files { changes, status } => {
                     for c in changes {

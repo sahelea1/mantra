@@ -267,6 +267,11 @@ pub fn worker_state_str(s: &WState) -> &'static str {
     }
 }
 
+/// The `state:` line of a worker's phase report.
+fn worker_report_state(w: &Worker) -> String {
+    if w.superseded && w.state == WState::Cancelled { "Done (superseded by a plan revision)".into() } else { format!("{:?}", w.state) }
+}
+
 pub struct Worker {
     pub task: Task,
     pub prompt: String,
@@ -302,6 +307,11 @@ pub struct Worker {
     pub model: Option<String>,
     /// The worker was already asked once for its closing STATUS line (never asked twice).
     pub status_asked: bool,
+    /// Time the agent was at work on this attempt (a turn running, the run not halted), summed by
+    /// `tick`. `spawned.elapsed()` restarts at a re-attach and counts halts; this does neither.
+    pub active: Duration,
+    /// Cancelled by a plan revision after it had finished: its phase report says so.
+    pub superseded: bool,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -873,6 +883,8 @@ impl Run {
                     report,
                     transient: w.transient,
                     model: w.model.clone(),
+                    active_secs: w.active.as_secs(),
+                    superseded: w.superseded,
                 }
             })
             .collect();
@@ -2198,6 +2210,8 @@ Then summarize in 2-4 lines.",
             transient: false,
             model,
             status_asked: false,
+            active: Duration::ZERO,
+            superseded: false,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued ({})", self.class_cap_text(&role)));
@@ -2680,8 +2694,10 @@ Then summarize in 2-4 lines.",
         // write worker outputs
         let pdir = self.dir.join(format!("phase-{}", idx + 1));
         let _ = std::fs::create_dir_all(&pdir);
-        for w in &self.workers {
-            let _ = std::fs::write(pdir.join(format!("{}.md", w.task.id)), format!("# {} — {}\nstate: {:?}\nattempt: {}\n\n{}\n", w.task.id, w.task.title, w.state, w.attempt, w.report));
+        // one file per task, from its newest attempt (an earlier, cancelled one must not stand in for it)
+        let mut written = HashSet::new();
+        for w in self.workers.iter().rev().filter(|w| written.insert(w.task.id.clone())) {
+            let _ = std::fs::write(pdir.join(format!("{}.md", w.task.id)), format!("# {} — {}\nstate: {}\nattempt: {}\n\n{}\n", w.task.id, w.task.title, worker_report_state(w), w.attempt, w.report));
         }
         self.launch_phase_commit(ctx, idx);
         match self.orchestrator {
@@ -2830,7 +2846,10 @@ Then summarize in 2-4 lines.",
             ctx.stop(a, false);
         }
         let branch = self.ws.as_ref().filter(|w| w.worktree).map(|w| format!(" — branch {} is ready; /land merges it into {}", w.branch, w.base_branch)).unwrap_or_default();
-        self.log("✦", "saffron", format!("run complete in {}{branch}", fmt_dur(self.elapsed())));
+        let total = self.total_tokens(|x| ctx.agent(x).map(|g| g.tokens_total).unwrap_or(0));
+        let cached: u64 = self.all_agents().into_iter().map(|x| ctx.agent(x).map(|g| g.tokens_cached).unwrap_or(0)).sum::<u64>().min(total);
+        let tokens = if total > 0 { format!(" · {} tok, {} cached", fmt_tokens(total), fmt_tokens(cached)) } else { String::new() };
+        self.log("✦", "saffron", format!("run complete in {}{tokens}{branch}", fmt_dur(self.elapsed())));
         ctx.notify(&format!("Mantra: run complete{branch}"));
         self.save_state();
     }
@@ -3795,7 +3814,7 @@ Then summarize in 2-4 lines.",
                     // a follow-up answered, not the task completing a second time.
                     let again = w.state == WState::Done;
                     w.state = WState::Done;
-                    let el = fmt_dur(w.spawned.elapsed());
+                    let el = fmt_dur(w.active + self.last_tick.elapsed().min(Duration::from_secs(1)));
                     let adhoc = w.adhoc;
                     let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
                     // Who asked for the follow-up: the user (typed in the zoomed view, or `@name …`,
@@ -3959,7 +3978,15 @@ Then summarize in 2-4 lines.",
         if self.last_tick.elapsed() < Duration::from_millis(900) {
             return;
         }
+        let dt = self.last_tick.elapsed().min(Duration::from_secs(10));
         self.last_tick = Instant::now();
+        if !self.halted() {
+            for w in self.workers.iter_mut() {
+                if w.agent.and_then(|a| ctx.agent(a)).map(|a| a.busy()).unwrap_or(false) {
+                    w.active += dt;
+                }
+            }
+        }
         // Persistence is event-driven: every journal line marks the state dirty, and this flush —
         // at most once per tick, which is the debounce — writes it out, halted or not.
         if self.state_dirty {
@@ -5740,6 +5767,7 @@ Then summarize in 2-4 lines.",
                         ctx.stop(a, true);
                     }
                     for w in self.workers.iter_mut().filter(|w| w.task.id == t.id) {
+                        w.superseded = w.state == WState::Done;
                         w.state = WState::Cancelled;
                     }
                     notes.push(format!("task {} was REMOVED (its worker is stopped)", t.id));
@@ -5748,6 +5776,7 @@ Then summarize in 2-4 lines.",
                     let done = self.workers.iter().rev().find(|w| w.task.id == t.id).map(|w| w.state == WState::Done).unwrap_or(false);
                     if done {
                         for w in self.workers.iter_mut().filter(|w| w.task.id == t.id) {
+                            w.superseded = w.state == WState::Done;
                             w.state = WState::Cancelled;
                         }
                         needs_work = true;

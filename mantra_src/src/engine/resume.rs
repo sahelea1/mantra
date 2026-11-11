@@ -388,6 +388,8 @@ impl Run {
                     // a model switched live for this task — if it still exists in the registry
                     model: w.model.clone().filter(|m| self.knows_model(m) && !self.adopted_roles.contains(&w.role)),
                     status_asked: false,
+                    active: Duration::from_secs(w.active_secs),
+                    superseded: w.superseded,
                 }
             })
             .collect();

@@ -2647,6 +2647,9 @@ impl App {
                     was_busy = (a.turn_active || a.awaiting_start) && !a.relaunching;
                     a.relaunching = false;
                     a.switching_backend = false;
+                    if a.thread_id.is_none() {
+                        crate::mlog!("agent {agent} ({}, {}) ready: session {thread_id}", a.name, format!("{:?}", a.backend).to_lowercase());
+                    }
                     a.thread_id = Some(thread_id);
                     if !model.is_empty() {
                         a.model = model;
@@ -2763,6 +2766,8 @@ impl App {
                 "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
                 // naming a thread is a nicety: an older app-server without `thread/name/set` is no reason to bother anyone
                 "name" => crate::mlog!("agent {agent}: thread/name/set not supported ({error})"),
+                // the archive of a task that has ended, after its process is gone: nothing to tell anyone
+                "archive" if self.agents.get(&agent).map(|a| matches!(a.status, Status::Stopped)).unwrap_or(false) => crate::mlog!("agent {agent}: thread/archive after exit ({error})"),
                 other => {
                     if let Some(a) = self.agents.get_mut(&agent) {
                         if other == "compact" {

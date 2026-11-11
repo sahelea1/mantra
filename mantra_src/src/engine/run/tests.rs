@@ -353,6 +353,8 @@ fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
         transient: false,
         model: None,
         status_asked: false,
+        active: std::time::Duration::ZERO,
+        superseded: false,
     }
 }
 impl Ctx for TestCtx {
@@ -4105,6 +4107,60 @@ fn retrying_a_gateway_failed_worker_does_not_spend_an_attempt() {
     run.workers[0].transient = true;
     run.retry_worker(&mut ctx, w, None);
     assert_eq!(run.max_attempts(), before + 1);
+}
+
+#[test]
+fn a_replaced_attempts_agent_is_stopped_at_once() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let w = ctx.add_idle();
+    run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+    run.retry_worker(&mut ctx, w, None);
+    assert!(ctx.stopped.contains(&w), "the cancelled attempt's agent got stop: {:?}", ctx.stopped);
+    assert_eq!(run.workers[0].state, WState::Cancelled);
+}
+
+#[test]
+fn a_workers_active_time_counts_busy_ticks_only() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let (busy, idle) = (ctx.add_busy(), ctx.add_idle());
+    run.workers.push(mk_worker("t1", "worker-small", busy, WState::Running));
+    run.workers.push(mk_worker("t2", "worker-small", idle, WState::Running));
+    run.last_tick = Instant::now() - Duration::from_secs(3);
+    run.tick(&mut ctx);
+    assert!(run.workers[0].active >= Duration::from_secs(3) && run.workers[0].active < Duration::from_secs(5), "{:?}", run.workers[0].active);
+    assert_eq!(run.workers[1].active, Duration::ZERO, "an idle agent is not at work");
+}
+
+#[test]
+fn a_phase_report_comes_from_the_newest_attempt_and_says_superseded() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("phase-report-newest");
+    run.plan = Some(class_phase(1, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 0 } };
+    let (a1, a2, c) = (ctx.add_idle(), ctx.add_idle(), ctx.add_idle());
+    run.workers.push(mk_worker("b0", "worker-big", a1, WState::Cancelled));
+    let mut second = mk_worker("b0", "worker-big", a2, WState::Done);
+    second.attempt = 2;
+    run.workers.push(second);
+    let mut gone = mk_worker("b1", "worker-big", c, WState::Cancelled);
+    gone.superseded = true;
+    run.workers.push(gone);
+    run.begin_handoff(&mut ctx, 0);
+    let b0 = std::fs::read_to_string(run.dir.join("phase-1/b0.md")).unwrap();
+    assert!(b0.contains("state: Done\nattempt: 2"), "{b0}");
+    let b1 = std::fs::read_to_string(run.dir.join("phase-1/b1.md")).unwrap();
+    assert!(b1.contains("state: Done (superseded by a plan revision)"), "{b1}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn an_exit_code_reads_as_a_word_and_a_number() {
+    assert_eq!(crate::util::exit_label(Some(0i64)), "exit 0");
+    assert_eq!(crate::util::exit_label(Some(137i32)), "exit 137");
+    assert_eq!(crate::util::exit_label::<i64>(None), "exit ?");
 }
 
 #[test]

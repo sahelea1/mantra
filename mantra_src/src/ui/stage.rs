@@ -634,7 +634,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     if h >= 5 {
         let mut l3 = vec![];
         if let (Some(w), Some(a)) = (w, a) {
-            let el = w.finished.map(|f| f.duration_since(w.spawned)).unwrap_or_else(|| w.spawned.elapsed());
+            let el = w.active;
             l3.push(Span::styled(format!("{} · {}", fmt_dur(el), fmt_tokens(a.tokens_total)), theme::faint()));
             let mut badges = vec![];
             if w.attempt > 1 {

@@ -98,6 +98,10 @@ pub struct WorkerState {
     /// The alias this attempt runs on when the user switched it live (`Run::set_agent_model`);
     /// `None` = the role's model. A resume and the next attempt of the task keep it.
     pub model: Option<String>,
+    /// Seconds this attempt's agent was at work (`Worker::active`): halts and waiting excluded.
+    pub active_secs: u64,
+    /// Cancelled by a plan revision after it had finished (`Worker::superseded`).
+    pub superseded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -469,7 +473,7 @@ pub(crate) mod tests {
             nested_run_base: vec![],
             ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None, base_commit: None, initial_commit: false, nested: vec![] }),
             handoff: "phase 1 done".into(),
-            workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into(), transient: false, model: Some("sol".into()) }],
+            workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into(), transient: false, model: Some("sol".into()), active_secs: 0, superseded: false }],
             agents: vec![AgentState { slot: "orchestrator".into(), name: "orchestrator".into(), role: "orchestrator".into(), provider: "openai".into(), model_alias: "astra".into(), effort: "high".into(), thread_id: Some("t-1".into()), cwd: "/tmp/wt/integration".into() }],
             history: vec![PhaseHistory { name: "Foundations".into(), workers: vec![("p1-a".into(), "A".into(), "◇".into(), true)], secs: 42 }],
             akasha: Default::default(),

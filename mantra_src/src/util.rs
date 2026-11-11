@@ -49,6 +49,11 @@ pub(crate) fn tz_offset_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// `exit 0` / `exit ?` for a command's exit code, never the `Some(0)` of a debug print.
+pub fn exit_label<T: std::fmt::Display>(code: Option<T>) -> String {
+    code.map(|c| format!("exit {c}")).unwrap_or_else(|| "exit ?".into())
+}
+
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
