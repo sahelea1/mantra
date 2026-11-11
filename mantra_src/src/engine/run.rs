@@ -1394,7 +1394,10 @@ impl Run {
         }
         self.log("◉", "violet", format!("orchestrator idle with {} unstarted task(s) — waking it", missing.len()));
         self.mark_edge(o);
-        ctx.prompt(o, format!("[mantra:resume] The run resumed. These tasks have no attempt yet: {}. Spawn them with mantra_spawn (spawns were refused while the run was paused), then call mantra_wait.", missing.join(", ")));
+        // what was queued for it (a revision's notes) comes before the task list that follows from it
+        let notes = std::mem::take(&mut self.orch_inbox);
+        let lead = if notes.is_empty() { String::new() } else { format!("{}\n\n", notes.join("\n")) };
+        ctx.prompt(o, format!("{lead}[mantra:resume] The run resumed. These tasks have no attempt yet: {}. Spawn them with mantra_spawn (spawns were refused while the run was paused), then call mantra_wait.", missing.join(", ")));
     }
 
     /// Chain of command, top rung before the user: a halt the run could not sort out by itself
@@ -5828,11 +5831,18 @@ Then summarize in 2-4 lines.",
             self.log("☰", "saffron", format!("revision: {}", notes.len()));
             self.orch_inbox.push(format!("The planner revised the current phase:\n- {}", notes.join("\n- ")));
         }
-        let past_build = matches!(self.stage, Stage::Phase { step: PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Handoff, .. });
+        let past_build = matches!(self.stage, Stage::Phase { step: PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. } | PhaseStep::Handoff, .. });
+        let gate_changed = op.gate != np.gate;
+        let mut rerun = false;
         let next = if needs_work && past_build {
             self.return_to_orchestrating(ctx);
             "the phase goes back to building — the orchestrator spawns the changed/added tasks, then Mantra merges and runs the gate again"
         } else if past_build {
+            if gate_changed && matches!(self.stage, Stage::Phase { step: PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. }, .. }) {
+                self.abandon_gate_round(ctx, "the plan's gate was revised");
+                self.stage = Stage::Phase { idx: cur, step: PhaseStep::Checks { round: 1 } };
+                rerun = true;
+            }
             "the gate runs again with the revised checks"
         } else {
             "the orchestrator has been told what changed"
@@ -5840,12 +5850,46 @@ Then summarize in 2-4 lines.",
         let escalated = self.halt.as_ref().map(|h| matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed)).unwrap_or(false);
         if escalated {
             let planner = self.planner;
-            self.resume_by(ctx, planner);
+            self.resume_by(ctx, planner); // resume_core sees Checks → run_checks(idx, 1)
+        } else if rerun {
+            // (as `resume_core`: a gate left with no checks has nothing to verify, QA is the gate)
+            if self.current_phase().map(|p| p.gate.checks.is_empty()).unwrap_or(true) {
+                self.spawn_gate_at_round(ctx, cur, 1);
+            } else {
+                self.run_checks(ctx, cur, 1);
+            }
         } else {
             self.check_phase_done(ctx);
             self.wake_orch(ctx);
         }
         next.into()
+    }
+
+    /// The gate round in progress no longer stands (its checks or tasks changed): stop the QA
+    /// agent and any fix worker, forget their results and whatever was due for them.
+    fn abandon_gate_round(&mut self, ctx: &mut dyn Ctx, why: &str) {
+        self.retire_gate_agent(ctx);
+        let live = |w: &Worker| w.adhoc && !matches!(w.state, WState::Done | WState::Cancelled);
+        let fixers: Vec<AgentId> = self.workers.iter().filter(|w| live(w)).filter_map(|w| w.agent).collect();
+        for a in fixers {
+            self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(a, true);
+        }
+        for w in self.workers.iter_mut().filter(|w| live(w)) {
+            w.state = WState::Cancelled;
+        }
+        self.checks.clear();
+        self.gate_report = None;
+        self.prev_gate = None;
+        self.last_gate_blocker = None;
+        self.last_verify_sig = None;
+        self.qa_ok = false;
+        self.checks_gen += 1;
+        self.resume_note = None;
+        if matches!(self.pending, Some(Pending::Gate { .. } | Pending::Fix { .. } | Pending::Checks { .. })) {
+            self.drop_pending(why);
+        }
+        self.log("◎", "amber", format!("gate round abandoned: {why}"));
     }
 
     /// Back from merging/checks/gate to building: the gate agent is stopped (it will be spawned

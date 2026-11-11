@@ -1907,6 +1907,135 @@ fn a_fix_worker_that_asked_and_wrote_blocked_waits_instead_of_halting() {
     assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "on_fix_done ran: {:?}", ctx.jobs);
 }
 
+/// The plan with the current phase's gate checks replaced.
+fn revised_checks(run: &Run, checks: &[&str]) -> serde_json::Value {
+    let mut plan = run.plan.clone().unwrap();
+    plan.phases[0].gate.checks = checks.iter().map(|c| c.to_string()).collect();
+    json!({"plan": serde_json::to_value(&plan).unwrap(), "reason": "the check was wrong"})
+}
+
+/// The plan's tasks with prompts long enough for a revision to be accepted.
+fn give_prompts(run: &mut Run) {
+    for p in run.plan.iter_mut().flat_map(|p| p.phases.iter_mut()) {
+        for t in &mut p.tasks {
+            t.prompt = "do the work described for this task".into();
+        }
+    }
+}
+
+fn ok_check(cmd: &str) -> Vec<CheckResult> {
+    vec![CheckResult { cmd: cmd.into(), ok: true, code: Some(0), output: String::new(), secs: 0 }]
+}
+
+/// WP-2.7: a blocked fix worker of a gate whose check was revised is not restarted with its old
+/// brief; the revised checks run and a fresh QA round sees them.
+#[test]
+fn a_gate_revision_cancels_a_blocked_fix_worker_and_reruns_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let fa = ctx.add_idle();
+    {
+        let w = run.workers.iter_mut().find(|w| w.task.id == "fix-1").unwrap();
+        w.agent = Some(fa);
+        w.state = WState::Failed("blocked".into());
+    }
+    let _ = gate;
+    run.halt = Some(Halt { reason: HaltReason::AttemptsExhausted, agent: Some(fa), message: "fix-1 blocked".into(), full: "fix-1 blocked".into(), since: Instant::now() });
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["new-check --flag"]));
+    assert!(ok, "{msg}");
+    assert!(!run.halted());
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+    assert_eq!(fix.state, WState::Cancelled);
+    assert!(ctx.stopped.contains(&fa));
+    assert!(ctx.spawned("fix-1").len() <= 1, "not respawned: {:?}", ctx.spawns);
+    assert_eq!(run.workers.iter().filter(|w| w.task.id == "fix-1" && w.state != WState::Cancelled).count(), 0);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("Checks"), "{:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("new-check --flag"), vec![], git::ReviewDiff::default()));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
+    let g = run.gate_agent.expect("a fresh QA agent");
+    assert!(ctx.prompts.iter().any(|(a, p)| *a == g && p.contains("new-check --flag")), "{:?}", ctx.prompts);
+}
+
+/// WP-2.7: a live QA round is abandoned when its gate is revised.
+#[test]
+fn a_gate_revision_stops_the_live_qa_agent_and_starts_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    let gen = run.checks_gen;
+    run.qa_ok = true;
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["other-check"]));
+    assert!(ok, "{msg}");
+    assert!(ctx.stopped.contains(&gate));
+    assert!(run.gate_agent.is_none());
+    assert!(!run.qa_ok);
+    assert!(run.checks_gen > gen);
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Checks { round: 1 }, .. }), "{:?}", run.stage);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+}
+
+/// WP-2.7: a gate round deferred during a halt is dropped by a gate revision; the QA prompt
+/// after the re-run shows fresh results.
+#[test]
+fn a_gate_revision_drops_a_deferred_gate_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    halt_by_hand(&mut run);
+    run.spawn_gate_at_round(&mut ctx, 0, 2);
+    assert!(matches!(run.pending, Some(Pending::Gate { .. })), "{:?}", run.pending);
+    run.checks = vec![CheckResult { cmd: "stale-check".into(), ok: false, code: Some(1), output: "x".into(), secs: 0 }];
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["fresh-check"]));
+    assert!(ok, "{msg}");
+    assert!(run.pending.is_none());
+    assert!(run.pulse.iter().any(|p| p.text.contains("dropped")));
+    assert!(run.checks.is_empty());
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("fresh-check"), vec![], git::ReviewDiff::default()));
+    let g = run.gate_agent.expect("QA started");
+    let p = ctx.prompts.iter().rev().find(|(a, _)| *a == g).map(|(_, p)| p.clone()).unwrap();
+    assert!(p.contains("fresh-check") && !p.contains("stale-check"), "{p}");
+}
+
+/// WP-2.7: a revision of a later phase leaves the gate alone.
+#[test]
+fn a_revision_of_a_later_phase_leaves_the_gate_alone() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let mut plan = two_phase_plan();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    give_prompts(&mut run);
+    let mut plan = run.plan.clone().unwrap();
+    plan.phases[1].gate.checks = vec!["later-check".into()];
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &json!({"plan": serde_json::to_value(&plan).unwrap(), "reason": "later"}));
+    assert!(ok, "{msg}");
+    assert_eq!(run.gate_agent, Some(gate));
+    assert!(!ctx.stopped.contains(&gate));
+    assert!(ctx.jobs.is_empty(), "{:?}", ctx.jobs);
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
+}
+
+/// WP-2.7: the revision's notes reach the orchestrator before the "no attempt yet" list.
+#[test]
+fn the_kick_carries_the_queued_notes_first() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.orch_inbox.push("The planner revised the current phase:\n- task t1 was ADDED".into());
+    run.kick_orchestrator(&mut ctx, &[]);
+    let (_, t) = ctx.prompts.last().expect("kicked");
+    assert!(t.find("ADDED").unwrap() < t.find("no attempt yet").unwrap(), "{t}");
+    assert!(run.orch_inbox.is_empty());
+}
+
 #[test]
 fn paths_in_finds_the_files_a_report_names() {
     let dir = std::env::temp_dir().join(format!("mantra-paths-{}", std::process::id()));
