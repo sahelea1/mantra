@@ -1834,6 +1834,12 @@ impl App {
             ag.activity = "compacting context".into();
             self.hub.send(a, Cmd::Compact);
         }
+        if self.in_run(a) {
+            self.with_run(|r, _| {
+                let name = r.name_of(a);
+                r.log("⇣", "amber", format!("{name}: context compaction requested (by you)"));
+            });
+        }
     }
 
     /// WP7.4: respawn a run agent in place (stage `r` on a non-crashed node, `ctrl+r` anywhere,
@@ -2854,6 +2860,14 @@ impl App {
                             }
                         }
                         Signal::Activity => {}
+                        Signal::Compacted { from, to } => {
+                            if self.in_run(agent) {
+                                self.with_run(|r, _| {
+                                    let name = r.name_of(agent);
+                                    r.log("⇣", "amber", format!("{name}: context compacted {}k → {}k", from / 1000, to / 1000));
+                                });
+                            }
+                        }
                         Signal::EnvironmentBroken(msg) => {
                             if self.in_run(agent) {
                                 self.with_run(|r, c| r.on_environment_broken(c, agent, msg));
@@ -3860,6 +3874,12 @@ impl App {
         ag.queued.clear();
         ag.notice(Level::Warn, "stopped by you — type to continue, or r to respawn");
         self.hub.send(a, Cmd::Interrupt);
+        if self.in_run(a) {
+            self.with_run(|r, _| {
+                let name = r.name_of(a);
+                r.log("■", "amber", format!("{name} interrupted (by you)"));
+            });
+        }
         true
     }
 

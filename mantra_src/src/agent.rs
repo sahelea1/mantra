@@ -129,6 +129,8 @@ pub enum Signal {
     /// `looks_like_broken_sandbox`): the sandbox itself cannot run commands on this host. Carries
     /// the offending output, truncated.
     EnvironmentBroken(String),
+    /// A compaction finished and the context is known to have shrunk (`from` → `to` tokens).
+    Compacted { from: u64, to: u64 },
 }
 
 /// Recognize diagnostics that the sandbox itself could not start. Mere mentions of bubblewrap,
@@ -605,6 +607,7 @@ impl Agent {
                                 if now_ctx < *from {
                                     *to = Some(now_ctx);
                                     let f = *from;
+                                    out.push(Signal::Compacted { from: f, to: now_ctx });
                                     it.touch();
                                     self.ctx_anim = Some((f, Instant::now()));
                                     self.compact_item = None;
@@ -1494,6 +1497,21 @@ mod tests {
         a.apply("item/completed", &json!({"item": {"type": "agentMessage", "id": "m1", "text": "done"}}));
         let sig = a.apply("turn/completed", &json!({"turn": {"id": "t2", "status": "completed"}}));
         assert!(sig.iter().any(|s| matches!(s, Signal::TurnDone { .. })));
+    }
+
+    /// WP-7.2: the compaction's result is a signal, once, when the context is known to have shrunk.
+    #[test]
+    fn a_finished_compaction_signals_its_sizes_once() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "solo", std::path::PathBuf::from("."));
+        let usage = |a: &mut Agent, ctx: u64| a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": ctx}, "last": {"inputTokens": ctx, "outputTokens": 0}, "modelContextWindow": 272000}}));
+        usage(&mut a, 180_000);
+        a.apply("item/started", &json!({"item": {"type": "contextCompaction", "id": "c1"}}));
+        a.apply("item/completed", &json!({"item": {"type": "contextCompaction", "id": "c1"}}));
+        let sigs = usage(&mut a, 30_000);
+        assert_eq!(sigs.iter().filter(|s| matches!(s, Signal::Compacted { from: 180_000, to: 30_000 })).count(), 1);
+        assert!(usage(&mut a, 31_000).iter().all(|s| !matches!(s, Signal::Compacted { .. })));
     }
 
     #[test]

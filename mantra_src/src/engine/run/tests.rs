@@ -6258,3 +6258,42 @@ fn read_plan_outlines_a_large_plan_and_returns_one_phase_on_request() {
     let (small, _) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
     assert!(small.contains("\"t1\"") && !small.contains("Phases:"), "{small}");
 }
+
+/// WP-7.2: a line that quotes someone's words keeps them whole in journal.jsonl, and only there.
+#[test]
+fn log_full_keeps_the_whole_text_in_the_journal_file() {
+    let (mut run, mut ctx, p) = planner_feature_run("log-full", Pattern::builtin());
+    let long = "the question ".repeat(30);
+    run.log_full("?", "amber", "short form…", &long);
+    run.log("?", "amber", "plain line");
+    run.log_full("?", "amber", "same", "same");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(run.dir.join("journal.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let q = lines.iter().find(|l| l["text"] == "short form…").unwrap();
+    assert_eq!(q["full"], long.as_str());
+    assert!(lines.iter().find(|l| l["text"] == "plain line").unwrap().get("full").is_none());
+    assert!(lines.iter().find(|l| l["text"] == "same").unwrap().get("full").is_none(), "no copy of an unshortened text");
+    let journal = run.journal_text(10);
+    assert!(journal.contains("short form…") && !journal.contains("the question the question"), "{journal}");
+    // a real call site: the user's feedback on the plan
+    let text = "an answer that is a good deal longer than sixty characters, so that it is cut in the feed";
+    run.stage = Stage::Review;
+    let _ = p;
+    run.user_input(&mut ctx, text);
+    let last = std::fs::read_to_string(run.dir.join("journal.jsonl")).unwrap();
+    assert!(last.lines().any(|l| l.contains(&format!("\"full\":\"plan feedback: {text}\""))), "{last}");
+}
+
+/// WP-7.2: the user's pause, resume and plan approval say so in the journal.
+#[test]
+fn pause_resume_and_approval_name_the_user() {
+    let (mut run, mut ctx, _p) = planner_feature_run("by-you", Pattern::builtin());
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.toggle_pause(&mut ctx);
+    assert!(run.journal_text(5).contains("run paused (by you)"));
+    run.toggle_pause(&mut ctx);
+    assert!(run.journal_text(5).contains("run resumed (by you)"), "{}", run.journal_text(5));
+    run.stage = Stage::Review;
+    run.approve_plan(&mut ctx);
+    assert!(run.journal_text(5).contains("plan approved (by you)"));
+}

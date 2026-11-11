@@ -1043,6 +1043,9 @@ pub(crate) fn codex_default_models() -> Vec<ModelEntry> {
     ]
 }
 
+/// Alias spellings `Registry::get` already logged a fallback for (once per name per process).
+static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 impl Registry {
     /// Advisory only: official endpoints cannot route another vendor's recognizable model IDs.
     /// Check the wire model, never its display alias, and leave gateways and unknown IDs alone.
@@ -1327,7 +1330,6 @@ impl Registry {
     pub fn get(&self, alias: &str) -> Option<&ModelEntry> {
         let (m, fell_back) = self.lookup(alias)?;
         if fell_back {
-            static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
             let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
             if !said.iter().any(|a| a == alias) {
                 said.push(alias.to_string());
@@ -1363,8 +1365,9 @@ impl Registry {
 
     /// An unset model context inherits the configured default model, then the assumed window.
     pub fn effective_context_window(&self, alias: &str, default_alias: &str) -> u64 {
-        self.get(alias).and_then(|m| m.context_window).filter(|n| *n > 0)
-            .or_else(|| self.get(default_alias).and_then(|m| m.context_window).filter(|n| *n > 0))
+        // `lookup`, not `get`: this runs for every alias at every run start and must not log the fallback
+        self.lookup(alias).and_then(|(m, _)| m.context_window).filter(|n| *n > 0)
+            .or_else(|| self.lookup(default_alias).and_then(|(m, _)| m.context_window).filter(|n| *n > 0))
             .unwrap_or(crate::discover::ASSUMED_CONTEXT)
     }
 
@@ -1653,6 +1656,21 @@ mod tests {
         assert_eq!(r.effective_context_window("unknown", "default"), 64_000);
         assert_eq!(r.context_windows_for_default("default")["other"], 64_000);
         assert_eq!(r.effective_context_window("other", "missing"), crate::discover::ASSUMED_CONTEXT);
+    }
+
+    /// WP-7.2: building the engine's alias maps looks up the other spelling of every alias; that is
+    /// not a user-facing resolution and must not log a fallback.
+    #[test]
+    fn the_engine_alias_maps_do_not_log_the_alias_fallback() {
+        let mut r = Registry::defaults();
+        r.models = vec![ModelEntry { alias: "zsolq".into(), context_window: Some(64_000), ..Default::default() }];
+        let said = || super::SAID.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|a| a == "zsolq-api");
+        assert_eq!(r.effective_context_window("zsolq-api", "zsolq"), 64_000);
+        assert!(r.context_windows_for_default("zsolq").contains_key("zsolq-api"));
+        assert!(r.alias_providers().contains_key("zsolq-api"));
+        assert!(!said(), "nothing was logged");
+        assert!(r.get("zsolq-api").is_some());
+        assert!(said(), "a genuine resolution still logs");
     }
 
     #[test]

@@ -853,13 +853,29 @@ impl Run {
     // ───────────────────────────── bookkeeping ─────────────────────────────
 
     pub fn log(&mut self, glyph: &str, color: &'static str, text: impl Into<String>) {
+        self.log_inner(glyph, color, text.into(), None);
+    }
+
+    /// A pulse line with its unshortened form for the journal file (questions, answers, reports).
+    pub fn log_full(&mut self, glyph: &str, color: &'static str, short: impl Into<String>, full: &str) {
+        self.log_inner(glyph, color, short.into(), Some(full));
+    }
+
+    /// `log_full` for a line that quotes `text`: the feed shows it cut to `n` characters, the
+    /// journal file keeps all of it. `line` builds the whole line around the quoted text.
+    fn log_quote(&mut self, glyph: &str, color: &'static str, n: usize, text: &str, line: impl Fn(&str) -> String) {
+        self.log_full(glyph, color, line(&trunc(text, n)), &line(text));
+    }
+
+    fn log_inner(&mut self, glyph: &str, color: &'static str, text: String, full: Option<&str>) {
         // Defensive: crash reasons and agent-supplied text can carry ANSI from a subprocess's
         // stderr; the journal and pulse feed must never show raw escape codes.
-        let text = crate::util::strip_ansi(&text.into());
+        let text = crate::util::strip_ansi(&text);
         self.pulse_seq += 1;
         let p = Pulse { n: self.pulse_seq, at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
         crate::mlog!("[run {}] {} {}", self.id, p.glyph, p.text);
-        self.journal_line(&p.glyph, &p.text);
+        let full = full.map(crate::util::strip_ansi);
+        self.journal_line_full(&p.glyph, &p.text, full.as_deref().filter(|f| *f != p.text));
         self.pulse.push_back(p);
         while self.pulse.len() > 300 {
             self.pulse.pop_front();
@@ -870,7 +886,16 @@ impl Run {
     /// Append one line to `journal.jsonl` only (no pulse entry): for text too long for the feed
     /// but worth keeping whole, like the backend's complete error behind a halt.
     fn journal_line(&self, glyph: &str, text: &str) {
-        let line = json!({"t": crate::util::unix_secs(), "glyph": glyph, "text": text}).to_string();
+        self.journal_line_full(glyph, text, None);
+    }
+
+    /// A journal line with an optional `full` key: the unshortened text, when `text` is a digest.
+    fn journal_line_full(&self, glyph: &str, text: &str, full: Option<&str>) {
+        let mut line = json!({"t": crate::util::unix_secs(), "glyph": glyph, "text": text});
+        if let Some(f) = full {
+            line["full"] = json!(f);
+        }
+        let line = line.to_string();
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl")) {
             use std::io::Write;
@@ -1296,6 +1321,7 @@ impl Run {
     /// Un-halt: re-prompt every agent that was interrupted for this, and pick the run back up
     /// wherever it left off. Always an explicit act — `space` / Resume, a retry, or the
     /// manager/planner acting on an escalation; changing a model never calls it.
+    #[cfg_attr(not(test), allow(dead_code))] // the pause key resumes through `resume_core` with `by`
     pub fn resume(&mut self, ctx: &mut dyn Ctx) {
         self.resume_by(ctx, None);
     }
@@ -1303,7 +1329,7 @@ impl Run {
     /// `resume`, with the agent that caused it (the planner acting on an escalation) left out of
     /// the "continue where you left off" re-prompts — it is mid-turn and knows.
     pub fn resume_by(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>) {
-        self.resume_core(ctx, except, true, true);
+        self.resume_core(ctx, except, true, true, None);
     }
 
     /// Lift a halt so that a restart of `target` (a retry, a respawn) can go ahead. When that
@@ -1314,12 +1340,13 @@ impl Run {
         let in_gate = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
         let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc || self.workers[i].owner_fixing.is_some()).unwrap_or(false);
         let replaces = in_gate && (Some(target) == self.gate_agent || fix_worker);
-        self.resume_core(ctx, except, !replaces, false);
+        self.resume_core(ctx, except, !replaces, false, None);
     }
 
     /// `respawn`: also put the workers the gateway outage failed back to work (not for a restart of
     /// one specific agent, which is its own answer).
-    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool, respawn: bool) {
+    /// `by`: who asked, for the journal (`Some("you")` for the pause key), `None` for the engine or an agent.
+    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool, respawn: bool, by: Option<&str>) {
         if self.halt.is_none() {
             return;
         }
@@ -1330,7 +1357,7 @@ impl Run {
         self.last_verify_sig = None;
         self.alerts.retain(|alert| *alert != resolved.message);
         let paused = std::mem::take(&mut self.paused_agents);
-        self.log("▶", "green", "run resumed");
+        self.log("▶", "green", match by { Some(b) => format!("run resumed (by {b})"), None => "run resumed".into() });
         self.save_state();
         let t0 = Instant::now();
         if respawn {
@@ -2194,7 +2221,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.want_review = false;
-        self.log("✓", "green", "plan approved");
+        self.log("✓", "green", "plan approved (by you)");
         self.start_phase(ctx, 0);
     }
 
@@ -2202,7 +2229,7 @@ Then summarize in 2-4 lines.",
         let Some(p) = self.planner else { return };
         self.want_review = false;
         self.stage = Stage::Planning;
-        self.log("✎", "saffron", format!("plan feedback: {}", trunc(text, 80)));
+        self.log_quote("✎", "saffron", 80, text, |t| format!("plan feedback: {t}"));
         self.mark_edge(p);
         ctx.prompt(p, format!("[mantra:revise] The user reviewed your plan and says:\n{text}\n\nSubmit the updated plan with mantra_submit_plan."));
     }
@@ -2256,6 +2283,7 @@ Then summarize in 2-4 lines.",
         let fresh = self.pattern.settings.orchestrator_context != "compact";
         let orch = match self.orchestrator {
             Some(o) if !fresh => {
+                self.log("⇣", "amber", "orchestrator: compacting for the next phase");
                 ctx.compact(o);
                 o
             }
@@ -3595,6 +3623,8 @@ Then summarize in 2-4 lines.",
                 if count <= max {
                     let wait = Duration::from_secs(4 * count as u64);
                     if kind == Some(ErrKind::ContextFull) {
+                        let who = self.name_of(a);
+                        self.log("⇣", "amber", format!("{who}: context full — compacting"));
                         ctx.compact(a);
                         self.shrink_assumed_context(ctx, a);
                     }
@@ -3805,7 +3835,7 @@ Then summarize in 2-4 lines.",
                         self.last_gate_blocker = None;
                         self.note_gate(idx, round, true, &summary);
                         self.orch_inbox.push(format!("Gate round {round}: QA passed — Mantra verifies the checks."));
-                        self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
+                        self.log_quote("◎", "green", 70, &summary, |t| format!("gate report: pass — {t}"));
                         self.qa_ok = true;
                         self.run_checks(ctx, idx, round);
                     }
@@ -3859,7 +3889,7 @@ Then summarize in 2-4 lines.",
                                 None => format!("fix-{round} ({})", self.fix_role(big)),
                             };
                             self.orch_inbox.push(format!("Gate round {round}: QA failed the phase — the fix goes to {who}. Full report: {path}."));
-                            self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
+                            self.log_quote("◎", "amber", 60, &why, |t| format!("gate round {round} not passed: {t}"));
                             // The fix goes to a worker; Mantra re-runs the checks and starts a
                             // fresh QA round when it is done (deferred if the run is halted).
                             self.start_fix(ctx, idx, round, why, big);
@@ -4198,7 +4228,7 @@ Then summarize in 2-4 lines.",
                     owner_failed = owner_round.map(|r| (r, format!("{tid} could not repair it (blocked)"), Some(report.clone())));
                 } else if blocked {
                     w.state = WState::Failed("blocked".into());
-                    self.log("⚠", "amber", format!("{tid} is blocked"));
+                    self.log_full("⚠", "amber", format!("{tid} is blocked"), &format!("{tid} is blocked: {report}"));
                     if let Some(round) = fix_round {
                         self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(&report, 200)));
                         self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)), format!("{tid} could not fix what gate round {round} found — it is blocked: {report}"), None);
@@ -4789,7 +4819,7 @@ Then summarize in 2-4 lines.",
     /// every reason, via `resume()`.
     pub fn toggle_pause(&mut self, ctx: &mut dyn Ctx) {
         if self.halted() {
-            self.resume(ctx);
+            self.resume_core(ctx, None, true, true, Some("you"));
             return;
         }
         for a in self.all_agents() {
@@ -4800,7 +4830,7 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
-        self.log("‖", "amber", "run paused");
+        self.log("‖", "amber", "run paused (by you)");
         self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), full: "paused by you".into(), since: Instant::now() });
         self.clock_stop();
         self.save_state();
@@ -4810,6 +4840,7 @@ Then summarize in 2-4 lines.",
         if !self.is_active() { return Err("Start a run to change its workflow permission.".into()); }
         if self.pattern.is_auto() { return Err("Auto needs its first workflow proposal before this can be changed.".into()); }
         self.pattern.settings.allow_pattern_changes = enabled;
+        self.log("⚙", "blue", format!("live workflow changes {} (by you)", if enabled { "allowed" } else { "locked" }));
         if !enabled && self.pending_pattern.is_some() {
             self.user_input(ctx, "The user turned off live workflow changes.");
         }
@@ -4860,11 +4891,11 @@ Then summarize in 2-4 lines.",
                 self.pending_questions.insert(q.from, q.text.clone());
                 let (p, pre) = self.planner_with_preface(ctx);
                 self.mark_edge(p);
-                self.log("›", "rose", format!("you → planner (answer for {who}): {}", trunc(text, 60)));
+                self.log_quote("›", "rose", 60, text, |t| format!("you → planner (answer for {who}): {t}"));
                 ctx.prompt(p, format!("{pre}[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
                 return;
             }
-            self.log("›", "rose", format!("you → {who} (answer): {}", trunc(text, 60)));
+            self.log_quote("›", "rose", 60, text, |t| format!("you → {who} (answer): {t}"));
             self.mark_edge(q.from);
             let next = if Some(q.from) == self.manager {
                 "Act on it — resume the run (mantra_resume_run), restart an agent (mantra_retry / mantra_respawn), brief the orchestrator, or hand a plan change to the planner (mantra_ask) — then summarize in 2-4 lines."
@@ -4888,7 +4919,7 @@ Then summarize in 2-4 lines.",
                 let orch_last = self.orchestrator.and_then(|o| ctx.agent(o)).map(|o| o.log_text(12)).unwrap_or_default();
                 let status = self.status_text(ctx);
                 let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "finale".into());
-                self.log("✦", "saffron", format!("re-prompt → planner: {}", trunc(text, 70)));
+                self.log_quote("✦", "saffron", 70, text, |t| format!("re-prompt → planner: {t}"));
                 self.mark_edge(p);
                 ctx.prompt(
                     p,
@@ -4928,7 +4959,7 @@ Then summarize in 2-4 lines.",
             Some(a) => {
                 self.mark_edge(a);
                 ctx.prompt_mode(a, format!("{pre}[from the user] {text}"), mode);
-                self.log("›", "rose", format!("you → planner: {}", trunc(text, 60)));
+                self.log_quote("›", "rose", 60, text, |t| format!("you → planner: {t}"));
                 true
             }
             None => false,
@@ -5293,6 +5324,10 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_inner(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<&'static str, String> {
+        // The respawn line shows only why; what an agent or the user wrote goes to the journal whole.
+        if let Some(n) = note.as_deref().filter(|n| respawn_why(Some(n)) == "requested") {
+            self.journal_line("↻", &format!("respawn note: {n}"));
+        }
         if let Some(wi) = self.worker_idx(a) {
             // `r` on the task that exhausted its attempts *is* the decision to try once more.
             if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted
@@ -5766,7 +5801,7 @@ Then summarize in 2-4 lines.",
                 // Only the planner's brief answers a question the orchestrator passed up to it;
                 // the manager briefing the orchestrator meanwhile must not swallow that question.
                 let answering = Some(a) == self.planner && self.orchestrator.map(|o| self.pending_questions.remove(&o).is_some()).unwrap_or(false);
-                self.log("✦", "saffron", format!("{from} → orchestrator{}: {}", if answering { " (answer)" } else { "" }, trunc(&m, 60)));
+                self.log_quote("✦", "saffron", 60, &m, |t| format!("{from} → orchestrator{}: {t}", if answering { " (answer)" } else { "" }));
                 if let Some(o) = self.orchestrator {
                     self.mark_edge(o);
                 }
@@ -5904,7 +5939,7 @@ Then summarize in 2-4 lines.",
                             let text = format!("[from the {from}] (answering your question) {m}");
                             self.remember_prompt(t, &text);
                             ctx.prompt(t, text);
-                            self.log("›", "rose", format!("{from} → {n} (answer): {}", trunc(&m, 60)));
+                            self.log_quote("›", "rose", 60, &m, |t| format!("{from} → {n} (answer): {t}"));
                             return (format!("answer sent to {n}"), true);
                         }
                         if let Some(refusal) = self.worker_done_guard(t) {
@@ -5937,7 +5972,7 @@ Then summarize in 2-4 lines.",
                         let text = format!("[from the {from}] {m}");
                         self.remember_prompt(t, &text);
                         ctx.prompt(t, text);
-                        self.log("›", "rose", format!("{from} → {n}: {}", trunc(&m, 60)));
+                        self.log_quote("›", "rose", 60, &m, |t| format!("{from} → {n}: {t}"));
                         (format!("sent to {n}"), true)
                     }
                     _ => (format!("unknown agent '{n}'"), false),
@@ -6012,7 +6047,7 @@ Then summarize in 2-4 lines.",
                 }
                 let who = self.name_of(a);
                 self.question = Some(Question { from: a, text: q.clone(), since: Instant::now() });
-                self.log("?", "saffron", format!("{who} asks you: {}", trunc(&q, 70)));
+                self.log_quote("?", "saffron", 70, &q, |t| format!("{who} asks you: {t}"));
                 self.alerts.push(format!("the {who} asks: {q}"));
                 ctx.notify(&format!("Mantra: the {who} has a question — {}", trunc(&q, 80)));
                 ("the user has been asked; their answer arrives as a [from the user] message. End your turn now — the run continues meanwhile.".into(), true)
@@ -6028,7 +6063,7 @@ Then summarize in 2-4 lines.",
                     self.extra_attempts += 1;
                 }
                 let who = self.name_of(a);
-                self.log(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", format!("{who} resumed the run: {}", trunc(&note, 60)));
+                self.log_quote(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", 60, &note, |t| format!("{who} resumed the run: {t}"));
                 if !note.trim().is_empty() {
                     // A stuck QA agent or fix worker is replaced by a fresh one on resume: the note
                     // goes to that one instead of waking the old one for a turn it will not finish.
@@ -6273,7 +6308,8 @@ Then summarize in 2-4 lines.",
         if let Stage::Finale { idx } = self.stage {
             if previous.flow.finale.get(idx) != self.pattern.flow.finale.get(idx) { self.respawn_finale(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
         }
-        self.log("✦", "saffron", format!("workflow {} → {}: {}", previous.name, self.pattern.name, proposal.reason));
+        let new_name = self.pattern.name.clone();
+        self.log_quote("✦", "saffron", 80, &proposal.reason, |t| format!("workflow {} → {new_name}: {t}", previous.name));
         self.save_state();
         if let Some(p) = self.planner {
             let changed = previous.flow.planner != self.pattern.flow.planner || !matches!((previous.roles.get(&previous.flow.planner), self.pattern.roles.get(&self.pattern.flow.planner)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
@@ -6490,7 +6526,7 @@ Then summarize in 2-4 lines.",
         if to_planner {
             let (p, pre) = self.planner_with_preface(ctx);
             let answer_with = if Some(a) == self.orchestrator { "mantra_brief_orchestrator" } else { "mantra_prompt" };
-            self.log("?", "amber", format!("{from} asks the planner: {}", trunc(&q, 70)));
+            self.log_quote("?", "amber", 70, &q, |t| format!("{from} asks the planner: {t}"));
             let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
             let status = self.status_text(ctx);
             self.mark_edge(p);
@@ -6500,7 +6536,7 @@ Then summarize in 2-4 lines.",
             );
             ("forwarded to the planner — its answer arrives as a message. Call mantra_wait if you have nothing else to do meanwhile.".into(), true)
         } else {
-            self.log("?", "amber", format!("{from} asks the orchestrator: {}", trunc(&q, 70)));
+            self.log_quote("?", "amber", 70, &q, |t| format!("{from} asks the orchestrator: {t}"));
             self.orch_event(ctx, format!("QUESTION from {from}: {q}\nIt is waiting for you. Answer with mantra_prompt(\"{from}\", …). If the decision is beyond your brief (it changes the plan, the scope or the product), pass it up with mantra_ask instead."));
             ("forwarded to the orchestrator — the answer arrives as a [from the orchestrator] message. If you cannot continue without it, end your turn now (no STATUS line); you will be woken with the answer.".into(), true)
         }
