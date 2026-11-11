@@ -820,13 +820,17 @@ pub fn antigravity_available() -> bool {
 /// Sonnet and Fable model runs with a 1M window on Claude Code (only Haiku is 200k), and
 /// `--autocompact` is derived from this figure; the gauge itself follows the window the CLI
 /// reports for the account (`hub/claude.rs`), so an ineligible plan still reads right.
-const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
-    ("opus46", "claude-opus-4-6", 1_000_000, ""),
-    ("opus48", "claude-opus-4-8", 1_000_000, ""),
-    ("opus5", "claude-opus-5", 1_000_000, ""),
-    ("sonnet5", "claude-sonnet-5", 1_000_000, ""),
-    ("fable5", "claude-fable-5", 1_000_000, ""),
+pub(crate) const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
+    ("fable52", "claude-fable-5-2", 1_000_000, ""),
     ("fable51", "claude-fable-5-1", 1_000_000, ""),
+    ("fable5", "claude-fable-5", 1_000_000, ""),
+    ("opus55", "claude-opus-5-5", 1_000_000, ""),
+    ("opus5", "claude-opus-5", 1_000_000, ""),
+    ("opus48", "claude-opus-4-8", 1_000_000, ""),
+    ("opus46", "claude-opus-4-6", 1_000_000, ""),
+    ("sonnet55", "claude-sonnet-5-5", 1_000_000, ""),
+    ("sonnet5", "claude-sonnet-5", 1_000_000, ""),
+    ("haiku55", "claude-haiku-5-5", 1_000_000, "fast & cheap"),
     ("haiku45", "claude-haiku-4-5-20251001", 200_000, "fast & cheap"),
 ];
 

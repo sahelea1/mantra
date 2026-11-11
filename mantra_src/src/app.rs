@@ -22,6 +22,8 @@ pub enum AppEvent {
     Job(JobTag, JobOut),
     /// One discovery source answered (Codex catalog or a provider's /models).
     Discovered { source: String, result: Result<Vec<crate::discover::Candidate>, String> },
+    /// A discovery source fell back to something usable: one line for the overlay's `skipped` list.
+    DiscoverNote(String),
     /// A command from a web client (`--web` / `--remote`), executed by `App::web_command`.
     Web(crate::web::Inbound),
     /// The answer to an agent's tool call worked out off the event loop (Solo's screenshot), for
@@ -1971,7 +1973,7 @@ impl App {
     /// (`only` = one provider id). Without Codex nothing asks for it: it is an add-on backend.
     pub fn discover(&mut self, only: Option<String>) {
         let mut sources: Vec<String> = vec![];
-        let codex = only.is_none() && !self.registry.codex_account_models().is_empty();
+        let codex = (only.is_none() || only.as_deref() == Some("openai")) && !self.registry.codex_account_models().is_empty();
         if codex {
             sources.push("codex".into());
         }
@@ -1989,7 +1991,25 @@ impl App {
         skipped.extend(provs.iter().filter(|p| p.kind == crate::config::ProviderKind::Antigravity).map(|p| format!("{}: run `agy models`, then add an available model ID by hand", p.id)));
         self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default(), origin: None }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
-            self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+            if p.base_url.trim().is_empty() && !self.demo {
+                // A subscription: ask the installed Claude Code what the account offers.
+                if let Some(Overlay::Discover(st)) = self.overlays.last_mut() {
+                    st.loading.push(p.id.clone());
+                }
+                let (id, cmd, tx) = (p.id.clone(), self.hub.claude_cmd.clone(), self.tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = match crate::discover::claude_cli_models(&cmd, &id) {
+                        Ok(found) => Ok(crate::discover::merge_with_builtins(found, &id)),
+                        Err(why) => {
+                            let _ = tx.send(AppEvent::DiscoverNote(format!("{id}: built-in model list ({why})")));
+                            Ok(crate::discover::claude_defaults(&id))
+                        }
+                    };
+                    let _ = tx.send(AppEvent::Discovered { source: id, result });
+                });
+            } else {
+                self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+            }
         }
         if codex {
             let cmd = self.hub.codex_cmd.clone();
@@ -2000,9 +2020,18 @@ impl App {
                 let r = async {
                     let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd, &[]).map_err(|e| e.to_string())?;
                     crate::rpc::handshake(&conn).await.map_err(|e| e.to_string())?;
-                    let v = conn.request_timeout("model/list", json!({"limit": 100}), Duration::from_secs(20)).await.map_err(|e| e.message)?;
+                    let mut found: Vec<crate::discover::Candidate> = vec![];
+                    let mut params = json!({"limit": 100});
+                    for _ in 0..5 {
+                        let v = conn.request_timeout("model/list", params.clone(), Duration::from_secs(20)).await.map_err(|e| e.message)?;
+                        found.extend(v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(crate::discover::from_codex).collect::<Vec<_>>()).unwrap_or_default());
+                        match v.get("nextCursor").or_else(|| v.get("next_cursor")).and_then(|c| c.as_str()).filter(|c| !c.is_empty()) {
+                            Some(cursor) => params = json!({"limit": 100, "cursor": cursor}),
+                            None => break,
+                        }
+                    }
                     let _ = child.kill().await;
-                    Ok::<_, String>(v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(crate::discover::from_codex).collect()).unwrap_or_default())
+                    Ok::<_, String>(found)
                 }
                 .await;
                 let _ = tx.send(AppEvent::Discovered { source: "codex".into(), result: r });
@@ -2320,6 +2349,11 @@ impl App {
                 }
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
+            AppEvent::DiscoverNote(note) => {
+                if let Some(Overlay::Discover(st)) = self.overlays.iter_mut().rev().find(|o| matches!(o, Overlay::Discover(_))) {
+                    st.skipped.push(note);
+                }
+            }
             AppEvent::Web(i) => self.web_command(i),
             AppEvent::ToolAnswer { agent, id, result } => self.hub.send(agent, Cmd::Respond { id, result }),
             AppEvent::Probed { provider, host, result } => self.on_probed(provider, host, result),

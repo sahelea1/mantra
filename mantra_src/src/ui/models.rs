@@ -764,7 +764,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
                         }
                     }
                 }
-                Some(ProvRow::Codex) => app.discover(None),
+                Some(ProvRow::Codex) => app.discover(Some("openai".into())),
                 None => app.toast("add a provider first (ctrl+n)", crate::agent::Level::Info),
             }
         }
