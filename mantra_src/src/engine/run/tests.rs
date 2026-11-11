@@ -6060,7 +6060,7 @@ fn a_failed_round_in_one_tasks_files_goes_back_to_its_own_worker() {
     assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"), "no fix worker");
     assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")), "{:?}", ctx.jobs);
     assert_eq!(run.fix_owner.as_deref(), Some("t1"));
-    assert!(run.journal_text(60).contains("gate round 1 found problems in t1's work — back to its own worker"));
+    assert!(run.journal_text(60).contains("gate round 1 found problems in the work of t1 — back to its own worker"));
     assert!(run.orch_inbox.iter().any(|l| l.contains("t1's own worker")), "{:?}", run.orch_inbox);
     assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1), "nothing is said to it before its worktree is current");
     // the worktree is current: it is told

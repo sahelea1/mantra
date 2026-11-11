@@ -93,6 +93,28 @@ grep -q 'orchestrator → p2-api (answer)' "$j" || { cat "$j"; echo "MISSING: th
 grep -q 'p2-api done' "$j" || { cat "$j"; echo "MISSING: the answered worker should finish"; exit 1; }
 echo "chain of command ok"
 
+# 0.12: a failed QA round goes back to the worker that wrote the code (MANTRA_MOCK_GATE_FAIL=1), or
+# to a fix worker when the findings name no file (=fix-worker); the next round passes either way.
+echo "gate fix (the task's own worker, then a fix worker)…"
+for mode in 1 fix-worker; do
+  export MANTRA_HOME="$(mktemp -d)"
+  out=$(MANTRA_MOCK_GATE_FAIL=$mode $bin --demo --pattern mantra-default --snapshot "wait:0.5;until:plan review@120;key:a;until:run complete@300;snap:done" run "build a tiny todo CLI" 2>&1)
+  echo "$out" | grep -qi 'panicked' && { echo "$out"; echo "PANIC in the gate fix scenario ($mode)"; exit 1; }
+  echo "$out" | grep -q '!! timeout' && { echo "$out"; echo "TIMEOUT: the run with a failed QA round did not complete ($mode)"; exit 1; }
+  j=$(ls "$MANTRA_HOME"/runs/*/*/journal.jsonl)
+  grep -q 'gate round 1 not passed' "$j" || { cat "$j"; echo "MISSING: QA round 1 should fail ($mode)"; exit 1; }
+  if [ "$mode" = 1 ]; then
+    grep -q 'back to its own worker' "$j" || { cat "$j"; echo "MISSING: the fix should go back to the task's own worker"; exit 1; }
+    grep -q 'p1-models repaired its work' "$j" || { cat "$j"; echo "MISSING: the owner should repair its work"; exit 1; }
+  else
+    grep -q 'fix-1 (' "$j" || { cat "$j"; echo "MISSING: a fix worker should take findings that name no file"; exit 1; }
+    grep -q 'fix-1 done' "$j" || { cat "$j"; echo "MISSING: the fix worker should finish"; exit 1; }
+  fi
+  grep -q 'qa gate started (round 2' "$j" || { cat "$j"; echo "MISSING: a second QA round should follow the fix ($mode)"; exit 1; }
+  grep -q 'run complete' "$j" || { cat "$j"; echo "MISSING: the run should complete after the fix ($mode)"; exit 1; }
+done
+echo "gate fix ok"
+
 # WP11: leave a run mid-phase, list it, resume it headlessly to completion, drive the /runs overlay, delete it.
 echo "runs: list / resume / delete…"
 export MANTRA_HOME="$(mktemp -d)"

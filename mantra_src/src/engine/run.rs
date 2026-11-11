@@ -136,6 +136,11 @@ pub trait Ctx {
     /// `to` replaces `from` in its slot (a respawn, a fallback): what was queued for `from` is
     /// now `to`'s. Default: nothing to carry.
     fn carry_over(&mut self, _from: AgentId, _to: AgentId) {}
+    /// Would a worker on `alias` with this role sandbox be started without its backend's sandbox
+    /// so that it can write the git directory (`SpawnReq::git_write`)? Only the app knows backends.
+    fn lifts_sandbox_for_git(&self, _alias: &str, _sandbox: &str) -> bool {
+        false
+    }
     fn compact(&mut self, a: AgentId);
     fn stop(&mut self, a: AgentId, archive: bool);
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool);
@@ -2582,9 +2587,10 @@ Then summarize in 2-4 lines.",
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
         let req = SpawnReq { claude_user_config: String::new(), git_write, name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
-        if git_write && !self.git_write_said {
+        // said once, and only when it is true of this worker's backend
+        if git_write && !self.git_write_said && ctx.lifts_sandbox_for_git(&req.role.model, &req.role.sandbox) {
             self.git_write_said = true;
-            self.log("ℹ", "blue", "fix workers on Codex run without Codex's sandbox (it keeps .git read-only, and a merge fix must write it); other backends keep the role's sandbox");
+            self.log("ℹ", "blue", "fix workers on Codex run without Codex's sandbox (it keeps .git read-only, and a merge fix must write it)");
         }
         let req = self.role_req(req);
         let id = match resume {
@@ -2984,7 +2990,7 @@ Then summarize in 2-4 lines.",
         self.fix_owner = Some(task.clone());
         self.qa_ok = false;
         self.fix_base_print = self.tree_print.clone();
-        self.log("⚒", "amber", format!("gate round {round} found problems in {task}'s work — back to its own worker"));
+        self.log("⚒", "amber", format!("gate round {round} found problems in the work of {task} — back to its own worker"));
         match (self.ws.clone(), self.workers[wi].wt.clone()) {
             (Some(ws), Some(dir)) => {
                 ctx.job(JobTag::OwnerSync { phase: idx, round, task }, Box::new(move || JobOut::Text(git::sync_worker(&ws, &dir).map(|_| String::new()))));

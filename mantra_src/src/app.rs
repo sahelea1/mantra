@@ -1021,6 +1021,10 @@ impl Ctx for Ctxt<'_> {
     fn interrupt(&mut self, a: AgentId) {
         self.hub.send(a, Cmd::Interrupt);
     }
+    fn lifts_sandbox_for_git(&self, alias: &str, sandbox: &str) -> bool {
+        let backend = self.registry.backend_of(&self.registry.resolve(alias));
+        backend == crate::config::ProviderKind::Codex && role_sandbox(sandbox, backend) == "workspace-write"
+    }
     fn carry_over(&mut self, from: AgentId, to: AgentId) {
         let moved = self.agents.get_mut(&from).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
         if !moved.is_empty() {
