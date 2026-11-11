@@ -775,6 +775,9 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.backend = backend;
     a.effort = effort.clone();
     a.ctx_window = (backend != crate::config::ProviderKind::Antigravity).then_some(cw);
+    if backend == crate::config::ProviderKind::ClaudeCode && cw < 100_000 {
+        a.notice(Level::Info, format!("context {}k is below Claude Code's minimum — it compacts at 100k", cw / 1000));
+    }
     a.approval = o.approval.clone();
     a.sandbox = o.sandbox.clone();
     if backend == crate::config::ProviderKind::Antigravity {
@@ -1490,7 +1493,7 @@ impl App {
         let context_window = self.registry.effective_context_window(&new.alias, &self.settings.default_model);
         // a run agent keeps the run's context cap (the backend was told it at spawn): the gauge
         // shows the window it really has, not the new model's whole one
-        let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).map(|r| r.pattern.settings.context_cap).filter(|c| *c > 0);
+        let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).and_then(|r| r.context_ceiling(a));
         let context_window = context_window.min(cap.unwrap_or(u64::MAX));
         // Context limits are launch flags on each backend, so a change must reach the process
         // as well as its gauge. Reuse the fresh-session handoff for that model configuration.
@@ -5384,6 +5387,45 @@ done"#;
         assert!(spec.envs.is_empty());
         assert!(spec.claude.is_none() && spec.bija.is_none());
         assert_eq!(spec.antigravity.unwrap().system_prompt, opts.instructions);
+    }
+
+    #[tokio::test]
+    async fn a_codex_model_is_told_the_context_override_and_compacts_at_85_percent() {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "cx".into(), kind: crate::config::ProviderKind::Codex, ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "cx-big".into(), provider: "cx".into(), model: "cx-big".into(), context_window: Some(1_000_000), ..Default::default() });
+        let (mut hub, _commands) = test_hub_with(1);
+        let opts = AgentOpts {
+            name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "cx-big".into(), effort: None, cwd: PathBuf::from("."), approval: "never".into(), sandbox: "workspace-write".into(), instructions: String::new(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(500_000), resume_thread: None, thread_name: None, mcp: vec![],
+        };
+        let (spec, _, _) = agent_spec(&mut hub, &reg, &opts);
+        assert!(spec.extra_args.contains(&"model_context_window=500000".to_string()), "{:?}", spec.extra_args);
+        assert!(spec.extra_args.contains(&"model_auto_compact_token_limit=425000".to_string()), "{:?}", spec.extra_args);
+    }
+
+    #[tokio::test]
+    async fn a_live_model_switch_keeps_the_roles_context_limit() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let provider = app.registry.providers[0].id.clone();
+        for alias in ["ctx-a", "ctx-b"] {
+            app.registry.models.push(crate::config::ModelEntry { alias: alias.into(), provider: provider.clone(), model: alias.into(), context_window: Some(1_000_000), ..Default::default() });
+        }
+        let mut pattern = Pattern::builtin();
+        let planner = pattern.flow.planner.clone();
+        pattern.roles.get_mut(&planner).unwrap().context = Some(250_000);
+        pattern.settings.context_cap = 0;
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), pattern, "test".into());
+        run.planner = Some(7);
+        app.run = Some(run);
+        let backend = app.registry.backend_of(&app.registry.resolve("ctx-a"));
+        let mut agent = Agent::new(7, "planner", &planner, PathBuf::new());
+        agent.model_alias = "ctx-a".into();
+        agent.backend = backend;
+        agent.ctx_window = Some(250_000);
+        app.agents.insert(7, agent);
+        let _rx = app.hub.test_register(7);
+        assert_eq!(app.set_model(7, "ctx-b"), Ok(()));
+        assert_eq!(app.agents[&7].ctx_window, Some(250_000), "a 1M model under a 250k role limit");
     }
 
     #[test]

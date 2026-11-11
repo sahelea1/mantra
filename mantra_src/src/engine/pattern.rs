@@ -40,6 +40,10 @@ pub struct Role {
     pub fallback2: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback3: Option<String>,
+    /// Optional ceiling (tokens) on the context window of this role's agents, on top of the
+    /// pattern's `context_cap` and the model's own window: the smallest wins. None = no role limit.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_role_context")]
+    pub context: Option<u64>,
     /// MCP servers this role's agents get (names from `settings.mcp_servers`, or `"*"` for every
     /// enabled one). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -71,6 +75,7 @@ impl Default for Role {
             max_tokens: None,
             fallback: None,
             fallback2: None,
+            context: None,
             fallback3: None,
             parallel: None,
             can_spawn_swarm: false,
@@ -206,12 +211,41 @@ pub struct PatternSettings {
     pub context_cap: u64,
 }
 
+/// The smallest context window a role limit or the pattern's cap may ask for.
+const MIN_CONTEXT: u64 = 16_000;
+
 pub(crate) fn parse_context_cap(text: &str) -> Option<u64> {
     let text = text.trim();
     if text.eq_ignore_ascii_case("off") || text.eq_ignore_ascii_case("full") {
         Some(0)
     } else {
         crate::util::parse_tokens(text)
+    }
+}
+
+fn deserialize_role_context<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RoleContext {
+        Tokens(u64),
+        Text(String),
+    }
+
+    match Option::<RoleContext>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RoleContext::Tokens(0)) => Ok(None),
+        Some(RoleContext::Tokens(tokens)) => Ok(Some(tokens)),
+        Some(RoleContext::Text(text)) => {
+            let t = text.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("none") {
+                return Ok(None);
+            }
+            match crate::util::parse_tokens(t) {
+                Some(0) => Ok(None),
+                Some(tokens) => Ok(Some(tokens)),
+                None => Err(serde::de::Error::custom("context must be a token count such as 200k or 1M, or 0 / off for no limit")),
+            }
+        }
     }
 }
 
@@ -479,6 +513,9 @@ impl Pattern {
             if !PERMISSIONS.contains(&r.permission.as_str()) {
                 errs.push(format!("role '{n}': permission must be one of {} (got '{}')", PERMISSIONS.join(", "), r.permission));
             }
+            if let Some(c) = r.context.filter(|c| *c < MIN_CONTEXT) {
+                errs.push(format!("role '{n}': context must be at least 16k tokens (got {c})"));
+            }
             match r.parallel {
                 Some(p) if !PARALLEL_RANGE.contains(&p) => errs.push(format!("role '{n}': parallel must be from {} to {} (got {p})", PARALLEL_RANGE.start(), PARALLEL_RANGE.end())),
                 // only workers are spawned many at a time; on any other kind the number would be read by nothing
@@ -525,6 +562,9 @@ impl Pattern {
         }
         if !self.is_auto() && !self.settings.planner_loop && self.worker_roles().is_empty() {
             errs.push("pattern needs at least one role with kind = \"worker\"".into());
+        }
+        if (1..MIN_CONTEXT).contains(&self.settings.context_cap) {
+            errs.push("settings.context_cap must be 0 (no cap) or at least 16k tokens".into());
         }
         if self.settings.max_parallel == 0 {
             errs.push("settings.max_parallel must be ≥ 1".into());
@@ -1320,6 +1360,30 @@ mod tests {
 
     /// Every built-in caps the context at 200k; a pattern file from before the setting existed
     /// (or one written by hand without it) keeps the model's full window.
+    #[test]
+    fn a_role_context_limit_reads_text_writes_tokens_and_rejects_too_small() {
+        let mut p = Pattern::builtin();
+        let planner = p.flow.planner.clone();
+        let toml = p.to_toml();
+        assert!(!toml.contains("\ncontext = "), "no limit, nothing written");
+        p.roles.get_mut(&planner).unwrap().context = Some(250_000);
+        let toml = p.to_toml();
+        assert!(toml.contains("context = 250000"), "{toml}");
+        assert_eq!(Pattern::from_toml(&toml).unwrap().roles[&planner].context, Some(250_000));
+        let text = toml.replace("context = 250000", "context = \"250k\"");
+        assert_eq!(Pattern::from_toml(&text).unwrap().roles[&planner].context, Some(250_000));
+        for off in ["0", "\"off\"", "\"none\"", "\"\""] {
+            let t = toml.replace("context = 250000", &format!("context = {off}"));
+            assert_eq!(Pattern::from_toml(&t).unwrap().roles[&planner].context, None, "{off}");
+        }
+        let small = toml.replace("context = 250000", "context = 8000");
+        let err = Pattern::from_toml(&small).unwrap_err().to_string();
+        assert!(err.contains("context must be at least 16k tokens (got 8000)"), "{err}");
+        let cap = Pattern::builtin().to_toml().replace("context_cap = 200000", "context_cap = 8000");
+        let err = Pattern::from_toml(&cap).unwrap_err().to_string();
+        assert!(err.contains("settings.context_cap must be 0 (no cap) or at least 16k tokens"), "{err}");
+    }
+
     #[test]
     fn the_context_cap_is_200k_in_the_builtins_and_off_for_old_patterns() {
         for p in all_builtins() {

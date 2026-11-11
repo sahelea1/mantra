@@ -20,7 +20,7 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "context", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
 const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "allow_pattern_changes"];
@@ -61,9 +61,23 @@ fn field_kind(entry: &str, field: &str) -> Kind {
             "instructions" => Kind::Lines,
             "description" | "mcp" => Kind::Text,
             "swarm" => Kind::Toggle,
-            "glyph" | "parallel" | "max_tokens" => Kind::Step,
+            "glyph" | "parallel" | "max_tokens" | "context" => Kind::Step,
             _ => Kind::Choice,
         },
+    }
+}
+
+/// The stops ←→ walks a role's `context` through (below the first is none).
+const CONTEXT_STEPS: [u64; 7] = [64_000, 128_000, 200_000, 272_000, 400_000, 500_000, 1_000_000];
+
+/// A role's context limit as the editor shows it: `250k`, `1M`, else the plain number.
+fn context_label(n: u64) -> String {
+    if n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n % 1000 == 0 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
     }
 }
 
@@ -209,6 +223,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "swarm" => if r.can_spawn_swarm { "on".into() } else { "off".into() },
                 "parallel" => r.parallel.map(|n| n.to_string()).unwrap_or_else(|| "none".into()),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
+                "context" => r.context.map(context_label).unwrap_or_else(|| "none".into()),
                 "mcp" => if r.mcp.is_empty() { "none".into() } else { r.mcp.join(", ") },
                 "description" => r.description.clone(),
                 "instructions" => r.instructions.clone(),
@@ -224,7 +239,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
 fn edit_value(app: &App, entry: &str, field: &str) -> String {
     let v = get_value(app, entry, field);
     match field {
-        "max_tokens" | "parallel" | "writable_roots" | "mcp" if v == "none" => String::new(),
+        "max_tokens" | "context" | "parallel" | "writable_roots" | "mcp" if v == "none" => String::new(),
         "context_cap" if app.studio.pattern.settings.context_cap == 0 => "0".into(),
         "manager_minutes" if app.studio.pattern.settings.manager_minutes == 0 => "off".into(),
         _ => v,
@@ -385,6 +400,12 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     let next = r.parallel.unwrap_or(0) as i64 + d as i64;
                     r.parallel = if next <= 0 { None } else { Some((next as usize).min(*PARALLEL_RANGE.end())) };
                 }
+                "context" => {
+                    let cur = r.context.and_then(|c| CONTEXT_STEPS.iter().position(|s| *s == c).or_else(|| CONTEXT_STEPS.iter().rposition(|s| *s < c)));
+                    let at = cur.map(|i| i as i64 + 1).unwrap_or(0);
+                    let next = (at + d as i64).clamp(0, CONTEXT_STEPS.len() as i64);
+                    r.context = (next > 0).then(|| CONTEXT_STEPS[next as usize - 1]);
+                }
                 "max_tokens" => {
                     let cur = r.max_tokens.unwrap_or(0) as i64;
                     let next = cur + d as i64 * 250_000;
@@ -421,6 +442,14 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     "effort" => r.effort = text.to_string(),
                     "fallback" => r.fallback = parse_fallback(text),
                     "max_tokens" => r.max_tokens = text.replace(['_', ','], "").trim().parse().ok(),
+                    "context" => {
+                        let t = text.trim();
+                        if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("off") {
+                            r.context = None;
+                        } else if let Some(n) = crate::util::parse_tokens(t) {
+                            r.context = Some(n).filter(|n| *n > 0);
+                        }
+                    }
                     "mcp" => r.mcp = parse_mcp(text),
                     _ => {}
                 }
@@ -940,6 +969,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small and swarm workers, high for finale steps.",
         "parallel" => "How many workers of this role run at once, counted apart from the rest (1-128; worker-swarm has 16). none = it shares the pattern's max_parallel with the other roles without one.",
         "fallback" => "The model that takes over when this role's model twice produces nothing within first_token_minutes. none = the manager is asked instead.",
+        "context" => "Optional ceiling on the context window of this role's agents, on top of the pattern's context_cap and the model's own window: the smallest wins. none = no role limit. Examples: 128k, 200k, 1M (at least 16k).",
         "permission" => "never keeps the sandbox and skips prompts. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox. on-request / untrusted asks you (ctrl+g).",
         "swarm" => "Lets this role start a temporary swarm in Solo. Swarm children cannot spawn another swarm.",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
@@ -1378,6 +1408,32 @@ mod tests {
         edit(&mut app, "none");
         assert_eq!(app.studio.pattern.roles["worker-swarm"].parallel, None);
         assert!(app.studio.pattern.validate().is_ok());
+    }
+
+    /// A role's `context` shows none or e.g. 250k, steps through the usual windows, and the editor
+    /// takes 200k / 1M text and clears on none.
+    #[test]
+    fn a_roles_context_limit_steps_and_edits() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert!(fields(&app, "planner").contains(&"context".to_string()) && field_hint("context").is_some());
+        assert_eq!(get_value(&app, "planner", "context"), "none");
+        nudge(&mut app, "planner", "context", 1);
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(64_000));
+        nudge(&mut app, "planner", "context", 1);
+        assert_eq!(get_value(&app, "planner", "context"), "128k");
+        nudge(&mut app, "planner", "context", 20);
+        assert_eq!(get_value(&app, "planner", "context"), "1M");
+        let t = EditTarget::RoleField("planner".into(), "context".into());
+        apply_edit(&mut app, &t, "250k");
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(250_000));
+        assert_eq!(get_value(&app, "planner", "context"), "250k");
+        apply_edit(&mut app, &t, "garbage");
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(250_000), "garbage changes nothing");
+        apply_edit(&mut app, &t, "none");
+        assert_eq!(app.studio.pattern.roles["planner"].context, None);
+        nudge(&mut app, "planner", "context", -1);
+        assert_eq!(app.studio.pattern.roles["planner"].context, None);
     }
 
     /// The fallback model cycles none → every other alias → none, and the editor's "none" clears it.

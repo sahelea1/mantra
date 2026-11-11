@@ -993,16 +993,26 @@ impl Run {
     }
 
     /// The context window a spawn is told it has: the attempt's own override (a halved assumed
-    /// window) or the model's, and never more than `settings.context_cap` (0 = no cap) — the
+    /// window), the role's `context` or the model's, and never more than `settings.context_cap` (0 = no cap) — the
     /// backend then compacts at the cap instead of letting an agent carry a 500k-token context
     /// through hours of tool cycling. An alias the registry does not know is capped as it is.
-    fn context_for(&self, alias: &str, over: Option<u64>) -> Option<u64> {
+    fn context_for(&self, role: &Role, over: Option<u64>) -> Option<u64> {
         let cap = self.pattern.settings.context_cap;
-        self.known_models.get(alias).copied().into_iter()
+        self.known_models.get(&role.model).copied().into_iter()
+            .chain(role.context)
             .chain(over)
             .chain((cap > 0).then_some(cap))
             .filter(|w| *w > 0)
             .min()
+    }
+
+    /// The ceiling the run puts on agent `a`'s context, whatever model it runs on: the smaller of
+    /// the pattern's cap and its role's `context` (and a worker's halved window). None = no ceiling.
+    pub fn context_ceiling(&self, a: AgentId) -> Option<u64> {
+        let cap = self.pattern.settings.context_cap;
+        let role = self.role_name_of(a).and_then(|n| self.pattern.role(&n).and_then(|r| r.context));
+        let halved = self.workers.iter().find(|w| w.agent == Some(a)).and_then(|w| w.context_override);
+        role.into_iter().chain(halved).chain((cap > 0).then_some(cap)).filter(|w| *w > 0).min()
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -1878,7 +1888,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: if self.pattern.settings.planner_loop { tools::loop_planner_tools() } else { tools::planner_tools(&wr) },
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -2159,7 +2169,7 @@ Then summarize in 2-4 lines.",
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
-        let context_override = self.context_for(&role.model, w.context_override);
+        let context_override = self.context_for(&role, w.context_override);
         let resumed = resume.is_some();
         // A fix worker shares the integration copy; it needs the git dir writable only to merge
         // branches that conflicted.
@@ -2377,7 +2387,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
             extra_writable: self.integ_writable(),
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -2636,7 +2646,7 @@ Then summarize in 2-4 lines.",
                 cwd: self.workspace_dir(),
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
                 extra_writable: self.integ_writable(),
-                context_override: self.context_for(&role.model, None),
+                context_override: self.context_for(&role, None),
                 network: self.pattern.settings.network,
                 writable_roots: self.pattern.settings.writable_roots.clone(),
                 mcp: vec![],
@@ -4242,7 +4252,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::manager_tools(),
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -4538,7 +4548,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::orchestrator_tools(),
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],

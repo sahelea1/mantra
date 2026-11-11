@@ -4440,18 +4440,51 @@ fn the_context_cap_bounds_the_window_a_spawn_is_told() {
     run.on_job(&mut ctx, JobTag::WorkerWt { task: "t1".into(), attempt: 1 }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
     assert_eq!(ctx.spawned("t1")[0].context_override, Some(128_000), "a 128k model keeps its window");
     // a halved assumption from an earlier attempt is still capped
-    assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
-    assert_eq!(run.context_for(&planner_model, Some(400_000)), Some(200_000));
-    assert_eq!(run.context_for("unknown-alias", None), Some(200_000), "nothing known: the cap stands");
+    let role_of = |model: &str| Role { model: model.into(), ..Role::default() };
+    let (planner_role, worker_role, unknown_role) = (role_of(&planner_model), role_of(&worker_model), role_of("unknown-alias"));
+    assert_eq!(run.context_for(&planner_role, Some(100_000)), Some(100_000));
+    assert_eq!(run.context_for(&planner_role, Some(400_000)), Some(200_000));
+    assert_eq!(run.context_for(&unknown_role, None), Some(200_000), "nothing known: the cap stands");
     // 0 = the model's own window, whatever it is
     run.pattern.settings.context_cap = 0;
-    assert_eq!(run.context_for(&planner_model, None), Some(1_000_000));
-    assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
-    assert_eq!(run.context_for(&worker_model, Some(400_000)), Some(128_000), "an override cannot inflate the model's limit");
-    assert_eq!(run.context_for("unknown-alias", None), None);
-    let orchestrator_window = run.context_for(&run.role(&run.pattern.flow.orchestrator).model, None);
+    assert_eq!(run.context_for(&planner_role, None), Some(1_000_000));
+    assert_eq!(run.context_for(&planner_role, Some(100_000)), Some(100_000));
+    assert_eq!(run.context_for(&worker_role, Some(400_000)), Some(128_000), "an override cannot inflate the model's limit");
+    assert_eq!(run.context_for(&unknown_role, None), None);
+    let orchestrator_window = run.context_for(&run.role(&run.pattern.flow.orchestrator), None);
     run.respawn_orchestrator(&mut ctx, None);
     assert_eq!(ctx.spawned("orchestrator")[0].context_override, orchestrator_window);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A role's `context` joins the cap and the model's window: the smallest of the three wins, on
+/// whatever model the spawn really uses, and `context_ceiling` reports it for a live switch.
+#[test]
+fn a_role_context_limit_is_one_more_ceiling() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("role-context");
+    run.set_known_models(known(&[("big", 1_000_000), ("small", 128_000)]));
+    run.pattern.settings.context_cap = 500_000;
+    let role = |model: &str, context: Option<u64>| Role { model: model.into(), context, ..Role::default() };
+    assert_eq!(run.context_for(&role("big", Some(250_000)), None), Some(250_000));
+    assert_eq!(run.context_for(&role("small", Some(250_000)), None), Some(128_000), "the model's window is smaller");
+    assert_eq!(run.context_for(&role("big", None), None), Some(500_000));
+    run.pattern.settings.context_cap = 0;
+    assert_eq!(run.context_for(&role("big", None), None), Some(1_000_000));
+    assert_eq!(run.context_for(&role("nope", Some(250_000)), None), Some(250_000), "unknown alias: the role limit stands");
+    run.pattern.settings.context_cap = 300_000;
+    assert_eq!(run.context_for(&role("nope", Some(250_000)), None), Some(250_000));
+    // the planner's role limit reaches the spawn and the ceiling
+    let planner = run.pattern.flow.planner.clone();
+    run.pattern.roles.get_mut(&planner).unwrap().context = Some(64_000);
+    run.stage = Stage::Planning;
+    run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner")[0].context_override, Some(64_000));
+    let pa = run.planner.unwrap();
+    assert_eq!(run.context_ceiling(pa), Some(64_000));
+    run.pattern.roles.get_mut(&planner).unwrap().context = None;
+    assert_eq!(run.context_ceiling(pa), Some(300_000));
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
