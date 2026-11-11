@@ -484,6 +484,9 @@ pub struct Run {
     gate_big: bool,
     /// Counts the checks jobs started in this run (their log files are named after it).
     checks_gen: u64,
+    /// A QA agent passed the phase in the current gate round and the verify checks are what is
+    /// left: only then may green checks hand the phase off. Not persisted.
+    qa_ok: bool,
     /// The label of the newest checks log (`checks/<label>.log` in the run dir).
     checks_label: String,
     /// One line per gate report and finale report of the run so far — what later reviewers start
@@ -675,6 +678,7 @@ impl Run {
             gate_report: None,
             gate_big: false,
             checks_gen: 0,
+            qa_ok: false,
             checks_label: String::new(),
             gate_nudges: 0,
             resume_note: None,
@@ -2056,6 +2060,7 @@ Then summarize in 2-4 lines.",
         };
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
         self.checks_gen += 1;
+        self.qa_ok = false;
         self.phase_started = Instant::now();
         self.last_review = Instant::now();
         self.workers.clear();
@@ -2436,6 +2441,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
         self.gate_big = false;
+        self.qa_ok = false;
         self.gate_nudges = 0;
         if round <= 1 {
             // loop protection counts across rounds; only the first round of a run of rounds starts it over
@@ -2530,6 +2536,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         let Some(phase) = self.current_phase().cloned() else { return };
+        self.qa_ok = false;
         self.retire_gate_agent(ctx);
         let role = self.fix_role(big);
         let scope = paths_in(&findings, &self.workspace_dir());
@@ -2924,6 +2931,9 @@ Then summarize in 2-4 lines.",
                     } else {
                         self.spawn_gate(ctx, phase);
                     }
+                } else if !self.qa_ok {
+                    // these checks did not follow a QA pass (a resume, a revision): QA decides, not the checks alone
+                    self.spawn_gate_at_round(ctx, phase, round.max(1));
                 } else if all_ok {
                     self.begin_handoff(ctx, phase);
                 } else if round < self.pattern.settings.gate_max_rounds {
@@ -3355,6 +3365,7 @@ Then summarize in 2-4 lines.",
                         self.last_gate_blocker = None;
                         self.note_gate(idx, round, true, &summary);
                         self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
+                        self.qa_ok = true;
                         self.run_checks(ctx, idx, round);
                     }
                     // the halt interrupted the round before a report: the resume picks the same
@@ -5659,6 +5670,7 @@ Then summarize in 2-4 lines.",
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
         self.checks_gen += 1;
+        self.qa_ok = false;
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;

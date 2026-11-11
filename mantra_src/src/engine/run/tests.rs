@@ -1619,6 +1619,7 @@ fn checks_failing_after_a_qa_pass_go_to_a_fix_worker() {
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
     run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
     assert!(!run.halted());
@@ -2002,6 +2003,7 @@ fn identical_verify_failures_escalate_before_the_rounds_run_out() {
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
     // QA passed, the checks still fail: fix-1 takes the output…
     run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
@@ -2025,6 +2027,7 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = |out: &str| vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: out.into(), secs: 0 }];
     run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
@@ -2038,6 +2041,7 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     let mut r2 = Run::new(PathBuf::from("."), no_manager(), "test".into());
     r2.plan = Some(one_task_phase());
     r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 3 } };
+    r2.qa_ok = true;
     r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3, gen: run.checks_gen }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
     assert!(r2.halted());
     assert_eq!(r2.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
@@ -3236,6 +3240,68 @@ fn a_fix_worker_finishing_during_a_halt_defers_the_checks_until_the_resume() {
     assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
     assert!(ctx.jobs[0].starts_with("FixChecks"), "{:?}", ctx.jobs);
     assert!(run.pending.is_none());
+}
+
+fn green() -> Vec<CheckResult> {
+    vec![CheckResult { cmd: "true".into(), ok: true, code: Some(0), output: String::new(), secs: 0 }]
+}
+
+fn gate_run_with_checks(ctx: &mut TestCtx, round: u32) -> (Run, AgentId, AgentId) {
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let planner = ctx.add_idle();
+    let gate = ctx.add_idle();
+    run.planner = Some(planner);
+    run.gate_agent = Some(gate);
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round } };
+    (run, planner, gate)
+}
+
+#[test]
+fn green_checks_after_a_resumed_failed_round_start_qa_instead_of_a_handoff() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 2);
+    run.prev_gate = Some((2, false, "src/a.rs is wrong".into()));
+    halt_by_hand(&mut run);
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_resume_run", &json!({"note": ""}));
+    assert!(ok, "{msg}");
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "QA decides, the green checks alone do not: {:?}", run.stage);
+    assert!(run.gate_agent.is_some());
+    assert!(run.pending.is_none());
+}
+
+#[test]
+fn green_checks_after_a_qa_pass_hand_off() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+    assert!(ok);
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(run.qa_ok);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    assert!(!matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { .. }, .. }), "{:?}", run.stage);
+    assert!(run.gate_agent.is_none(), "the passing QA agent is archived by the handoff");
+}
+
+/// The 22:14 race: the fix worker finished during a halt and the resume's own verify both ran
+/// checks; the second (green) result handed the phase off although QA had not seen the fix.
+#[test]
+fn a_fix_finished_during_a_halt_leads_to_one_checks_run_and_a_qa_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    halt_by_hand(&mut run);
+    finish_fix(&mut ctx, &mut run, 1);
+    run.resume(&mut ctx);
+    assert_eq!(ctx.jobs.len(), 1, "exactly one checks run: {:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    assert!(run.gate_agent.is_some());
 }
 
 // Pause boundary --------------------------------------------------------------------------
