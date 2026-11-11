@@ -3319,8 +3319,14 @@ fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
     run.run_checks(&mut ctx, 0, 0);
     assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0, gen: 4 }"]);
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.qa_ok = true; // a verify follows a QA pass
     run.run_checks(&mut ctx, 0, 1);
     assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, "a verify with no checks hands off");
+    // without a QA pass behind it (a resume, a revision) the same call asks QA instead of handing off
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.qa_ok = false;
+    run.run_checks(&mut ctx, 0, 1);
+    assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } }, "no handoff without a QA pass");
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -488,7 +488,7 @@
             more ? h('div', { class: 'mt-more', key: 'more' },
                 labelled('Key from', cell(k('env_key'), p.env_key ? '$' + p.env_key : '', p.env_key, providerSet(p.id, 'env_key'), { label: 'Environment variable', empty: 'no variable', placeholder: 'MY_PROVIDER_API_KEY', mono: true })),
                 labelled('Models', h('span', { class: 'cell-static' }, String(p.models))),
-                p.api_key ? labelled('Stored key', P.btn('Clear it', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Clear the key of ' + p.id + '?', body: 'The key stored in models.toml goes; ' + (p.env_key ? '$' + p.env_key + ' is read instead.' : 'requests then go without one.'), confirm: 'Clear', run: () => providerSet(p.id, 'api_key')('') }), { sm: true, kind: 'danger-ghost', key: 'clear' })) : null,
+                p.api_key ? labelled('Stored key', P.btn('Clear it', () => M.act.sheet({ kind: 'confirm', danger: true, title: 'Clear the key of ' + p.id + '?', body: 'The stored key (secrets.toml) goes; ' + (p.env_key ? '$' + p.env_key + ' is read instead.' : 'requests then go without one.'), confirm: 'Clear', run: () => providerSet(p.id, 'api_key')('') }), { sm: true, kind: 'danger-ghost', key: 'clear' })) : null,
                 p.host ? labelled('Requests go to', h('span', { class: 'cell-static mono' }, p.host)) : null) : null,
             rowErrs('p:' + p.id + ':'));
     }

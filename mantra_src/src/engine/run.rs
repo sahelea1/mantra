@@ -2651,8 +2651,11 @@ Then summarize in 2-4 lines.",
                 self.spawn_gate_at_round(ctx, idx, round + 1);
             } else if round == 0 {
                 self.spawn_gate(ctx, idx);
-            } else {
+            } else if self.qa_ok {
                 self.begin_handoff(ctx, idx);
+            } else {
+                // nothing to verify with and no QA pass behind this (a resume, a revision): QA decides
+                self.spawn_gate_at_round(ctx, idx, round.max(1));
             }
             return;
         }
@@ -3535,19 +3538,22 @@ Then summarize in 2-4 lines.",
                     return;
                 }
                 let all_ok = self.record_checks(results, dropped, diff, print);
+                // who repaired this round: the task's own worker, or the fix worker
+                let who = self.fix_owner.clone().unwrap_or_else(|| format!("fix-{round}"));
                 if !all_ok {
                     // A fix that leaves the very same failure behind did nothing: stop here.
                     let sig = failing_sig(&self.checks);
                     if self.last_verify_sig.as_deref() == Some(sig.as_str()) {
-                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, self.gate_agent, format!("phase {} gate: the same check(s) fail identically after fix-{round} — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
+                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, self.gate_agent, format!("phase {} gate: the same check(s) fail identically after {who}'s fix — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
                         return;
                     }
                     self.last_verify_sig = Some(sig);
                 }
                 // the fix worker left the tree exactly as it found it: QA is told, a fix can be an action outside the tree
                 if self.fix_base_print.is_some() && self.fix_base_print == self.tree_print {
-                    self.log("⚠", "amber", format!("fix-{round} changed no file in the workspace"));
-                    self.resume_note = Some("Note from Mantra: the fix worker of the last round changed no file in the workspace. If your findings required a change, they still stand.".into());
+                    self.log("⚠", "amber", format!("{who} changed no file in the workspace"));
+                    let whom = if self.fix_owner.is_some() { format!("{who}'s worker, which repaired the last round's findings,") } else { "the fix worker of the last round".to_string() };
+                    self.resume_note = Some(format!("Note from Mantra: {whom} changed no file in the workspace. If your findings required a change, they still stand."));
                 }
                 self.spawn_gate_at_round(ctx, phase, round + 1);
             }
@@ -3971,7 +3977,7 @@ Then summarize in 2-4 lines.",
                             self.log("◎", "amber", format!("gate round {round}: plan defect — the planner is asked, no fix worker"));
                             self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, Some(a),
                                 format!("phase {} gate: QA reports a plan defect — {}", idx + 1, trunc(&why, 80)),
-                                format!("phase {} gate: QA reports a plan defect (a gate check is wrong or cannot pass here; the work itself is not at fault). Amend the check with mantra_revise_plan.\n\n{why}", idx + 1),
+                                format!("phase {} gate: QA reports a plan defect (a gate check is wrong or cannot pass here; the work itself is not at fault). Amend the check with mantra_patch_plan (or mantra_revise_plan for a large change).\n\n{why}", idx + 1),
                                 None);
                             return;
                         }

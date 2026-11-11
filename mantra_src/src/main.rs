@@ -1464,7 +1464,7 @@ fn sandbox_helper_probe(cmd0: &str, cwd: &std::path::Path) -> Result<String, Str
 }
 
 /// The `provider` doctor row for the default model's provider: is the key source there (the
-/// env var set, or a key stored in models.toml), and does the endpoint accept it — checked with
+/// env var set, or a key stored in secrets.toml), and does the endpoint accept it — checked with
 /// `GET /models`, which is free on every provider; no inference request is ever sent. The verdict
 /// is `None` when there is nothing Mantra can check (Codex's own account, a subscription login).
 fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, String) {

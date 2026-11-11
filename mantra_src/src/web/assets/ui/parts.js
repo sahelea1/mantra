@@ -176,6 +176,9 @@
         const unread = s.ui.unread[a.id];
         const active = s.ui.route.name === 'agent' && Number(s.ui.route.id) === a.id;
         const w = a.worker;
+        // the agent that repairs what a QA round found: the fix worker, or the task's own worker
+        const fx = s.run && s.run.fix;
+        const fixing = !!(fx && (fx.agent === a.id || (fx.owner && w && w.task_id === fx.owner)));
         return h('button', { type: 'button', key: 'a' + a.id, class: 'row agent-row tone-' + st.tone + (active ? ' active' : '') + (opts.compact ? ' compact' : ''), onclick: () => M.act.nav('/agent/' + a.id) },
             glyph(a, 'lg'),
             h('span', { class: 'row-main' },
@@ -183,6 +186,7 @@
                     h('span', { class: 'name' }, w ? w.task_id : a.name),
                     w && w.attempt > 1 ? h('span', { class: 'mini-chip' }, '#' + w.attempt) : null,
                     w && w.tripwires && w.tripwires.length ? h('span', { class: 'mini-chip warn', title: 'edited outside its scope: ' + w.tripwires.join(', ') }, '⚠ ' + w.tripwires.length) : null,
+                    fixing ? h('span', { class: 'mini-chip warn', title: fx.owner ? 'repairs what QA round ' + fx.round + ' found in its own work' : 'repairs what QA round ' + fx.round + ' found' }, '⚒ fix r' + fx.round) : null,
                     a.approval_pending ? h('span', { class: 'mini-chip warn' }, '⚑') : null),
                 h('span', { class: 'row-sub' },
                     h('i', { class: 'dot' }),
