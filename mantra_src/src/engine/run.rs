@@ -492,6 +492,8 @@ pub struct Run {
     pub stage: Stage,
     /// `Some` while the run is halted (see `HaltReason`); `None` while running normally.
     pub halt: Option<Halt>,
+    /// A model was changed during this halt (set while halted by the model setters, cleared by `resume_core`): the band says so.
+    pub halt_touched: bool,
     /// A transition deferred by the pause boundary, performed once on resume (see `Pending`).
     pub pending: Option<Pending>,
     pub plan: Option<Plan>,
@@ -740,6 +742,7 @@ impl Run {
             brief,
             stage: Stage::Setup,
             halt: None,
+            halt_touched: false,
             pending: None,
             plan: None,
             plan_draft: None,
@@ -1119,6 +1122,7 @@ impl Run {
         if slot.is_empty() {
             return;
         }
+        self.halt_touched |= self.halt.is_some();
         let role_model = self.role_name_of(a).map(|r| self.role(&r).model).unwrap_or_default();
         let own = (alias != role_model).then(|| alias.to_string());
         let pinned = own.is_some();
@@ -1363,6 +1367,7 @@ impl Run {
             return;
         }
         let resolved = self.halt.take().unwrap();
+        self.halt_touched = false;
         self.clock_start();
         self.escalation_open = false;
         self.manager_escalation = None;
@@ -1684,8 +1689,8 @@ Then summarize in 2-4 lines.",
             return "space resumes once the gateway is back — the workers the outage took are respawned for free".into();
         }
         match h.reason {
-            HaltReason::User => "space resume".into(),
-            HaltReason::Auth | HaltReason::UsageLimit => "fix credentials or quota, then space".into(),
+            HaltReason::User => "space resumes".into(),
+            HaltReason::Auth | HaltReason::UsageLimit => "fix the credentials or quota, or m picks another model — then space resumes".into(),
             HaltReason::ProviderRejected => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
                 if h.message.to_lowercase().contains("message role") {
@@ -1695,14 +1700,14 @@ Then summarize in 2-4 lines.",
                 }
             }
             HaltReason::Environment => "fix the environment (see the message above), then space resumes".into(),
-            HaltReason::GateExhausted => "the planner has been asked to sort it out · or type feedback · space retries the gate".into(),
+            HaltReason::GateExhausted => "the planner has been asked · type feedback for it · space retries the gate".into(),
             HaltReason::AttemptsExhausted => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the task".into());
-                format!("r retry {who} · type feedback for the planner")
+                format!("r gives {who} one more attempt · type feedback for the planner")
             }
             HaltReason::AgentTurnFailed => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
-                format!("r respawn {who} · space retries the turn")
+                format!("r respawns {who} · space retries its turn")
             }
         }
     }
@@ -1905,6 +1910,34 @@ Then summarize in 2-4 lines.",
         ctx.prompt(o, format!("[mantra:event]\n{}\n\nCurrent status:\n{status}\nDecide what (if anything) to do, then call mantra_wait.", msgs.join("\n")));
     }
 
+    /// Each task's newest attempt (the highest attempt number; the later entry on a tie), in the
+    /// order the tasks first appeared.
+    pub fn newest_workers(&self) -> Vec<&Worker> {
+        let mut out: Vec<&Worker> = vec![];
+        for w in &self.workers {
+            match out.iter().position(|o| o.task.id == w.task.id) {
+                Some(i) if w.attempt >= out[i].attempt => out[i] = w,
+                Some(_) => {}
+                None => out.push(w),
+            }
+        }
+        out
+    }
+
+    /// (tasks of the current phase whose newest attempt is `Done`, tasks in the current phase).
+    pub fn phase_progress(&self) -> (usize, usize) {
+        let Some(p) = self.current_phase() else { return (0, 0) };
+        let newest = self.newest_workers();
+        let done = p.tasks.iter().filter(|t| newest.iter().any(|w| w.task.id == t.id && w.state == WState::Done)).count();
+        (done, p.tasks.len())
+    }
+
+    /// Workers of the current phase's tasks that are `Running` (their newest attempt).
+    pub fn phase_running(&self) -> usize {
+        let Some(p) = self.current_phase() else { return 0 };
+        self.newest_workers().iter().filter(|w| w.state == WState::Running && p.tasks.iter().any(|t| t.id == w.task.id)).count()
+    }
+
     pub(super) fn status_text(&self, ctx: &dyn Ctx) -> String {
         let mut s = String::new();
         if let Some(h) = &self.halt {
@@ -1915,14 +1948,14 @@ Then summarize in 2-4 lines.",
                 trunc(&h.message, 300)
             ));
         }
-        for w in &self.workers {
+        for w in self.newest_workers() {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, tok, el) = match a {
                 Some(a) => {
                     let (d, t) = a.plan_progress();
-                    (a.activity.clone(), if t > 0 { format!("{d}/{t}") } else { "-".into() }, fmt_tokens(a.tokens_total), fmt_dur(a.created.elapsed()))
+                    (a.activity.clone(), if t > 0 { format!("{d}/{t}") } else { String::new() }, fmt_tokens(a.tokens_total), fmt_dur(a.created.elapsed()))
                 }
-                None => ("-".into(), "-".into(), "0".into(), "-".into()),
+                None => ("-".into(), String::new(), "0".into(), "-".into()),
             };
             let state = match &w.state {
                 WState::Failed(m) => format!("FAILED ({})", trunc(m, 80)),
@@ -1933,8 +1966,13 @@ Then summarize in 2-4 lines.",
             // The user stopped this one by hand: say so, or the orchestrator reads a live worker
             // that has simply gone quiet and keeps prompting it.
             let stopped = w.agent.and_then(|a| ctx.agent(a)).map(|a| a.stopped_by_user).unwrap_or(false);
+            // a finished attempt has nothing left to report but its state
+            let finished = matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled);
+            let attempt = if w.attempt > 1 { format!(" (attempt {})", w.attempt) } else { String::new() };
+            let activity = if finished { String::new() } else { format!(", activity: {act}") };
+            let steps = if prog.is_empty() { String::new() } else { format!(", steps {prog}") };
             s.push_str(&format!(
-                "- {} [{}] {}: {state}, activity: {act}, steps {prog}, tokens {tok}, {el}{}{}{}\n",
+                "- {} [{}] {}{attempt}: {state}{activity}{steps}, tokens {tok}, {el}{}{}{}\n",
                 w.task.id,
                 w.task.role,
                 trunc(&w.task.title, 40),
@@ -1953,7 +1991,7 @@ Then summarize in 2-4 lines.",
     /// the waiting/paused/stopped flags. Clocks and token counts are left out on purpose.
     pub(super) fn status_fingerprint(&self, ctx: &dyn Ctx) -> String {
         let mut s = format!("{:?}|{}|", self.stage, self.halted());
-        for w in &self.workers {
+        for w in self.newest_workers() {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, stopped) = match a {
                 Some(a) => (a.activity.clone(), a.plan_progress(), a.stopped_by_user),
@@ -4854,7 +4892,7 @@ Then summarize in 2-4 lines.",
         self.pattern.settings.allow_pattern_changes = enabled;
         self.log("⚙", "blue", format!("live workflow changes {} (by you)", if enabled { "allowed" } else { "locked" }));
         if !enabled && self.pending_pattern.is_some() {
-            self.user_input(ctx, "The user turned off live workflow changes.");
+            self.user_input(ctx, "The user turned off live workflow changes.", Send::Auto);
         }
         self.save_state();
         Ok(())
@@ -4876,7 +4914,7 @@ Then summarize in 2-4 lines.",
     }
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
-    pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str) {
+    pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str, mode: Send) {
         self.planner_wait = None;
         if let Some(proposal) = self.pending_pattern.take() {
             self.question = None;
@@ -4886,7 +4924,7 @@ Then summarize in 2-4 lines.",
                 self.install_pattern(ctx, proposal);
             } else if let Some(p) = self.planner {
                 self.mark_edge(p);
-                ctx.prompt(p, format!("[from the user] Workflow proposal was not approved. Feedback: {text}\nKeep the active workflow; revise your proposal if needed."));
+                ctx.prompt_mode(p, format!("[from the user] Workflow proposal was not approved. Feedback: {text}\nKeep the active workflow; revise your proposal if needed."), mode);
             }
             self.save_state();
             return;
@@ -4904,7 +4942,7 @@ Then summarize in 2-4 lines.",
                 let (p, pre) = self.planner_with_preface(ctx);
                 self.mark_edge(p);
                 self.log_quote("›", "rose", 60, text, |t| format!("you → planner (answer for {who}): {t}"));
-                ctx.prompt(p, format!("{pre}[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
+                ctx.prompt_mode(p, format!("{pre}[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text), mode);
                 return;
             }
             self.log_quote("›", "rose", 60, text, |t| format!("you → {who} (answer): {t}"));
@@ -4914,7 +4952,7 @@ Then summarize in 2-4 lines.",
             } else {
                 "Act on it — brief the orchestrator (mantra_brief_orchestrator), revise the plan (mantra_revise_plan) or resume the run (mantra_resume_run) as needed — then summarize in 2-4 lines."
             };
-            ctx.prompt(q.from, format!("[from the user] (answering your question: {})\n{text}\n\n{next}", trunc(&q.text, 200)));
+            ctx.prompt_mode(q.from, format!("[from the user] (answering your question: {})\n{text}\n\n{next}", trunc(&q.text, 200)), mode);
             return;
         }
         match self.stage.clone() {
@@ -4922,7 +4960,7 @@ Then summarize in 2-4 lines.",
             Stage::Planning => {
                 if let Some(p) = self.planner {
                     self.mark_edge(p);
-                    ctx.prompt(p, format!("[user] {text}"));
+                    ctx.prompt_mode(p, format!("[user] {text}"), mode);
                 }
             }
             Stage::Review => self.plan_feedback(ctx, text),
@@ -4931,11 +4969,12 @@ Then summarize in 2-4 lines.",
                 let orch_last = self.orchestrator.and_then(|o| ctx.agent(o)).map(|o| o.log_text(12)).unwrap_or_default();
                 let status = self.status_text(ctx);
                 let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "finale".into());
-                self.log_quote("✦", "saffron", 70, text, |t| format!("re-prompt → planner: {t}"));
+                self.log_quote("✦", "saffron", 70, text, |t| format!("you → planner: {t}"));
                 self.mark_edge(p);
-                ctx.prompt(
+                ctx.prompt_mode(
                     p,
                     format!("{pre}[mantra:reprompt] The user says:\n{text}\n\nWe are in {phase}.\nWorkers:\n{status}\nOrchestrator's recent log:\n{}\nDecide: pause agents if needed, revise the plan if needed (mantra_revise_plan), brief the orchestrator (mantra_brief_orchestrator). Then summarize.", trunc(&orch_last, 3000)),
+                    mode,
                 );
             }
             Stage::Done | Stage::Failed(_) => self.log("ℹ", "gray", "this run is finished — start a new one with /run <goal>"),
@@ -4957,7 +4996,7 @@ Then summarize in 2-4 lines.",
         // Every user message enters through the planner, including a composer focused on a
         // worker. Emergency direct control belongs to the planner's tools.
         if self.pending_pattern.is_some() || self.question.is_some() || matches!(self.stage, Stage::Setup | Stage::Review) {
-            self.user_input(ctx, text);
+            self.user_input(ctx, text, mode);
             return true;
         }
         self.planner_wait = None;
@@ -6138,6 +6177,7 @@ Then summarize in 2-4 lines.",
     /// changed, for the app to switch live agents. Journals every change.
     pub fn adopt_pattern(&mut self, ctx: &mut dyn Ctx, a: super::pattern::Adoption, new_base: String, origin: &str) -> Result<Vec<String>, String> {
         self.validate_pattern_replacement(&a.pattern)?;
+        self.halt_touched |= self.halt.is_some();
         let previous = std::mem::replace(&mut self.pattern, a.pattern);
         self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
         self.sync_akasha_groups();
@@ -6232,7 +6272,9 @@ Then summarize in 2-4 lines.",
     /// (`effort`, computed by the caller from the registry), drops the pins of the role and
     /// journals it. Live agents are switched by the app.
     pub fn set_role_model(&mut self, role: &str, alias: &str, effort: Option<String>) -> Result<(), String> {
+        let halted = self.halt.is_some();
         let Some(r) = self.pattern.roles.get_mut(role) else { return Err(format!("no role {role} in this run")) };
+        self.halt_touched |= halted;
         r.model = alias.to_string();
         if let Some(e) = effort {
             r.effort = e;
@@ -6254,6 +6296,7 @@ Then summarize in 2-4 lines.",
             return Err("that agent is finished — pick the role instead (tab)".into());
         }
         let name = self.name_of(a);
+        self.halt_touched |= self.halt.is_some();
         if let Some(wi) = self.worker_idx(a) {
             self.workers[wi].model = Some(alias.to_string());
         } else {

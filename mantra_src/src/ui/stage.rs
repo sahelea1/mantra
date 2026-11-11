@@ -277,11 +277,16 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         // What fixes it must never be cut off by a long message: it gets the second line, or the
         // front of the only one. `e` opens the whole message.
         let keys = match (h.reason, h.agent.and_then(|a| app.agents.get(&a))) {
+            // a model was changed during this halt: it is still stopped until space
+            _ if r.halt_touched => format!("model changed {} · space resumes", theme::g("✓", "ok")),
             // the engine's hint for this one can be a long paragraph (the details have it): the
             // band keeps to the keys, and says a model change alone does not resume
             (HaltReason::ProviderRejected, Some(a)) => format!("m switch model for {}, then space resumes", a.name),
             _ => r.halt_hint(),
         };
+        let stopped = if r.halt_touched { "the run is still stopped" } else { "the run is stopped" };
+        // a multi-line message would run together on one row
+        let message = h.message.replace("\r\n", "\n").replace('\n', &format!(" {} ", theme::g("⏎", "|")));
         let head = format!(" {} halted {}", theme::g("⛔", "X"), fmt_dur(h.since.elapsed()));
         let st = Style::default().fg(theme::c(theme::AMBER)).add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let w = area.width as usize;
@@ -293,12 +298,12 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         let lines = if area.height >= 2 {
             // the hint, cut where it must be, and `e` pinned to the right edge so it always shows
             let more = format!("  {open}{}", theme::g(" ▸", " >"));
-            let left = trunc(&format!("   {} {keys}", theme::g("↳", "->")), w.saturating_sub(w_of(&more) + 1));
+            let left = trunc(&format!("   {} {stopped} — {keys}", theme::g("↳", "->")), w.saturating_sub(w_of(&more) + 1));
             let gap = w.saturating_sub(w_of(&left) + w_of(&more) + 1);
             let kst = if live { theme::bold(theme::fg(theme::AMBER)) } else { theme::fg(theme::AMBER) };
-            vec![band(&format!("{head} · {}", h.message)), Line::from(vec![Span::styled(left, kst), Span::raw(" ".repeat(gap)), Span::styled(more, theme::bold(theme::accent()))])]
+            vec![band(&format!("{head} · {message}")), Line::from(vec![Span::styled(left, kst), Span::raw(" ".repeat(gap)), Span::styled(more, theme::bold(theme::accent()))])]
         } else {
-            vec![band(&format!("{head} · {open} · {keys} · {}", h.message))]
+            vec![band(&format!("{head} · {open} · {stopped} — {keys} · {message}"))]
         };
         f.render_widget(Paragraph::new(lines), area);
         return;
@@ -379,8 +384,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
         let s = match step {
             PhaseStep::Orchestrating if r.pattern.settings.planner_loop => "planner-led execution · Akasha".into(),
             PhaseStep::Orchestrating => {
-                let done = r.workers.iter().filter(|w| w.state == WState::Done).count();
-                let total = r.current_phase().map(|p| p.tasks.len()).unwrap_or(0);
+                let (done, total) = r.phase_progress();
                 format!("building · {done}/{total} tasks done")
             }
             PhaseStep::Merging => "merging worker branches".into(),
@@ -866,7 +870,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[StageNode]) {
     let oa = run.orchestrator.and_then(|o| app.agents.get(&o));
     let ocol = role_col(run, &run.pattern.flow.orchestrator);
     let oglyph = run.pattern.role(&run.pattern.flow.orchestrator).map(|r| r.glyph.clone()).unwrap_or_else(|| "◉".into());
-    let running = run.workers.iter().filter(|w| w.state == WState::Running).count();
+    let running = run.phase_running();
     let watching = if running > 0 && oa.map(|a| !producing(a)).unwrap_or(false) {
         vec![Span::styled(format!("{} watching {running} worker{}", theme::g("◉", "@"), if running == 1 { "" } else { "s" }), theme::fg(theme::GREEN))]
     } else if oa.is_none() {
@@ -1037,8 +1041,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>
     let mut line2: Vec<Span<'static>> = vec![];
     match &step {
         PhaseStep::Orchestrating => {
-            let done = run.workers.iter().filter(|w| w.state == WState::Done).count();
-            let total = run.current_phase().map(|p| p.tasks.len()).unwrap_or(0);
+            let (done, total) = run.phase_progress();
             line2.push(Span::styled(format!("gate opens when all tasks are done ({done}/{total})"), theme::faint()));
         }
         PhaseStep::Merging => line2.push(Span::styled(if blocked { "merge paused".to_string() } else { format!("{} merging branches…", anim::spinner()) }, theme::fg(theme::AMBER))),
@@ -1202,16 +1205,19 @@ fn draw_pulse(f: &mut Frame, area: Rect, app: &App) {
     let end = total - scroll;
     let start = end.saturating_sub(h);
     let full_t = inner.width >= 40;
-    let w = inner.width.saturating_sub(if full_t { 15 } else { 12 }) as usize;
     let lines: Vec<Line> = run
         .pulse
         .iter()
         .skip(start)
         .take(end - start)
         .map(|p| {
+            let t = format!(" {} ", if full_t { p.t.as_str() } else { p.t.get(3..).unwrap_or(&p.t) });
+            let g = format!("{} ", theme::role_glyph(&p.glyph));
+            // the text gets exactly what the time and glyph leave: a line as wide as the panel fits
+            let w = (inner.width as usize).saturating_sub(w_of(&t) + w_of(&g));
             Line::from(vec![
-                Span::styled(format!(" {} ", if full_t { p.t.as_str() } else { p.t.get(3..).unwrap_or(&p.t) }), theme::faint()),
-                Span::styled(format!("{} ", theme::role_glyph(&p.glyph)), if anim::fade(Some(p.at), 1500) > 0.0 { theme::bold(theme::fg(theme::named(p.color))) } else { theme::fg(theme::named(p.color)) }),
+                Span::styled(t, theme::faint()),
+                Span::styled(g, if anim::fade(Some(p.at), 1500) > 0.0 { theme::bold(theme::fg(theme::named(p.color))) } else { theme::fg(theme::named(p.color)) }),
                 Span::styled(trunc(&p.text, w), Style::default().fg(theme::mix(theme::MUTED, theme::TEXT, anim::fade(Some(p.at), 1500)))),
             ])
         })
@@ -1249,7 +1255,7 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
     };
     let mut title = vec![
         Span::styled(format!(" {} {} ", theme::role_glyph(&a.glyph), a.name), theme::bold(theme::fg(col))),
-        Span::styled(format!("{} · {}·{} · {} · {} tok", a.role, a.model_alias, a.effort, st, fmt_tokens(a.tokens_total)), theme::dim()),
+        Span::styled(format!("{} · {}{} · {} · {} tok", a.role, a.model_alias, if a.effort.is_empty() { String::new() } else { format!("·{}", a.effort) }, st, fmt_tokens(a.tokens_total)), theme::dim()),
     ];
     title.extend(super::cached_suffix(a.cached_share()));
     title.push(Span::styled(" ⏎ zoom ", theme::faint()));
@@ -1494,5 +1500,52 @@ mod tests {
         let lines = welcome_lines(&app, 120);
         let row = lines.iter().find(|l| l.contains("lite · ")).expect("manager row");
         assert!(row.contains("lite · max→high"), "{row:?}");
+    }
+
+    /// WP-5.6: the halt band says the run is stopped, keeps the message's line breaks as " ⏎ ",
+    /// says a model change alone did not resume, and nothing overflows at 80 columns.
+    #[test]
+    fn the_halt_band_says_stopped_and_flattens_a_multi_line_message() {
+        use crate::engine::run::{Halt, HaltReason};
+        let mut app = phase_app();
+        let msg = "cat <<'EOS'\nimport json\r\nblocked\nSUMMARY: x";
+        app.run.as_mut().unwrap().halt = Some(Halt { reason: HaltReason::User, agent: None, message: msg.into(), full: msg.into(), since: std::time::Instant::now() });
+        for w in [80u16, 120] {
+            let rows = frame(&mut app, w, 36);
+            let all = rows.join("\n");
+            assert!(all.contains(&format!("{} the run is stopped — space resumes", theme::g("↳", "->"))), "{all}");
+            assert!(all.contains(&format!("cat <<'EOS' {} import json", theme::g("⏎", "|"))), "{all}");
+            assert!(!all.contains("EOSimport"), "{all}");
+            assert!(rows.iter().all(|r| crate::util::width(r) <= w as usize), "{all}");
+        }
+        app.run.as_mut().unwrap().halt_touched = true;
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains(&format!("the run is still stopped — model changed {} · space resumes", theme::g("✓", "ok"))), "{all}");
+    }
+
+    /// WP-5.6: a task with a cancelled first attempt counts once on the rail and the gate card.
+    #[test]
+    fn the_rail_and_the_gate_card_count_each_task_once() {
+        use crate::engine::run::WState;
+        let mut app = phase_app();
+        app.run.as_mut().unwrap().workers.insert(0, crate::web::snapshot::tests::worker("p1-api", 0, None, WState::Cancelled));
+        let all = frame(&mut app, 120, 36).join("\n");
+        assert!(all.contains("building · 1/2 tasks done"), "{all}");
+        assert!(all.contains("gate opens when all tasks are done (1/2)"), "{all}");
+    }
+
+    /// WP-5.6: a pulse line exactly as wide as the panel is cut without a stray row, and a peek
+    /// strip for an agent without effort has no dangling separator.
+    #[test]
+    fn a_full_width_pulse_line_and_an_effortless_peek_render_cleanly() {
+        let mut app = phase_app();
+        app.agents.get_mut(&10).unwrap().effort = String::new();
+        app.sel = 1;
+        for w in [80u16, 100, 120] {
+            let rows = frame(&mut app, w, 36);
+            let all = rows.join("\n");
+            assert!(!all.contains("·· ") && !all.contains("sol·"), "{all}");
+            assert!(rows.iter().all(|r| crate::util::width(r) <= w as usize), "{all}");
+        }
     }
 }

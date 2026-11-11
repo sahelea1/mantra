@@ -153,7 +153,7 @@ fn auto_workflow_requires_user_approval_and_survives_resume() {
     restored.resume_boot(&mut fresh, &st);
     assert!(restored.pending_pattern.is_some() && restored.question.is_some());
     assert!(fresh.prompts.is_empty(), "resume does not poll or imply approval");
-    restored.user_input(&mut fresh, "approve");
+    restored.user_input(&mut fresh, "approve", Send::Queue);
     assert_eq!(restored.pattern.name, proposed.name);
     assert!(restored.pending_pattern.is_none());
     let disk = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
@@ -173,7 +173,7 @@ fn workflow_rejection_and_dont_ask_mode_have_distinct_boundaries() {
     next.name = "adapted".into();
     let args = json!({"toml": next.to_toml(), "reason": "The manager topology is unnecessary for this task"});
     assert!(run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &args).1);
-    run.user_input(&mut ctx, "Do not approve this change");
+    run.user_input(&mut ctx, "Do not approve this change", Send::Queue);
     assert_eq!(run.pattern.name, super::super::pattern::NAME_DEFAULT);
     assert!(run.pending_pattern.is_none());
     ctx.agents.get_mut(&p).unwrap().approval = "never".into();
@@ -2157,7 +2157,7 @@ fn ask_user_shows_a_question_and_the_reply_answers_it() {
     assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("haven't submitted")));
     assert!(run.is_active());
 
-    run.user_input(&mut ctx, "SQLite, keep it simple");
+    run.user_input(&mut ctx, "SQLite, keep it simple", Send::Queue);
     assert!(run.question.is_none());
     assert!(run.alerts.is_empty());
     let (a, t) = ctx.prompts.last().expect("the answer is a prompt");
@@ -2983,7 +2983,7 @@ fn manager_status_journal_and_ask_user() {
     assert!(ok);
     assert!(run.alerts.iter().any(|a| a.starts_with("the manager asks:")));
     ctx.prompts.clear();
-    run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2");
+    run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2", Send::Queue);
     assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[from the user]") && t.contains("mantra_prompt")), "{:?}", ctx.prompts);
     assert!(ctx.prompts.iter().all(|(a, _)| *a != manager), "user answers enter through the planner");
     assert!(run.question.is_none() && run.alerts.is_empty());
@@ -6278,7 +6278,7 @@ fn log_full_keeps_the_whole_text_in_the_journal_file() {
     let text = "an answer that is a good deal longer than sixty characters, so that it is cut in the feed";
     run.stage = Stage::Review;
     let _ = p;
-    run.user_input(&mut ctx, text);
+    run.user_input(&mut ctx, text, Send::Queue);
     let last = std::fs::read_to_string(run.dir.join("journal.jsonl")).unwrap();
     assert!(last.lines().any(|l| l.contains(&format!("\"full\":\"plan feedback: {text}\""))), "{last}");
 }
@@ -6296,4 +6296,45 @@ fn pause_resume_and_approval_name_the_user() {
     run.stage = Stage::Review;
     run.approve_plan(&mut ctx);
     assert!(run.journal_text(5).contains("plan approved (by you)"));
+}
+
+/// WP-5.6: the task counters and `mantra_status` count each task once, by its newest attempt.
+#[test]
+fn phase_progress_and_status_text_count_a_twice_attempted_task_once() {
+    let (mut run, mut ctx, _p) = planner_feature_run("progress", Pattern::builtin());
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let id = run.plan.as_ref().unwrap().phases[0].tasks[0].id.clone();
+    let mut w1 = crate::web::snapshot::tests::worker(&id, 1, None, WState::Cancelled);
+    let mut w2 = crate::web::snapshot::tests::worker(&id, 2, None, WState::Running);
+    w1.task.title = "t".into();
+    w2.task.title = "t".into();
+    run.workers.push(w1);
+    run.workers.push(w2);
+    assert_eq!(run.phase_progress(), (0, 1));
+    assert_eq!(run.phase_running(), 1);
+    let text = run.status_text(&ctx);
+    assert_eq!(text.matches(&format!("- {id} ")).count(), 1, "{text}");
+    assert!(text.contains("(attempt 2)") && text.contains("running, activity:"), "{text}");
+    assert!(!text.contains("steps -"), "{text}");
+    run.workers[1].state = WState::Done;
+    assert_eq!(run.phase_progress(), (1, 1));
+    let text = run.status_text(&ctx);
+    assert!(text.contains("done, tokens") && !text.contains("activity:"), "{text}");
+    let _ = &mut ctx;
+}
+
+/// WP-5.6: the halt hints and `halt_touched`.
+#[test]
+fn halt_touched_is_set_by_a_model_change_while_halted_and_cleared_by_resume() {
+    let (mut run, mut ctx, planner) = planner_feature_run("touched", Pattern::builtin());
+    run.set_role_model("planner", "sol", None).ok();
+    assert!(!run.halt_touched, "nothing halted yet");
+    run.halt(&mut ctx, HaltReason::User, None, "stopped".into());
+    assert_eq!(run.halt_hint(), "space resumes");
+    run.set_role_model("planner", "sol", None).ok();
+    assert!(run.halt_touched);
+    run.resume(&mut ctx);
+    assert!(!run.halt_touched);
+    let _ = planner;
 }

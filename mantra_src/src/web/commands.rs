@@ -135,7 +135,7 @@ impl App {
                 if text.trim().is_empty() {
                     return Err("empty message".into());
                 }
-                self.with_run(|r, c| r.user_input(c, text.trim_end()));
+                self.with_run(|r, c| r.user_input(c, text.trim_end(), Send::Queue));
                 ok()
             }
             Command::StartRun { goal, pattern, parallel } => {

@@ -1034,7 +1034,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
                 } else if !p.needs_key() {
                     (format!(" {} subscription (OAuth login)", theme::g("○", "-")), format!(" {} OAuth", theme::g("○", "-")), theme::dim())
                 } else {
-                    let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
+                    let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored (secrets.toml)" };
                     (format!(" {} {key_msg}", theme::g("✓", "ok")), format!(" {} key", theme::g("✓", "ok")), theme::fg(theme::GREEN))
                 };
                 let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
@@ -1143,7 +1143,7 @@ fn keyflow_line(app: &App, k: &KeyFlow, width: usize) -> (Line<'static>, Option<
         _ => {
             spans.push(label("API key"));
             let x = Line::from(spans.clone()).width();
-            let after = if width >= x + 70 { "  (paste it — it is stored in models.toml, 0600)" } else { "  (paste it)" };
+            let after = if width >= x + 70 { "  (paste it — it is stored in secrets.toml, 0600)" } else { "  (paste it)" };
             let room = width.saturating_sub(x + w_of(after) + 1).max(16);
             if let Some(e) = edit {
                 let (shown, cur) = e.view(room);

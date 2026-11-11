@@ -545,7 +545,7 @@ fn inbox(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         l.push(Line::default());
         l.push(Line::from(Span::styled(" alerts", theme::bold(theme::fg(theme::AMBER)))));
         for a in alerts.iter().rev().take(6) {
-            l.push(Line::from(Span::styled(format!("  {} {}", theme::g("⚑", "!"), trunc(a, (r.width as usize).saturating_sub(8))), theme::fg(theme::AMBER))));
+            l.push(Line::from(Span::styled(format!("  {} {}", theme::g("⚑", "!"), trunc(&a.replace("\r\n", "\n").replace('\n', &format!(" {} ", theme::g("⏎", "|"))), (r.width as usize).saturating_sub(8))), theme::fg(theme::AMBER))));
         }
     }
     l.push(Line::default());

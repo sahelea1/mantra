@@ -1304,7 +1304,7 @@ fn doctor() {
             if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
                 format!("${} set", p.env_key)
             } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-                "key stored in models.toml".to_string()
+                "key stored (secrets.toml)".to_string()
             } else if p.env_key.trim().is_empty() {
                 "no key".to_string()
             } else {
@@ -1486,7 +1486,7 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
     let key_src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
         format!("${} set", p.env_key.trim())
     } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        "key stored in models.toml".to_string()
+        "key stored (secrets.toml)".to_string()
     } else {
         format!("${} NOT set and no key stored (/models to fix)", p.env_var_name())
     };

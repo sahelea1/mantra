@@ -4126,7 +4126,7 @@ impl App {
                     }
                     return;
                 }
-                self.with_run(|r, c| r.user_input(c, &text));
+                self.with_run(|r, c| r.user_input(c, &text, Send::Queue));
             }
             _ => {}
         }
@@ -4694,6 +4694,28 @@ mod tests {
             other => panic!("expected exactly one Cmd::Steer, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
+    }
+
+    /// WP-5.6: a message typed on the overview does what the footer says: it queues behind the
+    /// planner's busy turn (a queue chip) and sends no steer; ctrl+f sends it now.
+    #[test]
+    fn overview_enter_queues_behind_a_busy_planner_and_sends_no_steer() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let id = 51;
+        let mut agent = Agent::new(id, "planner", "planner", PathBuf::new());
+        agent.status = Status::Busy;
+        agent.turn_active = true;
+        app.agents.insert(id, agent);
+        let mut rx = app.hub.test_register(id);
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.planner = Some(id);
+        run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+        app.run = Some(run);
+        app.screen = Screen::Stage;
+        app.submit("please also add tests".into());
+        assert_eq!(app.agents[&id].queued.len(), 1, "queued: {:?}", app.agents[&id].queued);
+        assert!(app.agents[&id].queued[0].contains("please also add tests"));
+        assert!(!matches!(rx.try_recv(), Ok(Cmd::Steer { .. })), "no steer for a plain Enter");
     }
 
     #[test]
