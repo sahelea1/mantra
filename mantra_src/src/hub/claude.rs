@@ -609,6 +609,9 @@ struct Translator {
     /// every turn, so without this a single hot window would file one notice per turn; cleared
     /// again the moment the limits read healthy, so a second episode is still announced.
     rate_limit_warned: bool,
+    /// The latest `rate_limit_event` said `status: "rejected"` (a later `allowed` clears it): a
+    /// failing turn meanwhile is the usage limit, whatever its text says.
+    rate_limit_rejected: bool,
 }
 
 fn as_u64(v: &Value) -> Option<u64> {
@@ -646,6 +649,7 @@ impl Translator {
             turn_msgs: 0,
             fatal_auth: None,
             rate_limit_warned: false,
+            rate_limit_rejected: false,
         }
     }
 
@@ -811,6 +815,7 @@ impl Translator {
     /// every subsequent turn and a notice per turn would bury the transcript.
     fn on_rate_limit(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
         let status = v.pointer("/rate_limit_info/status").and_then(|x| x.as_str()).unwrap_or("allowed");
+        self.rate_limit_rejected = status == "rejected";
         // The most-consumed of the plan's windows (`five_hour`, `seven_day`, …), each 0.0..1.0.
         let hottest = v
             .pointer("/rate_limit_info/unifiedWindows")
@@ -978,7 +983,7 @@ impl Translator {
                     .unwrap_or_else(|| v.get("subtype").and_then(|x| x.as_str()).unwrap_or("turn failed").to_string())
             };
             let mut e = json!({"message": msg});
-            if let Some(code) = classify_claude_error(v, &msg) {
+            if let Some(code) = classify_claude_error(v, &msg, self.rate_limit_rejected) {
                 e["codexErrorInfo"] = json!(code);
             }
             e
@@ -996,8 +1001,11 @@ impl Translator {
 /// right `ErrKind`. `ErrKind::ProviderRejected` (WP6) doesn't exist yet in this batch, so 400/422
 /// map to the closest existing bucket, `ErrKind::BadRequest` (`"badRequest"`) — a WP6 follow-up can
 /// widen this once that variant lands, with no change needed here beyond the returned key.
-fn classify_claude_error(v: &Value, msg: &str) -> Option<&'static str> {
+fn classify_claude_error(v: &Value, msg: &str, rate_limited: bool) -> Option<&'static str> {
     let m = msg.to_lowercase();
+    if rate_limited || crate::agent::subscription_limit_text(&m) {
+        return Some("usageLimitExceeded");
+    }
     if m.contains("prompt is too long") || (m.contains("context") && (m.contains("too long") || m.contains("exceed"))) {
         return Some("contextWindowExceeded");
     }
@@ -1588,6 +1596,27 @@ done"#;
         assert_eq!(warnings(&blocked).len(), 1);
         assert!(warnings(&blocked)[0].contains("rejected"), "{:?}", warnings(&blocked));
         assert!(!is_heartbeat(&ev("allowed", 0.03)), "once per turn: cheap enough to log");
+    }
+
+    /// A failing turn while the subscription's rate limit reads "rejected" is the usage limit,
+    /// whatever its text says; once the limit reads "allowed" again it is classified on its own.
+    #[test]
+    fn a_failed_turn_under_a_rejected_rate_limit_is_a_usage_limit() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let ev = |status: &str| json!({"type": "rate_limit_event", "rate_limit_info": {"status": status, "unifiedWindows": {"five_hour": {"utilization": 0.5}}}});
+        let failed = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 5, "result": "anything"});
+        let code = |out: &[HubEvent]| -> Option<String> {
+            out.iter().find_map(|e| match e {
+                HubEvent::Notif { method, params, .. } if method == "turn/completed" => Some(params.pointer("/turn/error/codexErrorInfo").and_then(|x| x.as_str()).unwrap_or("").to_string()),
+                _ => None,
+            })
+        };
+        tr.on_line(&ev("rejected"), false);
+        assert_eq!(code(&tr.on_line(&failed, false)).as_deref(), Some("usageLimitExceeded"));
+        tr.on_line(&ev("allowed"), false);
+        assert_eq!(code(&tr.on_line(&failed, false)).as_deref(), Some(""), "healthy again: the same failure is not the usage limit");
+        let limit = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 5, "result": "You've hit your 5-hour limit · resets 9:20pm (UTC)"});
+        assert_eq!(code(&tr.on_line(&limit, false)).as_deref(), Some("usageLimitExceeded"), "the subscription wording alone is enough");
     }
 
     #[test]

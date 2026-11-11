@@ -1147,6 +1147,16 @@ pub fn is_transport_error(kind: Option<ErrKind>, msg: &str) -> bool {
     }
 }
 
+/// Claude Code's subscription wording ("You've hit your 5-hour limit · resets 9:20pm",
+/// "… session limit …", "… weekly limit …", "… Opus limit …") and its close relatives.
+/// `m` is lower-cased by the caller.
+pub fn subscription_limit_text(m: &str) -> bool {
+    (m.contains("hit your") && m.contains("limit"))
+        || m.contains("limit reached")
+        || m.contains("out of extra usage")
+        || m.contains("credits_required")
+}
+
 /// Billing and capacity failures may arrive as a generic bad request or rate-limit error.
 /// Match complete status tokens so token counts and request ids do not look like HTTP errors.
 pub fn is_usage_limit_error(kind: Option<ErrKind>, msg: &str) -> bool {
@@ -1154,6 +1164,9 @@ pub fn is_usage_limit_error(kind: Option<ErrKind>, msg: &str) -> bool {
         return true;
     }
     let m = msg.to_lowercase();
+    if subscription_limit_text(&m) {
+        return true;
+    }
     let status = m.split(|c: char| !c.is_ascii_alphanumeric()).any(|s| matches!(s, "402" | "429"));
     status || ["insufficient_quota", "insufficient quota", "quota exceeded", "quota exhausted", "exceeded your current quota", "usage limit", "usage_limit", "insufficient credits", "requires more credits", "out of credits", "credit balance is too low", "payment required", "rate limit exceeded", "rate limit reached", "rate_limit_exceeded", "resource_exhausted", "resource exhausted", "session budget exceeded"].iter().any(|s| m.contains(s))
 }
@@ -1513,6 +1526,16 @@ mod tests {
         for msg in ["used 1402 tokens", "request req429abc failed", "HTTP 503 Service Unavailable", "context window exceeded"] {
             assert!(!is_usage_limit_error(None, msg), "{msg}");
         }
+    }
+
+    /// Claude Code's subscription wording is a usage limit, not a transient error to retry.
+    #[test]
+    fn claude_subscription_limits_are_usage_limits() {
+        for msg in ["You've hit your 5-hour limit · resets 9:20pm (UTC)", "You've hit your session limit · resets 9:20pm (UTC)", "You've hit your weekly limit · resets 9:20pm (UTC)"] {
+            assert!(is_usage_limit_error(None, msg), "{msg}");
+            assert!(!is_transport_error(None, msg), "{msg}");
+        }
+        assert!(!is_usage_limit_error(None, "hit the limit of 3 retries"));
     }
 
     #[test]
