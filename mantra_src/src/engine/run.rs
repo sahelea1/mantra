@@ -1060,7 +1060,7 @@ impl Run {
     /// resume keep it — and nothing else: the role's other workers go on with the role's model.
     /// A switch back to the role's model forgets the choice. `set_role_model` (one role, or
     /// `all`) is the role-level change and writes the pattern copy instead.
-    pub fn set_agent_model(&mut self, a: AgentId, alias: &str) {
+    pub fn set_agent_model(&mut self, a: AgentId, alias: &str, by: &str) {
         let slot = self.slot_of(a);
         if slot.is_empty() {
             return;
@@ -1081,7 +1081,7 @@ impl Run {
         }
         let name = self.name_of(a);
         let scope = if pinned { "this agent only — its respawns and a resume keep it" } else { "the role's model" };
-        self.log("⚙", "blue", format!("{name}: model → {alias} ({scope})"));
+        self.log("⚙", "blue", format!("{name}: model → {alias} ({scope}) ({by})"));
         self.save_state();
     }
 
@@ -3773,7 +3773,7 @@ Then summarize in 2-4 lines.",
         let name = self.name_of(a);
         let note = format!("[mantra:fallback] The previous model ({running}) {reason}. You are its replacement on {next}. Your current files contain the work so far. Continue where it left off.");
         self.forget_agent_session(a);
-        self.set_agent_model(a, &next);
+        self.set_agent_model(a, &next, "fallback");
         let restarted = if let Some(wi) = self.worker_idx(a) {
             let dir = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone()));
             if let Some(dir) = dir {
@@ -5752,35 +5752,7 @@ Then summarize in 2-4 lines.",
         self.sync_akasha_groups();
         // A per-agent model choice outranks the role's model: for a role whose model the user just
         // changed in the pattern, the new role model wins over the old choice.
-        let f = self.pattern.flow.clone();
-        let finale_role = match self.stage {
-            Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
-            _ => None,
-        };
-        let slots = [("planner", Some(f.planner.clone())), ("manager", Some(f.manager.clone())), ("orchestrator", Some(f.orchestrator.clone())), ("gate", Some(f.phase_gate.clone())), ("finale", finale_role)];
-        let mut dropped: Vec<(String, String, String)> = vec![];
-        for (slot, role_name) in slots {
-            let Some(role_name) = role_name.filter(|r| a.model_roles.contains(r)) else { continue };
-            let new = self.role(&role_name).model;
-            self.fallback_used.remove(slot);
-            if let Some(old) = self.slot_models.remove(slot) {
-                dropped.push((slot.to_string(), old, new));
-            }
-        }
-        for i in 0..self.workers.len() {
-            let w = &mut self.workers[i];
-            if !a.model_roles.contains(&w.task.role) || matches!(w.state, WState::Done | WState::Cancelled) {
-                continue;
-            }
-            let slot = format!("worker:{}#{}", w.task.id, w.attempt);
-            let key = format!("worker:{}", w.task.id);
-            let old = w.model.take();
-            let new = self.pattern.roles.get(&self.workers[i].task.role).map(|r| r.model.clone()).unwrap_or_default();
-            self.fallback_used.remove(&key);
-            if let Some(old) = old {
-                dropped.push((slot, old, new));
-            }
-        }
+        let dropped = self.drop_role_pins(&a.model_roles);
         for (slot, old, new) in dropped {
             self.log("⚙", "blue", format!("{slot}: your per-agent model {old} gives way to the role's new model {new}"));
         }
@@ -5826,6 +5798,79 @@ Then summarize in 2-4 lines.",
             }
         }
         Ok(a.model_roles)
+    }
+
+    /// The role-level model of `roles` just changed: forget the per-agent choices (`slot_models`,
+    /// `Worker::model`) and the fallbacks in use for their slots, so the new role model is what a
+    /// respawn or the next attempt uses. Returns `(slot, old pin, new role model)` for the journal.
+    fn drop_role_pins(&mut self, roles: &[String]) -> Vec<(String, String, String)> {
+        let f = self.pattern.flow.clone();
+        let finale_role = match self.stage {
+            Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+            _ => None,
+        };
+        let slots = [("planner", Some(f.planner.clone())), ("manager", Some(f.manager.clone())), ("orchestrator", Some(f.orchestrator.clone())), ("gate", Some(f.phase_gate.clone())), ("finale", finale_role)];
+        let mut dropped: Vec<(String, String, String)> = vec![];
+        for (slot, role_name) in slots {
+            let Some(role_name) = role_name.filter(|r| roles.contains(r)) else { continue };
+            let new = self.role(&role_name).model;
+            self.fallback_used.remove(slot);
+            if let Some(old) = self.slot_models.remove(slot) {
+                dropped.push((slot.to_string(), old, new));
+            }
+        }
+        for i in 0..self.workers.len() {
+            let w = &mut self.workers[i];
+            if !roles.contains(&w.task.role) || matches!(w.state, WState::Done | WState::Cancelled) {
+                continue;
+            }
+            let slot = format!("worker:{}#{}", w.task.id, w.attempt);
+            let key = format!("worker:{}", w.task.id);
+            let old = w.model.take();
+            let new = self.pattern.roles.get(&self.workers[i].task.role).map(|r| r.model.clone()).unwrap_or_default();
+            self.fallback_used.remove(&key);
+            if let Some(old) = old {
+                dropped.push((slot, old, new));
+            }
+        }
+        dropped
+    }
+
+    /// The user chose `alias` as the model of `role` for this run only (the picker's role scope):
+    /// writes the run's pattern copy — the saved pattern is not touched — re-clamps a named effort
+    /// (`effort`, computed by the caller from the registry), drops the pins of the role and
+    /// journals it. Live agents are switched by the app.
+    pub fn set_role_model(&mut self, role: &str, alias: &str, effort: Option<String>) -> Result<(), String> {
+        let Some(r) = self.pattern.roles.get_mut(role) else { return Err(format!("no role {role} in this run")) };
+        r.model = alias.to_string();
+        if let Some(e) = effort {
+            r.effort = e;
+        }
+        for (slot, old, new) in self.drop_role_pins(&[role.to_string()]) {
+            self.log("⚙", "blue", format!("{slot}: your per-agent model {old} gives way to the role's new model {new}"));
+        }
+        self.log("⚙", "blue", format!("role {role}: model → {alias} for this run (by you) — the saved pattern is unchanged"));
+        self.save_state();
+        Ok(())
+    }
+
+    /// An agent that is not running (a finished or failed worker, a stopped slot) gets `alias` for
+    /// its next start: the task's newest attempt, or the fixed slot. `Err` for an agent that is in
+    /// no slot any more.
+    pub fn pin_next_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
+        let slot = self.slot_of(a);
+        if slot.is_empty() {
+            return Err("that agent is finished — pick the role instead (tab)".into());
+        }
+        let name = self.name_of(a);
+        if let Some(wi) = self.worker_idx(a) {
+            self.workers[wi].model = Some(alias.to_string());
+        } else {
+            self.slot_models.insert(slot, alias.to_string());
+        }
+        self.log("⚙", "blue", format!("{name}: its next start uses {alias} (by you)"));
+        self.save_state();
+        Ok(())
     }
 
     pub(crate) fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {

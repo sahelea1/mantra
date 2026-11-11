@@ -4646,7 +4646,7 @@ fn a_live_model_switch_sticks_to_that_task_and_not_to_its_role() {
     ready(&mut ctx, w);
     run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
     run.on_ready(&mut ctx, w, false, false);
-    run.set_agent_model(w, "nova");
+    run.set_agent_model(w, "nova", "by you");
     assert_eq!(run.workers[0].model.as_deref(), Some("nova"));
     assert_eq!(run.pattern.role("worker-small").unwrap().model, role_model, "the role is not rewritten");
     assert_eq!(run.agent_meta[&w].model_alias, "nova", "state.json carries it");
@@ -4662,7 +4662,7 @@ fn a_live_model_switch_sticks_to_that_task_and_not_to_its_role() {
     assert_eq!(ctx.spawned("t2").last().unwrap().model, role_model);
     // switching back to the role's model is no longer a choice of its own
     let a2 = run.workers.iter().rev().find(|w| w.task.id == "t1").and_then(|w| w.agent).unwrap();
-    run.set_agent_model(a2, &role_model);
+    run.set_agent_model(a2, &role_model, "by you");
     assert_eq!(run.workers.iter().rev().find(|w| w.task.id == "t1").unwrap().model, None);
     let _ = std::fs::remove_dir_all(&run.dir);
 }
@@ -4679,7 +4679,7 @@ fn a_fixed_agents_model_switch_survives_its_respawn() {
     let p = run.spawn_planner(&mut ctx);
     let role_model = run.role(&run.pattern.flow.planner.clone()).model.clone();
     assert_eq!(ctx.spawned("planner")[0].model, role_model);
-    run.set_agent_model(p, "nova");
+    run.set_agent_model(p, "nova", "by you");
     run.respawn(&mut ctx, p, None).unwrap();
     assert_eq!(ctx.spawned("planner").last().unwrap().model, "nova", "the respawned planner keeps the switch");
     // the orchestrator slot is its own
@@ -4687,7 +4687,7 @@ fn a_fixed_agents_model_switch_survives_its_respawn() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
     let o = run.spawn_orchestrator(&mut ctx);
     assert_eq!(ctx.spawned("orchestrator")[0].model, run.role("orchestrator").model, "untouched by the planner's switch");
-    run.set_agent_model(o, "nova");
+    run.set_agent_model(o, "nova", "by you");
     run.respawn(&mut ctx, o, None).unwrap();
     assert_eq!(ctx.spawned("orchestrator").last().unwrap().model, "nova");
     let _ = std::fs::remove_dir_all(&run.dir);
@@ -4704,7 +4704,7 @@ fn a_backend_switch_checkpoint_never_pairs_new_model_with_old_session() {
     ctx.agents.get_mut(&planner).unwrap().thread_id = Some("old-backend-only".into());
     run.on_ready(&mut ctx, planner, false, false);
     run.forget_agent_session(planner);
-    run.set_agent_model(planner, "nova");
+    run.set_agent_model(planner, "nova", "by you");
     let saved = RunState::load(&run.dir).unwrap();
     let slot = saved.agents.iter().find(|a| a.slot == "planner").unwrap();
     assert_eq!(slot.model_alias, "nova");
@@ -4727,7 +4727,7 @@ fn a_finale_switch_does_not_carry_over_to_the_next_step() {
     run.plan = Some(one_task_phase());
     run.start_finale(&mut ctx, 0);
     let f = run.finale_agent.expect("a finale agent");
-    run.set_agent_model(f, "nova");
+    run.set_agent_model(f, "nova", "by you");
     run.respawn(&mut ctx, f, None).unwrap();
     assert_eq!(ctx.spawned("qa").last().unwrap().model, "nova", "the respawned step keeps the switch");
     run.start_finale(&mut ctx, 1);
@@ -4747,7 +4747,7 @@ fn the_fallback_replaces_a_switched_model_that_went_silent() {
     run.dir = scratch_dir("slot-fallback");
     run.stage = Stage::Planning;
     let p = run.spawn_planner(&mut ctx);
-    run.set_agent_model(p, "nova");
+    run.set_agent_model(p, "nova", "by you");
     ctx.agents.get_mut(&p).unwrap().model_alias = "nova".into();
     let key = run.first_token_key(p).unwrap();
     run.first_token_strikes.insert(key, 1);

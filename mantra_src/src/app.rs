@@ -102,9 +102,33 @@ pub enum EditTarget {
     McpCommand,
 }
 
+/// What the model picker is choosing a model for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PickTarget {
+    /// `/model` with no agent in view: the default model of new Solo sessions.
+    NewSessions,
+    /// A run or Solo agent (live or not).
+    Agent(AgentId),
+    /// A role of the active run with no agent to hang it on (an empty slot, a task not started).
+    #[allow(dead_code)] // opened from a stage card without an agent (WP-5.4)
+    RunRole(String),
+    /// A field of the pattern open in the Studio: `field` is "model", "fallback", "fallback2" or "fallback3".
+    #[allow(dead_code)] // opened from the Studio's model fields (WP-5.3)
+    StudioField { role: String, field: String },
+}
+
+/// One selectable row of the model picker.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickRow {
+    /// "none": clears a fallback position.
+    None,
+    /// An index into `registry.models`.
+    Model(usize),
+}
+
 pub enum Overlay {
     Help { scroll: usize },
-    ModelPicker { sel: usize, target: Option<AgentId> },
+    ModelPicker { sel: usize, target: PickTarget, role_scope: bool, filter: String },
     Diff { agent: AgentId, file: usize, scroll: usize },
     Inbox { sel: usize },
     Plan { scroll: usize },
@@ -1506,6 +1530,102 @@ impl App {
         self.set_effort(a, &e);
     }
 
+    /// Opens the model picker for `target` on the row of the target's present value.
+    pub fn open_model_picker(&mut self, target: PickTarget) {
+        let cur = self.picker_current(&target);
+        let rows = self.picker_rows(&target, "");
+        let sel = cur.and_then(|c| rows.iter().position(|r| matches!(r, PickRow::Model(i) if self.registry.models[*i].alias == c))).unwrap_or(0);
+        self.overlays.push(Overlay::ModelPicker { sel, target, role_scope: false, filter: String::new() });
+    }
+
+    /// The alias the picker's target runs on now (for a Studio fallback field: its value).
+    pub fn picker_current(&self, target: &PickTarget) -> Option<String> {
+        match target {
+            PickTarget::NewSessions => Some(self.settings.default_model.clone()),
+            PickTarget::Agent(a) => self.agents.get(a).map(|x| x.model_alias.clone()),
+            PickTarget::RunRole(r) => self.run.as_ref().and_then(|run| run.pattern.roles.get(r)).map(|r| r.model.clone()),
+            PickTarget::StudioField { role, field } => {
+                let r = self.studio.pattern.roles.get(role)?;
+                match field.as_str() {
+                    "model" => Some(r.model.clone()),
+                    "fallback" => r.fallback.clone(),
+                    "fallback2" => r.fallback2.clone(),
+                    "fallback3" => r.fallback3.clone(),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The rows of the model picker: every model (for a fallback field: first "none", and not the
+    /// role's own model nor the other fallbacks of the role), narrowed by `filter` (alias, model
+    /// id or provider name contains it, case-insensitive).
+    pub fn picker_rows(&self, target: &PickTarget, filter: &str) -> Vec<PickRow> {
+        let f = filter.trim().to_lowercase();
+        let mut skip: Vec<String> = vec![];
+        let mut rows = vec![];
+        if let PickTarget::StudioField { role, field } = target {
+            if field != "model" {
+                if let Some(r) = self.studio.pattern.roles.get(role) {
+                    skip.push(r.model.clone());
+                    for (name, v) in [("fallback", &r.fallback), ("fallback2", &r.fallback2), ("fallback3", &r.fallback3)] {
+                        if name != field {
+                            skip.extend(v.clone());
+                        }
+                    }
+                }
+                if f.is_empty() {
+                    rows.push(PickRow::None);
+                }
+            }
+        }
+        for (i, m) in self.registry.models.iter().enumerate() {
+            if skip.contains(&m.alias) {
+                continue;
+            }
+            if !f.is_empty() && ![m.alias.to_lowercase(), m.model.to_lowercase(), self.registry.provider_name(&m.provider).to_lowercase()].iter().any(|x| x.contains(&f)) {
+                continue;
+            }
+            rows.push(PickRow::Model(i));
+        }
+        rows
+    }
+
+    /// Is the agent's process one that can take a prompt: not stopped or crashed, and not a
+    /// worker whose attempt is over?
+    pub(crate) fn picker_has_scope(&self, target: &PickTarget) -> bool {
+        matches!(target, PickTarget::Agent(a) if self.in_run(*a) && self.run.as_ref().and_then(|r| r.role_name_of(*a)).is_some_and(|n| self.run.as_ref().is_some_and(|r| r.pattern.roles.contains_key(&n))))
+    }
+
+    pub fn agent_alive(&self, a: AgentId) -> bool {
+        let Some(ag) = self.agents.get(&a) else { return false };
+        if matches!(ag.status, Status::Stopped | Status::Crashed(_)) {
+            return false;
+        }
+        !self.run.as_ref().is_some_and(|r| r.workers.iter().any(|w| w.agent == Some(a) && matches!(w.state, crate::engine::run::WState::Done | crate::engine::run::WState::Failed(_) | crate::engine::run::WState::Cancelled)))
+    }
+
+    /// The picker's apply for a role of the active run (the `tab` scope, or `RunRole`): the run's
+    /// pattern copy gets the model, the saved pattern stays as it is, live agents of the role switch.
+    pub fn set_run_role_model(&mut self, role: &str, alias: &str) -> Result<(), String> {
+        if self.registry.get(alias).is_none() {
+            return Err("unknown model".into());
+        }
+        if let Some(p) = self.registry.alias_problem(alias) {
+            return Err(p);
+        }
+        let effort = self.run.as_ref().and_then(|r| r.pattern.roles.get(role)).filter(|r| r.effort != crate::engine::pattern::EFFORT_AUTO).map(|r| self.registry.resolve(alias).resolve_effort(&r.effort));
+        match self.with_run(|r, _| r.set_role_model(role, alias, effort)) {
+            Some(r) => r?,
+            None => return Err("no run is open".into()),
+        }
+        self.registry_changed();
+        self.switch_live_agents_of_role(role, alias, true)?;
+        let halted = self.run.as_ref().is_some_and(|r| r.halted());
+        self.toast(format!("role {role} → {alias} (this run){}", if halted { " — still halted: space resumes" } else { "" }), Level::Ok);
+        Ok(())
+    }
+
     /// Switch a live agent in place. A provider/backend change gets a fresh compatible session
     /// and an explicit context handoff; the logical agent, launch policy and pending text survive.
     pub fn set_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
@@ -1614,7 +1734,7 @@ impl App {
         // the switch may bring an alias the run has not seen: refresh what it knows first
         self.registry_changed();
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
-            run.set_agent_model(a, &alias);
+            run.set_agent_model(a, &alias, "by you");
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
             self.toast(MODEL_CHANGED_HALTED, Level::Info);
@@ -3286,10 +3406,8 @@ impl App {
             return;
         }
         if ctrl && k.code == KeyCode::Char('k') && self.overlays.is_empty() {
-            let target = self.focus_agent();
-            let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
-            let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-            self.overlays.push(Overlay::ModelPicker { sel, target });
+            let target = self.focus_agent().map(PickTarget::Agent).unwrap_or(PickTarget::NewSessions);
+            self.open_model_picker(target);
             return;
         }
         if ctrl && k.code == KeyCode::Char('d') && self.overlays.is_empty() && !self.screen.is_config() {
@@ -3321,7 +3439,7 @@ impl App {
             return;
         }
         // page keys scroll the log in view, unless what is in front pages through its own list
-        let pages_itself = matches!(self.overlays.last(), Some(Overlay::Diff { .. } | Overlay::Plan { .. } | Overlay::Halt { .. } | Overlay::Help { .. } | Overlay::Discover(_))) || (self.overlays.is_empty() && self.screen.is_config());
+        let pages_itself = matches!(self.overlays.last(), Some(Overlay::Diff { .. } | Overlay::Plan { .. } | Overlay::Halt { .. } | Overlay::Help { .. } | Overlay::Discover(_) | Overlay::ModelPicker { .. })) || (self.overlays.is_empty() && self.screen.is_config());
         if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !pages_itself {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
@@ -3572,9 +3690,7 @@ impl App {
                 // On a halted run this is the fix for `ProviderRejected`: pick a different model
                 // for the affected agent (WP6.6). Works on any selected agent, halted or not.
                 if let Some(a) = selected {
-                    let cur = self.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
-                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-                    self.overlays.push(Overlay::ModelPicker { sel, target: Some(a) });
+                    self.open_model_picker(PickTarget::Agent(a));
                 }
             }
             KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
@@ -3888,9 +4004,7 @@ impl App {
             "/help" => self.overlays.push(Overlay::Help { scroll: 0 }),
             "/model" => {
                 if arg.is_empty() {
-                    let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
-                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-                    self.overlays.push(Overlay::ModelPicker { sel, target });
+                    self.open_model_picker(target.map(PickTarget::Agent).unwrap_or(PickTarget::NewSessions));
                 } else if let Some(a) = target {
                     if let Err(e) = self.set_model(a, arg) {
                         self.toast(e, Level::Warn);
@@ -5361,9 +5475,9 @@ done"#;
         let mut app = screen_app();
         let efforts = vec!["low".to_string(), "medium".into(), "high".into()];
         app.registry.models.push(crate::config::ModelEntry { alias: "longalias9".into(), model: "a-rather-long-model-identifier".into(), efforts, default_effort: "medium".into(), ..Default::default() });
-        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
         let rows = frame(&mut app, 80, 30);
-        let keys = rows.iter().find(|l| l.contains("model ") && l.contains("switch")).expect("key line");
+        let keys = rows.iter().find(|l| l.contains("apply")).expect("key line");
         assert!(keys.contains("esc"), "{keys:?}");
         let row = rows.iter().find(|l| l.contains("longalias9")).expect("model row");
         assert!(row.contains("medium") && row.contains("ctx"), "{row:?}");
@@ -5377,7 +5491,7 @@ done"#;
         let mut app = screen_app();
         app.registry.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), color: "violet".into(), kind: crate::config::ProviderKind::Bija, ..Default::default() });
         app.registry.models.push(crate::config::ModelEntry { alias: "glm".into(), model: "z/glm-5.3".into(), provider: "riti".into(), ..Default::default() });
-        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
         term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -5989,5 +6103,227 @@ done"#;
             assert_eq!(app.run.as_ref().unwrap().pattern.settings.context_cap, 77_000);
             app.run = None;
         });
+    }
+
+    // ─── WP-5.2: one model picker ───
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// A live run on a saved pattern whose roles all run on `sol`, with a live orchestrator and a
+    /// worker `t0` whose attempt is `state`. Returns `(orchestrator, worker agent)`.
+    fn picker_run(app: &mut App, name: &str, state: crate::engine::run::WState) -> (AgentId, AgentId) {
+        closed_run_on_saved_pattern(app, name, Stage::Planning, None);
+        app.start_run_with("build the parser", None, Some(8));
+        let run = app.run.as_mut().expect("a run");
+        run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+        run.plan = Some(one_task_plan());
+        let agent = |app: &mut App, name: &str, role: &str| {
+            let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts { claude_user_config: String::new(),
+                name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(), model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
+                approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture".into(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
+                context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
+            });
+            app.agents.get_mut(&id).unwrap().status = Status::Idle;
+            id
+        };
+        let (orch, worker) = (agent(app, "orchestrator", "orchestrator"), agent(app, "t0", "worker-small"));
+        let run = app.run.as_mut().unwrap();
+        run.orchestrator = Some(orch);
+        let mut w = crate::web::snapshot::tests::worker("t0", 1, Some(worker), state);
+        w.task.role = "worker-small".into();
+        run.workers.push(w);
+        (orch, worker)
+    }
+
+    #[tokio::test]
+    async fn a_fallback_field_offers_none_first_and_leaves_out_the_roles_own_models() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let mut p = Pattern::builtin();
+        p.roles.get_mut("qa").unwrap().model = "sol".into();
+        p.roles.get_mut("qa").unwrap().fallback = Some("luna".into());
+        p.roles.get_mut("qa").unwrap().fallback2 = Some("terra".into());
+        app.studio.pattern = p;
+        let alias = |app: &App, r: &PickRow| match r {
+            PickRow::None => "none".to_string(),
+            PickRow::Model(i) => app.registry.models[*i].alias.clone(),
+        };
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "fallback2".into() }, "");
+        let names: Vec<String> = rows.iter().map(|r| alias(&app, r)).collect();
+        assert_eq!(names[0], "none");
+        assert!(!names.contains(&"sol".to_string()), "the role's own model is not a fallback: {names:?}");
+        assert!(!names.contains(&"luna".to_string()), "another fallback of the role is taken: {names:?}");
+        assert!(names.contains(&"terra".to_string()), "this field's own value stays: {names:?}");
+        // the model field offers everything and no none row
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "model".into() }, "");
+        assert_eq!(rows.len(), app.registry.models.len());
+        assert!(rows.iter().all(|r| matches!(r, PickRow::Model(_))));
+        // a filter drops the none row
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "fallback".into() }, "openai");
+        assert!(!rows.is_empty() && rows.iter().all(|r| matches!(r, PickRow::Model(_))), "the provider's name is matched");
+    }
+
+    /// 24-character alias whole at 132 columns; a provider name wider than the old column keeps a
+    /// space before the backend tag; the rows scroll and the composer is left alone.
+    #[tokio::test]
+    async fn the_picker_keeps_a_long_alias_whole_and_a_space_after_the_provider() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry.models.push(crate::config::ModelEntry { alias: "a-very-long-alias-of-24-c".chars().take(24).collect(), model: "x/model".into(), ..Default::default() });
+        let long: String = "a-very-long-alias-of-24-c".chars().take(24).collect();
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
+        let rows = frame(&mut app, 132, 40);
+        let row = rows.iter().find(|l| l.contains(&long)).expect("its row");
+        assert!(row.contains(&format!("{long} ")), "{row:?}");
+        let codex = rows.iter().find(|l| l.contains("OpenAI (Codex)")).expect("a codex row");
+        let at = codex.find("OpenAI (Codex)").unwrap() + "OpenAI (Codex)".len();
+        assert!(codex[at..].starts_with(' '), "{codex:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tall_picker_scrolls_and_leaves_the_composer_whole() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        for i in 0..30 {
+            app.registry.models.push(crate::config::ModelEntry { alias: format!("extra{i:02}"), model: format!("x/extra-{i}"), ..Default::default() });
+        }
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
+        for _ in 0..40 {
+            press(&mut app, KeyCode::Down);
+        }
+        for (w, h) in [(80, 24), (100, 28), (140, 30)] {
+            let rows = frame(&mut app, w, h);
+            assert!(rows.iter().all(|l| l.chars().count() <= w as usize), "{w}x{h}");
+            assert!(rows.iter().any(|l| l.contains("model & effort")), "the box");
+            assert!(rows.iter().any(|l| l.contains(" of ") && l.contains("for: ")), "{w}x{h}: scrolls with a position");
+            assert!(rows.iter().any(|l| l.contains("▶ ") && l.contains("extra")), "{w}x{h}: the selected row is in view\n{}", rows.join("\n"));
+            // the keys line is the box's last content row: the composer and the footer (four rows) are below it, whole
+            let keys = rows.iter().position(|l| l.contains("apply") && l.contains("esc")).expect("keys");
+            assert!(keys + 6 <= h as usize, "{w}x{h}: keys at row {keys}\n{}", rows.join("\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_names_its_target_and_the_scope_switch_fits_every_width() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "pick-draw", crate::engine::run::WState::Failed("rejected".into()));
+            app.open_model_picker(PickTarget::Agent(orch));
+            let rows = frame(&mut app, 140, 36);
+            assert!(rows.iter().any(|l| l.contains("for: orchestrator") && l.contains("apply to:") && l.contains("[ this agent ]") && l.contains("role orchestrator (all its agents)")), "{}", rows.join("\n"));
+            press(&mut app, KeyCode::Tab);
+            let rows = frame(&mut app, 140, 36);
+            assert!(rows.iter().any(|l| l.contains("[ role orchestrator (all its agents) ]")), "{}", rows.join("\n"));
+            for w in [80, 100, 140] {
+                let rows = frame(&mut app, w, 30);
+                assert!(rows.iter().all(|l| l.chars().count() <= w as usize), "{w}");
+                assert!(rows.iter().any(|l| l.contains("for: ") && l.contains("apply to:")), "{w}: {}", rows.join("\n"));
+            }
+            // a failed worker is "not running": its next start
+            app.overlays.clear();
+            app.open_model_picker(PickTarget::Agent(worker));
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("t0 (not running)") && l.contains("its next start")), "{}", rows.join("\n"));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn picking_for_a_finished_worker_sets_its_next_start_and_sends_nothing() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (_orch, worker) = picker_run(&mut app, "pick-done", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::Agent(worker));
+            type_in(&mut app, "luna");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.overlays.is_empty());
+            assert_eq!(app.run.as_ref().unwrap().workers[0].model.as_deref(), Some("luna"));
+            assert_eq!(app.agents[&worker].model_alias, "sol", "no process was switched");
+            assert!(said(&app).iter().any(|l| l == "t0: its next start uses luna (by you)"), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn the_role_scope_changes_the_run_copy_and_a_live_agent_but_not_the_saved_pattern() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, _) = picker_run(&mut app, "pick-role", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::Agent(orch));
+            press(&mut app, KeyCode::Tab);
+            type_in(&mut app, "luna");
+            press(&mut app, KeyCode::Enter);
+            let run = app.run.as_ref().unwrap();
+            assert_eq!(run.pattern.roles["orchestrator"].model, "luna");
+            assert_eq!(app.agents[&orch].model_alias, "luna", "the live agent is switched");
+            assert_eq!(Pattern::load("pick-role", &app.project).unwrap().roles["orchestrator"].model, "sol", "the saved pattern is untouched");
+            assert!(said(&app).iter().any(|l| l == "role orchestrator: model → luna for this run (by you) — the saved pattern is unchanged"), "{:?}", said(&app));
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("role orchestrator → luna (this run)"));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_role_without_an_agent_gets_the_model_for_the_run() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            picker_run(&mut app, "pick-runrole", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::RunRole("qa".into()));
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("for: role qa") && l.contains("applies to every agent of the role from now on")), "{}", rows.join("\n"));
+            type_in(&mut app, "terra");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["qa"].model, "terra");
+            assert!(app.set_run_role_model("qa", "no-such-model").is_err());
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_studio_field_takes_a_fallback_and_none_clears_it() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let mut p = Pattern::builtin();
+            p.name = "pick-studio".into();
+            p.roles.get_mut("qa").unwrap().model = "sol".into();
+            app.studio.pattern = p;
+            let target = PickTarget::StudioField { role: "qa".into(), field: "fallback".into() };
+            app.open_model_picker(target.clone());
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("qa · fallback 1 — pattern pick-studio")), "{}", rows.join("\n"));
+            assert!(rows.iter().any(|l| l.contains("none") && l.contains("no fallback at this position")));
+            type_in(&mut app, "terra");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["qa"].fallback.as_deref(), Some("terra"));
+            assert_eq!(Pattern::load("pick-studio", &app.project).unwrap().roles["qa"].fallback.as_deref(), Some("terra"), "saved like a committed edit");
+            // the picker opens on the field's value; the none row clears it
+            app.open_model_picker(target);
+            let Some(Overlay::ModelPicker { sel, .. }) = app.overlays.last() else { panic!("no picker") };
+            assert!(*sel > 0);
+            press(&mut app, KeyCode::PageUp);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["qa"].fallback, None);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_filter_is_typed_cleared_by_esc_and_a_plus_still_steps_the_window() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.open_model_picker(PickTarget::NewSessions);
+        type_in(&mut app, "e");
+        press(&mut app, KeyCode::Char('c'));
+        let Some(Overlay::ModelPicker { filter, .. }) = app.overlays.last() else { panic!() };
+        assert_eq!(filter, "ec", "e and c type into the filter");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Esc);
+        let Some(Overlay::ModelPicker { filter, .. }) = app.overlays.last() else { panic!("esc with a filter only clears it") };
+        assert!(filter.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty());
     }
 }

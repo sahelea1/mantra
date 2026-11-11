@@ -113,6 +113,32 @@ pub fn trunc(s: &str, width: usize) -> String {
     out
 }
 
+/// Truncate to a display width keeping the END, adding an ellipsis in front: a model id's
+/// distinguishing part is its tail (`…opus-5-5`).
+pub fn trunc_start(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return String::new();
+    }
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
+        return s.to_string();
+    }
+    let mut kept: Vec<char> = vec![];
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw + 1 > width {
+            break;
+        }
+        kept.push(c);
+        w += cw;
+    }
+    kept.push('…');
+    kept.reverse();
+    kept.into_iter().collect()
+}
+
 pub fn width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
@@ -963,6 +989,14 @@ pub(crate) mod tests {
         assert_eq!(exe_from_argv0("", &path_var, &dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn trunc_start_keeps_the_end_of_a_model_id() {
+        let t = trunc_start("anthropic-creds/claude-opus-5-5", 14);
+        assert!(t.starts_with('…') && t.ends_with("opus-5-5") && width(&t) <= 14, "{t}");
+        assert_eq!(trunc_start("short", 14), "short");
+        assert_eq!(trunc_start("abc", 0), "");
+    }
+
     #[test]
     fn truncation() {
         assert_eq!(trunc("hello world", 6), "hello…");

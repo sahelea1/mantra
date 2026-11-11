@@ -1,7 +1,7 @@
 //! Modal overlays.
 
 use super::{theme, *};
-use crate::app::{App, Overlay, PatternChoice, Screen, Select, SelectThen};
+use crate::app::{App, Overlay, PatternChoice, PickRow, PickTarget, Screen, Select, SelectThen};
 use crate::engine::run::{HaltReason, Stage};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -34,7 +34,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) -> Option<usize> {
     let area = f.area();
     match &app.overlays[i] {
         Overlay::Help { scroll } => return Some(help(f, area, *scroll)),
-        Overlay::ModelPicker { sel, target } => model_picker(f, area, app, *sel, *target),
+        Overlay::ModelPicker { sel, target, role_scope, filter } => model_picker(f, area, app, *sel, target, *role_scope, filter),
         Overlay::Diff { agent, file, scroll } => return diff(f, area, app, *agent, *file, *scroll),
         Overlay::Inbox { sel } => inbox(f, area, app, *sel),
         Overlay::Plan { scroll } => return Some(plan(f, area, app, *scroll)),
@@ -63,7 +63,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
     let l: Vec<Line<'static>> = [
         h("everywhere"),
         k("ctrl+o", "switch Solo ⇄ Mandala"),
-        k("ctrl+k", "model picker (←→ effort)"),
+        k("ctrl+k", "model picker: type to filter · tab agent/role · ←→ effort"),
         k("ctrl+g", "inbox: approvals & alerts from all agents"),
         k("ctrl+e", "verbose log (full reasoning, output, diffs)"),
         k("ctrl+c", "close overlay / clear input / interrupt the turn · three presses quit"),
@@ -83,7 +83,7 @@ fn help(f: &mut Frame, area: Rect, scroll: usize) -> usize {
         k("←→↑↓ · 1-9 · ⏎", "select an agent · jump to the nth and zoom in · zoom into the selected (esc back)"),
         k("space · e", "pause / resume the run (a halted run resumes only on space) · a halt's whole message"),
         k("r · x · c", "retry (or restart a crashed agent) · interrupt · compact"),
-        k("m · +/-", "switch the selected agent's model (fixes a rejected model) · its effort"),
+        k("m · +/-", "switch the selected agent's model, running or not (fixes a rejected model) · its effort"),
         k("p · a", "plan · approve the plan (during review)"),
         k("message", "all run messages go to the planner; agent views inspect each role’s work"),
         k("/stop · /runs", "stop the run for good · this project's runs: resume, land or delete"),
@@ -124,87 +124,225 @@ fn backend_glyph(reg: &crate::config::Registry, provider: &str) -> &'static str 
     }
 }
 
-fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option<crate::hub::AgentId>) {
-    let rows = app.registry.models.len() as u16;
-    // Wide enough for every column (alias … note … "also via"); `centered` clamps it down on
-    // narrower terminals. There the notes go first, then (below ~100 columns) the effort bar, and
-    // the model id and provider columns narrow, so effort, context and "current" still show.
-    let r = centered(area, 132, rows + 7);
+/// The role a picker target is about, with its pattern entry: the run's copy for an agent of the
+/// run or a `RunRole`, the Studio's pattern for a field.
+fn picker_role(app: &App, target: &PickTarget) -> Option<(String, crate::engine::pattern::Role)> {
+    match target {
+        PickTarget::Agent(a) => {
+            let run = app.run.as_ref().filter(|_| app.in_run(*a))?;
+            let name = run.role_name_of(*a)?;
+            run.pattern.roles.get(&name).cloned().map(|r| (name, r))
+        }
+        PickTarget::RunRole(r) => app.run.as_ref()?.pattern.roles.get(r).cloned().map(|x| (r.clone(), x)),
+        PickTarget::StudioField { role, .. } => app.studio.pattern.roles.get(role).cloned().map(|x| (role.clone(), x)),
+        PickTarget::NewSessions => None,
+    }
+}
+
+/// Is the scope switch (this agent / its whole role) offered: an agent of the active run.
+fn picker_has_scope(app: &App, target: &PickTarget) -> bool {
+    matches!(target, PickTarget::Agent(_)) && picker_role(app, target).is_some()
+}
+
+fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: &PickTarget, role_scope: bool, filter: &str) {
+    let reg = &app.registry;
+    let picks = app.picker_rows(target, filter);
+    let n = picks.len();
+    // Box: as many rows as there are, up to the room above the composer and the footer (four rows
+    // at the bottom stay as they are: a box that ended inside the composer left its bottom border
+    // under the overlay); beyond that the rows scroll and the selection stays in view.
+    let room = if area.height >= 16 { Rect { height: area.height - 4, ..area } } else { area };
+    let r = centered(room, 132, n as u16 + 7);
     clear(f, area, r);
     let iw = r.width.saturating_sub(2) as usize;
-    let notes = iw >= 107;
-    let narrow = iw < 98;
-    let cur = target.and_then(|a| app.agents.get(&a));
-    // More models than rows (a discovery added some, or a short terminal): a window that keeps
-    // the selection in view, so the keys line below never falls off the box.
-    let n = app.registry.models.len();
-    let vis = (r.height.saturating_sub(2) as usize).saturating_sub(4).max(1);
-    let start = if n <= vis { 0 } else { sel.saturating_sub(vis / 2).min(n - vis) };
+    let vis = (r.height.saturating_sub(2) as usize).saturating_sub(5).max(1);
+    let start = if n <= vis { 0 } else { sel.min(n - 1).saturating_sub(vis / 2).min(n - vis) };
     let window = if n > vis { format!(" · {}-{} of {n}", start + 1, start + vis) } else { String::new() };
-    let mut l = vec![Line::from(Span::styled(format!("  for: {}{window}", cur.map(|a| a.name.clone()).unwrap_or_else(|| "new sessions".into())), theme::dim())), Line::default()];
+    let narrow = iw < 98;
+    let bar = iw >= 110;
+    let cur_alias = app.picker_current(target);
+    let agent = if let PickTarget::Agent(a) = target { app.agents.get(a) } else { None };
+    let alive = if let PickTarget::Agent(a) = target { app.agent_alive(*a) } else { true };
+    let role = picker_role(app, target);
+    let models = || picks.iter().filter_map(|p| if let PickRow::Model(i) = p { Some(&reg.models[*i]) } else { None });
+
+    // ── line 1: the target, and the scope switch
+    let role_name = role.as_ref().map(|(n, _)| n.clone());
+    let (label_full, label_short) = match target {
+        PickTarget::NewSessions => ("new Solo sessions".to_string(), "new Solo sessions".to_string()),
+        PickTarget::Agent(_) => {
+            let name = agent.map(|a| a.name.clone()).unwrap_or_default();
+            let (full, short) = match &role_name {
+                Some(r) if r != &name => (format!("{name} · role {r}"), name.clone()),
+                _ => (name.clone(), name.clone()),
+            };
+            if alive {
+                (full, short)
+            } else {
+                (format!("{name} (not running) — its next start"), format!("{name} (not running) — its next start"))
+            }
+        }
+        PickTarget::RunRole(r) => (format!("role {r} — this run"), format!("role {r} — this run")),
+        PickTarget::StudioField { role, field } => {
+            let what = match field.as_str() {
+                "model" => "model",
+                "fallback" => "fallback 1",
+                "fallback2" => "fallback 2",
+                _ => "fallback 3",
+            };
+            let l = format!("{role} · {what} — pattern {}", app.studio.pattern.name);
+            (l.clone(), l)
+        }
+    };
+    let mut line1 = vec![];
+    let scope = picker_has_scope(app, target).then(|| role_name.clone().unwrap_or_default());
+    let fits = |left: &str, right: usize| 2 + 5 + w_of(left) + w_of(&window) + 3 + right <= iw;
+    if let Some(rn) = scope {
+        let a_on = !role_scope;
+        let long = (" this agent ".to_string(), format!(" role {rn} (all its agents) "), "apply to:  ".to_string());
+        let short = (" agent ".to_string(), " role ".to_string(), "apply to:  ".to_string());
+        let wide = |t: &(String, String, String)| w_of(&t.0) + w_of(&t.1) + w_of(&t.2) + 4 + 3;
+        let (left, parts) = if fits(&label_full, wide(&long)) {
+            (label_full.clone(), Some(long))
+        } else if fits(&label_short, wide(&long)) {
+            (label_short.clone(), Some(long))
+        } else if fits(&label_short, wide(&short)) {
+            (label_short.clone(), Some(short))
+        } else {
+            (trunc(&label_short, iw.saturating_sub(4 + w_of(&window))), None)
+        };
+        line1.push(Span::styled(format!("  for: {left}{window}"), theme::dim()));
+        if let Some((mine, role_s, pre)) = parts {
+            let used = Line::from(line1.clone()).width() + w_of(&pre) + w_of(&mine) + w_of(&role_s) + 4 + 3;
+            line1.push(Span::raw(" ".repeat(iw.saturating_sub(used))));
+            line1.push(Span::styled(pre, theme::faint()));
+            let (on, off) = (theme::bold(theme::accent()), theme::dim());
+            line1.push(Span::styled(if a_on { format!("[{mine}]") } else { format!(" {mine} ") }, if a_on { on } else { off }));
+            line1.push(Span::raw("  "));
+            line1.push(Span::styled(if role_scope { format!("[{role_s}]") } else { format!(" {role_s} ") }, if role_scope { on } else { off }));
+        }
+    } else {
+        let left = if fits(&label_full, 0) { label_full.clone() } else { trunc(&label_full, iw.saturating_sub(4 + w_of(&window))) };
+        line1.push(Span::styled(format!("  for: {left}{window}"), theme::dim()));
+        if matches!(target, PickTarget::RunRole(_)) {
+            let note = "applies to every agent of the role from now on";
+            let used = Line::from(line1.clone()).width();
+            if used + w_of(note) + 3 <= iw {
+                line1.push(Span::raw(" ".repeat(iw - used - w_of(note) - 1)));
+                line1.push(Span::styled(note, theme::faint()));
+            }
+        }
+    }
+    let mut l = vec![Line::from(line1)];
+
+    // ── line 2: the filter (always reserved)
+    l.push(if filter.is_empty() { Line::default() } else { Line::from(Span::styled(format!("  filter: {filter}{}", theme::g("▏", "|")), theme::accent())) });
+
+    // ── column widths
+    let alias_max = models().map(|m| w_of(&m.alias)).max().unwrap_or(0).clamp(8, 24);
+    let model_max = models().map(|m| w_of(&m.model)).max().unwrap_or(0).clamp(12, 36);
+    let aw = if iw < 84 { 12 } else { alias_max + 2 };
+    let mw = if narrow { 14 } else { model_max + 2 };
+    // the provider column fits the widest name (mark and space included), a space after it
+    let pname = models().map(|m| w_of(&reg.provider_name(&m.provider))).max().unwrap_or(0);
+    let pw = (pname + 2).clamp(10, 18);
+    let bw = if narrow { 0 } else { 9 };
+    let ew = 8;
+    let head = |s: &str, w: usize| format!("{s:<w$}");
+    l.push(Line::from(Span::styled(format!("   {}{}{}{}{}{}{}", head("alias", aw), head("model", mw), head("provider", pw + 1), head("", bw), head("effort", ew), head("", if bar { 8 } else { 0 }), "context"), theme::bold(theme::muted()))));
+
+    // ── rows
+    let role_model = role.as_ref().map(|(_, r)| r.model.clone());
+    let chain = role.as_ref().map(|(_, r)| r.fallback_chain()).unwrap_or_default();
+    let on_pin = matches!(target, PickTarget::Agent(_)) && role_model.is_some() && cur_alias != role_model;
     let mut band = None;
-    for (i, m) in app.registry.models.iter().enumerate().skip(start).take(vis) {
-        let is_cur = cur.map(|a| a.model_alias == m.alias).unwrap_or(false);
-        let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur { cur.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
-        let st = if i == sel { theme::bold(theme::accent()) } else { theme::text() };
-        if i == sel {
+    for (i, pick) in picks.iter().enumerate().skip(start).take(vis) {
+        let is_sel = i == sel;
+        let st = if is_sel { theme::bold(theme::accent()) } else { theme::text() };
+        if is_sel {
             band = Some(l.len());
         }
-        let ctx = if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { "agy context".into() } else { m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into()) };
-        // Two aliases can point at the same model id through different providers — the provider
-        // column above already distinguishes them; call it out too so it isn't missed.
-        let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
-        let dup = if also_via.is_empty() { String::new() } else { format!(" (also via {})", also_via.join(", ")) };
-        let (mw, vw) = if narrow { (14, 15) } else { (18, 27) };
-        let mut row = vec![
-            Span::styled(format!(" {} ", if i == sel { theme::g("▶", ">") } else { " " }), st),
-            // width + 1: an 11-character alias (`astra-codex`) must not touch the model id
-            Span::styled(format!("{:<12}", trunc(&m.alias, 11)), st),
-            Span::styled(format!("{:<mw$}", trunc(&m.model, mw - 1)), theme::muted()),
-            Span::raw(" "),
-        ];
-        // the provider's chip (its colour), then the backend tag in what the column has left
-        let chip = crate::ui::provider_chip(&app.registry, &m.provider, if narrow { vw - 3 } else { 14 });
+        let cursor = Span::styled(format!(" {} ", if is_sel { theme::g("▶", ">") } else { " " }), st);
+        let m = match pick {
+            PickRow::None => {
+                l.push(Line::from(vec![cursor, Span::styled(format!("{:<aw$}", "none"), st), Span::styled(format!("{} no fallback at this position", theme::g("—", "-")), theme::dim())]));
+                continue;
+            }
+            PickRow::Model(i) => &reg.models[*i],
+        };
+        let is_cur = cur_alias.as_deref() == Some(m.alias.as_str());
+        let eff = if m.efforts().is_empty() { "—".to_string() } else if is_cur && agent.is_some() { agent.map(|a| a.effort.clone()).unwrap_or_default() } else { m.default_effort.clone() };
+        let ctx = if reg.backend_of(m) == crate::config::ProviderKind::Antigravity { "agy context".into() } else { m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into()) };
+        let mut row = vec![cursor, Span::styled(format!("{:<aw$}", trunc(&m.alias, aw - 1)), st), Span::styled(format!("{:<mw$}", crate::util::trunc_start(&m.model, mw - 1)), theme::muted())];
+        // the provider's chip (its colour), padded to the column and a space: the backend tag never touches it
+        let chip = crate::ui::provider_chip(reg, &m.provider, pw - 2);
         let chip_w = Line::from(chip.clone()).width();
         row.extend(chip);
-        if narrow {
-            row.push(Span::raw(" ".repeat(vw.saturating_sub(chip_w))));
-        } else {
-            row.push(Span::raw(" ".repeat(16usize.saturating_sub(chip_w))));
-            row.push(Span::styled(format!("{:<w$}", backend_glyph(&app.registry, &m.provider), w = vw - 16), theme::faint()));
+        row.push(Span::raw(" ".repeat((pw + 1).saturating_sub(chip_w))));
+        if bw > 0 {
+            row.push(Span::styled(format!("{:<bw$}", backend_glyph(reg, &m.provider)), theme::faint()));
         }
-        row.push(Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))));
-        if !narrow {
+        row.push(Span::styled(format!("{eff:<ew$}"), theme::fg(effort_color(&eff))));
+        if bar {
             row.push(Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))));
         }
-        row.push(Span::styled(format!(" {:<12}", ctx), theme::dim()));
-        // What is left of the row goes, in this order, to "current", the other route to the same
-        // model (whole or not at all: "(also vi" says nothing), then the note in what remains.
-        let mut left = iw.saturating_sub(Line::from(row.clone()).width());
+        row.push(Span::styled(format!("{ctx:<11}"), theme::dim()));
+        // what is left goes to marks, in this order, each whole or not at all
+        let mut left = iw.saturating_sub(Line::from(row.clone()).width() + 1);
+        let mut marks: Vec<(String, ratatui::style::Style)> = vec![];
         if is_cur {
-            let s = format!(" {} current", theme::g("●", "*"));
-            left = left.saturating_sub(w_of(&s));
-            row.push(Span::styled(s, theme::fg(theme::GREEN)));
+            marks.push((format!(" {} current", theme::g("●", "*")), theme::fg(theme::GREEN)));
         }
-        let dup = if notes && w_of(&dup) <= left { dup } else { String::new() };
-        left = left.saturating_sub(w_of(&dup));
-        // a model that takes images says so: its agents get the screenshot tools
+        if on_pin && role_model.as_deref() == Some(m.alias.as_str()) {
+            marks.push((format!(" {} role", theme::g("◆", "*")), theme::faint()));
+        }
+        if let Some(p) = chain.iter().position(|x| *x == m.alias) {
+            marks.push((format!(" {} fallback {}", theme::g("↪", ">"), p + 1), theme::faint()));
+        }
         let note = match (m.note.is_empty(), m.vision) {
             (_, false) => m.note.clone(),
             (true, true) => "vision".to_string(),
             (false, true) => format!("vision · {}", m.note),
         };
-        if notes && !is_cur && !note.is_empty() && left >= 9 {
-            row.push(Span::styled(format!(" {}", trunc(&note, left - 1)), theme::faint()));
+        for (s, st) in marks {
+            if w_of(&s) <= left {
+                left -= w_of(&s);
+                row.push(Span::styled(s, st));
+            }
         }
-        if !dup.is_empty() {
-            row.push(Span::styled(dup, theme::faint()));
+        // the note whole, or cut when there is room for a useful part, or just "vision"
+        if !note.is_empty() && w_of(&note) < left {
+            row.push(Span::styled(format!(" {note}"), theme::faint()));
+        } else if left >= 16 {
+            row.push(Span::styled(format!(" {}", trunc(&note, left - 1)), theme::faint()));
+        } else if m.vision && left >= 7 {
+            row.push(Span::styled(" vision", theme::faint()));
         }
         l.push(Line::from(row));
     }
+    if n == 0 {
+        l.push(Line::from(Span::styled("   no model matches the filter", theme::dim())));
+    }
+
+    // ── keys
     l.push(Line::default());
-    let keys = if narrow { "  ↑↓ model · ←→ effort · ⏎ switch · +/- c ctx · e edit models · esc" } else { "  ↑↓ model · +/- ctx · c edit ctx · ←→ effort (current model) · ⏎ switch · e edit models · esc" };
-    l.push(Line::from(Span::styled(keys, theme::faint())));
+    let mut keys: Vec<&str> = vec![if narrow { "↑↓" } else { "↑↓ model" }, if narrow { "type filters" } else { "type to filter" }];
+    if picker_has_scope(app, target) {
+        keys.push("tab scope");
+    }
+    if matches!(target, PickTarget::Agent(_)) && alive {
+        keys.push("←→ effort");
+    }
+    if !narrow {
+        keys.push("+/- ctx");
+    }
+    keys.push("⏎ apply");
+    if !narrow {
+        keys.push("ctrl+e edit models");
+    }
+    keys.push("esc");
+    l.push(Line::from(Span::styled(trunc(&format!("  {}", keys.join(" · ")), iw), theme::faint())));
+
     let blk = block("model & effort", theme::SIGNAL_RED);
     let inner = blk.inner(r);
     f.render_widget(Paragraph::new(l).block(blk), r);
@@ -792,73 +930,136 @@ pub fn key(app: &mut App, k: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
             _ => Some(Overlay::Qr),
         },
-        Overlay::ModelPicker { mut sel, target } => {
-            let n = app.registry.models.len().max(1);
+        Overlay::ModelPicker { mut sel, target, mut role_scope, mut filter } => {
+            let rows = app.picker_rows(&target, &filter);
+            let n = rows.len().max(1);
+            let picked = |app: &App, sel: usize| match rows.get(sel) {
+                Some(PickRow::Model(i)) => app.registry.models.get(*i).map(|m| m.alias.clone()),
+                _ => None,
+            };
+            let scoped = matches!(target, PickTarget::Agent(_)) && app.picker_has_scope(&target);
+            let mut stay = true;
             match k.code {
-                KeyCode::Esc => None,
-                KeyCode::Up => {
-                    sel = sel.saturating_sub(1);
-                    Some(Overlay::ModelPicker { sel, target })
+                KeyCode::Esc if !filter.is_empty() => {
+                    filter.clear();
+                    sel = 0;
                 }
-                KeyCode::Down => {
-                    sel = (sel + 1).min(n - 1);
-                    Some(Overlay::ModelPicker { sel, target })
-                }
+                KeyCode::Esc => stay = false,
+                KeyCode::Up => sel = sel.saturating_sub(1),
+                KeyCode::Down => sel = (sel + 1).min(n - 1),
+                KeyCode::PageUp => sel = sel.saturating_sub(10),
+                KeyCode::PageDown => sel = (sel + 10).min(n - 1),
+                KeyCode::Tab if scoped => role_scope = !role_scope,
                 KeyCode::Left | KeyCode::Right => {
-                    if let Some(a) = target {
-                        let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
-                        if app.agents.get(&a).map(|x| x.model_alias != alias).unwrap_or(false) {
-                            if let Err(e) = app.set_model(a, &alias) {
-                                app.toast(e, crate::agent::Level::Warn);
+                    if let PickTarget::Agent(a) = target {
+                        if app.agent_alive(a) && !(role_scope && scoped) {
+                            if let Some(alias) = picked(app, sel) {
+                                if app.agents.get(&a).map(|x| x.model_alias != alias).unwrap_or(false) {
+                                    match app.set_model(a, &alias) {
+                                        Ok(()) => app.model_switched_for_run_agent(a),
+                                        Err(e) => app.toast(e, crate::agent::Level::Warn),
+                                    }
+                                }
                             }
+                            app.step_effort(a, if k.code == KeyCode::Right { 1 } else { -1 });
                         }
-                        app.step_effort(a, if k.code == KeyCode::Right { 1 } else { -1 });
                     }
-                    Some(Overlay::ModelPicker { sel, target })
                 }
+                KeyCode::Enter if rows.is_empty() => {}
                 KeyCode::Enter => {
-                    let alias = app.registry.models.get(sel).map(|m| m.alias.clone()).unwrap_or_default();
-                    match target {
-                        Some(a) => match app.set_model(a, &alias) {
-                            Ok(()) => app.model_switched_for_run_agent(a),
-                            Err(e) => app.toast(e, crate::agent::Level::Warn),
-                        },
-                        None => {
+                    let alias = picked(app, sel);
+                    match (&target, alias) {
+                        (PickTarget::NewSessions, Some(alias)) => {
                             app.settings.default_model = alias;
                             app.save_settings();
                         }
+                        (PickTarget::Agent(a), Some(alias)) => {
+                            let a = *a;
+                            if scoped && role_scope {
+                                let role = app.run.as_ref().and_then(|r| r.role_name_of(a)).unwrap_or_default();
+                                if let Err(e) = app.set_run_role_model(&role, &alias) {
+                                    app.toast(e, crate::agent::Level::Warn);
+                                }
+                            } else if !app.agent_alive(a) {
+                                let name = app.agents.get(&a).map(|x| x.name.clone()).unwrap_or_default();
+                                match app.with_run(|r, _| r.pin_next_model(a, &alias)) {
+                                    Some(Ok(())) => app.toast(format!("{name}: its next start uses {alias}"), crate::agent::Level::Ok),
+                                    Some(Err(e)) => app.toast(e, crate::agent::Level::Warn),
+                                    None => app.toast(format!("{name} is not running"), crate::agent::Level::Warn),
+                                }
+                            } else {
+                                match app.set_model(a, &alias) {
+                                    Ok(()) => app.model_switched_for_run_agent(a),
+                                    Err(e) => app.toast(e, crate::agent::Level::Warn),
+                                }
+                            }
+                        }
+                        (PickTarget::RunRole(role), Some(alias)) => {
+                            if let Err(e) = app.set_run_role_model(role, &alias) {
+                                app.toast(e, crate::agent::Level::Warn);
+                            }
+                        }
+                        (PickTarget::StudioField { role, field }, alias) => {
+                            // the none row clears a fallback; a model goes in through the Studio's own setters
+                            if field == "model" {
+                                if let Some(alias) = alias {
+                                    super::studio::set_choice(app, role, "model", &alias);
+                                }
+                            } else if let Some(r) = app.studio.pattern.roles.get_mut(role) {
+                                let i = match field.as_str() {
+                                    "fallback" => 0,
+                                    "fallback2" => 1,
+                                    _ => 2,
+                                };
+                                r.set_fallback(i, alias);
+                                app.studio.dirty = true;
+                            }
+                            if super::studio::save_pattern(app) {
+                                app.sync_run_pattern("the Studio");
+                            }
+                        }
+                        _ => {}
                     }
-                    None
+                    stay = false;
                 }
-                KeyCode::Char('e') => {
+                KeyCode::Char('e') if ctrl => {
                     app.enter_screen(Screen::Models);
                     app.models_ui.providers = false;
-                    app.models_ui.row = sel;
-                    None
+                    app.models_ui.row = match rows.get(sel) {
+                        Some(PickRow::Model(i)) => *i,
+                        _ => 0,
+                    };
+                    stay = false;
                 }
-                KeyCode::Char('+') | KeyCode::Char('-') => {
+                KeyCode::Char(c @ ('+' | '-')) => {
                     const STEPS: &[u64] = &[16_000, 32_000, 64_000, 128_000, 200_000, 262_000, 272_000, 400_000, 524_000, 1_000_000];
-                    let d: i64 = if k.code == KeyCode::Char('+') { 1 } else { -1 };
-                    if let Some(m) = app.registry.models.get_mut(sel) {
-                        let cur = m.context_window.unwrap_or(0);
-                        let i = STEPS.iter().position(|x| *x >= cur).unwrap_or(STEPS.len() - 1) as i64;
-                        let j = (i + d).clamp(0, STEPS.len() as i64 - 1) as usize;
-                        m.context_window = Some(STEPS[j]);
-                        match app.save_registry() {
-                            Ok(()) => app.toast("context window changed — applies to new agents", crate::agent::Level::Info),
-                            Err(e) => app.toast(e, crate::agent::Level::Error),
+                    let d: i64 = if c == '+' { 1 } else { -1 };
+                    if let Some(PickRow::Model(mi)) = rows.get(sel) {
+                        if let Some(m) = app.registry.models.get_mut(*mi) {
+                            let cur = m.context_window.unwrap_or(0);
+                            let i = STEPS.iter().position(|x| *x >= cur).unwrap_or(STEPS.len() - 1) as i64;
+                            let j = (i + d).clamp(0, STEPS.len() as i64 - 1) as usize;
+                            m.context_window = Some(STEPS[j]);
+                            match app.save_registry() {
+                                Ok(()) => app.toast("context window changed — applies to new agents", crate::agent::Level::Info),
+                                Err(e) => app.toast(e, crate::agent::Level::Error),
+                            }
                         }
                     }
-                    Some(Overlay::ModelPicker { sel, target })
                 }
-                // the context window typed in place, in /models (no popup of its own)
-                KeyCode::Char('c') => {
-                    app.enter_screen(Screen::Models);
-                    super::models::edit_model_cell(app, sel, super::models::CONTEXT_COL);
-                    None
+                KeyCode::Backspace => {
+                    filter.pop();
+                    sel = 0;
                 }
-                _ => Some(Overlay::ModelPicker { sel, target }),
+                KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) && !c.is_control() => {
+                    filter.push(c);
+                    sel = 0;
+                }
+                _ => {}
             }
+            // the selection stays on a row after the list shrank
+            sel = sel.min(app.picker_rows(&target, &filter).len().saturating_sub(1));
+            stay.then_some(Overlay::ModelPicker { sel, target, role_scope, filter })
         }
         Overlay::Diff { agent, mut file, mut scroll } => {
             let nf = app.agents.get(&agent).map(|a| a.files.len()).unwrap_or(0).max(1);
@@ -965,9 +1166,8 @@ pub fn key(app: &mut App, k: KeyEvent) {
                 let a = app.run.as_ref().and_then(|r| r.halt.as_ref()).and_then(|h| h.agent);
                 match a {
                     Some(a) => {
-                        let cur = app.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
-                        let sel = app.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-                        Some(Overlay::ModelPicker { sel, target: Some(a) })
+                        app.open_model_picker(PickTarget::Agent(a));
+                        app.overlays.pop()
                     }
                     None => {
                         app.toast("this halt is not about one agent — select one on the stage and press m", crate::agent::Level::Info);
@@ -1445,7 +1645,7 @@ mod tests {
         // Codex models are explicit user entries; the backend helper no longer invents a
         // catalogue on a fresh install.
         app.registry.add_codex_model("astra-codex", "gpt-custom").unwrap();
-        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
         let s = screen_of(&mut app, 140, 30);
         let row = s.lines().find(|l| l.contains("astra-codex")).expect("its row");
         let after = &row[row.find("astra-codex").unwrap() + "astra-codex".len()..];

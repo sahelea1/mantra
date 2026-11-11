@@ -294,7 +294,7 @@ fn choice_value(app: &App, entry: &str, field: &str) -> String {
 
 /// Sets a choice field to `v`, one of its `choices`. A new model re-clamps a named effort to what
 /// it offers (`auto` stays auto).
-fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
+pub(crate) fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
     let reg = app.registry.clone();
     let p = &mut app.studio.pattern;
     match entry {
@@ -558,7 +558,7 @@ fn parse_roots(t: &str) -> Vec<String> {
 /// The pattern validated and, when valid, saved — what every commit ends in. Invalid, it stays
 /// unsaved ("● not saved" in the header, the first reason above the footer) until a later
 /// commit or ctrl+s finds it valid. Returns whether it was saved.
-fn save_pattern(app: &mut App) -> bool {
+pub(crate) fn save_pattern(app: &mut App) -> bool {
     match app.studio.pattern.validate() {
         Ok(()) => match app.studio.pattern.save() {
             Ok(_) => {
