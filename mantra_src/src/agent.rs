@@ -173,6 +173,8 @@ pub struct Agent {
     pub sandbox: String,
     /// A Mantra swarm member is doing work for this agent; idle time here is intentional.
     pub swarm_waiting: bool,
+    /// The last completed turn produced no text, command, file change, tool call or plan.
+    pub last_turn_empty: bool,
     pub thread_id: Option<String>,
     pub status: Status,
     pub items: Vec<Item>,
@@ -252,6 +254,7 @@ impl Agent {
             approval: "never".into(),
             sandbox: "workspace-write".into(),
             swarm_waiting: false,
+            last_turn_empty: false,
             thread_id: None,
             status: Status::Starting,
             items: vec![],
@@ -691,6 +694,12 @@ impl Agent {
                 let turn_items = &self.items[start.min(self.items.len())..];
                 let compact_turn = turn_items.iter().any(|i| matches!(i.kind, Kind::Compaction { .. }))
                     && !turn_items.iter().any(|i| matches!(i.kind, Kind::Agent | Kind::Reasoning | Kind::Command { .. } | Kind::Files { .. } | Kind::Tool { .. }));
+                self.last_turn_empty = status == "completed"
+                    && !turn_items.iter().any(|i| match &i.kind {
+                        Kind::Agent | Kind::Plan => !i.text.trim().is_empty(),
+                        Kind::Command { .. } | Kind::Files { .. } | Kind::Tool { .. } | Kind::Web { .. } => true,
+                        _ => false,
+                    });
                 self.compacting = false;
                 if compact_turn {
                     self.turn_count = self.turn_count.saturating_sub(1);

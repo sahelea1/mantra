@@ -351,6 +351,7 @@ fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
         idle_prompts: vec![],
         transient: false,
         model: None,
+        status_asked: false,
     }
 }
 impl Ctx for TestCtx {
@@ -685,6 +686,7 @@ mod akasha {
         run.orchestrator = Some(o);
         let a = member(&mut ctx, &mut run, "p1-a");
         let b = member(&mut ctx, &mut run, "p1-b");
+        ctx.agents.get_mut(&a).unwrap().final_message = Some("STATUS: done".into());
         run.on_turn_done(&mut ctx, a, "completed", None, None);
         assert_eq!(run.workers[0].state, WState::Done);
         // the orchestrator asks the done worker something; it is answering when p1-b's urgent note comes
@@ -837,6 +839,7 @@ fn a_done_worker_finishing_again_is_a_follow_up_not_a_second_completion() {
     run.orchestrator = Some(o);
     run.workers.push(mk_worker("p1-a", "worker-small", a, WState::Running));
     run.workers.push(mk_worker("p1-b", "worker-small", b, WState::Running));
+    ctx.agents.get_mut(&a).unwrap().final_message = Some("STATUS: done".into());
     run.on_turn_done(&mut ctx, a, "completed", None, None);
     assert!(run.pulse.back().unwrap().text.contains("p1-a done in"), "{:?}", run.pulse.back().map(|p| &p.text));
     ctx.agents.get_mut(&a).unwrap().push_user("also add a test for the empty case");
@@ -4819,5 +4822,106 @@ fn fallback_used_survives_a_resume() {
     assert_eq!(st.fallback_used.get("planner").cloned().unwrap_or_default(), ["pa", "pb"]);
     let back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
     assert_eq!(back.fallback_used, run.fallback_used);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+fn empty_turn_setup(tag: &str, fallback: bool) -> (Run, TestCtx, AgentId) {
+    let mut ctx = TestCtx::new();
+    let mut pat = no_manager();
+    if fallback {
+        pat.roles.get_mut("worker-small").unwrap().fallback = Some("claude-fallback".into());
+    }
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir(tag);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let a = ctx.add_busy();
+    ctx.agents.get_mut(&a).unwrap().model_alias = "primary".into();
+    let mut w = mk_worker("t1", "worker-small", a, WState::Running);
+    w.wt = Some(PathBuf::from("existing-worktree"));
+    run.workers.push(w);
+    (run, ctx, a)
+}
+
+fn empty_turn(ctx: &mut TestCtx, a: AgentId) {
+    let ag = ctx.agents.get_mut(&a).unwrap();
+    ag.last_turn_empty = true;
+    ag.final_message = None;
+}
+
+#[test]
+fn an_empty_worker_turn_is_asked_again_once() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-retry", false);
+    empty_turn(&mut ctx, a);
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert!(matches!(run.workers[0].state, WState::Retrying(_)), "not done");
+    assert!(run.pulse.iter().any(|p| p.text.contains("empty turn from primary (no text, no tool call) — asking again")));
+    assert_eq!(run.continue_queue.len(), 1);
+    assert!(run.continue_queue[0].2.starts_with("[mantra:retry] Your previous turn ended without any output"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_second_empty_turn_falls_back_or_fails_the_task() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-chain", true);
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert_ne!(run.workers[0].agent, Some(a));
+    assert_eq!(ctx.spawned("t1").last().unwrap().model, "claude-fallback");
+    assert!(run.pulse.iter().any(|p| p.text.contains("fallback claude-fallback (empty turns)")));
+    let _ = std::fs::remove_dir_all(&run.dir);
+
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-nochain", false);
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert!(matches!(run.workers[0].state, WState::Failed(ref e) if e.contains("empty turn twice from primary")), "{:?}", run.workers[0].state);
+    let told = run.orch_inbox.iter().chain(ctx.prompts.iter().map(|(_, t)| t)).any(|t| t.contains("t1 FAILED"));
+    assert!(told, "{:?} {:?}", run.orch_inbox, ctx.prompts);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn two_empty_fix_worker_turns_halt_without_running_checks() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-fix", false);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+    run.workers[0].task.id = "fix-1".into();
+    run.workers[0].adhoc = true;
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert!(run.halted(), "escalated");
+    assert!(!ctx.jobs.iter().any(|j| j.to_lowercase().contains("check")), "{:?}", ctx.jobs);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn an_empty_planner_turn_is_retried_not_nudged_for_a_plan() {
+    let (mut run, mut ctx, p) = planner_feature_run("empty-planner", Pattern::builtin());
+    empty_turn(&mut ctx, p);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert!(run.continue_queue.iter().any(|(a, _, m)| *a == p && m.starts_with("[mantra:retry]")));
+    assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("You haven't submitted a valid plan")));
+    assert_eq!(run.planner_nudges, 0);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_worker_without_a_status_line_is_asked_once() {
+    let (mut run, mut ctx, a) = empty_turn_setup("no-status", false);
+    ctx.agents.get_mut(&a).unwrap().final_message = Some("I changed some files.".into());
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert_ne!(run.workers[0].state, WState::Done);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == a && t.starts_with("[mantra] Your turn ended without the closing lines")));
+    assert!(run.pulse.iter().any(|p| p.text.contains("t1 ended its turn without a STATUS line")));
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert_eq!(run.workers[0].state, WState::Done);
     let _ = std::fs::remove_dir_all(&run.dir);
 }

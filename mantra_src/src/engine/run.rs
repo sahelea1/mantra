@@ -284,6 +284,8 @@ pub struct Worker {
     /// `None` = the role's model. The next attempt of the same task keeps it (`spawn_task`), and
     /// so does a resume — a switch made for one task is not a switch for its whole role.
     pub model: Option<String>,
+    /// The worker was already asked once for its closing STATUS line (never asked twice).
+    pub status_asked: bool,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -382,7 +384,6 @@ pub struct Pulse {
 enum FallbackWhy {
     UsageLimit,
     Silent,
-    #[allow(dead_code)] // the empty-turn trigger (WP-1.4)
     Empty,
     Rejected,
 }
@@ -2087,6 +2088,7 @@ Then summarize in 2-4 lines.",
             idle_prompts: vec![],
             transient: false,
             model,
+            status_asked: false,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued ({})", self.class_cap_text(&role)));
@@ -3112,6 +3114,13 @@ Then summarize in 2-4 lines.",
             }
             // worker with a non-retryable error or out of retries: falls through → reported to the orchestrator
         } else if status == "completed" {
+            if ctx.agent(a).map(|x| x.last_turn_empty).unwrap_or(false) && !was_yielded {
+                if self.on_empty_turn(ctx, a) {
+                    return;
+                }
+            } else if let Some(key) = self.first_token_key(a) {
+                self.empty_strikes.remove(&key);
+            }
             self.retry_counts.remove(&a);
             self.gateway_streak.remove(&a);
             self.effort_retried.remove(&a);
@@ -3460,6 +3469,53 @@ Then summarize in 2-4 lines.",
         true
     }
 
+    /// A turn completed with no text, command, file change, tool call or plan. First time: ask
+    /// again. Second time in a row: the role's fallback, else report a failure.
+    /// `true` = handled (retry scheduled, fallback started, or failure reported).
+    fn on_empty_turn(&mut self, ctx: &mut dyn Ctx, a: AgentId) -> bool {
+        let Some(key) = self.first_token_key(a) else { return false };
+        let n = {
+            let n = self.empty_strikes.entry(key.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let alias = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
+        let name = self.name_of(a);
+        let wi = self.worker_idx(a);
+        if n == 1 {
+            self.log("⚠", "amber", format!("{name}: empty turn from {alias} (no text, no tool call) — asking again"));
+            let wait = Duration::from_secs(2);
+            if let Some(wi) = wi {
+                self.workers[wi].state = WState::Retrying(Instant::now() + wait);
+            }
+            self.continue_queue.push((a, Instant::now() + wait, "[mantra:retry] Your previous turn ended without any output or tool call. Continue the task. If it is finished, end with your report.".into()));
+            return true;
+        }
+        self.empty_strikes.remove(&key);
+        if self.try_fallback(ctx, a, FallbackWhy::Empty, "") {
+            return true;
+        }
+        let text = format!("empty turn twice from {alias} (no text, no tool call)");
+        if let Some(wi) = wi {
+            self.on_worker_done(ctx, wi, "failed", Some(text));
+        } else if Some(a) == self.manager {
+            self.log("◈", "amber", format!("manager: {text} — a fresh manager comes with the next event"));
+            self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(a, true);
+            self.manager = None;
+            self.retry_counts.remove(&a);
+            if let Some(c) = self.manager_watchdog.take() {
+                self.wake_planner_for_idle(ctx, &c.about);
+            }
+            if let Some(e) = self.manager_escalation.take() {
+                self.manager_gave_up(ctx, e, " (it failed itself)");
+            }
+        } else {
+            self.halt_turn_failed(ctx, Some(a), format!("{name}: {text}"));
+        }
+        true
+    }
+
     fn clear_replaced_agent(&mut self, a: AgentId) {
         self.retry_counts.remove(&a);
         self.gateway_streak.remove(&a);
@@ -3523,6 +3579,17 @@ Then summarize in 2-4 lines.",
                 if waiting && status_line.is_none() {
                     self.log("?", "amber", format!("{tid} waits for an answer"));
                     return;
+                }
+                // A first turn that ends without the closing lines is asked for them once; a
+                // second one (or a follow-up on a done worker) counts as done, so this never loops.
+                if status_line.is_none() && self.workers[wi].state != WState::Done && !self.workers[wi].status_asked {
+                    if let Some(a) = agent {
+                        self.workers[wi].status_asked = true;
+                        self.log("?", "amber", format!("{tid} ended its turn without a STATUS line — asking for it"));
+                        self.mark_edge(a);
+                        ctx.prompt(a, "[mantra] Your turn ended without the closing lines. If the task is finished, reply with exactly: STATUS: done (or blocked) and SUMMARY: <2-5 lines>. If you are waiting for a decision, call mantra_ask and end your turn.".into());
+                        return;
+                    }
                 }
                 let blocked = status_line.map(|l| l.contains("blocked")).unwrap_or(false);
                 let w = &mut self.workers[wi];

@@ -357,6 +357,7 @@ impl Run {
                     transient: w.transient && w.state == "failed",
                     // a model switched live for this task — if it still exists in the registry
                     model: w.model.clone().filter(|m| self.knows_model(m)),
+                    status_asked: false,
                 }
             })
             .collect();

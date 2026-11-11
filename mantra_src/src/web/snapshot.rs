@@ -1612,6 +1612,7 @@ pub(crate) mod tests {
             idle_prompts: vec![],
             transient: false,
             model: None,
+            status_asked: false,
         }
     }
 
