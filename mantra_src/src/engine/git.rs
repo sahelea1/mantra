@@ -26,6 +26,10 @@ pub struct Workspace {
     /// the worktrees had something to branch from. Logged once, when the run starts.
     #[serde(default)]
     pub initial_commit: bool,
+    /// Not a repository itself, but holding some (relative to `integ`): shared mode only. QA
+    /// diffs these (`review_diff`) instead of finding nothing.
+    #[serde(default)]
+    pub nested: Vec<PathBuf>,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -171,6 +175,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         note,
         base_commit: None,
         initial_commit: false,
+        nested: vec![],
     };
     if isolation == "shared" {
         return Ok(shared(None));
@@ -181,7 +186,13 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
             if isolation == "worktree" {
                 return Err("isolation = worktree needs a git repository".into());
             }
-            return Ok(shared(Some("not a git repo — workers share the project directory".into())));
+            let mut ws = shared(Some("not a git repo — workers share the project directory".into()));
+            ws.nested = nested_repos(project);
+            if !ws.nested.is_empty() {
+                let names: Vec<String> = ws.nested.iter().take(4).map(|p| p.display().to_string()).collect();
+                ws.note = Some(format!("not a git repo — workers share the project directory; {} repositories inside it ({}) are diffed for QA", ws.nested.len(), names.join(", ")));
+            }
+            return Ok(ws);
         }
     };
     // `git init` and nothing else: an unborn HEAD has nothing to branch a worktree from. One empty
@@ -225,6 +236,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
             _ => None,
         },
         initial_commit,
+        nested: vec![],
     })
 }
 
@@ -445,10 +457,10 @@ const DIFF_EXCLUDES: &[&str] = &[":(exclude)*.lock", ":(exclude)package-lock.jso
 /// Blocking — run it on a background thread. Worktree mode marks new files "intent to add" first
 /// (Mantra commits everything with `add -A` anyway) so they show up as additions; in shared mode
 /// the user's index is left alone and untracked files are only listed.
-pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize) -> ReviewDiff {
+pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize, bases: &[(PathBuf, String)]) -> ReviewDiff {
     let dir = ws.integ.as_path();
     if git(dir, &["rev-parse", "--git-dir"]).is_err() {
-        return ReviewDiff::default();
+        return if !ws.worktree && !ws.nested.is_empty() { nested_review_diff(ws, max_bytes, bases) } else { ReviewDiff::default() };
     }
     let base = if ws.worktree {
         let phase = (span == DiffSpan::Phase).then(|| git(dir, &["log", "-1", "--format=%H", "--grep=^mantra: phase ", "HEAD"]).ok().filter(|h| !h.is_empty())).flatten();
@@ -487,6 +499,85 @@ pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize) -> ReviewDi
         diff.truncate(cut);
     }
     ReviewDiff { stat, diff, truncated }
+}
+
+/// Git work trees directly inside a non-repository project directory, at most two levels deep
+/// (`a/.git`, `a/b/.git`), as paths relative to `project`, sorted; hidden directories and anything
+/// over 200 entries per directory are skipped.
+pub fn nested_repos(project: &Path) -> Vec<PathBuf> {
+    fn subdirs(dir: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+        rd.take(200)
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.') && e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect()
+    }
+    let mut found = vec![];
+    for a in subdirs(project) {
+        if a.join(".git").exists() {
+            found.push(a);
+            continue;
+        }
+        for b in subdirs(&a) {
+            if b.join(".git").exists() {
+                found.push(b);
+            }
+        }
+    }
+    let mut rel: Vec<PathBuf> = found.iter().filter_map(|p| p.strip_prefix(project).ok().map(Path::to_path_buf)).collect();
+    rel.sort();
+    rel
+}
+
+/// `HEAD` of each nested repository (`repo\tsha` lines): the base of the phase about to start.
+pub fn nested_heads(ws: &Workspace) -> Vec<(PathBuf, String)> {
+    ws.nested.iter().filter_map(|r| git(&ws.integ.join(r), &["rev-parse", "HEAD"]).ok().filter(|h| !h.is_empty()).map(|h| (r.clone(), h))).collect()
+}
+
+/// The review of a shared, non-repository project: each nested repository's working tree against
+/// its base, under a heading, `max_bytes` split evenly between those with changes.
+fn nested_review_diff(ws: &Workspace, max_bytes: usize, bases: &[(PathBuf, String)]) -> ReviewDiff {
+    let mut parts: Vec<(String, String, String)> = vec![];
+    for rel in &ws.nested {
+        let Some((_, b)) = bases.iter().find(|(r, _)| r == rel) else { continue };
+        let dir = ws.integ.join(rel);
+        let mut stat_args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100", b.as_str(), "--"];
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", b.as_str(), "--"];
+        for a in [&mut args, &mut stat_args] {
+            a.push(".");
+            a.extend(DIFF_EXCLUDES.iter().copied());
+        }
+        let mut stat = git(&dir, &stat_args).unwrap_or_default();
+        let diff = git(&dir, &args).unwrap_or_default();
+        let fresh = git(&dir, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+        let list: Vec<&str> = fresh.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !list.is_empty() {
+            let shown = list.iter().take(30).copied().collect::<Vec<_>>().join(", ");
+            let more = if list.len() > 30 { format!(" … and {} more", list.len() - 30) } else { String::new() };
+            stat.push_str(&format!("\nuntracked (new) files: {shown}{more}"));
+        }
+        if stat.trim().is_empty() && diff.trim().is_empty() {
+            continue;
+        }
+        let head = format!("## repository {} (since {})", rel.display(), &b[..b.len().min(8)]);
+        parts.push((head, stat, diff));
+    }
+    let each = max_bytes / parts.len().max(1);
+    let mut out = ReviewDiff::default();
+    for (head, stat, mut diff) in parts {
+        if diff.len() > each {
+            let mut cut = each;
+            while cut > 0 && !diff.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            diff.truncate(cut);
+            out.truncated = true;
+        }
+        out.stat.push_str(&format!("{head}\n{}\n\n", stat.trim()));
+        out.diff.push_str(&format!("{head}\n{}\n\n", diff.trim()));
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -901,7 +992,7 @@ mod tests {
     }
 
     fn test_ws(dir: &Path, base: Option<String>) -> Workspace {
-        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base, initial_commit: false }
+        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base, initial_commit: false, nested: vec![] }
     }
 
     #[test]
@@ -916,13 +1007,13 @@ mod tests {
         std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.join("Cargo.lock"), "lock\n").unwrap();
         let ws = test_ws(&dir, Some(base));
-        let phase = review_diff(&ws, DiffSpan::Phase, 100_000);
+        let phase = review_diff(&ws, DiffSpan::Phase, 100_000, &[]);
         assert!(phase.stat.contains("tracked.txt") && phase.stat.contains("new.rs"), "{}", phase.stat);
         assert!(!phase.stat.contains("one.txt"), "phase one is already committed: {}", phase.stat);
         assert!(!phase.stat.contains("Cargo.lock") && !phase.diff.contains("Cargo.lock"), "lockfiles stay out");
         assert!(phase.diff.contains("+two") && phase.diff.contains("+fn main() {}"), "{}", phase.diff);
         assert!(!phase.truncated);
-        let run = review_diff(&ws, DiffSpan::Run, 100_000);
+        let run = review_diff(&ws, DiffSpan::Run, 100_000, &[]);
         assert!(run.stat.contains("one.txt") && run.stat.contains("new.rs"), "the run reaches back to its base: {}", run.stat);
         assert!(run.render().contains("one.txt"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -933,7 +1024,7 @@ mod tests {
         let dir = temp_repo("review-cap");
         std::fs::write(dir.join("big.txt"), "é".repeat(5000)).unwrap();
         let ws = test_ws(&dir, None);
-        let d = review_diff(&ws, DiffSpan::Phase, 1000);
+        let d = review_diff(&ws, DiffSpan::Phase, 1000, &[]);
         assert!(d.truncated);
         assert!(d.diff.len() <= 1000, "{}", d.diff.len());
         assert!(d.render().contains("diff cut here"));
@@ -947,7 +1038,7 @@ mod tests {
         std::fs::write(dir.join("fresh.txt"), "new\n").unwrap();
         let mut ws = test_ws(&dir, None);
         ws.worktree = false;
-        let d = review_diff(&ws, DiffSpan::Phase, 100_000);
+        let d = review_diff(&ws, DiffSpan::Phase, 100_000, &[]);
         assert!(d.stat.contains("tracked.txt"), "{}", d.stat);
         assert!(d.stat.contains("untracked (new) files: fresh.txt"), "{}", d.stat);
         let status = git(&dir, &["status", "--porcelain"]).unwrap();
@@ -960,9 +1051,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mantra-git-norepo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ws = test_ws(&dir, None);
-        let d = review_diff(&ws, DiffSpan::Run, 1000);
+        let d = review_diff(&ws, DiffSpan::Run, 1000, &[]);
         assert!(d.is_empty());
         assert!(d.render().contains("no git diff"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_repos_finds_two_levels_and_skips_hidden_and_deeper() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for p in ["a/.git", "b/c/.git", "b/c/d/.git", ".hidden/.git", "x/y/z/.git"] {
+            std::fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        assert_eq!(nested_repos(&dir), vec![PathBuf::from("a"), PathBuf::from("b/c")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_diff_of_a_non_repo_with_a_nested_repo_shows_work_since_the_base() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-nested-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, clean) = (dir.join("app"), dir.join("clean"));
+        for r in [&a, &clean] {
+            std::fs::create_dir_all(r).unwrap();
+            git(r, &["init", "-q"]).unwrap();
+            std::fs::write(r.join("f.txt"), "one\n").unwrap();
+            commit_all(r, "init").unwrap();
+        }
+        let ws = setup(&dir, "n1", "auto").unwrap();
+        assert!(!ws.worktree);
+        assert_eq!(ws.nested, vec![PathBuf::from("app"), PathBuf::from("clean")]);
+        assert!(ws.note.as_deref().unwrap().contains("2 repositories inside it (app, clean) are diffed for QA"), "{:?}", ws.note);
+        let bases = nested_heads(&ws);
+        assert_eq!(bases.len(), 2);
+        assert!(review_diff(&ws, DiffSpan::Phase, 100_000, &bases).is_empty());
+        std::fs::write(a.join("f.txt"), "one\ntwo\n").unwrap();
+        commit_all(&a, "work").unwrap();
+        let d = review_diff(&ws, DiffSpan::Phase, 100_000, &bases);
+        assert!(d.diff.contains("## repository app (since "), "{}", d.diff);
+        assert!(d.diff.contains("+two"), "{}", d.diff);
+        assert!(!d.render().contains("clean"), "a clean repository contributes nothing: {}", d.render());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

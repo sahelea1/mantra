@@ -39,6 +39,8 @@ impl Run {
         run.dir = dir;
         run.stage = st.stage.clone();
         run.ws = st.ws.clone();
+        run.nested_base = st.nested_base.clone();
+        run.nested_run_base = st.nested_run_base.clone();
         run.plan = plan;
         run.plan_version = st.plan_version;
         run.handoff = st.handoff.clone();
@@ -543,7 +545,7 @@ mod tests {
             pattern: "mantra-default".into(),
             plan_version: 1,
             stage,
-            ws: Some(Workspace { worktree: true, repo: tmp.to_path_buf(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false }),
+            ws: Some(Workspace { worktree: true, repo: tmp.to_path_buf(), integ: tmp.join("integration"), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] }),
             workers,
             agents,
             ..Default::default()

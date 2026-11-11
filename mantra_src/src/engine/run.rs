@@ -34,6 +34,8 @@ pub enum JobTag {
     /// The checks re-run after a fix worker finished a gate round (`round` is the round it fixed).
     FixChecks { phase: usize, round: u32, gen: u64 },
     Cleanup { phase: usize },
+    /// `HEAD` of each nested repository at a phase start (`JobOut::Text`, `repo\tsha` lines).
+    PhaseBase { phase: usize },
     Finish,
     Land,
     /// A vision tool call (`mantra_screenshot` / `mantra_view_image`), answered when the capture
@@ -504,6 +506,10 @@ pub struct Run {
     pub pulse_seq: u64,
     pub phase_started: Instant,
     pub ws: Option<Workspace>,
+    /// Nested repositories of a non-repository project: `HEAD` at the start of the current phase,
+    /// and at the start of the first one (the run's base). See `git::review_diff`.
+    pub(super) nested_base: Vec<(PathBuf, String)>,
+    pub(super) nested_run_base: Vec<(PathBuf, String)>,
     pub handoff: String,
     pub alerts: Vec<String>,
     pub edges: HashMap<AgentId, Instant>,
@@ -698,6 +704,8 @@ impl Run {
             pulse_seq: 0,
             phase_started: Instant::now(),
             ws: None,
+            nested_base: vec![],
+            nested_run_base: vec![],
             handoff: String::new(),
             alerts: vec![],
             edges: HashMap::new(),
@@ -892,6 +900,8 @@ impl Run {
             active_secs: Some(self.elapsed().as_secs()),
             updated_unix: crate::util::unix_secs(),
             ws: self.ws.clone(),
+            nested_base: self.nested_base.clone(),
+            nested_run_base: self.nested_run_base.clone(),
             handoff: self.handoff.clone(),
             gate_notes: self.gate_notes.clone(),
             workers,
@@ -2091,6 +2101,11 @@ Then summarize in 2-4 lines.",
         self.handoff_note_done = false;
         self.cleanup_done = false;
         self.log("◆", "saffron", format!("phase {}/{} — {}", idx + 1, plan.phases.len(), phase.name));
+        if let Some(w) = self.ws.clone().filter(|w| !w.worktree && !w.nested.is_empty()) {
+            ctx.job(JobTag::PhaseBase { phase: idx }, Box::new(move || {
+                JobOut::Text(Ok(git::nested_heads(&w).iter().map(|(r, h)| format!("{}\t{h}", r.display())).collect::<Vec<_>>().join("\n")))
+            }));
+        }
 
         if self.pattern.settings.planner_loop {
             self.planner_nudges = 0;
@@ -2256,7 +2271,7 @@ Then summarize in 2-4 lines.",
             w.task.title,
             if w.task.acceptance.is_empty() { "the task is fully done and verified" } else { &w.task.acceptance }
         );
-        let brief_context = worker_brief_context(&self.brief);
+        let brief_context = format!("{}{}", self.nested_note(), worker_brief_context(&self.brief));
         let prompt = match &resume {
             Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
             None => format!("{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
@@ -2383,6 +2398,7 @@ Then summarize in 2-4 lines.",
         let dir = self.workspace_dir();
         let timeout = Duration::from_secs(self.pattern.settings.check_timeout_secs);
         let ws = self.ws.clone();
+        let nested_base = self.nested_base.clone();
         // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
         // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
         let tidy = ws.as_ref().map(|w| w.worktree).unwrap_or(false);
@@ -2398,10 +2414,22 @@ Then summarize in 2-4 lines.",
                 let before = if tidy { git::status_snapshot(&dir) } else { None };
                 let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout, Some(&log_dir), &label) };
                 let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
-                let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES)).unwrap_or_default();
+                let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES, &nested_base)).unwrap_or_default();
                 JobOut::Checks(results, dropped, diff)
             }),
         );
+    }
+
+    /// One line for agents when the project directory is not a repository but holds some
+    /// (`Workspace::nested`); empty otherwise. Ends in a blank line, ready to prefix a section.
+    fn nested_note(&self) -> String {
+        match &self.ws {
+            Some(w) if !w.worktree && !w.nested.is_empty() => format!(
+                "The project directory is not a git repository; these repositories are inside it: {}. Run git commands inside the one you work on.\n\n",
+                w.nested.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            ),
+            _ => String::new(),
+        }
     }
 
     fn check_summary(&self) -> String {
@@ -2484,7 +2512,7 @@ Then summarize in 2-4 lines.",
         };
         let previous = if fixes.is_empty() { previous } else { format!("{previous}{}\n{fixes}", if self.prev_gate.is_some() { "Fix workers since then:" } else { "\nFix workers (before this round):" }) };
         let prompt = format!(
-            "[mantra:gate] Phase {}: {} — QA round {round}/{}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nGate checks (run by Mantra just now):\n{}\n\nWorker reports:\n{reports}{previous}\nThe phase's diff (stat, then the diff — start here, read a file in full only if the diff cannot answer):\n{}\n\nVerify the result against the goal and the criteria, then call mantra_gate_report. You do not fix anything: report each problem with file, what is wrong and what to change.",
+            "[mantra:gate] Phase {}: {} — QA round {round}/{}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nGate checks (run by Mantra just now):\n{}\n\nWorker reports:\n{reports}{previous}\n{}The phase's diff (stat, then the diff — start here, read a file in full only if the diff cannot answer):\n{}\n\nVerify the result against the goal and the criteria, then call mantra_gate_report. You do not fix anything: report each problem with file, what is wrong and what to change.",
             idx + 1,
             phase.name,
             self.pattern.settings.gate_max_rounds,
@@ -2492,6 +2520,7 @@ Then summarize in 2-4 lines.",
             if phase.gate.criteria.is_empty() { "build + tests pass, code coherent" } else { &phase.gate.criteria },
             if phase.gate.focus.is_empty() { "integration and consistency between the parallel changes" } else { &phase.gate.focus },
             self.check_summary(),
+            self.nested_note(),
             self.phase_diff.render()
         );
         let prompt = format!("{prompt}\n\n{}", worker_brief_context(&self.brief));
@@ -2668,6 +2697,7 @@ Then summarize in 2-4 lines.",
     /// Also used on explicit resume after a refused phase commit; no repeated archiving.
     pub(super) fn launch_phase_commit(&mut self, ctx: &mut dyn Ctx, idx: usize) {
         let ws = self.ws.clone();
+        let nested_run_base = self.nested_run_base.clone();
         let wts: Vec<(PathBuf, String)> = self.workers.iter().filter(|w| !w.adhoc).filter_map(|w| w.wt.clone().map(|d| (d, w.branch.clone()))).collect();
         let phase_name = self.current_phase().map(|p| p.name.clone()).unwrap_or_default();
         let msg = format!("mantra: phase {} — {}", idx + 1, phase_name);
@@ -2677,7 +2707,7 @@ Then summarize in 2-4 lines.",
             if committed.is_ok() {
                 for (d, b) in wts { git::remove_worker(&ws, &d, &b, false); }
             }
-            let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES);
+            let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES, &nested_run_base);
             JobOut::Cleanup(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }), diff)
         }));
     }
@@ -3023,6 +3053,13 @@ Then summarize in 2-4 lines.",
                 let what = if tool == "mantra_screenshot" { "took a screenshot" } else { "looked at an image" };
                 self.log("▣", "blue", format!("{name} {what}{}", if ok { "" } else { " — failed" }));
                 ctx.tool_result_items(agent, req, items, ok);
+            }
+            (JobTag::PhaseBase { phase }, JobOut::Text(Ok(t))) => {
+                if self.phase_idx() != Some(phase) { return; }
+                self.nested_base = t.lines().filter_map(|l| l.split_once('\t')).map(|(r, h)| (PathBuf::from(r), h.to_string())).collect();
+                if self.nested_run_base.is_empty() {
+                    self.nested_run_base = self.nested_base.clone();
+                }
             }
             (JobTag::Finish, _) => {}
             _ => {}

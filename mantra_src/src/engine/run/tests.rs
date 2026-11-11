@@ -2871,7 +2871,7 @@ fn refused_history_merge_halts_without_an_automatic_merge_fixer() {
     let mut ctx = TestCtx::new();
     let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
     run.plan = Some(one_task_phase());
-    run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+    run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
     let agent = ctx.add_idle();
     run.workers.push(mk_worker("t1", "worker-small", agent, WState::Done));
@@ -3098,7 +3098,7 @@ fn the_planner_finale_names_what_it_may_do_when_read_only() {
 fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
     let dir = std::env::temp_dir().join(format!("mantra-jobs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
+    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] };
     let mut ctx = TestCtx::new();
     let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
     run.ws = Some(ws);
@@ -3133,7 +3133,7 @@ fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
     sh(&["add", "-A"]);
     sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
     std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
+    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] };
     struct Capture(Vec<JobOut>);
     impl Capture {
         fn run(&mut self, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
@@ -4249,7 +4249,7 @@ fn run_in_fix_round(ctx: &mut TestCtx, integ: &Path) -> (Run, AgentId, AgentId) 
     run.planner = Some(planner);
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
-    run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.to_path_buf(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+    run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.to_path_buf(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
     let w = ctx.add_idle();
     let mut fix = mk_worker("fix-1", "worker-small", w, WState::Running);
     fix.adhoc = true;
