@@ -105,7 +105,6 @@ impl Role {
     }
 
     /// Sets position `i` (0..=2) to `alias` (None clears it), then normalizes.
-    #[allow(dead_code)] // the Studio's and the web's fallback editors (WP-5.3, WP-5.7)
     pub fn set_fallback(&mut self, i: usize, alias: Option<String>) {
         match i {
             0 => self.fallback = alias,

@@ -113,7 +113,6 @@ pub enum PickTarget {
     #[allow(dead_code)] // opened from a stage card without an agent (WP-5.4)
     RunRole(String),
     /// A field of the pattern open in the Studio: `field` is "model", "fallback", "fallback2" or "fallback3".
-    #[allow(dead_code)] // opened from the Studio's model fields (WP-5.3)
     StudioField { role: String, field: String },
 }
 
