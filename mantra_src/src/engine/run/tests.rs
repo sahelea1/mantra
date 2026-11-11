@@ -5159,7 +5159,7 @@ fn a_usage_limit_walks_the_fallback_chain_then_halts() {
 }
 
 #[test]
-fn a_fallback_skips_models_on_the_troubled_provider_and_later_spawns_start_on_one() {
+fn a_fallback_tries_the_next_model_of_the_same_provider_and_later_spawns_avoid_the_one_that_failed() {
     let (mut run, mut ctx) = chain_run("chain-provider");
     run.set_known_providers(HashMap::from([("pa".to_string(), "P1".to_string()), ("pb".into(), "P1".into()), ("pc".into(), "P2".into())]));
     let gate = run.pattern.flow.phase_gate.clone();
@@ -5170,19 +5170,31 @@ fn a_fallback_skips_models_on_the_troubled_provider_and_later_spawns_start_on_on
     }
     let a = run.spawn_planner(&mut ctx);
     run.on_turn_done(&mut ctx, a, "failed", Some("usage limit".into()), Some(ErrKind::UsageLimit));
-    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "pb shares pa's provider, which just hit its limit");
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb", "a limit is often one model's: its sibling on the same provider is tried next");
     assert!(!run.halted());
-    // a gate on the troubled provider starts on its fallback
+    // a gate on the model that just failed starts on its fallback
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
     run.spawn_gate_at_round(&mut ctx, 0, 1);
     assert_eq!(ctx.spawned(&gate).last().map(|s| s.model.clone()).as_deref(), Some("pc"));
-    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text.contains("starts on fallback pc") && p.text.contains("pa's provider hit its usage limit")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text.contains("starts on fallback pc") && p.text.contains("pa hit its usage limit")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
 #[test]
-fn a_pinned_worker_keeps_its_model_on_a_troubled_provider_and_is_warned_once() {
+fn silence_marks_the_whole_provider_and_the_chain_skips_its_other_models() {
+    let (mut run, mut ctx) = chain_run("chain-silent");
+    run.set_known_providers(HashMap::from([("pa".to_string(), "P1".to_string()), ("pb".into(), "P1".into()), ("pc".into(), "P2".into())]));
+    let a = run.spawn_planner(&mut ctx);
+    assert!(run.try_fallback(&mut ctx, a, FallbackWhy::Silent, ""));
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "an outage is the provider's: pb would only wait out the same deadline");
+    assert_eq!(run.troubled("pb").as_deref(), Some("pb's provider gave no output"));
+    assert_eq!(run.troubled("pc"), None);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_pinned_worker_keeps_its_model_in_trouble_and_is_warned_once() {
     let mut ctx = TestCtx::new();
     let mut pat = no_manager();
     pat.roles.get_mut("worker-small").unwrap().fallback = Some("other".into());
@@ -5195,12 +5207,12 @@ fn a_pinned_worker_keeps_its_model_on_a_troubled_provider_and_is_warned_once() {
     let mut w = mk_worker("t1", "worker-small", a, WState::Running);
     w.model = Some("x".into());
     run.workers.push(w);
-    run.mark_trouble("x", 3600, "hit its usage limit");
+    run.mark_trouble("x", 3600, "hit its usage limit", false);
     for _ in 0..2 {
         run.launch_worker(&mut ctx, 0, PathBuf::from("wt"), "b".into());
     }
     assert!(ctx.spawned("t1").iter().all(|s| s.model == "x"), "the user's pin wins");
-    let warned = run.pulse.iter().filter(|p| p.glyph == "⚠" && p.text == "worker:t1: runs on x as you chose, although its provider hit its usage limit").count();
+    let warned = run.pulse.iter().filter(|p| p.glyph == "⚠" && p.text == "worker:t1: runs on x as you chose, although x hit its usage limit").count();
     assert_eq!(warned, 1, "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(&run.dir);
 }

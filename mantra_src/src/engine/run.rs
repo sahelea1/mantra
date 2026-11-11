@@ -700,10 +700,13 @@ pub struct Run {
     known_models: HashMap<String, u64>,
     /// alias → provider id, from the app beside `known_models` (`set_known_providers`).
     known_providers: HashMap<String, String>,
-    /// Providers that just failed for a reason that is the provider's, not the task's: usage limit
-    /// (60 min), silent twice or empty twice (15 min), rejected the request shape (the whole run).
-    /// provider id → (until, why). Runtime only.
-    provider_trouble: HashMap<String, (Instant, &'static str)>,
+    /// What just failed for a reason that is not the task's, and until when new agents avoid it.
+    /// A model (`model:<alias>`): usage limit (60 min), empty turns twice (15 min), a rejected
+    /// request (a day) — its siblings on the same provider are still tried, a limit or a refusal
+    /// is often the model's alone. A provider (`provider:<id>`): no output twice (15 min) — an
+    /// outage is the provider's, and waiting out the deadline on each of its models helps nobody.
+    /// key → (until, why). Runtime only.
+    trouble: HashMap<String, (Instant, &'static str)>,
     /// Per slot (`first_token_key`): aliases already tried and given up on in this run.
     pub(super) fallback_used: HashMap<String, Vec<String>>,
     /// Per slot: consecutive empty turns (WP-1.4).
@@ -854,7 +857,7 @@ impl Run {
             slot_models: HashMap::new(),
             known_models: HashMap::new(),
             known_providers: HashMap::new(),
-            provider_trouble: HashMap::new(),
+            trouble: HashMap::new(),
             fallback_used: HashMap::new(),
             empty_strikes: HashMap::new(),
             replaced: vec![],
@@ -1048,7 +1051,7 @@ impl Run {
     }
 
     /// alias → provider id (`Registry::alias_providers`), from the app beside `set_known_models`:
-    /// what tells two aliases on the same troubled provider apart from two on different ones.
+    /// which aliases share a provider that went silent, and which saved session can be re-attached.
     pub fn set_known_providers(&mut self, m: HashMap<String, String>) {
         self.known_providers = m;
     }
@@ -1057,26 +1060,33 @@ impl Run {
         self.known_providers.get(alias).map(|p| p.as_str())
     }
 
-    /// Some(why) while `alias`'s provider has an unexpired trouble mark. `None` when the providers
-    /// were never told (tests) or the alias is unknown.
-    fn troubled(&self, alias: &str) -> Option<&'static str> {
+    /// Some("<alias> hit its usage limit" | "<alias>'s provider gave no output" | …) while the
+    /// model, or its whole provider, has an unexpired trouble mark.
+    fn troubled(&self, alias: &str) -> Option<String> {
+        let live = |k: &str| self.trouble.get(k).filter(|(until, _)| Instant::now() < *until).map(|(_, why)| *why);
+        if let Some(why) = live(&format!("model:{alias}")) {
+            return Some(format!("{alias} {why}"));
+        }
         let p = self.provider_of(alias)?;
-        self.provider_trouble.get(p).filter(|(until, _)| Instant::now() < *until).map(|(_, why)| *why)
+        live(&format!("provider:{p}")).map(|why| format!("{alias}'s provider {why}"))
     }
 
-    fn mark_trouble(&mut self, alias: &str, secs: u64, why: &'static str) {
-        if let Some(p) = self.provider_of(alias).map(str::to_string) {
-            self.provider_trouble.insert(p, (Instant::now() + Duration::from_secs(secs), why));
-        }
+    /// Mark `alias` (or, with `whole_provider`, everything on its provider) as in trouble.
+    fn mark_trouble(&mut self, alias: &str, secs: u64, why: &'static str, whole_provider: bool) {
+        let key = match self.provider_of(alias).filter(|_| whole_provider) {
+            Some(p) => format!("provider:{p}"),
+            None => format!("model:{alias}"),
+        };
+        self.trouble.insert(key, (Instant::now() + Duration::from_secs(secs), why));
     }
 
     /// The alias a spawn into `slot_key` runs on: the user's pin if any; else the role's model —
-    /// unless that model's provider is in trouble right now and the chain has one that is not.
+    /// unless that model is in trouble right now and the chain has one that is not.
     fn model_for_spawn(&mut self, slot_key: &str, role: &Role, pin: Option<&str>) -> String {
         if let Some(p) = pin.filter(|p| self.knows_model(p)) {
             if let Some(why) = self.troubled(p) {
                 if self.pin_trouble_warned.insert(slot_key.to_string()) {
-                    self.log("⚠", "amber", format!("{slot_key}: runs on {p} as you chose, although its provider {why}"));
+                    self.log("⚠", "amber", format!("{slot_key}: runs on {p} as you chose, although {why}"));
                 }
             }
             return p.to_string();
@@ -1086,7 +1096,7 @@ impl Run {
         let next = role.fallback_chain().into_iter().find(|f| self.knows_model(f) && self.troubled(f).is_none() && !used.contains(f));
         match next {
             Some(alias) => {
-                self.log("⇄", "amber", format!("{slot_key} starts on fallback {alias} — {}'s provider {why}", role.model));
+                self.log("⇄", "amber", format!("{slot_key} starts on fallback {alias} — {why}"));
                 alias
             }
             None => role.model.clone(),
@@ -4152,9 +4162,10 @@ Then summarize in 2-4 lines.",
             FallbackWhy::UsageLimit => (3600, "hit its usage limit", "usage limit", format!("hit its provider's usage limit ({})", trunc(error, 240))),
             FallbackWhy::Silent => (900, "gave no output", "no output", "produced no output twice in a row".to_string()),
             FallbackWhy::Empty => (900, "returned empty turns", "empty turns", "returned an empty turn twice in a row".to_string()),
-            FallbackWhy::Rejected => (86_400, "rejected the request", "rejected", format!("was rejected by its provider ({})", trunc(error, 240))),
+            FallbackWhy::Rejected => (86_400, "was rejected by its provider", "rejected", format!("was rejected by its provider ({})", trunc(error, 240))),
         };
-        self.mark_trouble(&running, secs, trouble);
+        // silence is an outage of the provider; a limit, a refusal or empty turns are the model's
+        self.mark_trouble(&running, secs, trouble, matches!(why, FallbackWhy::Silent));
         self.fallback_used.entry(key.clone()).or_default().push(running.clone());
         let used = self.fallback_used.get(&key).cloned().unwrap_or_default();
         let chain = self.pattern.role(&role_name).map(|r| r.fallback_chain()).unwrap_or_default();
