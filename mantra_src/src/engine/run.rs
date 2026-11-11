@@ -495,6 +495,8 @@ pub struct Run {
     /// A transition deferred by the pause boundary, performed once on resume (see `Pending`).
     pub pending: Option<Pending>,
     pub plan: Option<Plan>,
+    /// The last plan the validator rejected (with any patches applied since): `mantra_patch_plan` builds on it.
+    pub plan_draft: Option<Plan>,
     pub plan_version: u32,
     pub planner: Option<AgentId>,
     /// The run-wide supervisor (`flow.manager`), spawned when the first phase starts and re-spawned
@@ -738,6 +740,7 @@ impl Run {
             halt: None,
             pending: None,
             plan: None,
+            plan_draft: None,
             plan_version: 0,
             planner: None,
             manager: None,
@@ -1599,7 +1602,7 @@ We are in {phase}; the run is halted until you act.
 {facts}
 
 Decide, then act with exactly one of:
-- mantra_revise_plan — fix this phase's tasks or gate checks (a check that cannot pass on this machine is a plan bug, not a QA failure); the run resumes by itself with the revised phase.
+- mantra_patch_plan (or mantra_revise_plan for a large change) — fix this phase's tasks or gate checks (a check that cannot pass on this machine is a plan bug, not a QA failure); the run resumes by itself with the revised phase.
 - mantra_resume_run(note) — the plan is right; give the stuck agent a concrete hint and let it try again.
 - mantra_ask_user(question) — only if this needs a decision that changes what is being built.
 Then summarize in 2-4 lines.",
@@ -3909,7 +3912,7 @@ Then summarize in 2-4 lines.",
             if self.escalation_open && self.halted() && self.question.is_none() && status == "completed" {
                 self.escalation_open = false;
                 self.mark_edge(a);
-                ctx.prompt(a, "[mantra:escalation] The run is still halted and nothing changed. Act now with exactly one of mantra_revise_plan, mantra_resume_run(note) or mantra_ask_user(question).".into());
+                ctx.prompt(a, "[mantra:escalation] The run is still halted and nothing changed. Act now with exactly one of mantra_patch_plan (or mantra_revise_plan for a large change), mantra_resume_run(note) or mantra_ask_user(question).".into());
                 return;
             }
             // reprompt handled — forward any queued orchestrator notes
@@ -5512,6 +5515,47 @@ Then summarize in 2-4 lines.",
         );
     }
 
+    /// Merge (when revising), validate and, if valid, make `plan` live. A rejected plan is kept as
+    /// `plan_draft` so `mantra_patch_plan` can fix it without sending it again.
+    fn accept_plan(&mut self, ctx: &mut dyn Ctx, mut plan: Plan, revising: bool) -> (String, bool) {
+        plan.normalize();
+        if revising {
+            // keep completed phases exactly as they were
+            let cur = self.phase_idx().unwrap_or(0);
+            if let Some(old) = &self.plan {
+                let done_ids: Vec<String> = old.phases[..cur.min(old.phases.len())].iter().map(|p| p.id.clone()).collect();
+                let mut phases: Vec<Phase> = old.phases[..cur.min(old.phases.len())].to_vec();
+                phases.extend(plan.phases.iter().filter(|p| !done_ids.contains(&p.id)).cloned());
+                plan.phases = phases;
+            }
+        }
+        let mut validation_plan = plan.clone();
+        if revising { validation_plan.phases = validation_plan.phases.into_iter().skip(self.phase_idx().unwrap_or(0)).collect(); }
+        if let Err(errs) = validation_plan.validate(&self.pattern) {
+            self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
+            self.plan_draft = Some(plan);
+            return (format!("REJECTED — fix these and resubmit:\n- {}\nThe plan you sent is kept as a draft: fix it with mantra_patch_plan (only the changed parts) instead of sending it again.", errs.join("\n- ")), false);
+        }
+        self.plan_draft = None;
+        let old = self.plan.replace(plan.clone());
+        self.plan_version += 1;
+        self.save_plan();
+        self.retitle(ctx, &plan.title);
+        if self.pattern.settings.planner_loop {
+            self.loop_progress();
+            self.log("☰", "saffron", format!("plan v{} · one phase — {}", self.plan_version, trunc(&plan.title, 50)));
+            self.save_state();
+            return (if revising { "ACCEPTED. Continue the single phase using the revised plan." } else { "ACCEPTED. Summarize the plan and end your turn." }.into(), true);
+        }
+        let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
+        self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
+        if revising {
+            let next = self.apply_revision(ctx, old);
+            return (format!("ACCEPTED. The revision is live; completed phases were kept. What happens next: {next}. Brief the orchestrator if it needs more than the diff Mantra gives it, then summarize."), true);
+        }
+        ("ACCEPTED. Reply with a 2-4 line summary of the plan and end your turn.".into(), true)
+    }
+
     fn handle_tool(&mut self, ctx: &mut dyn Ctx, a: AgentId, tool: &str, args: &Value) -> (String, bool) {
         // A turn that already ended with `mantra_wait` takes no more tools: the first call after the
         // yield interrupts the turn, and any further call in it is only refused.
@@ -5648,45 +5692,45 @@ Then summarize in 2-4 lines.",
                 if self.loop_executing() && !self.pattern.settings.allow_pattern_changes {
                     return ("REFUSED: the user locked the live plan. Continue with the approved plan or ask the user to enable changes.".into(), false);
                 }
-                let mut plan = match Plan::from_value(args) {
+                let plan = match Plan::from_value(args) {
                     Ok(p) => p,
                     Err(e) => return (format!("REJECTED: {e}"), false),
                 };
-                plan.normalize();
                 let revising = tool == "mantra_revise_plan" && self.phase_idx().is_some();
+                self.accept_plan(ctx, plan, revising)
+            }
+            "mantra_patch_plan" => {
+                if Some(a) != self.planner { return ("REFUSED: only the planner may submit or revise the plan".into(), false); }
+                if self.pattern.is_auto() { return ("REJECTED: Auto needs a concrete approved workflow first; use mantra_revise_pattern".into(), false); }
+                if self.pattern.settings.planner_loop && !(self.stage == Stage::Planning || (self.loop_executing() && self.handoff.is_empty())) {
+                    return ("REFUSED: use mantra_submit_plan while planning and mantra_revise_plan during execution.".into(), false);
+                }
+                if self.loop_executing() && !self.pattern.settings.allow_pattern_changes {
+                    return ("REFUSED: the user locked the live plan. Continue with the approved plan or ask the user to enable changes.".into(), false);
+                }
+                let reason = s("reason");
+                if reason.trim().is_empty() { return ("REJECTED: say why the plan changes".into(), false); }
+                let base = match self.plan_draft.clone().or_else(|| self.plan.clone()) {
+                    Some(p) => p,
+                    None => return ("REFUSED: there is no plan yet — submit one with mantra_submit_plan".into(), false),
+                };
+                let patched = match super::plan::apply_ops(&base, args.get("ops").unwrap_or(&Value::Null)) {
+                    Ok(p) => p,
+                    Err(e) => return (format!("REJECTED: {e}. Nothing was changed."), false),
+                };
+                let revising = self.phase_idx().is_some();
                 if revising {
-                    // keep completed phases exactly as they were
                     let cur = self.phase_idx().unwrap_or(0);
-                    if let Some(old) = &self.plan {
-                        let done_ids: Vec<String> = old.phases[..cur.min(old.phases.len())].iter().map(|p| p.id.clone()).collect();
-                        let mut phases: Vec<Phase> = old.phases[..cur.min(old.phases.len())].to_vec();
-                        phases.extend(plan.phases.iter().filter(|p| !done_ids.contains(&p.id)).cloned());
-                        plan.phases = phases;
+                    for (i, old) in base.phases.iter().enumerate().take(cur) {
+                        if patched.phases.get(i) != Some(old) {
+                            return (format!("REJECTED: phase '{}' is already finished and cannot be changed. Nothing was changed.", old.id), false);
+                        }
                     }
                 }
-                let mut validation_plan = plan.clone();
-                if revising { validation_plan.phases = validation_plan.phases.into_iter().skip(self.phase_idx().unwrap_or(0)).collect(); }
-                if let Err(errs) = validation_plan.validate(&self.pattern) {
-                    self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
-                    return (format!("REJECTED — fix these and resubmit:\n- {}", errs.join("\n- ")), false);
-                }
-                let old = self.plan.replace(plan.clone());
-                self.plan_version += 1;
-                self.save_plan();
-                self.retitle(ctx, &plan.title);
-                if self.pattern.settings.planner_loop {
-                    self.loop_progress();
-                    self.log("☰", "saffron", format!("plan v{} · one phase — {}", self.plan_version, trunc(&plan.title, 50)));
-                    self.save_state();
-                    return (if revising { "ACCEPTED. Continue the single phase using the revised plan." } else { "ACCEPTED. Summarize the plan and end your turn." }.into(), true);
-                }
-                let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
-                self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
-                if revising {
-                    let next = self.apply_revision(ctx, old);
-                    return (format!("ACCEPTED. The revision is live; completed phases were kept. What happens next: {next}. Brief the orchestrator if it needs more than the diff Mantra gives it, then summarize."), true);
-                }
-                ("ACCEPTED. Reply with a 2-4 line summary of the plan and end your turn.".into(), true)
+                let n = args.get("ops").and_then(|o| o.as_array()).map(|a| a.len()).unwrap_or(0);
+                let (text, ok) = self.accept_plan(ctx, patched, revising);
+                if ok { self.log("☰", "saffron", format!("plan patched: {n} operation(s) — {}", trunc(&reason, 60))); }
+                (text, ok)
             }
             "mantra_pause_agents" => {
                 let mut done = vec![];

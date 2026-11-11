@@ -124,6 +124,21 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
             },
             &["plan"],
         ),
+        tool(
+            "mantra_patch_plan",
+            "Change parts of the plan without sending it again. Give a list of operations; Mantra applies them to the current plan (or to the plan it just rejected), validates the result exactly like mantra_revise_plan and, if it is valid, makes it live. Use this for every small change — one gate check, one task prompt, one added task. Use mantra_revise_plan only when most of the plan changes.",
+            json!({
+                "ops": {"type": "array", "items": {"type": "object", "properties": {
+                    "op": {"type": "string", "enum": ["set_task", "add_task", "remove_task", "set_gate", "set_check", "add_check", "remove_check", "set_phase", "set_plan"]},
+                    "phase": {"type": "string", "description": "phase id (as in the plan), or its 1-based number"},
+                    "task": {"type": "string", "description": "task id"},
+                    "index": {"type": "integer", "description": "1-based position of a gate check"},
+                    "value": {"description": "see the operation"}
+                }, "required": ["op"]}},
+                "reason": {"type": "string"}
+            }),
+            &["ops", "reason"],
+        ),
         tool("mantra_pause_agents", "Pause (interrupt) agents so they stop working until resumed.", json!({"agents": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}}), &["agents"]),
         tool("mantra_resume_agents", "Resume paused agents.", json!({"agents": {"type": "array", "items": {"type": "string"}}}), &["agents"]),
         tool("mantra_brief_orchestrator", "Send instructions to the orchestrator (it acts on them right away).", json!({"message": {"type": "string"}}), &["message"]),
@@ -424,7 +439,8 @@ mantra-role: planner
 - Carry project and per-ticket rules from the brief into task prompts, including recipient language, status format, decision logs and configured commit trailers; do not copy credentials.
 - For CI, identify the target ref and commit SHA. A superseded pipeline cancelled by GitLab auto-cancel is not a failed build or a passing gate: follow the newest required pipeline for that same target, inspect required jobs, and record its SHA/status. Runner queue time alone is not a failure; schedule re-entry while queued or running.
 - Submit your plan by calling `mantra_submit_plan`. Never just write the plan as text or into a file.
-- Mantra validates the plan and returns errors; fix them and resubmit.
+- Mantra validates the plan and returns errors. Fix them with `mantra_patch_plan` — send only the operations that change something; the rejected plan is kept as a draft, so never send the whole plan a second time.
+- Later changes (a gate check, a task prompt, an added task) also go through `mantra_patch_plan`. `mantra_revise_plan` re-sends everything and is only for a plan that changes in most places.
 - When re-prompted by the user during a run ([mantra:reprompt]): read state with `mantra_status`/`mantra_log`,
   pause agents that would waste work (`mantra_pause_agents`), revise the plan (`mantra_revise_plan`) if needed,
   and tell the orchestrator what changed (`mantra_brief_orchestrator`). Then summarize what you did in 2-4 lines.

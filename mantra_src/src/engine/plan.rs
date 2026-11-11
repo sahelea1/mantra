@@ -247,6 +247,139 @@ fn unstring(obj: &mut Value, key: &str, wanted: fn(&Value) -> bool) {
     }
 }
 
+/// Apply `ops` to a copy of `plan`. The first operation that cannot be applied stops it with a
+/// message that names the operation's position and what is wrong.
+pub fn apply_ops(plan: &Plan, ops: &Value) -> Result<Plan, String> {
+    let ops = match ops {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        v => v.clone(),
+    };
+    let Some(ops) = ops.as_array() else { return Err("`ops` must be a list of operations".into()) };
+    if ops.is_empty() {
+        return Err("`ops` is empty".into());
+    }
+    // overlay the given fields on a serialisable struct
+    fn overlay<T: Serialize + serde::de::DeserializeOwned>(at: &str, target: &T, value: &Value, keys: &[&str]) -> Result<T, String> {
+        let mut cur = serde_json::to_value(target).map_err(|e| e.to_string())?;
+        for (k, v) in value.as_object().into_iter().flatten() {
+            if !keys.contains(&k.as_str()) {
+                if k == "id" {
+                    return Err(format!("{at}: a task's id cannot change — remove it and add a new one"));
+                }
+                return Err(format!("{at}: unknown field '{k}' (allowed: {})", keys.join(", ")));
+            }
+            let mut v = v.clone();
+            if let Value::String(s) = &v {
+                if let Some(p) = serde_json::from_str::<Value>(s).ok().filter(Value::is_array) {
+                    v = p;
+                }
+            }
+            cur[k] = v;
+        }
+        serde_json::from_value(cur).map_err(|e| format!("{at}: {e}"))
+    }
+    let mut plan = plan.clone();
+    for (i, op) in ops.iter().enumerate() {
+        let name = op.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+        let at = format!("op {} ({name})", i + 1);
+        let sget = |k: &str| op.get(k).and_then(Value::as_str).map(str::to_string).or_else(|| op.get(k).and_then(Value::as_i64).map(|n| n.to_string()));
+        let value = match op.get("value") {
+            Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+                Ok(v) if v.is_object() => v,
+                _ => Value::String(s.clone()),
+            },
+            Some(v) => v.clone(),
+            None => Value::Null,
+        };
+        let phase_idx = |plan: &Plan| -> Result<usize, String> {
+            let x = sget("phase").ok_or_else(|| format!("{at}: `phase` is required"))?;
+            plan.phases
+                .iter()
+                .position(|p| p.id == x)
+                .or_else(|| x.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= plan.phases.len()).map(|n| n - 1))
+                .ok_or_else(|| format!("{at}: no phase '{x}' (phases: {})", plan.phases.iter().map(|p| p.id.clone()).collect::<Vec<_>>().join(", ")))
+        };
+        let task_pos = |plan: &Plan| -> Result<(usize, usize), String> {
+            let x = sget("task").ok_or_else(|| format!("{at}: `task` is required"))?;
+            plan.phases
+                .iter()
+                .enumerate()
+                .find_map(|(pi, p)| p.tasks.iter().position(|t| t.id == x).map(|ti| (pi, ti)))
+                .ok_or_else(|| format!("{at}: no task '{x}'"))
+        };
+        let check_idx = |plan: &Plan, pi: usize| -> Result<usize, String> {
+            let n = plan.phases[pi].gate.checks.len();
+            let idx = sget("index").and_then(|s| s.parse::<usize>().ok());
+            match idx {
+                Some(k) if k >= 1 && k <= n => Ok(k - 1),
+                _ => Err(format!("{at}: phase '{}' has {n} check(s)", plan.phases[pi].id)),
+            }
+        };
+        let need_obj = |keys: &[&str]| -> Result<Value, String> {
+            if !value.is_object() {
+                return Err(format!("{at}: value must be an object with any of {}", keys.join(", ")));
+            }
+            Ok(value.clone())
+        };
+        let need_str = || -> Result<String, String> { value.as_str().map(str::to_string).ok_or_else(|| format!("{at}: value must be a string")) };
+        match name.as_str() {
+            "set_task" => {
+                let (pi, ti) = task_pos(&plan)?;
+                let keys = ["title", "role", "prompt", "scope", "acceptance", "effort"];
+                let v = need_obj(&keys)?;
+                plan.phases[pi].tasks[ti] = overlay(&at, &plan.phases[pi].tasks[ti], &v, &keys)?;
+            }
+            "add_task" => {
+                let pi = phase_idx(&plan)?;
+                let mut v = need_obj(&["id", "role", "prompt"])?;
+                if let Some(p) = v.get("scope").and_then(Value::as_str).and_then(|s| serde_json::from_str::<Value>(s).ok()).filter(Value::is_array) {
+                    v["scope"] = p;
+                }
+                let t: Task = serde_json::from_value(v).map_err(|e| format!("{at}: value is not a task: {e}"))?;
+                plan.phases[pi].tasks.push(t);
+            }
+            "remove_task" => {
+                let (pi, ti) = task_pos(&plan)?;
+                plan.phases[pi].tasks.remove(ti);
+            }
+            "set_gate" => {
+                let pi = phase_idx(&plan)?;
+                let keys = ["checks", "focus", "criteria"];
+                let v = need_obj(&keys)?;
+                plan.phases[pi].gate = overlay(&at, &plan.phases[pi].gate, &v, &keys)?;
+            }
+            "set_check" => {
+                let pi = phase_idx(&plan)?;
+                let k = check_idx(&plan, pi)?;
+                plan.phases[pi].gate.checks[k] = need_str()?;
+            }
+            "add_check" => {
+                let pi = phase_idx(&plan)?;
+                plan.phases[pi].gate.checks.push(need_str()?);
+            }
+            "remove_check" => {
+                let pi = phase_idx(&plan)?;
+                let k = check_idx(&plan, pi)?;
+                plan.phases[pi].gate.checks.remove(k);
+            }
+            "set_phase" => {
+                let pi = phase_idx(&plan)?;
+                let keys = ["name", "goal"];
+                let v = need_obj(&keys)?;
+                plan.phases[pi] = overlay(&at, &plan.phases[pi], &v, &keys)?;
+            }
+            "set_plan" => {
+                let keys = ["title", "summary", "orchestrator_brief", "final_checks"];
+                let v = need_obj(&keys)?;
+                plan = overlay(&at, &plan, &v, &keys)?;
+            }
+            other => return Err(format!("{at}: unknown operation '{other}'")),
+        }
+    }
+    plan.normalize();
+    Ok(plan)
+}
+
 /// JSON schema given to the planner's tools.
 pub fn plan_schema(worker_roles: &[String]) -> Value {
     json!({
@@ -411,5 +544,49 @@ mod tests {
         assert_eq!(parsed.final_checks, vec!["cargo test".to_string()]);
         let err = Plan::from_value(&json!({"plan": {"title": "T", "phases": "not json"}})).expect_err("prose is still refused");
         assert!(err.contains("does not match the schema"), "{err}");
+    }
+
+    #[test]
+    fn apply_ops_covers_every_operation() {
+        let mut p = sample();
+        p.normalize();
+        let ops = json!([
+            {"op": "set_task", "task": "a1", "value": {"prompt": "do the first thing better", "scope": ["src/x/**"]}},
+            {"op": "add_task", "phase": "1", "value": {"id": "a3", "role": "worker-small", "prompt": "a third thing to do"}},
+            {"op": "remove_task", "task": "a2"},
+            {"op": "add_check", "phase": "p1", "value": "echo hi"},
+            {"op": "set_check", "phase": "p1", "index": 1, "value": "false"},
+            {"op": "set_gate", "phase": "p1", "value": {"focus": "look here"}},
+            {"op": "set_phase", "phase": "p1", "value": "{\"goal\": \"g\"}"},
+            {"op": "set_plan", "value": {"title": "New", "final_checks": ["true"]}},
+        ]);
+        let q = apply_ops(&p, &ops).unwrap();
+        assert_eq!(q.title, "New");
+        assert_eq!(q.final_checks, vec!["true"]);
+        let ph = &q.phases[0];
+        assert_eq!(ph.goal, "g");
+        assert_eq!(ph.gate.focus, "look here");
+        assert_eq!(ph.gate.checks, vec!["false", "echo hi"]);
+        assert_eq!(ph.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["a1", "a3"]);
+        assert_eq!(ph.tasks[0].scope, vec!["src/x/**"]);
+        let q = apply_ops(&q, &json!([{"op": "remove_check", "phase": "p1", "index": 2}])).unwrap();
+        assert_eq!(q.phases[0].gate.checks, vec!["false"]);
+        assert_eq!(p.title, "T");
+    }
+
+    #[test]
+    fn apply_ops_errors_name_the_position() {
+        let mut p = sample();
+        p.normalize();
+        let e = apply_ops(&p, &json!([{"op": "add_check", "phase": "p1", "value": "x"}, {"op": "set_gate", "phase": "zz", "value": {}}])).unwrap_err();
+        assert!(e.contains("op 2 (set_gate): no phase 'zz' (phases: p1)"), "{e}");
+        let e = apply_ops(&p, &json!([{"op": "remove_task", "task": "nope"}])).unwrap_err();
+        assert!(e.contains("op 1 (remove_task): no task 'nope'"), "{e}");
+        let e = apply_ops(&p, &json!([{"op": "set_check", "phase": "p1", "index": 3, "value": "x"}])).unwrap_err();
+        assert!(e.contains("phase 'p1' has 1 check(s)"), "{e}");
+        let e = apply_ops(&p, &json!([{"op": "set_check", "phase": "p1", "index": 1, "value": {"a": 1}}])).unwrap_err();
+        assert!(e.contains("value must be a string"), "{e}");
+        let e = apply_ops(&p, &json!([{"op": "set_task", "task": "a1", "value": {"id": "new"}}])).unwrap_err();
+        assert!(e.contains("a task's id cannot change"), "{e}");
     }
 }

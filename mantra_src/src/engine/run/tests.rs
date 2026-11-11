@@ -6153,3 +6153,73 @@ fn gate_fix_is_a_setting_that_old_pattern_files_default() {
     bad.settings.gate_fix = "fix-worker".into();
     assert!(bad.validate().is_ok());
 }
+
+fn two_task_plan(scope_b: &str) -> serde_json::Value {
+    json!({"plan": {"title": "Patchable", "summary": "S", "phases": [{"name": "A", "tasks": [
+        {"id": "a", "title": "x", "role": "worker-small", "prompt": "do the first thing well", "scope": ["src/a/**"]},
+        {"id": "b", "title": "y", "role": "worker-small", "prompt": "do the second thing well", "scope": [scope_b]}], "gate": {"checks": ["true"]}}]}})
+}
+
+/// WP-8.1: a rejected plan is kept as a draft and a patch fixes it without re-sending it.
+#[test]
+fn a_rejected_plan_is_patched_not_resent() {
+    let (mut run, mut ctx, p) = planner_feature_run("patch-draft", Pattern::builtin());
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_submit_plan", &two_task_plan("src/a/**"));
+    assert!(!ok && msg.contains("kept as a draft") && msg.contains("mantra_patch_plan"), "{msg}");
+    assert!(run.plan.is_none() && run.plan_draft.is_some());
+    // a patch that is itself invalid keeps the patched draft; the next one fixes the rest
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "set_task", "task": "b", "value": {"prompt": "x"}}], "reason": "shorter"}));
+    assert!(!ok && msg.contains("prompt is missing or too short") && msg.contains("both claim"), "{msg}");
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "set_task", "task": "b", "value": {"scope": ["src/b/**"], "prompt": "do the second thing well"}}], "reason": "disjoint"}));
+    assert!(ok && msg.starts_with("ACCEPTED"), "{msg}");
+    assert!(run.plan_draft.is_none());
+    assert_eq!(run.plan_version, 1);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert_eq!(run.stage, Stage::Review);
+    // no reason, bad op: nothing changes
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "remove_task", "task": "zz"}], "reason": "r"}));
+    assert!(!ok && msg.contains("op 1 (remove_task): no task 'zz'") && msg.contains("Nothing was changed"), "{msg}");
+    assert!(!run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [], "reason": " "})).1);
+}
+
+/// WP-8.1: at the gate, a patched check resumes the run with the checks re-run.
+#[test]
+fn a_patched_gate_check_resumes_a_halted_gate() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    run.plan.as_mut().unwrap().phases[0].gate.checks = vec!["one".into(), "two".into(), "bad-check".into()];
+    run.plan_version = 1;
+    halt_by_hand(&mut run);
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "set_check", "phase": "p1", "index": 3, "value": "true"}], "reason": "the check cannot pass here"}));
+    assert!(ok, "{msg}");
+    assert!(!run.halted());
+    assert_eq!(run.plan_version, 2);
+    assert_eq!(run.plan.as_ref().unwrap().phases[0].gate.checks, vec!["one", "two", "true"]);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("Checks"), "{:?}", ctx.jobs);
+    assert!(run.journal_text(10).contains("plan patched: 1 operation(s)"), "{}", run.journal_text(10));
+}
+
+/// WP-8.1: a patch may not touch a finished phase.
+#[test]
+fn a_patch_cannot_change_a_finished_phase() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    let mut second = run.plan.as_ref().unwrap().phases[0].clone();
+    second.id = "p2".into();
+    second.tasks[0].id = "t2".into();
+    run.plan.as_mut().unwrap().phases.push(second);
+    run.plan.as_mut().unwrap().normalize();
+    run.stage = Stage::Phase { idx: 1, step: PhaseStep::Gate { round: 1 } };
+    run.plan_version = 1;
+    let before = run.plan.clone();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "add_check", "phase": "p1", "value": "echo hi"}], "reason": "r"}));
+    assert!(!ok && msg.contains("phase 'p1' is already finished"), "{msg}");
+    assert_eq!(run.plan, before);
+    assert_eq!(run.plan_version, 1);
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "add_check", "phase": "p2", "value": "echo hi"}], "reason": "r"}));
+    assert!(ok, "{msg}");
+}
