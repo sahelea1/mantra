@@ -477,6 +477,17 @@ pub struct PhaseRecord {
     pub ended: Instant,
 }
 
+/// What the canvas needs to draw the fix of a gate round (WP-5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixView {
+    pub round: u32,
+    /// The task id when that task's own worker fixes; `None` for a generic `fix-<round>` worker.
+    pub owner: Option<String>,
+    pub agent: Option<AgentId>,
+    /// The checks that follow the fix are running: the edge points back to the gate.
+    pub returning: bool,
+}
+
 pub struct Run {
     /// Akasha notebooks by group name, configured by the pattern.
     pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
@@ -528,7 +539,10 @@ pub struct Run {
     /// The task whose own worker repairs the current gate round (`None` = a generic fix worker),
     /// the findings the round was started with, and the owners' reports of this phase so far
     /// (task, round, report) for the next QA agent.
-    pub(super) fix_owner: Option<String>,
+    pub(crate) fix_owner: Option<String>,
+    /// The fix that just ended while its checks re-run (WP-5.5): what the canvas draws as the
+    /// edge coming back. Cleared when the next QA round spawns or the phase leaves the gate.
+    pub(crate) fix_done: Option<FixView>,
     fix_findings: String,
     owner_fixes: Vec<(String, u32, String)>,
     gate_plan_defect: bool,
@@ -557,7 +571,7 @@ pub struct Run {
     git_write_said: bool,
     /// The previous gate round's verdict for the phase in progress, shown to the next round's
     /// fresh agent (`pass|fail` and the summary).
-    prev_gate: Option<(u32, bool, String)>,
+    pub(crate) prev_gate: Option<(u32, bool, String)>,
     /// The merged phase's diff as of the last checks run: what the gate agent starts from.
     phase_diff: git::ReviewDiff,
     /// The run's diff as of the last phase commit: what the finale starts from.
@@ -761,6 +775,7 @@ impl Run {
             gate_big: false,
             gate_fix_by: None,
             fix_owner: None,
+            fix_done: None,
             fix_findings: String::new(),
             owner_fixes: vec![],
             gate_plan_defect: false,
@@ -1246,6 +1261,41 @@ impl Run {
 
     pub fn is_active(&self) -> bool {
         !matches!(self.stage, Stage::Done | Stage::Failed(_))
+    }
+
+    /// The fix of a gate round for the canvas: `Some` while the stage is `Fix`, and (returning) while
+    /// the checks that follow that fix run; `None` otherwise.
+    pub fn fix_view(&self) -> Option<FixView> {
+        match &self.stage {
+            Stage::Phase { step: PhaseStep::Fix { round }, .. } => {
+                let agent = match &self.fix_owner {
+                    Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).and_then(|w| w.agent),
+                    None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).and_then(|w| w.agent),
+                };
+                Some(FixView { round: *round, owner: self.fix_owner.clone(), agent, returning: false })
+            }
+            Stage::Phase { step: PhaseStep::Checks { .. }, .. } => self.fix_done.clone(),
+            _ => None,
+        }
+    }
+
+    /// (the gate round in progress or 0, `gate_max_rounds`).
+    pub fn gate_rounds(&self) -> (u32, u32) {
+        let r = match &self.stage {
+            Stage::Phase { step: PhaseStep::Gate { round } | PhaseStep::Fix { round } | PhaseStep::Checks { round }, .. } => *round,
+            _ => 0,
+        };
+        (r, self.pattern.settings.gate_max_rounds)
+    }
+
+    /// The newest QA verdict of this phase: (round, pass, report).
+    pub fn last_gate_verdict(&self) -> Option<&(u32, bool, String)> {
+        self.prev_gate.as_ref()
+    }
+
+    /// The newest QA report called a gate check wrong (the planner is asked).
+    pub fn gate_plan_defect(&self) -> bool {
+        self.gate_plan_defect
     }
 
     pub fn halted(&self) -> bool {
@@ -2301,6 +2351,7 @@ Then summarize in 2-4 lines.",
         self.last_review = Instant::now();
         self.workers.clear();
         self.fix_owner = None;
+        self.fix_done = None;
         self.fix_findings.clear();
         self.owner_fixes.clear();
         self.checks.clear();
@@ -2711,6 +2762,7 @@ Then summarize in 2-4 lines.",
         }
         self.retire_gate_agent(ctx);
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
+        self.fix_done = None;
         self.gate_report = None;
         self.gate_big = false;
         self.gate_fix_by = None;
@@ -3009,6 +3061,11 @@ Then summarize in 2-4 lines.",
         } else {
             self.orch_inbox.push(format!("Gate fix r{round} by {who} finished. Mantra re-runs the checks and QA."));
         }
+        let agent = match &self.fix_owner {
+            Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).and_then(|w| w.agent),
+            None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).and_then(|w| w.agent),
+        };
+        self.fix_done = Some(FixView { round, owner: self.fix_owner.clone(), agent, returning: true });
         if let Some(t) = self.fix_owner.clone() {
             self.owner_fixes.push((t, round, report));
         }
@@ -3068,6 +3125,7 @@ Then summarize in 2-4 lines.",
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
         self.fix_owner = None;
+        self.fix_done = None;
         self.fix_findings.clear();
         self.owner_fixes.clear();
         self.log("✓", "green", if self.pattern.settings.planner_loop { "planner verified the goal — saving the phase" } else { "gate passed — archiving workers, writing handoff" });
@@ -6525,6 +6583,7 @@ Then summarize in 2-4 lines.",
             }
         }
         self.fix_owner = None;
+        self.fix_done = None;
         self.fix_findings.clear();
     }
 

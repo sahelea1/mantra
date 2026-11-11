@@ -475,6 +475,14 @@ pub struct PlannerWaitView {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct FixPayload {
+    pub round: u32,
+    pub owner: Option<String>,
+    pub agent: Option<u32>,
+    pub returning: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RunView {
     pub id: String,
     /// The run's name for people (the plan's title, else the goal's first words); `id` stays the key.
@@ -496,6 +504,12 @@ pub struct RunView {
     pub completion_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_wait: Option<PlannerWaitView>,
+    /// The gate fix being drawn (WP-5.5): `null` outside a fix and the checks that follow it.
+    #[serde(default)]
+    pub fix: Option<FixPayload>,
+    /// `[round, max]` of the QA gate (round 0 outside the gate).
+    #[serde(default)]
+    pub gate_round: [u32; 2],
     pub plan_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<u32>,
@@ -1100,6 +1114,8 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         planner_loop: r.pattern.settings.planner_loop,
         completion_summary: (r.pattern.settings.planner_loop && !r.handoff.is_empty() && r.stage == Stage::Done).then(|| r.handoff.clone()),
         planner_wait: r.planner_wait_info().map(|w| PlannerWaitView { due_at: w.due_unix.saturating_mul(1000), condition: w.condition.clone() }),
+        fix: r.fix_view().map(|f| FixPayload { round: f.round, owner: f.owner, agent: f.agent, returning: f.returning }),
+        gate_round: { let (a, b) = r.gate_rounds(); [a, b] },
         plan_version: r.plan_version,
         planner: r.planner,
         manager: r.manager,
@@ -1775,6 +1791,22 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["title"], "Notes sync");
         assert_eq!(json["stage"]["label"], "phase 1 · fix r2");
+    }
+
+    #[test]
+    fn the_run_payload_carries_the_gate_fix_and_round() {
+        let app = test_app();
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert!(json["fix"].is_null(), "{json}");
+        assert_eq!(json["gate_round"][0], 0);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 2 } };
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert_eq!(json["fix"]["round"], 2);
+        assert_eq!(json["fix"]["returning"], false);
+        assert!(json["fix"]["owner"].is_null());
+        assert_eq!(json["gate_round"][0], 2);
+        assert_eq!(json["gate_round"][1], run.pattern.settings.gate_max_rounds);
     }
 
     /// Token counts travel with their cached share — per agent and for the run — so the web

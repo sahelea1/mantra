@@ -5997,6 +5997,44 @@ fn a_failed_round_in_one_tasks_files_goes_back_to_its_own_worker() {
     assert!(p2.contains("t1 (its own worker, round 1)") && p2.contains("returns the right value now"), "{p2}");
 }
 
+/// WP-5.5: what the canvas draws follows the fix: the owner while it repairs, the way back while
+/// the checks re-run, nothing once the next QA round or the hand-off is reached.
+#[test]
+fn the_fix_view_follows_an_owner_fix_from_the_verdict_to_the_next_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    assert_eq!(run.fix_view(), None);
+    assert_eq!(run.gate_rounds(), (1, run.pattern.settings.gate_max_rounds));
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: Some("t1".into()), agent: Some(a1), returning: false }));
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec!["t1".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Checks { round: 1 }, .. }), "{:?}", run.stage);
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: Some("t1".into()), agent: Some(a1), returning: true }));
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    assert_eq!(run.fix_view(), None, "the next QA round draws no fix");
+    assert_eq!(run.gate_rounds().0, 2);
+}
+
+#[test]
+fn the_fix_view_of_a_generic_fix_worker_names_its_agent() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let v = run.fix_view().expect("a fix");
+    assert_eq!((v.round, v.owner.clone(), v.returning), (1, None, false));
+    let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+    run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+    let agent = run.workers.iter().find(|w| w.task.id == "fix-1").and_then(|w| w.agent).unwrap();
+    assert_eq!(run.fix_view().and_then(|v| v.agent), Some(agent));
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: None, agent: Some(agent), returning: true }));
+}
+
 #[test]
 fn an_owner_that_is_blocked_hands_the_round_to_a_fix_worker_with_its_report() {
     let mut ctx = TestCtx::new();

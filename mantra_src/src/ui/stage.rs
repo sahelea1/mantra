@@ -5,7 +5,7 @@ use crate::agent::Agent;
 use crate::app::{App, StageNode};
 use crate::engine::pattern::Role;
 use crate::engine::plan::Task;
-use crate::engine::run::{HaltReason, PhaseStep, Run, Stage, WState, Worker};
+use crate::engine::run::{FixView, HaltReason, PhaseStep, Run, Stage, WState, Worker};
 use crate::hub::AgentId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
@@ -392,7 +392,7 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
             PhaseStep::Gate { round } => format!("QA gate · round {round}"),
             // named like the worker on the canvas (`fix-<round>`) and the web's "fix r<round>"
             PhaseStep::Fix { round: 0 } => "merge fix · fix-0 merges the conflicting branches".into(),
-            PhaseStep::Fix { round } => format!("QA gate · fix r{round} · fix-{round} repairs what QA round {round} found"),
+            PhaseStep::Fix { round } => format!("QA gate · round {round}/{} · fix by {}", r.gate_rounds().1, r.fix_view().and_then(|f| f.owner).unwrap_or_else(|| format!("fix-{round}"))),
             PhaseStep::Handoff if r.pattern.settings.planner_loop => "saving the verified result".into(),
             PhaseStep::Handoff => "handoff → next phase".into(),
         };
@@ -557,7 +557,18 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let dimmed = matches!(v, V::NotStarted | V::Queued);
     let gst = if dimmed { theme::faint() } else { theme::bold(theme::fg(base)) };
     let glyph = role.map(|r| theme::role_glyph(&r.glyph)).unwrap_or_else(|| "◇".into());
-    cv.spans(x - 1, y, &[Span::raw(" "), Span::styled(format!("{glyph} "), gst), Span::styled(trunc(&t.id, (iw - 6).max(4) as usize), if dimmed { theme::dim() } else { theme::bold(theme::text()) }), Span::raw(" ")], iw);
+    // WP-5.5: the task's own worker is repairing what QA found — `⚒ r{round}` before the state mark,
+    // dropped if the title would not keep the task id's first 6 characters
+    let badge = run.fix_view().filter(|f| w.is_some() && f.owner.as_deref() == Some(t.id.as_str())).map(|f| format!("{} r{}", theme::g("⚒", "F"), f.round));
+    let badge_at = badge.as_ref().map(|b| r.x as i32 + r.width as i32 - 5 - w_of(b) as i32).filter(|s| *s - 1 >= r.x as i32 + 4 + t.id.chars().count().min(6) as i32);
+    let id_room = match badge_at {
+        Some(s) => ((s - 1 - (r.x as i32 + 4)).max(1) as usize).min((iw - 6).max(4) as usize),
+        None => (iw - 6).max(4) as usize,
+    };
+    cv.spans(x - 1, y, &[Span::raw(" "), Span::styled(format!("{glyph} "), gst), Span::styled(trunc(&t.id, id_room), if dimmed { theme::dim() } else { theme::bold(theme::text()) }), Span::raw(" ")], iw);
+    if let (Some(b), Some(s)) = (&badge, badge_at) {
+        cv.put(s - 1, y, &format!(" {b} "), theme::bold(theme::fg(theme::ROSE)));
+    }
     let mark = match v {
         V::Running => anim::spinner().to_string(),
         V::Waiting => theme::g("⚑", "!").to_string(),
@@ -622,6 +633,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
                 }
                 (V::Waiting, Some(a)) if a.swarm_waiting => vec![Span::styled("waiting for Akasha swarm", theme::fg(theme::AMBER))],
                 (V::Waiting, _) => vec![Span::styled("needs approval · ctrl+g", theme::fg(theme::AMBER))],
+                (V::Running, a) if badge.is_some() && !a.is_some_and(producing) => vec![Span::styled("fixing what QA found", theme::fg(theme::AMBER))],
                 (_, Some(a)) if !a.busy() && a.stopped_by_user => vec![Span::styled("stopped by you · r respawn", theme::fg(theme::AMBER))],
                 (_, Some(a)) if !a.busy() && run.waiting_for_answer(a.id) => vec![Span::styled("asked a question · waiting for the answer", theme::fg(theme::AMBER))],
                 // The shimmer only proves the frame is repainting; a `last_event` that has stopped
@@ -1026,6 +1038,166 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[StageNode]) {
     let gw = (w - 4).clamp(30, 56);
     let gr = Rect { x: (cx - gw / 2) as u16, y: (yb + 3) as u16, width: gw as u16, height: 4 };
     gate_card(cv, gr, app, run, &sel);
+    // WP-5.5: a gate fix is drawn — the generic fix worker as a card beside/below the gate, the
+    // task's own worker as an edge from the gate back up to its card
+    if let Some(fv) = run.fix_view() {
+        match &fv.owner {
+            None => fix_worker_card(cv, area, app, run, &sel, &fv, gr, card_h),
+            Some(owner) => {
+                let col = centers.iter().enumerate().flat_map(|(r, row)| row.iter().map(move |(c, ti)| (r, *c, *ti))).find(|(_, _, ti)| &ph.tasks[*ti].id == owner).map(|(r, c, _)| (r as i32, c));
+                let a = fv.agent.and_then(|a| app.agents.get(&a));
+                let v = vstate(run.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == owner), a);
+                let e = fix_edge(run, &fv, v);
+                let (first, last) = (last_row.first().unwrap().0, last_row.last().unwrap().0);
+                // an owner in an upper row is marked by its badge; the edge ends at the bus end nearest the trunk
+                let c = match col { Some((r, c)) if r == rows - 1 => Some(c), _ => None };
+                fix_owner_edge(cv, &e, cx, yb, c, first.min(cx), last.max(cx));
+            }
+        }
+    }
+}
+
+/// How the edge between the gate and its fix is drawn (WP-5.5).
+struct FixEdge {
+    st: Style,
+    march: bool,
+    returning: bool,
+    failed: bool,
+}
+
+fn fix_edge(run: &Run, fv: &FixView, v: V) -> FixEdge {
+    let (st, march, failed) = if fv.returning {
+        (theme::fg(theme::GREEN), true, false)
+    } else if matches!(v, V::Failed | V::Waiting) {
+        (theme::fg(theme::RED), false, true)
+    } else if prompting(run, fv.agent) {
+        (theme::bold(theme::fg(theme::ROSE)), true, false)
+    } else {
+        (theme::fg(theme::AMBER), false, false)
+    };
+    FixEdge { st, march, returning: fv.returning, failed }
+}
+
+/// Which way a cell of the edge points when the edge goes from the gate to the fix.
+#[derive(Clone, Copy, PartialEq)]
+enum Pt {
+    Right,
+    Left,
+    Up,
+    Down,
+}
+
+/// One cell of the fix edge; `i` counts from the gate. Arrows sit every 4th cell on a horizontal
+/// run and every 2nd on a vertical one, marching away from the gate (towards it when returning).
+fn fix_cell(cv: &mut Cv, e: &FixEdge, i: i32, x: i32, y: i32, out: Pt) {
+    let horiz = matches!(out, Pt::Right | Pt::Left);
+    let dir = if !e.returning {
+        out
+    } else {
+        match out {
+            Pt::Right => Pt::Left,
+            Pt::Left => Pt::Right,
+            Pt::Up => Pt::Down,
+            Pt::Down => Pt::Up,
+        }
+    };
+    let ph = if e.march { anim::march(80) as i32 } else { 0 };
+    let k = if e.returning { i + ph } else { i - ph };
+    let g = if e.failed {
+        if horiz { theme::g("┄", ".") } else { theme::g("┆", ":") }
+    } else if k.rem_euclid(if horiz { 4 } else { 2 }) == 0 {
+        match dir {
+            Pt::Right => theme::g("▸", ">"),
+            Pt::Left => theme::g("◂", "<"),
+            Pt::Up => theme::g("▴", "^"),
+            Pt::Down => theme::g("▾", "v"),
+        }
+    } else if horiz {
+        theme::g("━", "=")
+    } else {
+        theme::g("┃", "|")
+    };
+    cv.ch(x, y, g, e.st);
+}
+
+/// The heavy box glyph that joins the given sides.
+fn conn(up: bool, down: bool, left: bool, right: bool) -> &'static str {
+    match (up, down, left, right) {
+        (true, true, false, false) => theme::g("┃", "|"),
+        (false, false, true, true) => theme::g("━", "="),
+        (false, true, false, true) => theme::g("┏", "+"),
+        (false, true, true, false) => theme::g("┓", "+"),
+        (true, false, false, true) => theme::g("┗", "+"),
+        (true, false, true, false) => theme::g("┛", "+"),
+        (true, true, false, true) => theme::g("┣", "+"),
+        (true, true, true, false) => theme::g("┫", "+"),
+        (false, true, true, true) => theme::g("┳", "+"),
+        (true, false, true, true) => theme::g("┻", "+"),
+        _ => theme::g("╋", "+"),
+    }
+}
+
+/// The generic fix worker (`fix-<round>`) as a card right of the gate, else below it, joined to
+/// the gate by the fix edge; no card where neither fits (the gate card's text says it all).
+#[allow(clippy::too_many_arguments)]
+fn fix_worker_card(cv: &mut Cv, area: Rect, app: &App, run: &Run, sel: &Option<StageNode>, fv: &FixView, gr: Rect, card_h: i32) {
+    let id = format!("fix-{}", fv.round);
+    let Some(w) = run.workers.iter().rev().find(|w| w.task.id == id) else { return };
+    let (fw, fh) = (30i32, if card_h == 5 { 5i32 } else { 4 });
+    let (gx, gy, gw, gh) = (gr.x as i32, gr.y as i32, gr.width as i32, gr.height as i32);
+    let (ax, ay, aw, ah) = (area.x as i32, area.y as i32, area.width as i32, area.height as i32);
+    let right = gx + gw + 9 + fw <= ax + aw;
+    let (fx, fy) = if right {
+        (gx + gw + 9, gy)
+    } else if gy + gh + 2 + fh <= ay + ah && gx + gw / 2 - fw / 2 >= ax {
+        (gx + gw / 2 - fw / 2, gy + gh + 2)
+    } else {
+        return;
+    };
+    let a = w.agent.and_then(|a| app.agents.get(&a));
+    let e = fix_edge(run, fv, vstate(Some(w), a));
+    if right {
+        let (x1, x2) = (gx + gw + 1, fx - 2);
+        for x in x1..=x2 {
+            fix_cell(cv, &e, x - x1, x, gy + 1, Pt::Right);
+        }
+    } else {
+        for y in gy + gh..fy {
+            fix_cell(cv, &e, y - (gy + gh), gx + gw / 2, y, Pt::Down);
+        }
+    }
+    let node = w.agent.map(StageNode::Agent).unwrap_or_else(|| StageNode::Task(w.task.id.clone()));
+    worker_card(cv, Rect { x: fx as u16, y: fy as u16, width: fw as u16, height: fh as u16 }, run, &w.task, Some(w), a, sel.as_ref() == Some(&node), app);
+}
+
+/// The edge from the gate's top centre up to the join bus and along it to the repairing task's
+/// drop (`owner_c`, a card of the last row). With no drop (the owner is in an upper row) it ends
+/// at the bus end `end` nearest the trunk. `lo`/`hi` are the ends of the whole bus.
+fn fix_owner_edge(cv: &mut Cv, e: &FixEdge, cx: i32, yb: i32, owner_c: Option<i32>, lo: i32, hi: i32) {
+    let c = owner_c.unwrap_or(lo);
+    let dx = (c - cx).signum();
+    let by = yb + 1;
+    // the stem above the gate, then the junction on the bus
+    fix_cell(cv, e, 0, cx, yb + 2, Pt::Up);
+    if c == cx {
+        cv.ch(cx, by, conn(owner_c.is_some(), true, lo < cx, hi > cx), e.st);
+        if owner_c.is_some() {
+            fix_cell(cv, e, 2, cx, yb, Pt::Up);
+        }
+        return;
+    }
+    cv.ch(cx, by, conn(false, true, lo < cx, hi > cx), e.st);
+    let (a, b) = (cx.min(c), cx.max(c));
+    let out = if dx > 0 { Pt::Right } else { Pt::Left };
+    for x in a + 1..b {
+        fix_cell(cv, e, (x - cx).abs() + 1, x, by, out);
+    }
+    if owner_c.is_some() {
+        cv.ch(c, by, conn(true, false, c > lo, c < hi), e.st);
+        fix_cell(cv, e, (c - cx).abs() + 2, c, yb, Pt::Up);
+    } else {
+        fix_cell(cv, e, (c - cx).abs() + 1, c, by, out);
+    }
 }
 
 fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>) {
@@ -1037,6 +1209,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>
         Stage::Phase { step, .. } => step.clone(),
         _ => PhaseStep::Orchestrating,
     };
+    let fv = run.fix_view();
     let blocked = run.halted() || ga.is_some_and(|a| matches!(a.status, Status::Waiting | Status::Retrying(_)) || a.swarm_waiting);
     let mut line2: Vec<Span<'static>> = vec![];
     match &step {
@@ -1045,7 +1218,19 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>
             line2.push(Span::styled(format!("gate opens when all tasks are done ({done}/{total})"), theme::faint()));
         }
         PhaseStep::Merging => line2.push(Span::styled(if blocked { "merge paused".to_string() } else { format!("{} merging branches…", anim::spinner()) }, theme::fg(theme::AMBER))),
-        PhaseStep::Fix { round } => line2.push(Span::styled(if blocked { format!("fix-{round} paused") } else { format!("{} fix-{round} is working on {}…", anim::spinner(), if *round == 0 { "the merge" } else { "what QA found" }) }, theme::fg(theme::AMBER))),
+        PhaseStep::Fix { round } => {
+            let what = match (&fv, *round) {
+                (_, 0) => "fix-0 merges the conflicting branches".to_string(),
+                (Some(FixView { owner: Some(t), .. }), _) => format!("back to {t} — it repairs its own work"),
+                _ => format!("fix-{round} repairs what QA found"),
+            };
+            let t = format!("{} {what}", theme::g("⚒", "F"));
+            line2.push(Span::styled(if blocked { format!("paused · {t}") } else { format!("{} {t}", anim::spinner()) }, theme::fg(theme::AMBER)));
+        }
+        PhaseStep::Checks { .. } if fv.as_ref().is_some_and(|f| f.returning) => {
+            let t = "checks after the fix…";
+            line2.push(Span::styled(if blocked { format!("paused · {t}") } else { format!("{} {t}", anim::spinner()) }, theme::fg(theme::BLUE)));
+        }
         _ => {
             if run.checks.is_empty() && matches!(step, PhaseStep::Checks { .. }) {
                 line2.push(Span::styled(if blocked { "checks paused".to_string() } else { format!("{} running checks…", anim::spinner()) }, theme::fg(theme::BLUE)));
@@ -1072,14 +1257,70 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>
         cv.boxed(r, st, selected, matches!(step, PhaseStep::Orchestrating) && !selected);
         cv.spans(r.x as i32 + 1, r.y as i32, &[Span::raw(" "), Span::styled(format!("{} ", theme::role_glyph(&role.glyph)), theme::bold(theme::fg(col))), Span::styled(format!("gate · {gname} "), theme::bold(theme::text()))], r.width as i32 - 2);
         let l1 = if matches!(step, PhaseStep::Handoff) { format!("{} passed — handing off", theme::g("✓", "v")) } else { format!("{} · {}", role.model, role.effort) };
-        cv.put(r.x as i32 + 2, r.y as i32 + 1, &trunc(&l1, (r.width as usize).saturating_sub(4)), theme::dim());
+        match gate_line1(run, ga, &step, col, r.width as i32 - 4) {
+            Some(l) => cv.spans(r.x as i32 + 2, r.y as i32 + 1, &l, r.width as i32 - 4),
+            None => {
+                cv.put(r.x as i32 + 2, r.y as i32 + 1, &trunc(&l1, (r.width as usize).saturating_sub(4)), theme::dim());
+            }
+        }
         cv.spans(r.x as i32 + 2, r.y as i32 + 2, &line2, r.width as i32 - 4);
     } else {
-        let round = if let PhaseStep::Gate { round } = step { format!("round {round} · ") } else { String::new() };
-        let mut l = vec![Span::styled(round, theme::fg(col))];
-        l.extend(line2);
-        agent_card(cv, r, run, app, ga, &format!("gate · {gname}"), &role.glyph, col, l, is_sel(sel, run.gate_agent, "gate"), "gate");
+        agent_card(cv, r, run, app, ga, &format!("gate · {gname}"), &role.glyph, col, line2, is_sel(sel, run.gate_agent, "gate"), "gate");
+        // `round r/max · ` and the QA agent's activity or verdict replace the card's activity line
+        if let Some(l) = gate_line1(run, ga, &step, col, r.width as i32 - 4).filter(|_| r.height >= 3) {
+            for x in r.x as i32 + 1..r.x as i32 + r.width as i32 - 1 {
+                cv.ch(x, r.y as i32 + 1, " ", Style::default());
+            }
+            cv.spans(r.x as i32 + 2, r.y as i32 + 1, &l, r.width as i32 - 4);
+        }
     }
+}
+
+/// The number of findings in a QA report: lines that start with `1.`, `-`, `*` or `F1`.
+fn finding_count(report: &str) -> usize {
+    report
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| {
+            let rest = l.trim_start_matches(|c: char| c.is_ascii_digit());
+            l.starts_with(['-', '*']) || (l.starts_with('F') && l[1..].starts_with(|c: char| c.is_ascii_digit())) || (rest.len() < l.len() && rest.starts_with('.'))
+        })
+        .count()
+}
+
+/// The gate card's first content line (WP-5.5): `round {r}/{max} · ` and what QA says now — its
+/// activity while it works, its verdict after. `None` where the card keeps its own line.
+fn gate_line1(run: &Run, ga: Option<&Agent>, step: &PhaseStep, col: (u8, u8, u8), iw: i32) -> Option<Vec<Span<'static>>> {
+    let (round, max) = run.gate_rounds();
+    if round == 0 {
+        return None;
+    }
+    let verdict = run.last_gate_verdict().filter(|(r, _, _)| *r == round);
+    let findings = |rep: &str| match finding_count(rep) {
+        0 => format!("{} failed", theme::g("✗", "x")),
+        1 => format!("{} 1 finding", theme::g("✗", "x")),
+        k => format!("{} {k} findings", theme::g("✗", "x")),
+    };
+    let prefix = format!("round {round}/{max} · ");
+    let room = (iw as usize).saturating_sub(w_of(&prefix));
+    let text: Vec<Span<'static>> = match (step, verdict) {
+        (PhaseStep::Gate { .. }, _) if run.gate_plan_defect() => vec![Span::styled(format!("{} a check is wrong — the planner is asked", theme::g("✗", "x")), theme::fg(theme::AMBER))],
+        (PhaseStep::Gate { .. }, Some((_, false, rep))) if !ga.is_some_and(producing) => vec![Span::styled(findings(rep), theme::fg(theme::RED))],
+        (PhaseStep::Gate { .. }, _) => {
+            let a = ga?;
+            if producing(a) {
+                anim::shimmer(&trunc(&a.activity, room), theme::mix_rgb(col, theme::MUTED), theme::TEXT)
+            } else {
+                vec![Span::styled(trunc(&a.activity, room), theme::dim())]
+            }
+        }
+        (PhaseStep::Checks { .. }, Some((_, true, _))) => vec![Span::styled(format!("{} QA passed — verifying checks", theme::g("✓", "v")), theme::fg(theme::GREEN))],
+        (PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, Some((_, false, rep))) => vec![Span::styled(findings(rep), theme::fg(theme::RED))],
+        _ => return None,
+    };
+    let mut l = vec![Span::styled(prefix, theme::fg(col))];
+    l.extend(text);
+    Some(l)
 }
 
 fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[StageNode]) {
@@ -1547,5 +1788,179 @@ mod tests {
             assert!(!all.contains("·· ") && !all.contains("sol·"), "{all}");
             assert!(rows.iter().all(|r| crate::util::width(r) <= w as usize), "{all}");
         }
+    }
+
+    // ── WP-5.5: a gate fix is drawn ──
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Fx {
+        Owner,
+        Generic,
+        ReturningGeneric,
+        ReturningOwner,
+        Passed,
+    }
+
+    /// A phase whose two tasks are done and whose gate is in the state `fx`.
+    fn fix_app(fx: Fx) -> App {
+        use crate::engine::run::{FixView, PhaseStep, WState};
+        use crate::web::snapshot::tests::{add_agent, worker};
+        let mut app = phase_app();
+        let run = app.run.as_mut().unwrap();
+        run.workers[1].state = WState::Done;
+        run.prev_gate = Some((1, false, "1. tools/audit.sh: wrong exit code\n2. docs missing\n- a third\nF4 and a fourth\nplain prose".into()));
+        let owner_view = |returning| FixView { round: 1, owner: Some("p1-api".into()), agent: Some(10), returning };
+        match fx {
+            Fx::Owner | Fx::ReturningOwner => {
+                run.fix_owner = Some("p1-api".into());
+                run.stage = Stage::Phase { idx: 0, step: if fx == Fx::Owner { PhaseStep::Fix { round: 1 } } else { PhaseStep::Checks { round: 1 } } };
+                if fx == Fx::Owner {
+                    run.workers[0].state = WState::Running;
+                    run.workers[0].owner_fixing = Some(1);
+                } else {
+                    run.fix_done = Some(owner_view(true));
+                }
+                app.agents.get_mut(&10).unwrap().activity = if fx == Fx::Owner { "editing tools/audit.sh".into() } else { "done".into() };
+            }
+            Fx::Generic | Fx::ReturningGeneric => {
+                add_agent(&mut app, 12, "fix-1");
+                let run = app.run.as_mut().unwrap();
+                let mut w = worker("fix-1", 1, Some(12), if fx == Fx::Generic { WState::Running } else { WState::Done });
+                w.adhoc = true;
+                run.workers.push(w);
+                run.stage = Stage::Phase { idx: 0, step: if fx == Fx::Generic { PhaseStep::Fix { round: 1 } } else { PhaseStep::Checks { round: 1 } } };
+                if fx == Fx::ReturningGeneric {
+                    run.fix_done = Some(FixView { round: 1, owner: None, agent: Some(12), returning: true });
+                }
+                app.agents.get_mut(&12).unwrap().activity = "editing tools/audit.sh".into();
+                app.agents.get_mut(&12).unwrap().model_alias = "luna".into();
+            }
+            Fx::Passed => {
+                run.prev_gate = Some((2, true, "all good".into()));
+                run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 2 } };
+            }
+        }
+        app
+    }
+
+    fn assert_fits(rows: &[String], w: u16) {
+        for l in rows {
+            assert!(w_of(l) <= w as usize, "line overflows {w}: {l:?}");
+        }
+    }
+
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no row with {needle:?}:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn a_generic_fix_worker_is_a_card_right_of_the_gate_joined_by_an_edge() {
+        let mut app = fix_app(Fx::Generic);
+        let rows = frame(&mut app, 200, 40);
+        assert_fits(&rows, 200);
+        let g = row_of(&rows, "gate · qa");
+        let fix = row_of(&rows, "◇ fix-1");
+        assert!(rows[fix].find("fix-1").unwrap() > rows[g].find("gate ·").unwrap(), "the fix card is right of the gate:\n{}", rows.join("\n"));
+        assert!(rows[g + 1].contains('▸') || rows[g + 1].contains('>'), "an arrow on the gate's second row: {:?}", rows[g + 1]);
+        assert!(rows[g + 1].contains("round 1/3 · ✗ 4 findings"), "{:?}", rows[g + 1]);
+        assert!(rows[g + 2].contains("⚒ fix-1 repairs what QA found"), "{:?}", rows[g + 2]);
+        assert!(app.stage_nav.iter().any(|(n, _, _)| *n == StageNode::Agent(12)), "the fix card is a node");
+        // the rail says who fixes
+        assert!(rows.join("\n").contains("QA gate · round 1/3 · fix by fix-1"), "{}", rows.join("\n"));
+        // 120 columns: the gate is 56 wide, so the card goes below it
+        let mut app = fix_app(Fx::Generic);
+        let rows = frame(&mut app, 120, 40);
+        assert_fits(&rows, 120);
+        let (g, fix) = (row_of(&rows, "gate · qa"), row_of(&rows, "◇ fix-1"));
+        assert!(fix > g + 3 && rows[g + 4].contains('▾'), "{}", rows.join("\n"));
+        // too small for the card: the gate's text is all there is, nothing breaks
+        for (w, h) in [(60u16, 20u16), (80, 28)] {
+            let mut app = fix_app(Fx::Generic);
+            let rows = frame(&mut app, w, h);
+            assert_fits(&rows, w);
+        }
+    }
+
+    #[test]
+    fn a_fix_card_below_the_gate_has_a_vertical_edge() {
+        let mut app = fix_app(Fx::Generic);
+        let rows = frame(&mut app, 100, 44);
+        assert_fits(&rows, 100);
+        let (g, fix) = (row_of(&rows, "gate · qa"), row_of(&rows, "◇ fix-1"));
+        assert!(fix > g + 3, "the card is below the gate:\n{}", rows.join("\n"));
+        assert!(rows[g + 4].contains('▾') || rows[g + 5].contains('▾'), "{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn the_owner_wears_the_badge_and_the_edge_runs_from_the_gate_to_it() {
+        for (w, h) in [(80u16, 28u16), (120, 34), (160, 40)] {
+            let mut app = fix_app(Fx::Owner);
+            let rows = frame(&mut app, w, h);
+            assert_fits(&rows, w);
+            let t = rows[row_of(&rows, "╭ ◇ p1-api")].clone();
+            assert!(t.contains("⚒ r1"), "badge on the owner's title row: {t:?}");
+            let all = rows.join("\n");
+            assert!(all.contains("editing tools/audit.sh") || all.contains("fixing what QA found"), "the owner's activity: {all}");
+            assert!(all.contains("fix by p1-api"), "{all}");
+            assert!(!rows.iter().any(|l| l.contains("◇ fix-1")), "no fix card for an owner");
+            if w == 80 {
+                continue; // 80x28 has no room for the gate card at all (the card list stops at the workers)
+            }
+            assert!(all.contains("back to p1-api — it repairs its own work"), "{all}");
+            assert!(all.contains("round 1/3 · ✗ 4 findings"), "{all}");
+            assert!(all.contains('▴') && all.contains('┃'), "the edge up from the gate: {all}");
+        }
+    }
+
+    #[test]
+    fn the_checks_after_a_fix_run_the_edge_back_to_the_gate() {
+        for fx in [Fx::ReturningGeneric, Fx::ReturningOwner] {
+            for (w, h) in [(80u16, 28u16), (120, 34), (160, 40)] {
+                let mut app = fix_app(fx);
+                let rows = frame(&mut app, w, h);
+                assert_fits(&rows, w);
+                let all = rows.join("\n");
+                if fx == Fx::ReturningOwner {
+                    assert!(all.contains("⚒ r1"), "{all}");
+                }
+                if w == 80 {
+                    continue;
+                }
+                assert!(all.contains("checks after the fix…"), "{all}");
+                assert!(all.contains("round 1/3 · ✗ 4 findings"), "{all}");
+                if fx == Fx::ReturningOwner {
+                    assert!(all.contains('▾'), "the edge comes back down to the gate: {all}");
+                }
+            }
+        }
+        let rows = frame(&mut fix_app(Fx::ReturningGeneric), 200, 40);
+        let g = row_of(&rows, "gate · qa");
+        assert!(rows[g + 1].contains('◂'), "the edge points back to the gate: {:?}", rows[g + 1]);
+    }
+
+    #[test]
+    fn nothing_of_the_fix_is_left_once_the_gate_passed() {
+        for (w, h) in [(80u16, 28u16), (160, 40)] {
+            let mut app = fix_app(Fx::Passed);
+            let rows = frame(&mut app, w, h);
+            assert_fits(&rows, w);
+            let all = rows.join("\n");
+            assert!(!all.contains('⚒') && !all.contains("◇ fix-1") && !all.contains("checks after the fix"), "{all}");
+            if w > 80 {
+                assert!(all.contains("round 2/3 · ✓ QA passed — verifying checks"), "{all}");
+            }
+        }
+        // and the engine forgets the fix: a new QA round or the hand-off clears it
+        let mut app = fix_app(Fx::ReturningOwner);
+        let run = app.run.as_mut().unwrap();
+        assert!(run.fix_view().is_some_and(|f| f.returning));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 2 } };
+        assert!(run.fix_view().is_none());
+    }
+
+    #[test]
+    fn findings_are_counted_from_the_report() {
+        assert_eq!(finding_count("1. a\n  2. b\n- c\n* d\nF4 e\nF e\nprose\n10. x"), 6);
+        assert_eq!(finding_count("looks fine"), 0);
     }
 }
