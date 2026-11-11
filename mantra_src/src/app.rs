@@ -961,6 +961,14 @@ impl Ctx for Ctxt<'_> {
     fn interrupt(&mut self, a: AgentId) {
         self.hub.send(a, Cmd::Interrupt);
     }
+    fn carry_over(&mut self, from: AgentId, to: AgentId) {
+        let moved = self.agents.get_mut(&from).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+        if !moved.is_empty() {
+            if let Some(b) = self.agents.get_mut(&to) {
+                b.queued.extend(moved);
+            }
+        }
+    }
     fn compact(&mut self, a: AgentId) {
         if let Some(ag) = self.agents.get_mut(&a) {
             ag.compacting = true;
@@ -2384,6 +2392,13 @@ impl App {
             }
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
+        if let Some(r) = self.run.as_mut() {
+            for (old, new) in std::mem::take(&mut r.replaced) {
+                if self.screen == Screen::Zoom(old) {
+                    self.set_screen(Screen::Zoom(new));
+                }
+            }
+        }
         if self.run.is_some() {
             self.follow_respawned_task();
             let n = self.stage_nodes().len();
@@ -2391,6 +2406,19 @@ impl App {
                 self.sel = n - 1;
             }
             self.select_halted_agent();
+        }
+    }
+
+    /// Journal that queued user messages went to an agent of the run.
+    fn log_delivered(&mut self, agent: AgentId, queued: &[String]) {
+        let Some(first) = queued.first() else { return };
+        if !self.in_run(agent) {
+            return;
+        }
+        let more = if queued.len() > 1 { format!(" (+{} more)", queued.len() - 1) } else { String::new() };
+        if let Some(r) = self.run.as_mut() {
+            let name = r.name_of(agent);
+            r.log("›", "rose", format!("delivered to {name}: {}{more}", crate::util::trunc(first, 60)));
         }
     }
 
@@ -2483,10 +2511,10 @@ impl App {
                     None => return,
                 };
                 if method == "turn/started" {
-                    if let Some(a) = self.agents.get_mut(&agent) {
-                        for q in std::mem::take(&mut a.queued) {
-                            self.hub.send(agent, Cmd::Steer { text: q });
-                        }
+                    let drained = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+                    self.log_delivered(agent, &drained);
+                    for q in drained {
+                        self.hub.send(agent, Cmd::Steer { text: q });
                     }
                 }
                 if method == "thread/tokenUsage/updated" && (Some(agent) == self.solo || self.screen == Screen::Zoom(agent)) {
@@ -2509,8 +2537,11 @@ impl App {
                     if pending {
                         self.compact_agent(agent);
                     }
-                    let queued = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+                    // a failed turn keeps the queue: the retry's (or the fallback's) first turn takes it
+                    let failed = params.pointer("/turn/status").and_then(|s| s.as_str()) == Some("failed");
+                    let queued = if failed { vec![] } else { self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default() };
                     if !queued.is_empty() {
+                        self.log_delivered(agent, &queued);
                         prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false, Send::Auto);
                     }
                 }
@@ -3168,6 +3199,11 @@ impl App {
         if k.code == KeyCode::Backspace && self.input.is_empty() {
             if let Some(a) = self.composer_agent() {
                 if let Some(text) = self.agents.get_mut(&a).and_then(|ag| ag.queued.pop()) {
+                    if self.in_run(a) {
+                        if let Some(r) = self.run.as_mut() {
+                            r.log("↩", "gray", "a queued message was taken back for editing");
+                        }
+                    }
                     self.input.set(&text);
                     return;
                 }
@@ -4738,6 +4774,30 @@ done"#;
         app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
         app.select_halted_agent();
         assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_keeps_the_queue_and_a_completed_one_flushes_it() {
+        use crate::web::snapshot::tests::add_agent;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.stage = Stage::Planning;
+        app.run = Some(run);
+        add_agent(&mut app, 1, "planner");
+        let _ = app.hub.alloc_id(); // the replacement planner must not reuse id 1
+        let _rx = app.hub.test_register(1);
+        app.agents.get_mut(&1).unwrap().queued.push("please also add tests".into());
+        app.on_hub(HubEvent::Notif { agent: 1, method: "turn/completed".into(), params: json!({"turn":{"status":"failed","error":{"message":"boom"}}}) });
+        // the engine's free respawn of a failed planner follows; the chips went with it
+        let p = app.run.as_ref().unwrap().planner.unwrap();
+        assert_eq!(app.agents[&p].queued, ["please also add tests"], "a failed turn leaves the chips");
+        app.agents.get_mut(&p).unwrap().turn_active = true;
+        app.agents.get_mut(&p).unwrap().awaiting_start = false;
+        let _rx2 = app.hub.test_register(p);
+        app.on_hub(HubEvent::Notif { agent: p, method: "turn/completed".into(), params: json!({"turn":{"status":"completed"}}) });
+        assert!(!app.agents[&p].queued.iter().any(|q| q.contains("please also add tests")), "a completed turn flushes");
+        assert!(app.run.as_ref().unwrap().pulse.iter().any(|p| p.text.starts_with("delivered to planner: please also add tests")));
     }
 
     #[test]

@@ -17,6 +17,7 @@ struct TestCtx {
     /// for the vision tools': see `finished`).
     jobs: Vec<String>,
     stopped: Vec<AgentId>,
+    carried: Vec<(AgentId, AgentId)>,
     efforts_set: Vec<(AgentId, String)>,
     renamed: Vec<(AgentId, String)>,
     /// Every `ctx.spawn`'s role model alias, by the id it was given.
@@ -46,7 +47,7 @@ struct Spawned {
 impl TestCtx {
     // Tests below exercise the Conductor's decisions without making a provider call.
     fn new() -> TestCtx {
-        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
+        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], carried: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
     }
     /// Hands every finished vision job back to `run`, as the app's event loop would.
     fn settle(&mut self, run: &mut Run) {
@@ -370,6 +371,9 @@ impl Ctx for TestCtx {
     }
     fn prompt_mode(&mut self, a: AgentId, text: String, _mode: Send) {
         self.prompts.push((a, text));
+    }
+    fn carry_over(&mut self, from: AgentId, to: AgentId) {
+        self.carried.push((from, to));
     }
     fn interrupt(&mut self, a: AgentId) {
         self.interrupted.push(a);
@@ -4923,5 +4927,48 @@ fn a_worker_without_a_status_line_is_asked_once() {
     assert!(run.pulse.iter().any(|p| p.text.contains("t1 ended its turn without a STATUS line")));
     run.on_turn_done(&mut ctx, a, "completed", None, None);
     assert_eq!(run.workers[0].state, WState::Done);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn respawning_the_planner_carries_the_queue_and_records_the_replacement() {
+    let (mut run, mut ctx, p) = planner_feature_run("carry-over", Pattern::builtin());
+    run.respawn_planner(&mut ctx, None);
+    let new = run.planner.unwrap();
+    assert_ne!(new, p);
+    assert_eq!(ctx.carried, [(p, new)]);
+    assert_eq!(run.replaced, [(p, new)]);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_prompt_sent_just_before_a_halt_comes_back_with_the_resume_prompt() {
+    let (mut run, mut ctx, a) = empty_turn_setup("redeliver", false);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    let name = run.name_of(a);
+    let (_, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": name, "message": "use the new parser"}));
+    assert!(ok);
+    run.halt_full(&mut ctx, HaltReason::AgentTurnFailed, Some(a), "x".into(), "x".into());
+    ctx.prompts.clear();
+    run.resume(&mut ctx);
+    let resume = ctx.prompts.iter().find(|(x, t)| *x == a && t.starts_with("[mantra:resume]")).expect("resume prompt").1.clone();
+    assert!(resume.contains("Sent to you just before the pause") && resume.contains("- [from the orchestrator] use the new parser"), "{resume}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn the_orchestrator_cannot_prompt_a_worker_through_a_halt() {
+    let (mut run, mut ctx, a) = empty_turn_setup("hold", false);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    let name = run.name_of(a);
+    run.halt_full(&mut ctx, HaltReason::AgentTurnFailed, Some(a), "x".into(), "x".into());
+    ctx.prompts.clear();
+    let (text, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": name, "message": "carry on"}));
+    assert!(ok && text.starts_with("held — the run is halted"), "{text}");
+    assert!(ctx.prompts.is_empty());
+    run.resume(&mut ctx);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == a && t.contains("- [from the orchestrator] carry on")), "{:?}", ctx.prompts);
     let _ = std::fs::remove_dir_all(&run.dir);
 }

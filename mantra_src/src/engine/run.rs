@@ -120,6 +120,9 @@ pub trait Ctx {
     /// reach an agent that is already busy. Engine call sites always use plain `prompt`.
     fn prompt_mode(&mut self, a: AgentId, text: String, mode: Send);
     fn interrupt(&mut self, a: AgentId);
+    /// `to` replaces `from` in its slot (a respawn, a fallback): what was queued for `from` is
+    /// now `to`'s. Default: nothing to carry.
+    fn carry_over(&mut self, _from: AgentId, _to: AgentId) {}
     fn compact(&mut self, a: AgentId);
     fn stop(&mut self, a: AgentId, archive: bool);
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool);
@@ -601,6 +604,13 @@ pub struct Run {
     pub(super) fallback_used: HashMap<String, Vec<String>>,
     /// Per slot: consecutive empty turns (WP-1.4).
     empty_strikes: HashMap<String, u8>,
+    /// `(old, new)` for every agent a respawn or fallback replaced; the app drains it so a zoomed
+    /// view follows the replacement.
+    pub replaced: Vec<(AgentId, AgentId)>,
+    /// The last five `mantra_prompt` texts sent to each agent, with when.
+    recent_prompts: HashMap<AgentId, VecDeque<(Instant, String)>>,
+    /// Messages a halt may have swallowed (or held back): shown to the agent on resume.
+    redeliver: HashMap<AgentId, Vec<String>>,
     /// Slots already warned that they run on a pinned model whose provider is in trouble
     /// (`model_for_spawn`), so the warning is journalled once per slot. Runtime only.
     pin_trouble_warned: HashSet<String>,
@@ -713,6 +723,9 @@ impl Run {
             provider_trouble: HashMap::new(),
             fallback_used: HashMap::new(),
             empty_strikes: HashMap::new(),
+            replaced: vec![],
+            recent_prompts: HashMap::new(),
+            redeliver: HashMap::new(),
             pin_trouble_warned: HashSet::new(),
             known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
@@ -1085,6 +1098,15 @@ impl Run {
     /// message comes in two lengths: `message` for the pulse line, the band and the alert; `full`
     /// — the backend's whole error, nothing cut off — for the journal, `state.json` and whoever
     /// the halt is escalated to.
+    /// Keep the last five `mantra_prompt` texts sent to `t`, for `halt_full` to hand back on resume.
+    fn remember_prompt(&mut self, t: AgentId, text: &str) {
+        let q = self.recent_prompts.entry(t).or_default();
+        q.push_back((Instant::now(), text.to_string()));
+        while q.len() > 5 {
+            q.pop_front();
+        }
+    }
+
     fn halt_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
         // A halt about one agent's provider (or its failed turn) is a soft halt: the others finish
         // the turn they are in, and the pause boundary holds whatever they would start next.
@@ -1107,6 +1129,12 @@ impl Run {
                 ctx.interrupt(a);
                 if !self.paused_agents.contains(&a) {
                     self.paused_agents.push(a);
+                }
+                // what was sent to it in the last seconds may have died with the interrupted turn
+                let fresh: Vec<String> = self.recent_prompts.get(&a).map(|q| q.iter().filter(|(t, _)| t.elapsed() < Duration::from_secs(20)).map(|(_, m)| m.clone()).collect()).unwrap_or_default();
+                if !fresh.is_empty() {
+                    self.recent_prompts.remove(&a);
+                    self.redeliver.entry(a).or_default().extend(fresh);
                 }
             }
         }
@@ -1220,11 +1248,24 @@ impl Run {
         // Re-prompt what the halt interrupted — unless the pick-up above already gave it its
         // next prompt (`edges` is stamped at every engine prompt) or archived it.
         let live = self.all_agents();
-        for a in paused {
+        for a in paused.clone() {
             if Some(a) == except || !live.contains(&a) || self.edges.get(&a).map(|t| *t >= t0).unwrap_or(false) {
                 continue;
             }
-            ctx.prompt(a, self.with_akasha(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into()));
+            let mut text = String::from("[mantra:resume] The run was paused and is resuming now. Continue where you left off.");
+            if let Some(held) = self.redeliver.remove(&a).filter(|h| !h.is_empty()) {
+                text.push_str("\n\nSent to you just before the pause — it may not have reached you (ignore what you already acted on):");
+                for m in held {
+                    text.push_str(&format!("\n- {m}"));
+                }
+            }
+            ctx.prompt(a, self.with_akasha(a, text));
+        }
+        // messages held for an agent the halt had not interrupted (it was idle): plain delivery
+        let leftover: Vec<(AgentId, Vec<String>)> = std::mem::take(&mut self.redeliver).into_iter().filter(|(a, h)| live.contains(a) && !paused.contains(a) && !h.is_empty()).collect();
+        for (a, held) in leftover {
+            self.mark_edge(a);
+            ctx.prompt(a, self.with_akasha(a, held.join("\n\n")));
         }
         self.wake_orch(ctx);
     }
@@ -3451,6 +3492,9 @@ Then summarize in 2-4 lines.",
                 self.workers[wi].prompt = join_note(Some(note), task_prompt.clone());
                 self.launch_worker(ctx, wi, dir, branch);
                 self.workers[wi].prompt = task_prompt;
+                if let Some(new) = self.workers[wi].agent.filter(|n| *n != a) {
+                    self.replaced.push((a, new));
+                }
                 true
             } else {
                 false
@@ -4582,11 +4626,15 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_manager(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
-        if let Some(old) = self.manager.take() {
+        let old_manager = self.manager.take();
+        if let Some(old) = old_manager {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_manager_with(ctx, None);
+        if let Some(old) = old_manager {
+            self.replaced.push((old, id));
+        }
         self.mark_edge(id);
         let brief = self.manager_brief("[mantra:respawn] You are the new manager of this run (the previous one was respawned).");
         let mut prompt = join_note(note, brief);
@@ -4690,11 +4738,16 @@ Then summarize in 2-4 lines.",
 
     fn respawn_planner(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
         let shared_finale = self.planner.is_some() && self.finale_agent == self.planner && matches!(self.stage, Stage::Finale { .. });
-        if let Some(old) = self.planner.take() {
+        let old_planner = self.planner.take();
+        if let Some(old) = old_planner {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_planner(ctx);
+        if let Some(old) = old_planner {
+            ctx.carry_over(old, id);
+            self.replaced.push((old, id));
+        }
         if shared_finale {
             self.finale_agent = Some(id);
             if let Stage::Finale { idx } = self.stage {
@@ -4729,11 +4782,15 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_orchestrator(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
-        if let Some(old) = self.orchestrator.take() {
+        let old_orch = self.orchestrator.take();
+        if let Some(old) = old_orch {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_orchestrator(ctx);
+        if let Some(old) = old_orch {
+            self.replaced.push((old, id));
+        }
         self.mark_edge(id);
         let phase_json = self.current_phase().map(|p| serde_json::to_string_pretty(p).unwrap_or_default()).unwrap_or_default();
         let status = self.status_text(ctx);
@@ -4753,7 +4810,8 @@ Then summarize in 2-4 lines.",
             Stage::Phase { step: PhaseStep::Gate { round }, .. } => round,
             _ => 1,
         };
-        if let Some(old) = self.gate_agent.take() {
+        let old_gate = self.gate_agent.take();
+        if let Some(old) = old_gate {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
@@ -4764,6 +4822,9 @@ Then summarize in 2-4 lines.",
             return Some(RESPAWN_DEFERRED);
         }
         self.spawn_gate_at_round(ctx, idx, round);
+        if let (Some(old), Some(g)) = (old_gate, self.gate_agent) {
+            self.replaced.push((old, g));
+        }
         if let (Some(n), Some(g)) = (note, self.gate_agent) {
             ctx.prompt(g, format!("[mantra:respawn] {n}"));
         }
@@ -5146,10 +5207,22 @@ Then summarize in 2-4 lines.",
                         // An answer to a question the target asked up the chain: it is waiting
                         // for exactly this, so none of the idle-worker guards apply.
                         let answering = self.pending_questions.remove(&t).is_some();
+                        // During a halt the orchestrator's messages to its workers, the gate and the
+                        // finale are held: the interrupted agent would lose them. They arrive with the
+                        // resume prompt. (The planner and the manager keep prompting — that is how
+                        // halts get resolved.)
+                        if self.halted() && Some(a) == self.orchestrator && (self.worker_idx(t).is_some() || Some(t) == self.gate_agent || Some(t) == self.finale_agent) {
+                            let from = self.name_of(a);
+                            let text = if answering { format!("[from the {from}] (answering your question) {m}") } else { format!("[from the {from}] {m}") };
+                            self.redeliver.entry(t).or_default().push(text);
+                            return (format!("held — the run is halted; {n} gets this when it resumes"), true);
+                        }
                         if answering {
                             self.mark_edge(t);
                             let from = self.name_of(a);
-                            ctx.prompt(t, format!("[from the {from}] (answering your question) {m}"));
+                            let text = format!("[from the {from}] (answering your question) {m}");
+                            self.remember_prompt(t, &text);
+                            ctx.prompt(t, text);
                             self.log("›", "rose", format!("{from} → {n} (answer): {}", trunc(&m, 60)));
                             return (format!("answer sent to {n}"), true);
                         }
@@ -5180,7 +5253,9 @@ Then summarize in 2-4 lines.",
                         }
                         self.mark_edge(t);
                         let from = self.name_of(a);
-                        ctx.prompt(t, format!("[from the {from}] {m}"));
+                        let text = format!("[from the {from}] {m}");
+                        self.remember_prompt(t, &text);
+                        ctx.prompt(t, text);
                         self.log("›", "rose", format!("{from} → {n}: {}", trunc(&m, 60)));
                         (format!("sent to {n}"), true)
                     }
