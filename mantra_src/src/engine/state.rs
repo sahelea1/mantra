@@ -55,6 +55,11 @@ pub struct RunState {
     pub handoff: String,
     /// One line per gate/finale report so far (see `Run::gate_notes`).
     pub gate_notes: Vec<String>,
+    /// `Run::gate_seq` / `last_gate_file` (WP-2.8).
+    #[serde(default)]
+    pub gate_seq: u32,
+    #[serde(default)]
+    pub last_gate_file: Option<PathBuf>,
     pub workers: Vec<WorkerState>,
     pub agents: Vec<AgentState>,
     /// Phases already completed (for the summary screen after a resume).
@@ -465,6 +470,8 @@ pub(crate) mod tests {
             id: "123-add-login".into(),
             title: "Add a login page".into(),
             gate_notes: vec!["phase 1 · QA round 1: pass — fine".into()],
+            gate_seq: 0,
+            last_gate_file: None,
             project: PathBuf::from("/tmp/proj"),
             brief: "add login".into(),
             pattern: "mantra-default".into(),

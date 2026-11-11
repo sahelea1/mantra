@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod helpers;
-use helpers::{failing_cmds, failing_sig, fnv1a, join_note, parse_gate_from_text, paths_in, project_is_empty, reason_label, worker_brief_context};
-pub use helpers::{tidy_title, title_from_goal};
+use helpers::{failing_cmds, fit_or_point, failing_sig, fnv1a, join_note, parse_gate_from_text, paths_in, project_is_empty, reason_label, worker_brief_context};
+pub use helpers::{is_fix_id, tidy_title, title_from_goal};
 
 /// How much of a phase's diff the QA agent is shown (the rest is one `git diff` away).
 const GATE_DIFF_BYTES: usize = 30_000;
@@ -50,7 +50,7 @@ pub enum JobOut {
     Merge(git::MergeResult),
     /// The results, the paths the checks left behind that were discarded before any commit, and
     /// the phase's diff for the gate agent that follows.
-    Checks(Vec<CheckResult>, Vec<String>, git::ReviewDiff),
+    Checks(Vec<CheckResult>, Vec<String>, git::ReviewDiff, Option<String>),
     /// The phase commit's outcome, plus the run's diff so far (what the finale reviews).
     Cleanup(Result<String, String>, git::ReviewDiff),
     Text(Result<String, String>),
@@ -97,6 +97,9 @@ pub struct SpawnReq {
     /// The pattern's `settings.claude_user_config` ("inherit" | "project"), set by `Run::role_req`;
     /// empty = inherit.
     pub claude_user_config: String,
+    /// A fix worker on the integration copy of a worktree run: it must write `.git` (merge a
+    /// conflict by hand), which Codex's workspace-write sandbox forbids (`Ctxt::spawn`).
+    pub git_write: bool,
 }
 
 /// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
@@ -517,6 +520,17 @@ pub struct Run {
     /// One line per gate report and finale report of the run so far — what later reviewers start
     /// from instead of re-deriving it. Saved with the state.
     pub gate_notes: Vec<String>,
+    /// Gate reports written to `gate/` so far (their file names are numbered by it) and the newest one.
+    pub(super) gate_seq: u32,
+    pub(super) last_gate_file: Option<PathBuf>,
+    /// The gate agent that was retired last: `mantra_log` can still read it.
+    last_gate_agent: Option<AgentId>,
+    /// Fingerprint of the workspace after the newest checks run, and as it was when the last fix
+    /// worker started: equal means that fix changed nothing (`on_job`, `FixChecks`).
+    tree_print: Option<String>,
+    fix_base_print: Option<String>,
+    /// The "fix workers run without Codex's sandbox" line was journaled in this run.
+    git_write_said: bool,
     /// The previous gate round's verdict for the phase in progress, shown to the next round's
     /// fresh agent (`pass|fail` and the summary).
     prev_gate: Option<(u32, bool, String)>,
@@ -726,6 +740,12 @@ impl Run {
             gate_nudges: 0,
             resume_note: None,
             gate_notes: vec![],
+            gate_seq: 0,
+            last_gate_file: None,
+            last_gate_agent: None,
+            tree_print: None,
+            fix_base_print: None,
+            git_write_said: false,
             prev_gate: None,
             phase_diff: git::ReviewDiff::default(),
             run_diff: None,
@@ -888,7 +908,7 @@ impl Run {
                     _ => String::new(),
                 };
                 let mut report = w.report.clone();
-                crate::util::tail_bytes(&mut report, 6000);
+                crate::util::tail_bytes(&mut report, 24_000);
                 WorkerState {
                     task: w.task.id.clone(),
                     title: w.task.title.clone(),
@@ -938,6 +958,8 @@ impl Run {
             nested_run_base: self.nested_run_base.clone(),
             handoff: self.handoff.clone(),
             gate_notes: self.gate_notes.clone(),
+            gate_seq: self.gate_seq,
+            last_gate_file: self.last_gate_file.clone(),
             workers,
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
@@ -1498,7 +1520,7 @@ impl Run {
         let status = self.status_text(ctx);
         let checks = self.check_summary();
         let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
-        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}\n", if *ok { "pass" } else { "fail" }, trunc(s, 400))).unwrap_or_default();
+        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}\n", if *ok { "pass" } else { "fail" }, fit_or_point(s, 6_000, self.last_gate_file.as_deref()))).unwrap_or_default();
         (phase, format!("Workers:\n{status}{report}Gate checks (last run):\n{checks}"))
     }
 
@@ -1737,7 +1759,7 @@ Then summarize in 2-4 lines.",
             "planner" => return self.planner,
             "manager" => return self.manager,
             "orchestrator" | "orch" => return self.orchestrator,
-            "gate" | "qa" => return self.gate_agent.or(self.finale_agent),
+            "gate" | "qa" => return self.gate_agent.or(self.finale_agent).or(self.last_gate_agent),
             "finale" => return self.finale_agent,
             _ => {}
         }
@@ -1745,7 +1767,7 @@ Then summarize in 2-4 lines.",
             return w.agent;
         }
         if n == self.pattern.flow.phase_gate {
-            return self.gate_agent;
+            return self.gate_agent.or(self.last_gate_agent);
         }
         None
     }
@@ -2026,7 +2048,7 @@ Then summarize in 2-4 lines.",
         let name = self.pattern.flow.planner.clone();
         let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
-        let req = SpawnReq { claude_user_config: String::new(),
+        let req = SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "planner".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2252,7 +2274,7 @@ Then summarize in 2-4 lines.",
         let queued = self.slots_taken(&task.role) >= self.pattern.cap_of(&task.role);
         let tid = task.id.clone();
         let role = task.role.clone();
-        let adhoc = task.id.starts_with("fix-");
+        let adhoc = is_fix_id(&task.id);
         // A halved context from an earlier attempt of the same task carries forward, and so does
         // the model the user switched that attempt to: a retry or a respawn is the same task.
         let previous = self.workers.iter().rev().find(|w| w.task.id == tid);
@@ -2342,10 +2364,9 @@ Then summarize in 2-4 lines.",
         let w = &self.workers[wi];
         // Codex's workspace-write sandbox keeps every `.git` read-only whatever the writable roots
         // say, so a fix worker on the integration copy (merging conflicted branches, unstaging a
-        // file) could not touch the index. It runs unsandboxed; the worktree still isolates it.
-        if w.adhoc && role.sandbox != "read-only" {
-            role.sandbox = "danger-full-access".into();
-        }
+        // file) could not touch the index: the app lifts the sandbox for Codex (`git_write`); other
+        // backends keep the role's own.
+        let git_write = w.adhoc && self.ws.as_ref().is_some_and(|ws| ws.worktree);
         let scope = if w.task.scope.is_empty() { "(not restricted)".to_string() } else { w.task.scope.join(", ") };
         let instructions = format!(
             "{}\n{}\n## Your task: {} — {}\nScope: {scope}\nAcceptance: {}\n",
@@ -2371,7 +2392,11 @@ Then summarize in 2-4 lines.",
         let extra_writable = if w.adhoc { self.integ_writable() } else { vec![] };
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
-        let req = SpawnReq { claude_user_config: String::new(), name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        let req = SpawnReq { claude_user_config: String::new(), git_write, name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        if git_write && !self.git_write_said {
+            self.git_write_said = true;
+            self.log("ℹ", "blue", "fix workers on Codex run without Codex's sandbox (it keeps .git read-only, and a merge fix must write it); other backends keep the role's sandbox");
+        }
         let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
@@ -2499,7 +2524,8 @@ Then summarize in 2-4 lines.",
                 let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout, Some(&log_dir), &label) };
                 let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
                 let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES, &nested_base)).unwrap_or_default();
-                JobOut::Checks(results, dropped, diff)
+                let print = git::tree_print(&dir, ws.as_ref()).map(|t| format!("{:016x}", fnv1a(&t)));
+                JobOut::Checks(results, dropped, diff, print)
             }),
         );
     }
@@ -2516,6 +2542,10 @@ Then summarize in 2-4 lines.",
         }
     }
 
+    fn gate_dir(&self) -> PathBuf {
+        self.dir.join("gate")
+    }
+
     fn check_summary(&self) -> String {
         if self.checks.is_empty() {
             return "(no gate checks defined)".into();
@@ -2530,7 +2560,7 @@ Then summarize in 2-4 lines.",
                     "PASS".to_string()
                 } else {
                     match c.code {
-                        Some(n) => format!("FAIL (exit {n})"),
+                        Some(_) => format!("FAIL ({})", crate::util::exit_label(c.code)),
                         None => "FAIL (timed out)".to_string(),
                     }
                 };
@@ -2552,6 +2582,7 @@ Then summarize in 2-4 lines.",
     /// Archive the gate agent: every QA round is a fresh agent, so the one that reported is done.
     fn retire_gate_agent(&mut self, ctx: &mut dyn Ctx) {
         if let Some(g) = self.gate_agent.take() {
+            self.last_gate_agent = Some(g);
             self.tokens_prev += ctx.agent(g).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(g, true);
         }
@@ -2589,10 +2620,10 @@ Then summarize in 2-4 lines.",
         } else {
             "Do not edit anything: you verify and report, Mantra routes every fix to a worker."
         };
-        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 600))).collect();
-        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, trunc(&w.report, 600))).collect();
+        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, fit_or_point(&w.report, 2_000, None))).collect();
+        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, fit_or_point(&w.report, 4_000, None))).collect();
         let previous = match &self.prev_gate {
-            Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, trunc(sum, 1200)),
+            Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, fit_or_point(sum, 12_000, self.last_gate_file.as_deref())),
             None => String::new(),
         };
         let previous = if fixes.is_empty() { previous } else { format!("{previous}{}\n{fixes}", if self.prev_gate.is_some() { "Fix workers since then:" } else { "\nFix workers (before this round):" }) };
@@ -2613,7 +2644,7 @@ Then summarize in 2-4 lines.",
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
         };
-        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
             name: name.clone(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2641,10 +2672,18 @@ Then summarize in 2-4 lines.",
         let line = format!("phase {} · QA round {round}: {} — {}", idx + 1, if pass { "pass" } else { "fail" }, trunc(summary.replace('\n', " ").trim(), 400));
         self.gate_notes.push(line.clone());
         self.prev_gate = Some((round, pass, summary.to_string()));
+        // the whole report goes to disk: agents are pointed to it where they get a cut copy
+        self.gate_seq += 1;
+        let fname = format!("phase-{}-qa-{:02}-round-{round}-{}.md", idx + 1, self.gate_seq, if pass { "pass" } else { "fail" });
+        let gate_dir = self.gate_dir();
+        let _ = std::fs::create_dir_all(&gate_dir);
+        let file = gate_dir.join(&fname);
+        let body = format!("# phase {} · QA round {round} · {} · plan v{}\n\n{}\n", idx + 1, if pass { "pass" } else { "fail" }, self.plan_version, summary.trim());
+        self.last_gate_file = std::fs::write(&file, body).is_ok().then_some(file);
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("gate-reports.md")) {
             use std::io::Write;
-            let _ = writeln!(f, "- {line}");
+            let _ = writeln!(f, "- {line} → gate/{fname}");
         }
     }
 
@@ -2665,21 +2704,22 @@ Then summarize in 2-4 lines.",
     /// next QA round (`on_fix_done`). The caller has checked `round < gate_max_rounds`.
     fn start_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
         if self.halted() {
-            self.defer(Pending::Fix { idx, round, findings: trunc(&findings, 6000), big });
+            self.defer(Pending::Fix { idx, round, findings, big });
             return;
         }
         let Some(phase) = self.current_phase().cloned() else { return };
         self.qa_ok = false;
+        self.fix_base_print = self.tree_print.clone();
         self.retire_gate_agent(ctx);
         let role = self.fix_role(big);
         let scope = paths_in(&findings, &self.workspace_dir());
-        let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\nThe gate will re-run: {}", phase.gate.checks.join(" ; ")) };
+        let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\n\nThe gate checks as they stand (Mantra re-runs all of them after you):\n{}", self.check_summary()) };
         let prompt = format!(
             "[mantra:fix] Phase {} ({}), {}. The gate found the problems below. Fix exactly these — no refactors, no extras — and stop.\n\nFindings:\n{}\n\nYou work in the integrated copy of the phase: every worker's changes are already merged here. Stay with the files the findings name{}. Before you finish run only what covers what you touched, once.{checks}\nEnd with the STATUS and SUMMARY lines.",
             idx + 1,
             phase.name,
             if round == 0 { "before the first QA round".to_string() } else { format!("gate round {round}") },
-            trunc(findings.trim(), 6000),
+            fit_or_point(findings.trim(), 48_000, self.last_gate_file.as_deref()),
             if scope.is_empty() { String::new() } else { format!(" ({})", scope.join(", ")) }
         );
         let what = if round == 0 { "Merge the conflicting branches".to_string() } else { format!("Fix what gate round {round} found") };
@@ -2754,7 +2794,7 @@ Then summarize in 2-4 lines.",
             self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(a, true);
         }
-        self.gate_agent = None;
+        self.last_gate_agent = self.gate_agent.take().or(self.last_gate_agent);
         let phase_name = self.current_phase().map(|p| p.name.clone()).unwrap_or_default();
         self.history.push(PhaseRecord {
             name: phase_name.clone(),
@@ -2876,7 +2916,7 @@ Then summarize in 2-4 lines.",
             }
             p
         } else {
-            ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
+            ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
                 name: step.role.clone(),
                 effort,
                 thread_name: self.thread_name(&step.role),
@@ -3054,11 +3094,11 @@ Then summarize in 2-4 lines.",
                 self.conflicts = m.conflicts;
                 self.run_checks(ctx, phase, 0);
             }
-            (JobTag::Checks { phase, round, gen }, JobOut::Checks(results, dropped, diff)) => {
+            (JobTag::Checks { phase, round, gen }, JobOut::Checks(results, dropped, diff, print)) => {
                 if self.checks_result_stale(gen, phase) {
                     return;
                 }
-                let all_ok = self.record_checks(results, dropped, diff);
+                let all_ok = self.record_checks(results, dropped, diff, print);
                 if round == 0 {
                     // Merge conflicts are not for a read-only QA agent to resolve: a fix worker
                     // merges the branches, then the gate runs on the result.
@@ -3109,11 +3149,11 @@ Then summarize in 2-4 lines.",
                     );
                 }
             }
-            (JobTag::FixChecks { phase, round, gen }, JobOut::Checks(results, dropped, diff)) => {
+            (JobTag::FixChecks { phase, round, gen }, JobOut::Checks(results, dropped, diff, print)) => {
                 if self.checks_result_stale(gen, phase) {
                     return;
                 }
-                let all_ok = self.record_checks(results, dropped, diff);
+                let all_ok = self.record_checks(results, dropped, diff, print);
                 if !all_ok {
                     // A fix that leaves the very same failure behind did nothing: stop here.
                     let sig = failing_sig(&self.checks);
@@ -3122,6 +3162,11 @@ Then summarize in 2-4 lines.",
                         return;
                     }
                     self.last_verify_sig = Some(sig);
+                }
+                // the fix worker left the tree exactly as it found it: QA is told, a fix can be an action outside the tree
+                if self.fix_base_print.is_some() && self.fix_base_print == self.tree_print {
+                    self.log("⚠", "amber", format!("fix-{round} changed no file in the workspace"));
+                    self.resume_note = Some("Note from Mantra: the fix worker of the last round changed no file in the workspace. If your findings required a change, they still stand.".into());
                 }
                 self.spawn_gate_at_round(ctx, phase, round + 1);
             }
@@ -3168,7 +3213,7 @@ Then summarize in 2-4 lines.",
 
     /// Take a checks run's results: journal them, keep them and the phase diff for the next gate
     /// agent. True when every check passed (or there were none).
-    fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff) -> bool {
+    fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff, print: Option<String>) -> bool {
         for c in &results {
             let why = if c.ok {
                 String::new()
@@ -3184,6 +3229,7 @@ Then summarize in 2-4 lines.",
         let all_ok = results.iter().all(|c| c.ok);
         self.checks = results;
         self.phase_diff = diff;
+        self.tree_print = print;
         all_ok
     }
 
@@ -3513,6 +3559,7 @@ Then summarize in 2-4 lines.",
                     Some((true, summary)) => {
                         self.last_gate_blocker = None;
                         self.note_gate(idx, round, true, &summary);
+                        self.orch_inbox.push(format!("Gate round {round}: QA passed — Mantra verifies the checks."));
                         self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
                         self.qa_ok = true;
                         self.run_checks(ctx, idx, round);
@@ -3535,7 +3582,9 @@ Then summarize in 2-4 lines.",
                     Some((false, why)) => {
                         let big = self.gate_big;
                         self.note_gate(idx, round, false, &why);
+                        let path = self.last_gate_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                         if self.gate_plan_defect {
+                            self.orch_inbox.push(format!("Gate round {round}: QA reports a plan defect — the planner is asked. Full report: {path}."));
                             self.log("◎", "amber", format!("gate round {round}: plan defect — the planner is asked, no fix worker"));
                             self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, Some(a),
                                 format!("phase {} gate: QA reports a plan defect — {}", idx + 1, trunc(&why, 80)),
@@ -3560,6 +3609,7 @@ Then summarize in 2-4 lines.",
                             );
                         } else if round < self.pattern.settings.gate_max_rounds {
                             self.gate_report = None;
+                            self.orch_inbox.push(format!("Gate round {round}: QA failed the phase — the fix goes to fix-{round} ({}). Full report: {path}.", self.fix_role(big)));
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
                             // The fix goes to a worker; Mantra re-runs the checks and starts a
                             // fresh QA round when it is done (deferred if the run is halted).
@@ -3894,9 +3944,9 @@ Then summarize in 2-4 lines.",
                     w.state = WState::Failed("blocked".into());
                     self.log("⚠", "amber", format!("{tid} is blocked"));
                     if let Some(round) = fix_round {
-                        self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)));
+                        self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)), format!("{tid} could not fix what gate round {round} found — it is blocked: {report}"), None);
                     } else {
-                        self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", trunc(&report, 1200)));
+                        self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", fit_or_point(&report, 4_000, None)));
                     }
                 } else {
                     // A done worker the user (or the orchestrator) messaged finishes again: that is
@@ -4615,7 +4665,7 @@ Then summarize in 2-4 lines.",
     pub(super) fn spawn_manager_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.manager.trim().to_string();
         let role = self.role_for_slot("manager", &name);
-        let req = SpawnReq { claude_user_config: String::new(),
+        let req = SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "manager".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4916,7 +4966,7 @@ Then summarize in 2-4 lines.",
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
         let role = self.role_for_slot("orchestrator", &name);
-        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -5445,7 +5495,15 @@ Then summarize in 2-4 lines.",
                 match self.resolve(&n).and_then(|t| ctx.agent(t)) {
                     Some(ag) => {
                         let mut t = ag.log_text(if full { 400 } else { lines });
-                        crate::util::tail_bytes(&mut t, if full { 40_000 } else { 8_000 });
+                        let before = t.len();
+                        crate::util::tail_bytes(&mut t, if full { 40_000 } else { 16_000 });
+                        if t.len() < before {
+                            // cut at the start of a log entry, not mid-sentence
+                            t = match t.find("\n[") {
+                                Some(i) => format!("[earlier entries omitted]\n{}", &t[i + 1..]),
+                                None => format!("[earlier entries omitted]\n{t}"),
+                            };
+                        }
                         (t, true)
                     }
                     None => (format!("unknown agent '{n}'"), false),

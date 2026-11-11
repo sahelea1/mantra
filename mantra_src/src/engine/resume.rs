@@ -36,6 +36,8 @@ impl Run {
             _ => st.display_title(),
         };
         run.gate_notes = st.gate_notes.clone();
+        run.gate_seq = st.gate_seq;
+        run.last_gate_file = st.last_gate_file.clone();
         run.dir = dir;
         run.stage = st.stage.clone();
         run.ws = st.ws.clone();

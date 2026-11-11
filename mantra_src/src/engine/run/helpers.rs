@@ -40,6 +40,17 @@ pub(super) fn paths_in(text: &str, root: &Path) -> Vec<String> {
         // `src/x.rs:12:5`, `src/x.rs#L10`, a trailing sentence dot
         let t = raw.split([':', '#']).next().unwrap_or("").trim_matches(|c: char| matches!(c, '.' | '*' | '!' | '?' | '-'));
         let t = t.strip_prefix("./").unwrap_or(t);
+        // an absolute path under the workspace is that file; one elsewhere (a run directory, an archive) is not ours
+        let t = match t.strip_prefix('/') {
+            Some(_) => match Path::new(t).strip_prefix(root).ok().and_then(|r| r.to_str()) {
+                Some(rel) if !rel.is_empty() => rel,
+                _ => continue,
+            },
+            None => t,
+        };
+        if t.starts_with('~') {
+            continue;
+        }
         if t.len() < 3 || t.len() > 200 || t.starts_with('/') || t.starts_with('-') || t.contains("://") || t.split('/').any(|seg| seg == "..") {
             continue;
         }
@@ -64,6 +75,32 @@ pub(super) fn paths_in(text: &str, root: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// `text` whole when it fits `max` bytes; else cut at the last line break before `max`, with
+/// one closing line that says where the rest is. Never cuts mid-line, never silently.
+pub fn fit_or_point(text: &str, max: usize, file: Option<&Path>) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = match text[..end].rfind('\n') {
+        Some(i) => &text[..i],
+        None => &text[..end],
+    };
+    let tail = match file {
+        Some(f) => format!("[cut here — the full text is in {}]", f.display()),
+        None => "[cut here]".to_string(),
+    };
+    format!("{head}\n{tail}")
+}
+
+/// `fix-<digits>`: the ids Mantra gives gate and finale fix workers.
+pub fn is_fix_id(id: &str) -> bool {
+    id.strip_prefix("fix-").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// One line per failing check, for halt messages.

@@ -910,6 +910,7 @@ impl Ctx for Ctxt<'_> {
     fn spawn(&mut self, r: SpawnReq) -> AgentId {
         let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
         let sandbox = role_sandbox(&r.role.sandbox, backend);
+        let sandbox = if r.git_write && backend == crate::config::ProviderKind::Codex && sandbox == "workspace-write" { "danger-full-access".to_string() } else { sandbox };
         spawn_agent(
             self.hub,
             self.agents,
@@ -939,6 +940,7 @@ impl Ctx for Ctxt<'_> {
     fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
         let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
         let sandbox = role_sandbox(&r.role.sandbox, backend);
+        let sandbox = if r.git_write && backend == crate::config::ProviderKind::Codex && sandbox == "workspace-write" { "danger-full-access".to_string() } else { sandbox };
         spawn_agent(
             self.hub,
             self.agents,

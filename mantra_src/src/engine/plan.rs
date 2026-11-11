@@ -124,6 +124,9 @@ impl Plan {
                 } else if !t.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                     errs.push(format!("task id '{}' may only contain letters, digits, - and _", t.id));
                 }
+                if super::run::is_fix_id(&t.id) {
+                    errs.push(format!("task id '{}' is reserved for Mantra's fix workers — choose another id", t.id));
+                }
                 if !workers.contains(&t.role) {
                     errs.push(format!("task '{}': role '{}' is not a worker role (use one of: {})", t.id, t.role, workers.join(", ")));
                 }

@@ -535,6 +535,29 @@ pub fn nested_heads(ws: &Workspace) -> Vec<(PathBuf, String)> {
     ws.nested.iter().filter_map(|r| git(&ws.integ.join(r), &["rev-parse", "HEAD"]).ok().filter(|h| !h.is_empty()).map(|h| (r.clone(), h))).collect()
 }
 
+/// What `dir` looks like as a git work tree: `HEAD`, `status --porcelain` and the whole `git diff`,
+/// one text. `None` when `dir` is not a work tree.
+fn tree_print_of(dir: &Path) -> Option<String> {
+    git(dir, &["rev-parse", "--is-inside-work-tree"]).ok().filter(|t| t == "true")?;
+    let head = git(dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let status = git(dir, &["status", "--porcelain"]).unwrap_or_default();
+    let diff = git(dir, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD"]).unwrap_or_default();
+    Some(format!("{head}\n{status}\n{diff}"))
+}
+
+/// A fingerprint source for the workspace after the checks ran (WP-2.9): the work tree's own
+/// `tree_print_of`, or — for a shared directory that is not a repository — that of every nested
+/// repository, one after the other. `None` when there is no git state to look at. The caller
+/// hashes it.
+pub fn tree_print(dir: &Path, ws: Option<&Workspace>) -> Option<String> {
+    if let Some(p) = tree_print_of(dir) {
+        return Some(p);
+    }
+    let ws = ws?;
+    let parts: Vec<String> = ws.nested.iter().filter_map(|r| tree_print_of(&ws.integ.join(r)).map(|p| format!("{}\n{p}", r.display()))).collect();
+    if parts.is_empty() { None } else { Some(parts.join("\n--\n")) }
+}
+
 /// The review of a shared, non-repository project: each nested repository's working tree against
 /// its base, under a heading, `max_bytes` split evenly between those with changes.
 fn nested_review_diff(ws: &Workspace, max_bytes: usize, bases: &[(PathBuf, String)]) -> ReviewDiff {
@@ -1065,6 +1088,25 @@ mod tests {
             std::fs::create_dir_all(dir.join(p)).unwrap();
         }
         assert_eq!(nested_repos(&dir), vec![PathBuf::from("a"), PathBuf::from("b/c")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_print_changes_with_the_work_and_covers_nested_repositories() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        git(&app, &["init", "-q"]).unwrap();
+        std::fs::write(app.join("f.txt"), "one\n").unwrap();
+        commit_all(&app, "init").unwrap();
+        assert!(tree_print(&dir.join("nope"), None).is_none());
+        let ws = setup(&dir, "p1", "auto").unwrap();
+        let before = tree_print(&dir, Some(&ws)).expect("the nested repository is looked at");
+        assert_eq!(tree_print(&dir, Some(&ws)).unwrap(), before, "no change, same print");
+        std::fs::write(app.join("f.txt"), "two\n").unwrap();
+        assert_ne!(tree_print(&dir, Some(&ws)).unwrap(), before);
+        assert_ne!(tree_print(&app, None).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

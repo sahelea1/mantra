@@ -45,6 +45,7 @@ struct Spawned {
     tools: Vec<String>,
     /// The MCP servers it asked for.
     mcp: Vec<String>,
+    git_write: bool,
 }
 impl TestCtx {
     // Tests below exercise the Conductor's decisions without making a provider call.
@@ -370,7 +371,7 @@ impl Ctx for TestCtx {
         self.next += 1;
         self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
         let tools = r.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from)).collect();
-        self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools, mcp: r.mcp.clone() });
+        self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools, mcp: r.mcp.clone(), git_write: r.git_write });
         self.spawned_instructions.push((id, r.instructions));
         self.spawned_models.push((id, r.role.model));
         id
@@ -1630,7 +1631,7 @@ fn checks_failing_after_a_qa_pass_go_to_a_fix_worker() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
     run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(!run.halted());
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes the failing checks");
@@ -1695,7 +1696,7 @@ fn merge_conflicts_go_to_a_fix_worker_because_the_gate_cannot_merge() {
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
     run.conflicts = vec!["mantra-w/r/p1-a-1".into()];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: run.checks_gen }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: run.checks_gen }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
     assert!(run.gate_agent.is_none(), "no QA agent reads a tree that is not merged yet");
     let w = run.workers.iter().find(|w| w.task.id == "fix-0").expect("a worker merges the branches, before QA round 1");
     assert_eq!(w.task.role, "worker-big");
@@ -1961,7 +1962,7 @@ fn a_gate_revision_cancels_a_blocked_fix_worker_and_reruns_the_checks() {
     assert_eq!(run.workers.iter().filter(|w| w.task.id == "fix-1" && w.state != WState::Cancelled).count(), 0);
     assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
     assert!(ctx.jobs[0].starts_with("Checks"), "{:?}", ctx.jobs);
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("new-check --flag"), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("new-check --flag"), vec![], git::ReviewDiff::default(), None));
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
     let g = run.gate_agent.expect("a fresh QA agent");
     assert!(ctx.prompts.iter().any(|(a, p)| *a == g && p.contains("new-check --flag")), "{:?}", ctx.prompts);
@@ -2001,7 +2002,7 @@ fn a_gate_revision_drops_a_deferred_gate_round() {
     assert!(run.pending.is_none());
     assert!(run.pulse.iter().any(|p| p.text.contains("dropped")));
     assert!(run.checks.is_empty());
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("fresh-check"), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("fresh-check"), vec![], git::ReviewDiff::default(), None));
     let g = run.gate_agent.expect("QA started");
     let p = ctx.prompts.iter().rev().find(|(a, _)| *a == g).map(|(_, p)| p.clone()).unwrap();
     assert!(p.contains("fresh-check") && !p.contains("stale-check"), "{p}");
@@ -2207,13 +2208,13 @@ fn identical_verify_failures_escalate_before_the_rounds_run_out() {
     run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
     // QA passed, the checks still fail: fix-1 takes the output…
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(!run.halted());
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
     assert!(w.prompt.contains("Permission denied"), "{}", w.prompt);
     // …and when the very same failure is still there afterwards, nobody is fixing it
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(run.halted(), "the identical failure twice means nobody is fixing it");
     assert!(run.halt.as_ref().unwrap().message.contains("identically"));
     assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));
@@ -2230,9 +2231,9 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
     run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = |out: &str| vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: out.into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default(), None));
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }));
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }, None));
     assert!(!run.halted());
     let g2 = run.gate_agent.expect("round 2");
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
@@ -2243,7 +2244,7 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     r2.plan = Some(one_task_phase());
     r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 3 } };
     r2.qa_ok = true;
-    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3, gen: run.checks_gen }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
+    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3, gen: run.checks_gen }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default(), None));
     assert!(r2.halted());
     assert_eq!(r2.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
     assert!(r2.workers.is_empty(), "no fix worker after the last round");
@@ -3365,7 +3366,7 @@ fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
     run.run_checks(&mut ctx, 0, 0);
     match ctx.1 .0.pop() {
-        Some(JobOut::Checks(results, _, diff)) => {
+        Some(JobOut::Checks(results, _, diff, _)) => {
             assert_eq!(results.iter().map(|c| c.ok).collect::<Vec<_>>(), vec![true, false]);
             assert!(diff.stat.contains("a.txt") && diff.diff.contains("+two"), "{diff:?}");
         }
@@ -3403,18 +3404,18 @@ fn only_the_newest_checks_run_counts() {
     assert_eq!(run.checks_gen, first + 1);
     let said = |run: &Run| run.pulse.iter().filter(|p| p.text.contains("superseded")).count();
     // the older run lands first: nothing happens
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
     assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } });
     assert!(run.gate_agent.is_none());
     assert_eq!(said(&run), 1);
     // the newest one is handled
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first + 1 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first + 1 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
     assert!(run.gate_agent.is_some(), "the current run's result starts QA");
     assert_eq!(said(&run), 1);
     // a result for a run that a stage change made meaningless is ignored too
     run.checks_gen += 1;
     let g = run.checks_gen;
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: g }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: g }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
     assert_eq!(said(&run), 2, "the stage is no longer Checks");
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }));
 }
@@ -3469,7 +3470,7 @@ fn green_checks_after_a_resumed_failed_round_start_qa_instead_of_a_handoff() {
     let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_resume_run", &json!({"note": ""}));
     assert!(ok, "{msg}");
     assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "QA decides, the green checks alone do not: {:?}", run.stage);
     assert!(run.gate_agent.is_some());
     assert!(run.pending.is_none());
@@ -3484,7 +3485,7 @@ fn green_checks_after_a_qa_pass_hand_off() {
     run.on_turn_done(&mut ctx, gate, "completed", None, None);
     assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
     assert!(run.qa_ok);
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
     assert!(!matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { .. }, .. }), "{:?}", run.stage);
     assert!(run.gate_agent.is_none(), "the passing QA agent is archived by the handoff");
 }
@@ -3500,7 +3501,7 @@ fn a_fix_finished_during_a_halt_leads_to_one_checks_run_and_a_qa_round() {
     finish_fix(&mut ctx, &mut run, 1);
     run.resume(&mut ctx);
     assert_eq!(ctx.jobs.len(), 1, "exactly one checks run: {:?}", ctx.jobs);
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
     assert!(run.gate_agent.is_some());
 }
@@ -4555,7 +4556,7 @@ fn a_fix_worker_the_gateway_failed_halts_without_waking_anyone_and_is_respawned_
     let spawned = jobs.0.spawned("fix-1");
     assert_eq!(spawned.len(), 1, "{:?}", jobs.0.spawns.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
     assert_eq!(spawned[0].cwd, integ);
-    assert_eq!(spawned[0].sandbox, "danger-full-access", "a fix worker on the integration copy runs unsandboxed");
+    assert!(spawned[0].git_write, "a fix worker on the integration copy asks for a writable .git (the app lifts Codex's sandbox)");
     let fresh = run.workers.iter().rev().find(|w| w.task.id == "fix-1").unwrap();
     assert!(fresh.state == WState::Running && fresh.wt.as_ref() == Some(&integ));
     assert!(jobs.0.prompts.iter().any(|(a, _)| Some(*a) == fresh.agent), "the fresh fix worker is given its task");
@@ -5667,4 +5668,176 @@ fn resuming_a_paused_run_says_you_had_paused_it_and_lists_the_roles() {
     assert!(lines.iter().any(|l| l.starts_with("roles: planner ") && l.contains(" · orchestrator ")), "{lines:?}");
     assert!(again.closed_unix.is_none() && RunState::load(&again.dir).unwrap().closed_unix.is_none());
     let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// WP-2.8 / 2.9 / 2.10 -------------------------------------------------------------------------
+
+#[test]
+fn fit_or_point_keeps_whole_lines_and_says_where_the_rest_is() {
+    use helpers::fit_or_point;
+    assert_eq!(fit_or_point("short\ntext", 100, None), "short\ntext");
+    let text = "line one\nline two\nline three";
+    let cut = fit_or_point(text, 20, None);
+    assert_eq!(cut, "line one\nline two\n[cut here]");
+    let pointed = fit_or_point(text, 20, Some(Path::new("/x/gate/r.md")));
+    assert!(pointed.ends_with("[cut here — the full text is in /x/gate/r.md]") && !pointed.contains("three"), "{pointed}");
+    // no line break before the limit: cut at a char boundary, still marked
+    assert!(fit_or_point(&"é".repeat(40), 11, None).ends_with("[cut here]"));
+}
+
+#[test]
+fn fix_ids_are_fix_and_digits_only() {
+    assert!(helpers::is_fix_id("fix-1") && helpers::is_fix_id("fix-12"));
+    assert!(!helpers::is_fix_id("fix-login") && !helpers::is_fix_id("fix-") && !helpers::is_fix_id("xfix-1"));
+}
+
+#[test]
+fn a_plan_may_not_use_a_fix_worker_id() {
+    let pattern = Pattern::builtin();
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks[0].prompt = "do the thing described here".into();
+    plan.phases[0].tasks[0].id = "fix-2".into();
+    let errs = plan.validate(&pattern).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("'fix-2' is reserved for Mantra's fix workers")), "{errs:?}");
+    plan.phases[0].tasks[0].id = "fix-login".into();
+    assert!(plan.validate(&pattern).is_ok());
+    // and such a task is an ordinary worker, not an ad-hoc one on the integration copy
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.spawn_task(&mut ctx, plan.phases[0].tasks[0].clone(), None, None);
+    assert!(!run.workers.last().unwrap().adhoc);
+}
+
+#[test]
+fn paths_in_drops_what_lies_outside_the_workspace() {
+    let dir = std::env::temp_dir().join(format!("mantra-paths-out-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let t = format!("see /etc/x.conf and ~/a/b.txt and {}/src/x.rs and src/x.rs", dir.display());
+    assert_eq!(paths_in(&t, &dir), vec!["src/x.rs".to_string()]);
+    assert!(paths_in("/home/u/.mantra/runs/r1/gate.md ~/notes/a.md", &dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_long_gate_report_reaches_the_fix_worker_and_the_next_qa_round_by_file() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("long-gate-report");
+    let findings = format!("{}\nLAST-FINDING-LINE src/a.rs is wrong", "filler line of the report ".repeat(600));
+    assert!(findings.len() > 15_000);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": false, "summary": findings}));
+    assert!(ok);
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    let file = run.last_gate_file.clone().expect("the report was written");
+    assert!(file.starts_with(run.dir.join("gate")) && file.file_name().unwrap().to_string_lossy().ends_with("-round-1-fail.md"), "{file:?}");
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(body.starts_with("# phase 1 · QA round 1 · fail · plan v") && body.contains("LAST-FINDING-LINE"));
+    assert!(std::fs::read_to_string(run.dir.join("gate-reports.md")).unwrap().contains("→ gate/phase-1-qa-01-round-1-fail.md"));
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
+    assert!(fix.prompt.contains("LAST-FINDING-LINE"), "the fix worker gets the whole report");
+    assert!(run.orch_inbox.iter().any(|m| m.starts_with("Gate round 1: QA failed the phase — the fix goes to fix-1 (") && m.contains(&file.display().to_string())), "{:?}", run.orch_inbox);
+    // the next QA round: the report is past 12k, so it is cut at a line and points to the file
+    finish_fix(&mut ctx, &mut run, 1);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    let g2 = run.gate_agent.expect("round 2");
+    let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == g2).unwrap();
+    assert!(p.contains(&format!("[cut here — the full text is in {}]", file.display())), "{p}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_qa_pass_tells_the_orchestrator_without_waking_it() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("qa-pass-inbox");
+    run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert!(run.orch_inbox.contains(&"Gate round 1: QA passed — Mantra verifies the checks.".to_string()), "{:?}", run.orch_inbox);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn mantra_log_still_reads_the_retired_gate_agent() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("log-retired-gate");
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    assert!(run.gate_agent.is_none());
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_log", &json!({"agent": "gate"}));
+    assert!(ok, "{msg}");
+    assert!(!msg.contains("unknown agent"), "{msg}");
+    assert_eq!(run.resolve("gate"), Some(gate));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn mantra_log_cuts_at_an_entry_and_says_so() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let ag = ctx.agents.get_mut(&gate).unwrap();
+    for i in 0..40 {
+        ag.items.push(crate::agent::Item { id: format!("i{i}"), kind: crate::agent::Kind::Agent, text: format!("entry {i} {}", "x".repeat(1000)), done: true, version: 0, expanded: false, started: None, cache: None });
+    }
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_log", &json!({"agent": "gate", "lines": 40}));
+    assert!(ok);
+    assert!(msg.starts_with("[earlier entries omitted]\n[agent] entry "), "{}", &msg[..60]);
+    assert!(msg.len() <= 16_100 && msg.contains("entry 39"));
+}
+
+#[test]
+fn the_fix_prompt_shows_the_check_results() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("fix-prompt-checks");
+    run.checks = vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: "assertion failed: left == right".into(), secs: 1 }];
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+    assert!(fix.prompt.contains("The gate checks as they stand") && fix.prompt.contains("assertion failed: left == right"), "{}", fix.prompt);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A fix worker's `SpawnReq` as the engine builds it (the fix runs, then its workspace job lands).
+fn fix_spawn(worktree: bool) -> Spawned {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("fix-sandbox");
+    if worktree {
+        run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
+    }
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    finish_fix(&mut ctx, &mut run, 1);
+    let _ = std::fs::remove_dir_all(&run.dir);
+    ctx.spawned("fix-1").pop().expect("the fix worker was spawned")
+}
+
+#[test]
+fn a_fix_worker_keeps_the_role_sandbox_and_asks_for_git_only_in_worktree_mode() {
+    let role_sandbox = Pattern::builtin().roles.get("worker-small").map(|r| r.sandbox.clone()).unwrap_or_default();
+    let shared = fix_spawn(false);
+    assert!(!shared.git_write);
+    assert_eq!(shared.sandbox, role_sandbox, "the role's own sandbox, never forced");
+    let wt = fix_spawn(true);
+    assert!(wt.git_write);
+    assert_eq!(wt.sandbox, role_sandbox, "the engine leaves the sandbox alone; the app lifts it for Codex");
+}
+
+#[test]
+fn a_fix_that_changed_nothing_is_journaled_and_qa_is_told() {
+    for (same, expect) in [(true, true), (false, false)] {
+        let mut ctx = TestCtx::new();
+        let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+        run.dir = scratch_dir("fix-no-change");
+        run.tree_print = Some("print-a".into());
+        run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+        assert_eq!(run.fix_base_print.as_deref(), Some("print-a"));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+        let after = if same { "print-a" } else { "print-b" };
+        run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), Some(after.into())));
+        let qa = run.gate_agent.expect("round 2");
+        let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == qa).unwrap();
+        assert_eq!(p.contains("the fix worker of the last round changed no file in the workspace"), expect, "{p}");
+        assert_eq!(run.pulse.iter().any(|j| j.text.contains("fix-1 changed no file in the workspace")), expect);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
 }
