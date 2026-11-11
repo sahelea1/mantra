@@ -3736,11 +3736,12 @@ Then summarize in 2-4 lines.",
 
     pub fn on_files_changed(&mut self, ctx: &mut dyn Ctx, a: AgentId, paths: &[String]) {
         let Some(wi) = self.worker_idx(a) else { return };
+        let base = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone())).unwrap_or_else(|| self.project.clone());
         let w = &mut self.workers[wi];
         if w.task.scope.is_empty() {
             return;
         }
-        let outside: Vec<String> = paths.iter().filter(|p| !crate::util::in_scope(&w.task.scope, p)).filter(|p| !w.tripwires.contains(p)).cloned().collect();
+        let outside: Vec<String> = paths.iter().filter(|p| !crate::util::in_scope_from(&w.task.scope, p, &base)).filter(|p| !w.tripwires.contains(p)).cloned().collect();
         if outside.is_empty() {
             return;
         }
@@ -5021,7 +5022,11 @@ Then summarize in 2-4 lines.",
                 if let Err(e) = remaining.validate(&self.pattern) { return (format!("REJECTED: {}", e.join("; ")), false); }
                 self.plan = Some(plan);
                 self.plan_version += 1;
-                for w in self.workers.iter_mut().filter(|w| w.task.id == tid) { w.task.scope = scope.clone(); w.tripwires.retain(|p| !crate::util::in_scope(&scope, p)); }
+                for w in self.workers.iter_mut().filter(|w| w.task.id == tid) {
+                    let base = w.wt.clone().or_else(|| w.agent.and_then(|a| ctx.agent(a)).map(|ag| ag.cwd.clone())).unwrap_or_else(|| self.project.clone());
+                    w.task.scope = scope.clone();
+                    w.tripwires.retain(|p| !crate::util::in_scope_from(&scope, p, &base));
+                }
                 self.save_plan();
                 self.log("☰", "saffron", format!("planner updated {tid} scope: {} ({reason})", scope.join(", ")));
                 self.orch_inbox.push(format!("[from the planner] Task {tid} scope is now {}. Reason: {reason}", scope.join(", ")));

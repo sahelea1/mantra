@@ -180,6 +180,45 @@ pub fn in_scope(scope: &[String], rel_path: &str) -> bool {
     })
 }
 
+/// Is `path` (as an agent reported it, relative to `cwd` or absolute) inside one of `scope`'s
+/// globs, when both are read against `cwd`? Also true when the glob matches the path's tail
+/// starting at any directory boundary below `cwd` that is a git repository root or the first
+/// path component (a scope written relative to a nested repository).
+pub fn in_scope_from(scope: &[String], path: &str, cwd: &Path) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    let p = Path::new(path);
+    let rel = if p.is_absolute() {
+        match p.strip_prefix(cwd) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => {
+                // Outside cwd: only a scope glob written as an absolute / `~` path can cover it.
+                let home = dirs::home_dir();
+                let abs: Vec<String> = scope.iter().map(|g| expand_tilde(g.trim(), home.as_deref())).filter(|g| g.is_absolute()).map(|g| g.to_string_lossy().into_owned()).collect();
+                return !abs.is_empty() && in_scope(&abs, path);
+            }
+        }
+    } else {
+        path.trim_start_matches("./").to_string()
+    };
+    if in_scope(scope, &rel) {
+        return true;
+    }
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    let mut prefix = PathBuf::new();
+    for (i, c) in comps.iter().take(3).enumerate() {
+        if i + 1 >= comps.len() {
+            break; // the last component is the file itself, not a directory
+        }
+        prefix.push(c);
+        if cwd.join(&prefix).join(".git").exists() && in_scope(scope, &comps[i + 1..].join("/")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Count added/removed lines in a unified diff.
 pub fn diff_stats(diff: &str) -> (usize, usize) {
     let mut a = 0;
@@ -877,6 +916,21 @@ pub(crate) mod tests {
         assert!(in_scope(&["src/auth".into()], "src/auth/mod.rs"));
         assert!(!in_scope(&["src/auth/**".into()], "src/orders/mod.rs"));
         assert!(in_scope(&[], "anything"));
+    }
+    #[test]
+    fn scope_from_reads_both_sides_against_cwd() {
+        let cwd = std::env::temp_dir().join(format!("mantra-scope-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(cwd.join("repo/tools")).unwrap();
+        let scope = vec!["tools/x.sh".to_string()];
+        assert!(!in_scope_from(&scope, "repo/tools/x.sh", &cwd), "no repository below cwd: the path is simply elsewhere");
+        std::fs::create_dir_all(cwd.join("repo/.git")).unwrap();
+        assert!(in_scope_from(&scope, "repo/tools/x.sh", &cwd));
+        assert!(in_scope_from(&scope, &cwd.join("repo/tools/x.sh").to_string_lossy(), &cwd), "absolute under cwd");
+        assert!(!in_scope_from(&scope, "repo/tools/y.sh", &cwd));
+        assert!(!in_scope_from(&scope, "/elsewhere/tools/x.sh", &cwd), "outside cwd is out of scope");
+        assert!(in_scope_from(&["/elsewhere/**".to_string()], "/elsewhere/tools/x.sh", &cwd), "unless an absolute glob covers it");
+        let _ = std::fs::remove_dir_all(&cwd);
     }
     #[test]
     fn stats() {
