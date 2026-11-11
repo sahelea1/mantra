@@ -2510,6 +2510,14 @@ impl App {
                     Some(a) => a.apply(&method, &params),
                     None => return,
                 };
+                if method == "warning" && self.in_run(agent) {
+                    if let Some(msg) = params.get("message").and_then(|m| m.as_str()).filter(|m| m.starts_with("provider rate limit:")) {
+                        let msg = msg.to_string();
+                        if let Some(r) = self.run.as_mut() {
+                            r.log_quota_warning(agent, &msg);
+                        }
+                    }
+                }
                 if method == "turn/started" {
                     let drained = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
                     self.log_delivered(agent, &drained);
@@ -4798,6 +4806,25 @@ done"#;
         app.on_hub(HubEvent::Notif { agent: p, method: "turn/completed".into(), params: json!({"turn":{"status":"completed"}}) });
         assert!(!app.agents[&p].queued.iter().any(|q| q.contains("please also add tests")), "a completed turn flushes");
         assert!(app.run.as_ref().unwrap().pulse.iter().any(|p| p.text.starts_with("delivered to planner: please also add tests")));
+    }
+
+    #[test]
+    fn a_quota_warning_reaches_the_journal_once() {
+        use crate::web::snapshot::tests::add_agent;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.stage = Stage::Planning;
+        app.run = Some(run);
+        add_agent(&mut app, 1, "planner");
+        let before = app.run.as_ref().unwrap().pulse.len();
+        app.on_hub(HubEvent::Notif { agent: 1, method: "warning".into(), params: json!({"message": "provider rate limit: the five_hour window is 91% used"}) });
+        app.on_hub(HubEvent::Notif { agent: 1, method: "warning".into(), params: json!({"message": "something else"}) });
+        let run = app.run.as_ref().unwrap();
+        assert_eq!(run.pulse.len() - before, 1);
+        let line = run.pulse.back().unwrap();
+        assert!(line.text.starts_with("planner: provider rate limit: the five_hour window is 91% used"), "{}", line.text);
+        assert!(line.text.ends_with("has no fallback model (Studio → fallback)"), "{}", line.text);
     }
 
     #[test]

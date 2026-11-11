@@ -1098,6 +1098,15 @@ impl Run {
     /// message comes in two lengths: `message` for the pulse line, the band and the alert; `full`
     /// — the backend's whole error, nothing cut off — for the journal, `state.json` and whoever
     /// the halt is escalated to.
+    /// A provider's quota warning (once per episode, from the translator) goes to the journal too.
+    pub fn log_quota_warning(&mut self, a: AgentId, message: &str) {
+        let role = self.role_name_of(a).unwrap_or_default();
+        let no_chain = self.pattern.role(&role).map(|r| r.fallback_chain().is_empty()).unwrap_or(false);
+        let suffix = if no_chain { format!(" — role {role} has no fallback model (Studio → fallback)") } else { String::new() };
+        let name = self.name_of(a);
+        self.log("⚠", "amber", format!("{name}: {message}{suffix}"));
+    }
+
     /// Keep the last five `mantra_prompt` texts sent to `t`, for `halt_full` to hand back on resume.
     fn remember_prompt(&mut self, t: AgentId, text: &str) {
         let q = self.recent_prompts.entry(t).or_default();
