@@ -55,6 +55,10 @@ pub struct RunState {
     /// run without groups writes the same `state.json` as before, and an older file loads with none.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
+    /// Per slot: the model aliases a fallback already gave up on (`Run::fallback_used`), so a
+    /// resumed run does not go back to a dead model.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fallback_used: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -462,6 +466,7 @@ pub(crate) mod tests {
             agents: vec![AgentState { slot: "orchestrator".into(), name: "orchestrator".into(), role: "orchestrator".into(), provider: "openai".into(), model_alias: "astra".into(), effort: "high".into(), thread_id: Some("t-1".into()), cwd: "/tmp/wt/integration".into() }],
             history: vec![PhaseHistory { name: "Foundations".into(), workers: vec![("p1-a".into(), "A".into(), "◇".into(), true)], secs: 42 }],
             akasha: Default::default(),
+            fallback_used: Default::default(),
         }
     }
 

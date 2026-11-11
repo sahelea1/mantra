@@ -377,6 +377,16 @@ pub struct Pulse {
     pub text: String,
 }
 
+/// What made `Run::try_fallback` give up on a model.
+#[derive(Clone, Copy, PartialEq)]
+enum FallbackWhy {
+    UsageLimit,
+    Silent,
+    #[allow(dead_code)] // the empty-turn trigger (WP-1.4)
+    Empty,
+    Rejected,
+}
+
 /// Why a run stopped making progress on its own and needs a person.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HaltReason {
@@ -580,6 +590,19 @@ pub struct Run {
     /// saved alias that still exists from one that was deleted, and gives `settings.context_cap`
     /// a window to be measured against. Empty = never told (tests): every alias is trusted.
     known_models: HashMap<String, u64>,
+    /// alias → provider id, from the app beside `known_models` (`set_known_providers`).
+    known_providers: HashMap<String, String>,
+    /// Providers that just failed for a reason that is the provider's, not the task's: usage limit
+    /// (60 min), silent twice or empty twice (15 min), rejected the request shape (the whole run).
+    /// provider id → (until, why). Runtime only.
+    provider_trouble: HashMap<String, (Instant, &'static str)>,
+    /// Per slot (`first_token_key`): aliases already tried and given up on in this run.
+    pub(super) fallback_used: HashMap<String, Vec<String>>,
+    /// Per slot: consecutive empty turns (WP-1.4).
+    empty_strikes: HashMap<String, u8>,
+    /// Slots already warned that they run on a pinned model whose provider is in trouble
+    /// (`model_for_spawn`), so the warning is journalled once per slot. Runtime only.
+    pin_trouble_warned: HashSet<String>,
     /// The aliases whose model takes images (`ModelEntry.vision`), from the app beside
     /// `known_models` (`set_vision_models`). Empty = none: unlike `known_models`, never trusted
     /// blindly — a screenshot tool reaches an agent only when its model is known to see.
@@ -685,6 +708,11 @@ impl Run {
             last_status: HashMap::new(),
             slot_models: HashMap::new(),
             known_models: HashMap::new(),
+            known_providers: HashMap::new(),
+            provider_trouble: HashMap::new(),
+            fallback_used: HashMap::new(),
+            empty_strikes: HashMap::new(),
+            pin_trouble_warned: HashSet::new(),
             known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
             owner: super::state::Owner::this_process(),
@@ -825,6 +853,7 @@ impl Run {
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
             akasha: self.akasha.clone(),
+            fallback_used: self.fallback_used.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
         .save(&self.dir);
     }
@@ -833,6 +862,52 @@ impl Run {
     /// resume and after every live model switch — the only times an alias can enter the run.
     pub fn set_known_models(&mut self, models: HashMap<String, u64>) {
         self.known_models = models;
+    }
+
+    /// alias → provider id (`Registry::alias_providers`), from the app beside `set_known_models`:
+    /// what tells two aliases on the same troubled provider apart from two on different ones.
+    pub fn set_known_providers(&mut self, m: HashMap<String, String>) {
+        self.known_providers = m;
+    }
+
+    fn provider_of(&self, alias: &str) -> Option<&str> {
+        self.known_providers.get(alias).map(|p| p.as_str())
+    }
+
+    /// Some(why) while `alias`'s provider has an unexpired trouble mark. `None` when the providers
+    /// were never told (tests) or the alias is unknown.
+    fn troubled(&self, alias: &str) -> Option<&'static str> {
+        let p = self.provider_of(alias)?;
+        self.provider_trouble.get(p).filter(|(until, _)| Instant::now() < *until).map(|(_, why)| *why)
+    }
+
+    fn mark_trouble(&mut self, alias: &str, secs: u64, why: &'static str) {
+        if let Some(p) = self.provider_of(alias).map(str::to_string) {
+            self.provider_trouble.insert(p, (Instant::now() + Duration::from_secs(secs), why));
+        }
+    }
+
+    /// The alias a spawn into `slot_key` runs on: the user's pin if any; else the role's model —
+    /// unless that model's provider is in trouble right now and the chain has one that is not.
+    fn model_for_spawn(&mut self, slot_key: &str, role: &Role, pin: Option<&str>) -> String {
+        if let Some(p) = pin.filter(|p| self.knows_model(p)) {
+            if let Some(why) = self.troubled(p) {
+                if self.pin_trouble_warned.insert(slot_key.to_string()) {
+                    self.log("⚠", "amber", format!("{slot_key}: runs on {p} as you chose, although its provider {why}"));
+                }
+            }
+            return p.to_string();
+        }
+        let Some(why) = self.troubled(&role.model) else { return role.model.clone() };
+        let used = self.fallback_used.get(slot_key).cloned().unwrap_or_default();
+        let next = role.fallback_chain().into_iter().find(|f| self.knows_model(f) && self.troubled(f).is_none() && !used.contains(f));
+        match next {
+            Some(alias) => {
+                self.log("⇄", "amber", format!("{slot_key} starts on fallback {alias} — {}'s provider {why}", role.model));
+                alias
+            }
+            None => role.model.clone(),
+        }
     }
 
     /// Which aliases take images (`vision_aliases`), from the app at the same moments as
@@ -908,12 +983,12 @@ impl Run {
     }
 
     /// The role as a spawn into `slot` should see it: with the model the user chose live for
-    /// that slot, if any, in place of the role's (`set_agent_model`).
-    fn role_for_slot(&self, slot: &str, role_name: &str) -> Role {
+    /// that slot, if any, in place of the role's (`set_agent_model`), else the role's model or —
+    /// while its provider is in trouble — the first usable fallback (`model_for_spawn`).
+    fn role_for_slot(&mut self, slot: &str, role_name: &str) -> Role {
         let mut role = self.role(role_name);
-        if let Some(m) = self.slot_models.get(slot) {
-            role.model = m.clone();
-        }
+        let pin = self.slot_models.get(slot).cloned();
+        role.model = self.model_for_spawn(slot, &role, pin.as_deref());
         role
     }
 
@@ -1000,11 +1075,21 @@ impl Run {
     /// — the backend's whole error, nothing cut off — for the journal, `state.json` and whoever
     /// the halt is escalated to.
     fn halt_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
+        // A halt about one agent's provider (or its failed turn) is a soft halt: the others finish
+        // the turn they are in, and the pause boundary holds whatever they would start next.
+        let soft = agent.is_some() && matches!(reason, HaltReason::Auth | HaltReason::UsageLimit | HaltReason::ProviderRejected | HaltReason::AgentTurnFailed);
+        let mut left_alone = 0;
         for a in self.all_agents() {
             // The manager is not part of the work being stopped — it is who gets told about the
             // halt next, mid-turn or not (a steer into its running turn is exactly right), and it
             // must not be re-prompted to "continue where you left off" on resume either.
             if Some(a) == self.manager && Some(a) != agent {
+                continue;
+            }
+            if soft && Some(a) != agent {
+                if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
+                    left_alone += 1;
+                }
                 continue;
             }
             if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
@@ -1022,6 +1107,10 @@ impl Run {
             }
         }
         self.log("⛔", "red", format!("halted: {message}"));
+        if let (true, Some(about)) = (left_alone > 0, agent) {
+            let name = self.name_of(about);
+            self.log("‖", "amber", format!("{left_alone} agent(s) keep working until their turn ends — the halt is about {name} only"));
+        }
         if full != message {
             self.journal_line("⛔", &format!("halted (full): {}", crate::util::strip_ansi(&full)));
         }
@@ -2041,12 +2130,11 @@ Then summarize in 2-4 lines.",
     /// worktree still holds its edits, so the prompt tells it to continue rather than restart.
     pub(super) fn launch_worker_with(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String, resume: Option<String>) {
         let plan_summary = self.plan.as_ref().map(|p| p.summary.clone()).unwrap_or_default();
-        let w = &self.workers[wi];
-        let mut role = self.role(&w.task.role);
+        let mut role = self.role(&self.workers[wi].task.role);
         // The model the user switched this task to (`set_agent_model`) outranks the role's.
-        if let Some(m) = &w.model {
-            role.model = m.clone();
-        }
+        let (slot_key, pin) = (format!("worker:{}", self.workers[wi].task.id), self.workers[wi].model.clone());
+        role.model = self.model_for_spawn(&slot_key, &role, pin.as_deref());
+        let w = &self.workers[wi];
         // Codex's workspace-write sandbox keeps every `.git` read-only whatever the writable roots
         // say, so a fix worker on the integration copy (merging conflicted branches, unstaging a
         // file) could not touch the index. It runs unsandboxed; the worktree still isolates it.
@@ -2636,7 +2724,12 @@ Then summarize in 2-4 lines.",
     }
 
     fn alert(&mut self, ctx: &mut dyn Ctx, text: String) {
-        self.log("⚑", "amber", text.clone());
+        self.alert_as(ctx, "⚑", text);
+    }
+
+    /// `alert` journalled under its own glyph.
+    fn alert_as(&mut self, ctx: &mut dyn Ctx, glyph: &str, text: String) {
+        self.log(glyph, "amber", text.clone());
         self.alerts.push(text.clone());
         ctx.notify(&format!("Mantra needs you: {text}"));
     }
@@ -2893,7 +2986,7 @@ Then summarize in 2-4 lines.",
             // Quota and billing errors are sometimes reported as transient or bad-request
             // failures. A configured replacement gets a fresh process before any retry/halt.
             let kind = if crate::agent::is_usage_limit_error(kind, &msg) { Some(ErrKind::UsageLimit) } else { kind };
-            if kind == Some(ErrKind::UsageLimit) && self.fallback_after_usage_limit(ctx, a, &msg) {
+            if kind == Some(ErrKind::UsageLimit) && self.try_fallback(ctx, a, FallbackWhy::UsageLimit, &msg) {
                 return;
             }
             // A dead or flaky gateway is nobody's fault: it never costs an attempt, so it is
@@ -2940,7 +3033,10 @@ Then summarize in 2-4 lines.",
             }
             // ProviderRejected is deterministic (bad model/role for this provider) — never retried,
             // and halts immediately even for a worker (unlike other worker errors, which are
-            // reported to the orchestrator below).
+            // reported to the orchestrator below) — unless the role's chain has another model.
+            if kind == Some(ErrKind::ProviderRejected) && self.try_fallback(ctx, a, FallbackWhy::Rejected, &msg) {
+                return;
+            }
             let reason = match kind {
                 Some(ErrKind::Auth) => Some(HaltReason::Auth),
                 Some(ErrKind::UsageLimit) => Some(HaltReason::UsageLimit),
@@ -3290,25 +3386,40 @@ Then summarize in 2-4 lines.",
         }
     }
 
-    /// A provider's exhausted balance is not a failed implementation attempt. Replace just
-    /// this agent, keeping a worker's current worktree, task, and attempt budget intact.
-    fn fallback_after_usage_limit(&mut self, ctx: &mut dyn Ctx, a: AgentId, error: &str) -> bool {
+    /// Move agent `a` to the next model of its role's chain. `false` when the run is halted, the
+    /// agent has no role, or nothing in the chain is left — the caller then does what it did before.
+    /// A provider's exhausted balance (or silence, empty turns, a rejected request) is not a failed
+    /// implementation attempt: just this agent is replaced, a worker keeping its current worktree,
+    /// task and attempt budget.
+    fn try_fallback(&mut self, ctx: &mut dyn Ctx, a: AgentId, why: FallbackWhy, error: &str) -> bool {
         if self.halted() {
             return false;
         }
         let Some(role_name) = self.role_name_of(a) else { return false };
+        let Some(key) = self.first_token_key(a) else { return false };
         let running = self.worker_idx(a).and_then(|wi| self.workers[wi].model.clone())
             .or_else(|| self.slot_models.get(&self.slot_of(a)).cloned())
             .or_else(|| ctx.agent(a).map(|ag| ag.model_alias.clone()).filter(|m| !m.is_empty()))
-            .unwrap_or_else(|| self.role_for_slot(&self.slot_of(a), &role_name).model);
-        let fallback = self.pattern.role(&role_name).and_then(|role| role.fallback.as_ref())
-            .filter(|alias| !alias.trim().is_empty() && **alias != running && self.knows_model(alias)).cloned();
-        let Some(alias) = fallback else { return false };
+            .unwrap_or_else(|| self.role(&role_name).model);
+        let (secs, trouble, short, reason) = match why {
+            FallbackWhy::UsageLimit => (3600, "hit its usage limit", "usage limit", format!("hit its provider's usage limit ({})", trunc(error, 240))),
+            FallbackWhy::Silent => (900, "gave no output", "no output", "produced no output twice in a row".to_string()),
+            FallbackWhy::Empty => (900, "returned empty turns", "empty turns", "returned an empty turn twice in a row".to_string()),
+            FallbackWhy::Rejected => (86_400, "rejected the request", "rejected", format!("was rejected by its provider ({})", trunc(error, 240))),
+        };
+        self.mark_trouble(&running, secs, trouble);
+        self.fallback_used.entry(key.clone()).or_default().push(running.clone());
+        let used = self.fallback_used.get(&key).cloned().unwrap_or_default();
+        let chain = self.pattern.role(&role_name).map(|r| r.fallback_chain()).unwrap_or_default();
+        let next = chain.into_iter().find(|f| !used.contains(f) && *f != running && self.knows_model(f) && self.troubled(f).is_none());
+        let Some(next) = next else {
+            self.save_state();
+            return false;
+        };
         let name = self.name_of(a);
-        let first_token_key = self.first_token_key(a);
-        let note = format!("[mantra:fallback] The previous provider hit its billing or usage limit ({}). You are its replacement on {alias}. Your current files contain the work so far. Continue where it left off.", trunc(error, 240));
+        let note = format!("[mantra:fallback] The previous model ({running}) {reason}. You are its replacement on {next}. Your current files contain the work so far. Continue where it left off.");
         self.forget_agent_session(a);
-        self.set_agent_model(a, &alias);
+        self.set_agent_model(a, &next);
         let restarted = if let Some(wi) = self.worker_idx(a) {
             let dir = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone()));
             if let Some(dir) = dir {
@@ -3332,10 +3443,9 @@ Then summarize in 2-4 lines.",
             return false;
         }
         self.clear_replaced_agent(a);
-        if let Some(key) = first_token_key {
-            self.first_token_strikes.remove(&key);
-        }
-        self.alert(ctx, format!("{name}: {running} hit a provider billing or usage limit — continuing on fallback {alias}. {}", trunc(error, 160)));
+        self.first_token_strikes.remove(&key);
+        self.empty_strikes.remove(&key);
+        self.alert_as(ctx, "⇄", format!("{name}: {running} → fallback {next} ({short})"));
         self.save_state();
         true
     }
@@ -3843,34 +3953,9 @@ Then summarize in 2-4 lines.",
             }
             return;
         }
-        let role_name = self.role_name_of(a);
-        let running = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
-        let fallback = role_name
-            .as_ref()
-            .and_then(|r| self.pattern.role(r))
-            .and_then(|r| r.fallback.clone().filter(|f| !f.trim().is_empty() && *f != r.model && *f != running));
-        if let (Some(alias), Some(role_name)) = (fallback, role_name) {
-            self.log("↻", "amber", format!("{name}: no output twice — falling back to {alias}"));
-            if let Some(r) = self.pattern.roles.get_mut(&role_name) {
-                r.model = alias;
-            }
-            // The fallback is the role's model from now on (a resume rebuilds the pattern from the
-            // run's `pattern.toml`, which `save_state` rewrites below); a model the user had
-            // switched this very agent to is what went silent, so it no longer outranks the role.
-            match self.worker_idx(a) {
-                Some(wi) => self.workers[wi].model = None,
-                None => {
-                    let slot = self.slot_of(a);
-                    self.slot_models.remove(&slot);
-                }
-            }
-            // the new model gets its own restart-then-escalate cycle
-            self.first_token_strikes.remove(&key);
-            let note = format!("[mantra:watchdog] Your previous model produced no output for {quiet}, twice in a row; you are its replacement. Continue where you left off.");
-            if let Err(e) = self.respawn(ctx, a, Some(note)) {
-                self.log("!", "amber", format!("{name}: could not respawn on the fallback ({e})"));
-            }
-            self.save_state();
+        // The role's next model, if its chain has one: the agent (or slot) is pinned to it, and the
+        // trouble mark makes later spawns of the role start on a fallback too (`model_for_spawn`).
+        if self.try_fallback(ctx, a, FallbackWhy::Silent, "") {
             return;
         }
         // The manager is a supervisor, not a step of the run: a fresh one, never a halt.

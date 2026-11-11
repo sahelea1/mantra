@@ -1339,6 +1339,13 @@ impl Registry {
         self.names().into_iter().map(|(name, m)| (name, m.effective_context())).collect()
     }
 
+    /// alias → provider id for every name `get` answers to (the key set of
+    /// `context_windows_for_default`), `"openai"` where an entry names none — what
+    /// `Run::set_known_providers` is handed, so a fallback skips models on a troubled provider.
+    pub fn alias_providers(&self) -> std::collections::HashMap<String, String> {
+        self.names().into_iter().map(|(name, m)| (name, if m.provider.is_empty() { "openai".to_string() } else { m.provider.clone() })).collect()
+    }
+
     /// The names whose model takes images — what `Run::set_vision_models` is handed — in both
     /// spellings, like `context_windows`: a role naming `sol-api` keeps its screenshot tools.
     pub fn vision_names(&self) -> std::collections::HashSet<String> {

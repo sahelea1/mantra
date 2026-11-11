@@ -3574,10 +3574,9 @@ fn first_token_deadline_restarts_once_then_falls_back_to_the_roles_model() {
     let third = run.planner.unwrap();
     assert_ne!(third, second);
     assert_eq!(ctx.spawned_models.last().unwrap().1, "luna", "respawned on the fallback alias");
-    assert!(run.pulse.iter().any(|p| p.glyph == "↻" && p.text == "planner: no output twice — falling back to luna"), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
-    assert_eq!(run.pattern.roles["planner"].model, "luna", "later spawns of the role stay on it");
-    let saved = std::fs::read_to_string(dir.join("pattern.toml")).unwrap();
-    assert!(saved.contains("model = \"luna\""), "a resume must see the switch: {saved}");
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text == format!("planner: {primary} → fallback luna (no output)")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    assert_eq!(run.pattern.roles["planner"].model, primary, "the role's model is not rewritten");
+    assert_eq!(run.slot_models.get("planner").map(String::as_str), Some("luna"), "the slot is pinned to the fallback: its respawns and a resume keep it");
     assert!(!run.halted());
 
     // the fallback gets its own restart; if it is silent too there is nobody left to fall back to
@@ -4324,7 +4323,7 @@ fn the_fallback_replaces_a_switched_model_that_went_silent() {
     run.first_token_strikes.insert(key, 1);
     run.on_first_token_deadline(&mut ctx, p, Duration::from_secs(300));
     assert_eq!(ctx.spawned("planner").last().unwrap().model, "luna", "on the fallback, not back on the switch");
-    assert!(run.slot_models.is_empty());
+    assert_eq!(run.slot_models.get("planner").map(String::as_str), Some("luna"), "the fallback replaces the switch as the slot's pin");
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
@@ -4359,7 +4358,7 @@ fn billing_fallback_keeps_worker_files_and_attempt_and_alerts_the_owner() {
     assert_eq!(run.workers[0].model.as_deref(), Some("claude-fallback"));
     assert!(run.continue_queue.is_empty() && !run.retry_counts.contains_key(&a));
     assert!(run.alerts.iter().any(|alert| alert.contains("fallback claude-fallback")));
-    assert!(ctx.notified.iter().any(|alert| alert.contains("billing or usage limit")));
+    assert!(ctx.notified.iter().any(|alert| alert.contains("openrouter-primary → fallback claude-fallback (usage limit)")), "{:?}", ctx.notified);
     // A late error from the stopped primary cannot restore the halt.
     run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 402: Insufficient credits".into()), Some(ErrKind::UsageLimit));
     assert!(!run.halted());
@@ -4648,4 +4647,144 @@ fn a_screenshot_and_an_image_come_back_as_input_images() {
     let (_, items, ok) = ctx.items.last().cloned().unwrap();
     assert!(!ok && items[0]["text"].as_str().unwrap_or_default().contains("does not take images"), "{items:?}");
     assert!(!run.dir.join("screenshots").join("p1-api-1.png").exists());
+}
+
+/// A planner whose role has the chain `pa` → `pb` → `pc` (`fallback`, `fallback2`).
+fn chain_run(tag: &str) -> (Run, TestCtx) {
+    let mut pat = no_manager();
+    {
+        let r = pat.roles.get_mut("planner").unwrap();
+        r.model = "pa".into();
+        r.fallback = Some("pb".into());
+        r.fallback2 = Some("pc".into());
+    }
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir(tag);
+    run.stage = Stage::Planning;
+    (run, TestCtx::new())
+}
+
+#[test]
+fn a_usage_limit_walks_the_fallback_chain_then_halts() {
+    let (mut run, mut ctx) = chain_run("chain-walk");
+    let a = run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pa");
+    run.on_turn_done(&mut ctx, a, "failed", Some("You've hit your 5-hour limit · resets 9:20pm (UTC)".into()), Some(ErrKind::UsageLimit));
+    let b = run.planner.unwrap();
+    assert_ne!(b, a);
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb", "respawned on the first fallback");
+    assert!(!run.halted());
+    assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("[mantra:retry]")), "a usage limit is not retried: {:?}", ctx.prompts);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == b && t.contains("[mantra:fallback] The previous model (pa) hit its provider's usage limit") && t.contains("replacement on pb")), "{:?}", ctx.prompts);
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text == "planner: pa → fallback pb (usage limit)"), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    assert_eq!(run.pattern.roles["planner"].model, "pa", "the role's model is not rewritten");
+    run.on_turn_done(&mut ctx, b, "failed", Some("You've hit your weekly limit".into()), Some(ErrKind::UsageLimit));
+    let c = run.planner.unwrap();
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "the second fallback");
+    assert!(!run.halted());
+    run.on_turn_done(&mut ctx, c, "failed", Some("You've hit your weekly limit".into()), Some(ErrKind::UsageLimit));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::UsageLimit), "the chain is spent");
+    assert_eq!(run.fallback_used.get("planner").cloned().unwrap_or_default(), ["pa", "pb", "pc"]);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_fallback_skips_models_on_the_troubled_provider_and_later_spawns_start_on_one() {
+    let (mut run, mut ctx) = chain_run("chain-provider");
+    run.set_known_providers(HashMap::from([("pa".to_string(), "P1".to_string()), ("pb".into(), "P1".into()), ("pc".into(), "P2".into())]));
+    let gate = run.pattern.flow.phase_gate.clone();
+    {
+        let r = run.pattern.roles.get_mut(&gate).unwrap();
+        r.model = "pa".into();
+        r.fallback = Some("pc".into());
+    }
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("usage limit".into()), Some(ErrKind::UsageLimit));
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "pb shares pa's provider, which just hit its limit");
+    assert!(!run.halted());
+    // a gate on the troubled provider starts on its fallback
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.spawn_gate_at_round(&mut ctx, 0, 1);
+    assert_eq!(ctx.spawned(&gate).last().map(|s| s.model.clone()).as_deref(), Some("pc"));
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text.contains("starts on fallback pc") && p.text.contains("pa's provider hit its usage limit")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_pinned_worker_keeps_its_model_on_a_troubled_provider_and_is_warned_once() {
+    let mut ctx = TestCtx::new();
+    let mut pat = no_manager();
+    pat.roles.get_mut("worker-small").unwrap().fallback = Some("other".into());
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir("pinned-trouble");
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.set_known_providers(HashMap::from([("x".to_string(), "P1".to_string()), ("other".into(), "P2".into())]));
+    let a = ctx.add_busy();
+    let mut w = mk_worker("t1", "worker-small", a, WState::Running);
+    w.model = Some("x".into());
+    run.workers.push(w);
+    run.mark_trouble("x", 3600, "hit its usage limit");
+    for _ in 0..2 {
+        run.launch_worker(&mut ctx, 0, PathBuf::from("wt"), "b".into());
+    }
+    assert!(ctx.spawned("t1").iter().all(|s| s.model == "x"), "the user's pin wins");
+    let warned = run.pulse.iter().filter(|p| p.glyph == "⚠" && p.text == "worker:t1: runs on x as you chose, although its provider hit its usage limit").count();
+    assert_eq!(warned, 1, "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_rejected_request_falls_back_when_the_chain_has_a_model() {
+    let (mut run, mut ctx) = chain_run("chain-rejected");
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("Unexpected message role.".into()), Some(ErrKind::ProviderRejected));
+    assert!(!run.halted());
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb");
+    assert!(run.pulse.iter().any(|p| p.text == "planner: pa → fallback pb (rejected)"));
+    assert!(ctx.prompts.iter().any(|(_, t)| t.contains("was rejected by its provider (Unexpected message role.)")), "{:?}", ctx.prompts);
+    // without a chain: the existing halt
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("chain-rejected-none");
+    run.stage = Stage::Planning;
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("Unexpected message role.".into()), Some(ErrKind::ProviderRejected));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::ProviderRejected));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_halt_about_one_agents_provider_lets_the_others_finish_their_turn() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("soft-halt");
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let p = ctx.add_idle();
+    run.planner = Some(p);
+    let w = ctx.add_busy();
+    run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+    run.on_turn_done(&mut ctx, p, "failed", Some("invalid api key".into()), Some(ErrKind::Auth));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::Auth));
+    assert!(!ctx.interrupted.contains(&w), "the healthy worker keeps its turn");
+    assert!(run.pulse.iter().any(|x| x.glyph == "‖" && x.text == "1 agent(s) keep working until their turn ends — the halt is about planner only"), "{:?}", run.pulse.iter().map(|x| x.text.clone()).collect::<Vec<_>>());
+    // a user pause still stops everyone
+    run.resume(&mut ctx);
+    run.halt(&mut ctx, HaltReason::User, None, "paused".into());
+    assert!(ctx.interrupted.contains(&w));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn fallback_used_survives_a_resume() {
+    let (mut run, _ctx) = chain_run("fallback-used-state");
+    run.fallback_used.insert("planner".into(), vec!["pa".into(), "pb".into()]);
+    run.save_state();
+    let st = RunState::load(&run.dir).unwrap();
+    assert_eq!(st.fallback_used.get("planner").cloned().unwrap_or_default(), ["pa", "pb"]);
+    let back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+    assert_eq!(back.fallback_used, run.fallback_used);
+    let _ = std::fs::remove_dir_all(&run.dir);
 }

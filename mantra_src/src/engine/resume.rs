@@ -43,6 +43,7 @@ impl Run {
         run.plan_version = st.plan_version;
         run.handoff = st.handoff.clone();
         run.akasha = st.akasha.clone();
+        run.fallback_used = st.fallback_used.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         run.sync_akasha_groups();
         run.started_unix = st.started_unix;
         // a finished run written before `finished_unix` existed: its last save is the closest

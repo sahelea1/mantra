@@ -1577,10 +1577,12 @@ impl App {
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
         let known = self.registry.context_windows_for_default(&self.settings.default_model);
+        let providers = self.registry.alias_providers();
         let sees = crate::engine::run::vision_aliases(&self.registry);
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
             // the switch may bring an alias the run has not seen: refresh what it knows first
             run.set_known_models(known);
+            run.set_known_providers(providers);
             run.set_vision_models(sees);
             run.set_agent_model(a, &alias);
         }
@@ -1730,6 +1732,7 @@ impl App {
         }
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
+        run.set_known_providers(self.registry.alias_providers());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
@@ -1825,6 +1828,7 @@ impl App {
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
+        run.set_known_providers(self.registry.alias_providers());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
