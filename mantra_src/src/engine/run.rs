@@ -2132,7 +2132,7 @@ Then summarize in 2-4 lines.",
         if let Some(phase) = self.current_phase() {
             s.push_str(&format!("\nCurrent phase:\n```json\n{}\n```\n", serde_json::to_string_pretty(phase).unwrap_or_default()));
         }
-        s.push_str(&format!("Recent journal:\n{}\nCall mantra_read_phase for live task states and mantra_read_plan for another phase.", self.journal_text(25)));
+        s.push_str(&format!("Recent journal:\n{}\nCall mantra_read_phase for live task states and mantra_read_plan(phase=…) for another phase.", self.journal_text(25)));
         s
     }
 
@@ -5358,7 +5358,7 @@ Then summarize in 2-4 lines.",
         let resume = if let Some(phase) = self.current_phase() {
             let phase_json = serde_json::to_string_pretty(phase).unwrap_or_default();
             format!(
-                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; call mantra_read_plan first if you must revise other phases.",
+                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; call mantra_read_plan(phase=…) for another phase.",
                 self.plan_version
             )
         } else if let Some(plan) = &self.plan {
@@ -5839,7 +5839,28 @@ Then summarize in 2-4 lines.",
                 None => ("no phase is active".into(), false),
             },
             "mantra_read_plan" => match &self.plan {
-                Some(p) => (serde_json::to_string_pretty(p).unwrap_or_default(), true),
+                Some(p) => {
+                    let want = s("phase");
+                    if !want.is_empty() {
+                        let found = p.phases.iter().position(|ph| ph.id == want).or_else(|| want.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= p.phases.len()).map(|n| n - 1));
+                        return match found {
+                            Some(i) => (serde_json::to_string_pretty(&p.phases[i]).unwrap_or_default(), true),
+                            None => (format!("no phase '{want}' (phases: {})", p.phases.iter().map(|ph| ph.id.clone()).collect::<Vec<_>>().join(", ")), false),
+                        };
+                    }
+                    let full = serde_json::to_string_pretty(p).unwrap_or_default();
+                    if args.get("full").and_then(Value::as_bool).unwrap_or(false) || full.chars().count() <= 30_000 {
+                        return (full, true);
+                    }
+                    let cur = self.phase_idx();
+                    let mut o = format!("Plan v{}: {}\n{}\n\norchestrator_brief: {} characters\nfinal_checks: {}\nPhases:\n", self.plan_version, p.title, p.summary, p.orchestrator_brief.chars().count(), p.final_checks.len());
+                    for (i, ph) in p.phases.iter().enumerate() {
+                        let state = match cur { Some(c) if i == c => "CURRENT", Some(c) if i > c => "pending", Some(_) => "done", None if matches!(self.stage, Stage::Finale { .. } | Stage::Done) => "done", None => "pending" };
+                        o.push_str(&format!("- {} · {} — {state} · {} task(s): {} · {} gate check(s)\n", ph.id, ph.name, ph.tasks.len(), ph.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", "), ph.gate.checks.len()));
+                    }
+                    o.push_str(&format!("\nThe whole plan is {} characters. Read one phase with mantra_read_plan(phase=\"<id>\"), or pass full=true.", full.chars().count()));
+                    (o, true)
+                }
                 None => ("no plan submitted yet".into(), false),
             },
             "mantra_spawn" => {

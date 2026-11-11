@@ -6223,3 +6223,38 @@ fn a_patch_cannot_change_a_finished_phase() {
     let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "add_check", "phase": "p2", "value": "echo hi"}], "reason": "r"}));
     assert!(ok, "{msg}");
 }
+
+fn big_plan(run: &mut Run) {
+    let mut plan = Plan { title: "Big".into(), summary: "a big plan".into(), orchestrator_brief: "b".repeat(100), ..Default::default() };
+    for n in 1..=3 {
+        plan.phases.push(Phase { id: format!("p{n}"), name: format!("Phase {n}"), tasks: vec![Task { id: format!("t{n}"), role: "worker-small".into(), prompt: "x".repeat(12_000), ..Default::default() }], ..Default::default() });
+    }
+    run.plan = Some(plan);
+    run.plan_version = 4;
+    run.stage = Stage::Phase { idx: 1, step: PhaseStep::Checks { round: 0 } };
+}
+
+/// WP-8.2: a large plan is read as an outline, one phase at a time.
+#[test]
+fn read_plan_outlines_a_large_plan_and_returns_one_phase_on_request() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let planner = ctx.add_idle();
+    run.planner = Some(planner);
+    big_plan(&mut run);
+    let (out, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+    assert!(ok && out.contains("Phases:") && out.len() < 6_000, "{}", out.len());
+    assert!(out.contains("Plan v4: Big") && out.contains("p1 · Phase 1 — done") && out.contains("p2 · Phase 2 — CURRENT") && out.contains("p3 · Phase 3 — pending") && out.contains("mantra_read_plan(phase="), "{out}");
+    for arg in ["p2", "2"] {
+        let (ph, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"phase": arg}));
+        assert!(ok && ph.contains("\"id\": \"p2\"") && ph.contains("\"t2\"") && !ph.contains("\"t1\""), "{arg}");
+    }
+    let (err, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"phase": "zz"}));
+    assert!(!ok && err.contains("p1, p2, p3"), "{err}");
+    let (all, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"full": true}));
+    assert!(ok && all.len() > 36_000 && all.contains("\"t3\""));
+    // a small plan comes back whole
+    run.plan = Some(one_task_phase());
+    let (small, _) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+    assert!(small.contains("\"t1\"") && !small.contains("Phases:"), "{small}");
+}

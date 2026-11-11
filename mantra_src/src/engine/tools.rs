@@ -112,7 +112,15 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
         tool("mantra_revise_pattern", "Propose a complete replacement workflow as TOML, with the reason and impact. Use rarely when the current workflow is broken or inappropriate, or to create Auto's first workflow. Mantra asks the user to approve unless they explicitly enabled approve-all. You cannot approve your own proposal.", json!({"toml": {"type": "string"}, "reason": {"type": "string"}}), &["toml", "reason"]),
         tool("mantra_wait_for_external_condition", "Schedule a bounded, nonblocking re-entry, then end your turn. Mantra wakes you once after seconds; inspect the condition then and act on the result. Use for CI, deployment, or another external dependency instead of shell sleep/poll loops. This does not evaluate the condition automatically.", json!({"seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "condition": {"type": "string"}, "on_reentry": {"type": "string"}}), &["seconds", "condition", "on_reentry"]),
         read_phase_tool(),
-        tool("mantra_read_plan", "Read the full plan (every phase), as last submitted — mantra_read_phase only shows the current one. Use before revising a phase you haven't seen in this thread.", json!({}), &[]),
+        tool(
+            "mantra_read_plan",
+            "Read the plan as last accepted. A large plan comes back as an outline; pass phase=\"<id>\" for one phase in full.",
+            json!({
+                "phase": {"type": "string", "description": "phase id or 1-based number: return only that phase, in full"},
+                "full": {"type": "boolean", "description": "return the whole plan even when it is large"}
+            }),
+            &[],
+        ),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
         tool(
             "mantra_revise_plan",
