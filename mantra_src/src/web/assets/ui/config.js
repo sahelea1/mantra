@@ -793,6 +793,11 @@
     }
     function toggleCtl(on, onchange, label) { return h('input', { type: 'checkbox', class: 'switch', checked: !!on, 'aria-label': label, onchange: (e) => onchange(e.target.checked) }); }
 
+    // A pick button for a model: `alias · model id` + provider chip; opens the model sheet and writes the choice.
+    function modelBtn(val, label, onpick, except, none) {
+        return h('button', { type: 'button', class: 'select pick-btn', 'aria-label': label + ': ' + (val || 'none'), onclick: () => M.act.sheet({ kind: 'pick-model', title: label, current: val, except, none, onpick }) }, P.modelRef(val));
+    }
+
     function roleCard(name, role, O) {
         const models = O.models || [];
         const m = models.find((x) => x.alias === role.model);
@@ -804,13 +809,16 @@
             h('div', { class: 'role-head', key: 'h' }, glyph, h('div', { class: 'role-titles' }, h('b', null, name), h('span', { class: 'dim sm' }, role.kind + (worker ? role.parallel ? ' · up to ' + role.parallel + ' at once' : ' · shares the pool' : ''))),
                 h('span', { class: 'dim sm role-desc' }, role.description || '')),
             h('div', { class: 'pe-grid', key: 'g' },
-                pf('Model', sel(role.model, models.map((x) => x.alias), set('model'), 'Model of ' + name)),
+                pf('Model', modelBtn(role.model, 'Model of ' + name, (v) => { role.model = v; if (role.fallback === v) role.fallback = null; touch(); })),
                 pf('Effort', sel(role.effort, efforts, set('effort'), 'Effort of ' + name), role.effort === 'auto' ? 'Mantra picks it per spawn from the role’s job' : null),
                 pf('Sandbox', sel(role.sandbox, O.sandboxes || [], set('sandbox'), 'Sandbox of ' + name)),
                 pf('Approvals', sel(role.permission, O.permissions || [], set('permission'), 'Approvals of ' + name)),
                 pf('Akasha swarm', toggleCtl(role.can_spawn_swarm, set('can_spawn_swarm'), 'Allow ' + name + ' to start an Akasha swarm'), 'May delegate to a temporary Akasha swarm; members cannot spawn another swarm'),
                 worker ? pf('Workers at once', txt(role.parallel, (v) => { role.parallel = String(v).trim() === '' ? null : nums(v); touch(); }, { num: true, min: O.parallel[0], max: O.parallel[1], placeholder: 'shares the pool', label: 'Workers at once of ' + name }), 'A class of its own; empty shares the pattern’s pool') : null,
-                pf('Fallback', sel(role.fallback || '', [['', 'none — the manager is asked']].concat(models.filter((x) => x.alias !== role.model).map((x) => x.alias)), (v) => { role.fallback = v || null; touch(); }, 'Fallback of ' + name), 'Takes over when the model gives no first token in time'),
+                [['fallback', 'Fallback 1', 'Takes over when the model cannot go on — the manager is asked when none'], ['fallback2', 'Fallback 2', null], ['fallback3', 'Fallback 3', null]]
+                    .filter(([k], i) => i === 0 || role[['fallback', 'fallback2'][i - 1]])
+                    .map(([k, l, hint]) => pf(l, modelBtn(role[k] || null, l + ' of ' + name, (v) => { role[k] = v; touch(); }, role.model, 'none'), hint)),
+                pf('Context limit', sel(role.context || '', P.CTX_CHOICES.map((n) => [n === null ? '' : n, P.ctxLabel(n)]).concat(role.context && !P.CTX_CHOICES.includes(role.context) ? [[role.context, P.ctxLabel(role.context)]] : []), (v) => { role.context = v === '' ? null : Number(v); touch(); }, 'Context limit of ' + name), 'Most tokens of context this role works with'),
                 pf('MCP servers', txt((role.mcp || []).join(', '), (v) => { role.mcp = v.split(/[\s,]+/).filter(Boolean); touch(); }, { placeholder: O.mcp && O.mcp.length ? 'none · * for all · ' + O.mcp.join(', ') : 'none (Settings › MCP servers)', label: 'MCP servers of ' + name, mono: true })),
                 pf('Description', txt(role.description, set('description'), { label: 'Description of ' + name })),
                 pf('Instructions', txt(role.instructions, set('instructions'), { area: true, rows: 7, label: 'Instructions of ' + name }), null, true)),

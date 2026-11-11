@@ -502,17 +502,21 @@
         opts = opts || {};
         const all = (S.app && S.app.models) || [];
         if (!all.length) return P.empty('model', 'No models', 'The model registry is empty.');
-        const models = all.filter((m) => m.alias !== opts.except);
+        // a text filter above a long list (alias, model id, provider name); its text lives on the sheet
+        const sh = S.ui.sheet || {};
+        const q = ((sh.filter || '') + '').trim().toLowerCase();
+        const models = all.filter((m) => m.alias !== opts.except).filter((m) => !q || [m.alias, m.model, m.provider_name].some((x) => (x || '').toLowerCase().includes(q)));
+        const filterBox = all.length > 12 ? h('input', { key: '-filter', class: 'input pick-filter', type: 'search', value: sh.filter || '', placeholder: 'Filter models…', 'aria-label': 'Filter models', spellcheck: 'false', autocapitalize: 'off', oninput: (e) => { sh.filter = e.target.value; changed(); } }) : null;
         const none = opts.none ? h('button', { type: 'button', key: '-none', class: 'pick' + (currentAlias ? '' : ' on'), onclick: () => onPick(null) },
             h('span', { class: 'pick-main' }, h('b', null, 'None')), h('span', { class: 'pick-sub' }, opts.none),
             currentAlias ? null : icon('check', 'pick-check')) : null;
-        return h('div', { class: 'pick-list' }, none, models.map((m) => h('button', {
+        return h('div', { class: 'pick-list' }, filterBox, none, models.map((m) => h('button', {
             type: 'button', key: m.alias, class: 'pick' + (m.alias === currentAlias ? ' on' : '') + (m.problem ? ' problem' : ''),
             disabled: m.problem ? true : null,
             onclick: () => onPick(m.alias),
         }, h('span', { class: 'pick-main' }, h('b', null, m.alias), h('span', { class: 'dim mono sm' }, ' ' + m.model)),
             // the backend only when the provider's name does not already say it ("Bija · Bija")
-            h('span', { class: 'pick-sub' }, [m.provider_name, m.backend && m.backend !== 'codex' && F.backend(m.backend) !== m.provider_name ? F.backend(m.backend) : null, (m.effective_context_window || m.context_window) ? F.tokens(m.effective_context_window || m.context_window) + ' ctx' + (m.context_window ? '' : ' (default)') : null, m.note].filter(Boolean).join(' · ')),
+            h('span', { class: 'pick-sub' }, P.provChip(m.provider_name, m.provider_color), [m.backend && m.backend !== 'codex' && F.backend(m.backend) !== m.provider_name ? F.backend(m.backend) : null, (m.effective_context_window || m.context_window) ? F.tokens(m.effective_context_window || m.context_window) + ' ctx' + (m.context_window ? '' : ' (default)') : null, m.note].filter(Boolean).map((x) => ' · ' + x).join('')),
             m.problem ? h('span', { class: 'pick-problem' }, m.problem) : null,
             m.alias === currentAlias ? icon('check', 'pick-check') : null)));
     }
@@ -545,26 +549,52 @@
                 const role = all ? null : (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
                 if (!all && !role) break;
                 title = 'Model for ' + (all ? 'all roles' : role.name);
+                const live = !!(S.run && S.run.active);
+                const scope = sh.scope || (live ? 'run' : 'pattern');
+                const chain = all ? [] : (role.fallbacks || (role.fallback ? [role.fallback] : []));
+                const entry = (key, label, value, sub, to) => h('button', { type: 'button', key, class: 'pick', onclick: () => sheet(to) },
+                    h('span', { class: 'pick-main' }, h('b', null, label), value), h('span', { class: 'pick-sub' }, sub), icon('chevron', 'pick-check'));
                 body = [
-                    // the fallback is per role: its own sheet, one tap away (above the long model list)
-                    all ? null : h('div', { class: 'pick-list', key: 'fb', style: { marginBottom: '14px' } }, h('button', { type: 'button', class: 'pick', onclick: () => sheet({ kind: 'role-fallback', role: role.name }) },
-                        h('span', { class: 'pick-main' }, h('b', null, 'Fallback model'), h('span', { class: 'dim sm' }, ' ' + (role.fallback || 'none'))),
-                        h('span', { class: 'pick-sub' }, 'Takes over when ' + role.model_alias + ' gives no first token in time'),
-                        icon('chevron', 'pick-check'))),
+                    live ? h('div', { class: 'scope-toggle', key: 'scope' }, P.segmented(scope, [['run', 'This run only'], ['pattern', 'Save to the pattern']], (v) => { sh.scope = v; changed(); }, 'Where the change applies')) : null,
+                    // the fallbacks and the context limit are per role: their own sheets, one tap away (above the long model list)
+                    all ? null : h('div', { class: 'pick-list', key: 'fb', style: { marginBottom: '14px' } },
+                        [0, 1, 2].filter((i) => i <= chain.length).map((i) => entry('fb' + i, 'Fallback ' + (i + 1), h('span', { class: 'role-ref' }, ' ', P.modelRef(chain[i] || null)),
+                            i === 0 ? 'Tried in order when ' + role.model_alias + ' cannot go on' : 'Tried when the one before cannot go on', { kind: 'role-fallback', role: role.name, index: i })),
+                        entry('ctx', 'Context limit', h('span', { class: 'dim sm' }, ' ' + P.ctxLabel(role.context)), 'Most tokens of context this role works with', { kind: 'role-context', role: role.name })),
                     modelPickList(all ? null : role.model_alias, (alias) => {
                         closeSheet();
-                        cmd('set_role_model', { role: sh.role, alias, all }, { ok: modelOk((all ? 'all roles' : sh.role) + ' → ' + alias) });
+                        const to = (all ? 'all roles' : sh.role) + ' → ' + alias;
+                        cmd('set_role_model', { role: sh.role, alias, all, scope: live ? scope : 'pattern' }, { ok: modelOk(scope === 'run' && live ? to + ' (this run)' : to) });
                     })];
                 break;
             }
             case 'role-fallback': {
                 const role = (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
                 if (!role) break;
-                title = 'Fallback for ' + role.name;
-                body = modelPickList(role.fallback || null, (alias) => {
+                const idx = sh.index || 0;
+                const chain = role.fallbacks || (role.fallback ? [role.fallback] : []);
+                const cur = chain[idx] || null;
+                title = 'Fallback ' + (idx + 1) + ' for ' + role.name;
+                body = modelPickList(cur, (alias) => {
                     closeSheet();
-                    if (alias !== (role.fallback || null)) cmd('set_role_fallback', { role: role.name, alias }, { ok: alias ? role.name + ' falls back to ' + alias : role.name + ': no fallback' });
-                }, { except: role.model_alias, none: 'The manager is asked instead' });
+                    if (alias !== cur) cmd('set_role_fallback', { role: role.name, alias, index: idx }, { ok: alias ? role.name + ' falls back to ' + alias : role.name + ': fallback ' + (idx + 1) + ' cleared' });
+                }, { except: role.model_alias, none: idx === 0 ? 'The manager is asked instead' : 'No further fallback' });
+                break;
+            }
+            case 'pick-model': {
+                title = sh.title || 'Model';
+                body = modelPickList(sh.current || null, (alias) => { closeSheet(); if (alias !== (sh.current || null)) sh.onpick(alias); }, { except: sh.except, none: sh.none });
+                break;
+            }
+            case 'role-context': {
+                const role = (S.app && S.app.pattern_roles || []).find((r) => r.name === sh.role);
+                if (!role) break;
+                title = 'Context limit for ' + role.name;
+                const cur = role.context || null;
+                const choices = P.CTX_CHOICES.includes(cur) ? P.CTX_CHOICES : P.CTX_CHOICES.concat([cur]);
+                body = h('div', { class: 'pick-list' }, choices.map((n) => h('button', { type: 'button', key: 'c' + n, class: 'pick' + (n === cur ? ' on' : ''),
+                    onclick: () => { closeSheet(); if (n !== cur) cmd('set_role_context', { role: role.name, tokens: n }, { ok: role.name + ': context ' + P.ctxLabel(n) }); } },
+                    h('span', { class: 'pick-main' }, h('b', null, P.ctxLabel(n))), n === cur ? icon('check', 'pick-check') : null)));
                 break;
             }
             case 'effort': {

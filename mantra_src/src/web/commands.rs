@@ -227,7 +227,20 @@ impl App {
                 }
                 ok()
             }
-            Command::SetRoleModel { role, alias, all } => {
+            Command::SetRoleModel { role, alias, all, scope } if scope.as_deref() == Some("run") => {
+                if self.run.is_none() {
+                    return Err("no run is open".into());
+                }
+                let targets: Vec<String> = if all { self.run.as_ref().map(|r| r.pattern.roles.keys().cloned().collect()).unwrap_or_default() } else { vec![role] };
+                if let Some(bad) = targets.iter().find(|t| !self.run.as_ref().is_some_and(|r| r.pattern.roles.contains_key(*t))) {
+                    return Err(format!("no such role: {bad}"));
+                }
+                for name in &targets {
+                    self.set_run_role_model(name, &alias)?;
+                }
+                Ok(json!({"changed": targets, "scope": "run"}))
+            }
+            Command::SetRoleModel { role, alias, all, scope: _ } => {
                 let mut pattern = Pattern::load(&self.pattern_name, &self.project).map_err(|e| e.to_string())?;
                 if self.registry.get(&alias).is_none() {
                     return Err("unknown model".into());
@@ -264,7 +277,7 @@ impl App {
                 }
                 Ok(json!({"changed": targets, "path": path.display().to_string()}))
             }
-            Command::SetRoleFallback { role, alias } => {
+            Command::SetRoleFallback { role, alias, index } => {
                 let mut pattern = Pattern::load(&self.pattern_name, &self.project).map_err(|e| e.to_string())?;
                 let Some(r) = pattern.roles.get_mut(&role) else { return Err("no such role".into()) };
                 if let Some(a) = &alias {
@@ -278,9 +291,21 @@ impl App {
                         return Err("a fallback must be another model than the role's own".into());
                     }
                 }
-                r.fallback = alias.clone();
+                let i = usize::from(index.unwrap_or(0));
+                if i > 2 {
+                    return Err("a role has three fallbacks (index 0-2)".into());
+                }
+                r.set_fallback(i, alias.clone());
                 let path = pattern.save().map_err(|e| e.to_string())?;
                 // the active run picks it up only when it runs this very pattern (as set_role_model)
+                self.sync_run_pattern("the web editor");
+                Ok(json!({"path": path.display().to_string()}))
+            }
+            Command::SetRoleContext { role, tokens } => {
+                let mut pattern = Pattern::load(&self.pattern_name, &self.project).map_err(|e| e.to_string())?;
+                let Some(r) = pattern.roles.get_mut(&role) else { return Err("no such role".into()) };
+                r.context = tokens.filter(|t| *t > 0);
+                let path = pattern.save().map_err(|e| e.to_string())?;
                 self.sync_run_pattern("the web editor");
                 Ok(json!({"path": path.display().to_string()}))
             }
@@ -745,7 +770,7 @@ mod tests {
             pattern.save().unwrap();
             app.pattern_name = pattern.name.clone();
 
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true, scope: None });
             match &r {
                 ServerMsg::Result(x) => assert!(x.ok, "{x:?}"),
                 other => panic!("{other:?}"),
@@ -771,7 +796,7 @@ mod tests {
             pattern.roles.get_mut("planner").unwrap().effort = "high".into();
             pattern.save().unwrap();
             app.pattern_name = pattern.name.clone();
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true, scope: None });
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             let saved = Pattern::load(&app.pattern_name, &app.project).unwrap();
             assert_eq!(saved.roles["planner"].effort, "medium", "a named effort is clamped to the new model");
@@ -789,7 +814,7 @@ mod tests {
             pattern.save().unwrap();
             app.pattern_name = pattern.name.clone();
             let own = pattern.roles["planner"].model.clone();
-            let mut set = |app: &mut App, role: &str, alias: Option<&str>| run(app, &mut h, 1, Command::SetRoleFallback { role: role.into(), alias: alias.map(|a| a.into()) });
+            let mut set = |app: &mut App, role: &str, alias: Option<&str>| run(app, &mut h, 1, Command::SetRoleFallback { role: role.into(), alias: alias.map(|a| a.into()), index: None });
             let refused = |r: ServerMsg| matches!(r, ServerMsg::Result(ref x) if !x.ok);
             assert!(refused(set(&mut app, "planner", Some("no-such-alias"))), "an unknown alias");
             assert!(refused(set(&mut app, "planner", Some(own.as_str()))), "the role's own model");
@@ -802,6 +827,36 @@ mod tests {
             let r = set(&mut app, "planner", None);
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert_eq!(saved(), None, "none clears it");
+        });
+    }
+
+    #[test]
+    fn set_role_fallback_index_and_set_role_context_are_saved_and_pattern_get_carries_them() {
+        with_mantra_home(|| {
+            let (mut app, mut h, _rx) = wired();
+            for a in ["b1", "b2"] {
+                app.registry.models.push(crate::config::ModelEntry { alias: a.into(), model: format!("{a}-model"), ..Default::default() });
+            }
+            let mut pattern = Pattern::builtin();
+            pattern.name = "set-role-chain-test".into();
+            pattern.save().unwrap();
+            app.pattern_name = pattern.name.clone();
+            let load = || Pattern::load("set-role-chain-test", std::path::Path::new(".")).unwrap();
+            let ok = |r: ServerMsg| matches!(r, ServerMsg::Result(ref x) if x.ok);
+            assert!(ok(run(&mut app, &mut h, 1, Command::SetRoleFallback { role: "planner".into(), alias: Some("b1".into()), index: Some(0) })));
+            assert!(ok(run(&mut app, &mut h, 1, Command::SetRoleFallback { role: "planner".into(), alias: Some("b2".into()), index: Some(1) })));
+            assert_eq!(load().roles["planner"].fallback_chain(), vec!["b1", "b2"]);
+            assert!(!ok(run(&mut app, &mut h, 1, Command::SetRoleFallback { role: "planner".into(), alias: Some("b1".into()), index: Some(3) })));
+            assert!(ok(run(&mut app, &mut h, 1, Command::SetRoleFallback { role: "planner".into(), alias: None, index: Some(0) })));
+            assert_eq!(load().roles["planner"].fallback_chain(), vec!["b2"], "the chain closes up");
+            assert!(ok(run(&mut app, &mut h, 1, Command::SetRoleContext { role: "planner".into(), tokens: Some(200_000) })));
+            assert_eq!(load().roles["planner"].context, Some(200_000));
+            assert!(!ok(run(&mut app, &mut h, 1, Command::SetRoleContext { role: "nobody".into(), tokens: Some(1) })));
+            let got = serde_json::to_value(load()).unwrap();
+            let planner = &got["roles"]["planner"];
+            assert_eq!((planner["fallback"].as_str(), planner["context"].as_u64()), (Some("b2"), Some(200_000)));
+            assert!(ok(run(&mut app, &mut h, 1, Command::SetRoleContext { role: "planner".into(), tokens: None })));
+            assert_eq!(load().roles["planner"].context, None);
         });
     }
 
@@ -819,7 +874,7 @@ mod tests {
             app.project = project.clone();
             app.pattern_name = pattern.name.clone();
 
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true, scope: None });
             match &r {
                 ServerMsg::Result(x) => assert!(x.ok, "{x:?}"),
                 other => panic!("{other:?}"),
@@ -853,7 +908,7 @@ mod tests {
             other.save().unwrap();
             app.pattern_name = other.name.clone();
 
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: String::new(), alias: "capped".into(), all: true, scope: None });
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert_eq!(app.run.as_ref().unwrap().pattern.roles["planner"].model, planner_model_before, "the active run's own pattern must be untouched");
             assert_ne!(app.agents[&planner_agent].model_alias, "capped", "the run's own live agent must be untouched");
@@ -884,7 +939,7 @@ mod tests {
             run_.workers.push(worker("p1-old", 4, WState::Cancelled));
             app.run = Some(run_);
 
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "worker-small".into(), alias: "luna".into(), all: false });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "worker-small".into(), alias: "luna".into(), all: false, scope: None });
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert_eq!(app.agents[&3].model_alias, "luna", "a running worker switches: {:?}", app.toast);
             assert_eq!(app.agents[&2].model_alias, "sol", "a done attempt ran on sol, and its card keeps saying so");
@@ -912,7 +967,7 @@ mod tests {
             app.run = Some(run_);
             assert_ne!(pattern.roles["planner"].model, "luna");
 
-            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "planner".into(), alias: "luna".into(), all: false });
+            let r = run(&mut app, &mut h, 1, Command::SetRoleModel { role: "planner".into(), alias: "luna".into(), all: false, scope: None });
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             let run_ = app.run.as_ref().unwrap();
             assert!(run_.halted(), "the model change must not resume the run");
@@ -926,7 +981,7 @@ mod tests {
             let r = run(&mut app, &mut h, 2, Command::PauseResume);
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             assert!(!app.run.as_ref().unwrap().halted());
-            let r = run(&mut app, &mut h, 3, Command::SetRoleModel { role: "planner".into(), alias: "sol".into(), all: false });
+            let r = run(&mut app, &mut h, 3, Command::SetRoleModel { role: "planner".into(), alias: "sol".into(), all: false, scope: None });
             assert!(matches!(r, ServerMsg::Result(ref x) if x.ok), "{r:?}");
             // (the only word is that the run took the pattern's change — not the halted-run hint)
             assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("run updated: 1 change(s) from the pattern"));

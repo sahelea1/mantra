@@ -63,6 +63,18 @@
             a.tokens_total ? h('span', { class: 'ctx-tok' }, ' · ' + F.tokens(a.tokens_total) + ' tok', cachedNote(a.tokens_total, a.tokens_cached)) : null);
     }
 
+    // The provider's name marked with its colour (`.prov-<colour>`), wherever a model is chosen.
+    function provChip(name, color) { return h('span', { class: 'prov prov-' + (color || 'gray') }, name || ''); }
+    // A role's context limit choices (tokens; null = none) and how one reads.
+    const CTX_CHOICES = [null, 64000, 128000, 200000, 272000, 400000, 500000, 1000000];
+    const ctxLabel = (n) => (n ? F.tokens(n) : 'none');
+    // The model a role names, as the pick buttons show it: `alias · model id` with the provider chip.
+    function modelRef(alias) {
+        const m = ((S().app || {}).models || []).find((x) => x.alias === alias);
+        if (!alias) return h('span', { class: 'dim' }, 'none');
+        return h('span', { class: 'model-ref' }, h('b', null, alias), m ? [h('span', { class: 'dim mono sm' }, m.model), provChip(m.provider_name, m.provider_color)] : h('span', { class: 'dim sm' }, ' not in /models'));
+    }
+
     function modelChip(a, onclick) {
         return h(onclick ? 'button' : 'span', { class: 'chip model', onclick: onclick || null, type: onclick ? 'button' : null, title: a.model ? a.model + (a.provider_name ? ' via ' + a.provider_name : '') : null },
             h('b', null, a.model_alias || a.model || '?'),
@@ -484,7 +496,7 @@
     }
 
     M.parts = {
-        glyph, btn, iconBtn, effortBar, ctxGauge, ctxColor, modelChip, status, retryingText, completedAgent, statusPill, wstate, groups, roleLabel,
+        glyph, btn, iconBtn, provChip, modelRef, CTX_CHOICES, ctxLabel, effortBar, ctxGauge, ctxColor, modelChip, status, retryingText, completedAgent, statusPill, wstate, groups, roleLabel,
         agentRow, taskRow, section, teamList, stageRail, stageSegments, runSummary, runCard,
         haltBand, haltPrimary, haltResumeLabel, stageWhere, questionBand, reviewBand, bands, feedbackField, approvalCard, empty, loading, waitText, errorBox, toggle, segmented, copyBtn, HALT_TITLE,
     };

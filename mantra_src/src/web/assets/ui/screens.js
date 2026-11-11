@@ -418,7 +418,7 @@
                 h('span', { class: 'row-title' }, r.name),
                 h('span', { class: 'row-sub' }, r.kind),
                 r.can_spawn_swarm ? h('span', { class: 'row-sub' }, 'Can start an Akasha swarm in Solo') : null,
-                r.fallback ? h('span', { class: 'row-sub role-fallback', title: 'Used when ' + r.model_alias + ' gives no first token in time' }, '↪ falls back to ', h('b', null, r.fallback)) : null),
+                (r.fallbacks && r.fallbacks.length ? r.fallbacks : r.fallback ? [r.fallback] : []).length ? h('span', { class: 'row-sub role-fallback', title: 'Used in this order when ' + r.model_alias + ' cannot go on' }, '↪ falls back to ', (r.fallbacks && r.fallbacks.length ? r.fallbacks : [r.fallback]).map((x, i) => [i ? ' → ' : '', h('b', { key: 'f' + i }, x)])) : null),
             h('span', { class: 'chip model' }, h('b', null, r.model_alias), r.effort ? [h('span', { class: 'sep' }, '·'),
                 r.effort === 'auto' ? h('span', { class: 'effort-auto', title: 'Auto effort: Mantra picks it for each spawn' }, 'auto') : h('span', null, r.effort)] : null),
             icon('chevron', 'chev')))), {

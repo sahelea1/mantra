@@ -1033,6 +1033,26 @@ dl.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .pick.on { border-color: var(--focus); background: var(--selected); }
 .pick-main { display: flex; align-items: baseline; gap: 4px; }
 .pick-sub { color: var(--dim); font-size: var(--fs-xs); }
+/* a provider's name marked with its colour (one class per pattern colour) */
+.prov { display: inline-flex; align-items: center; gap: .35em; }
+.prov::before { content: ""; width: .62em; height: .62em; border-radius: 2px; background: currentColor; flex: none; }
+.prov-saffron { color: var(--saffron); }
+.prov-violet { color: var(--violet); }
+.prov-teal { color: var(--teal); }
+.prov-cyan { color: var(--cyan); }
+.prov-green { color: var(--green); }
+.prov-rose { color: var(--rose); }
+.prov-red { color: var(--red); }
+.prov-amber { color: var(--amber); }
+.prov-blue { color: var(--blue); }
+.prov-gray { color: var(--gray); }
+.pick-filter { margin-bottom: 4px; }
+.scope-toggle { margin-bottom: 12px; }
+.scope-toggle .segmented { display: flex; }
+.scope-toggle .segmented button { flex: 1; }
+.pick-btn { display: flex; align-items: center; text-align: left; min-height: 40px; width: 100%; }
+.model-ref { display: inline-flex; flex-wrap: wrap; align-items: baseline; column-gap: .4em; min-width: 0; }
+.role-ref { display: inline-flex; min-width: 0; margin-left: .35em; }
 .pick-problem { color: var(--red); font-size: var(--fs-xs); }
 .pick-check { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: var(--accent-text); }
 .pick.problem { opacity: .8; }

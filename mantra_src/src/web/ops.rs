@@ -419,7 +419,7 @@ impl App {
             .iter()
             .map(|m| {
                 json!({
-                    "alias": m.alias, "provider": if m.is_custom_provider() { m.provider.as_str() } else { CODEX_ACCOUNT }, "provider_name": reg.provider_name(&m.provider),
+                    "alias": m.alias, "provider": if m.is_custom_provider() { m.provider.as_str() } else { CODEX_ACCOUNT }, "provider_name": reg.provider_name(&m.provider), "provider_color": reg.provider_color(&m.provider),
                     "model": m.model, "backend": kind_str(reg.backend_of(m)), "context_window": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { m.context_window }, "effective_context_window": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { Some(reg.effective_context_window(&m.alias, &self.settings.default_model)) }, "compact_percent": if reg.backend_of(m) == ProviderKind::Antigravity { None } else { m.auto_compact_percent },
                     "default_effort": m.default_effort, "efforts": m.efforts(), "vision": m.vision, "note": m.note,
                     "problem": reg.alias_problem(&m.alias), "test": self.models_ui.status.get(&m.alias), "default": m.alias == self.settings.default_model,
@@ -429,11 +429,11 @@ impl App {
         let mut providers = vec![];
         let codex = reg.codex_account_models();
         if !codex.is_empty() {
-            providers.push(json!({"id": CODEX_ACCOUNT, "name": reg.provider_name(CODEX_ACCOUNT), "kind": "codex", "account": true, "models": codex.len(), "key_set": true}));
+            providers.push(json!({"id": CODEX_ACCOUNT, "name": reg.provider_name(CODEX_ACCOUNT), "kind": "codex", "account": true, "models": codex.len(), "key_set": true, "color": reg.provider_color(CODEX_ACCOUNT)}));
         }
         for p in &reg.providers {
             providers.push(json!({
-                "id": p.id, "name": p.name, "base_url": p.base_url, "env_key": p.env_key,
+                "id": p.id, "name": p.name, "color": reg.provider_color(&p.id), "base_url": p.base_url, "env_key": p.env_key,
                 "api_key": p.api_key.as_deref().filter(|k| !k.trim().is_empty()).map(mask),
                 "key_set": p.resolve_key().is_some(), "kind": kind_str(p.kind), "auth": p.auth,
                 "wire": if p.kind == ProviderKind::Bija { if p.wire.trim().is_empty() { "openai" } else { p.wire.as_str() } } else { "" },

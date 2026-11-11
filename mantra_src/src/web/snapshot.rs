@@ -82,6 +82,9 @@ pub struct ModelInfo {
     pub model: String,
     pub provider: String,
     pub provider_name: String,
+    /// The provider's colour name (`Registry::provider_color`), for the chip beside its name.
+    #[serde(default)]
+    pub provider_color: String,
     /// "codex" | "claude-code"
     pub backend: String,
     pub efforts: Vec<String>,
@@ -115,6 +118,12 @@ pub struct PatternRoleView {
     /// Model alias used when this role's model gives no first token in time (`Role.fallback`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// The whole fallback chain in order (`Role::fallback_chain`); `fallback` is its first.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    /// The role's own context limit in tokens (`Role.context`).
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 /// A pattern the start-run picker offers: built-ins first (in `Pattern::names()` order), then the
@@ -1232,6 +1241,7 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 model: m.model.clone(),
                 provider: m.provider.clone(),
                 provider_name: app.registry.provider_name(&m.provider),
+                provider_color: app.registry.provider_color(&m.provider).into(),
                 backend: backend_str(app.registry.backend_of(m)).into(),
                 efforts: m.efforts(),
                 default_effort: m.default_effort.clone(),
@@ -1246,7 +1256,11 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
             .map(|p| p.ordered_roles())
             .unwrap_or_default()
             .into_iter()
-            .map(|(name, role)| PatternRoleView {
+            .map(|(name, role)| {
+            let fallbacks = role.fallback_chain();
+            PatternRoleView {
+                fallbacks: fallbacks.clone(),
+                context: role.context,
                 name,
                 kind: role.kind,
                 glyph: role.glyph,
@@ -1256,8 +1270,8 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 effort: role.effort,
                 sandbox: role.sandbox,
                 can_spawn_swarm: role.can_spawn_swarm,
-                fallback: role.fallback,
-            })
+                fallback: fallbacks.first().cloned(),
+            }})
             .collect(),
         push_enabled: env.push,
         tls: env.tls,
@@ -1856,6 +1870,8 @@ pub(crate) mod tests {
         app.pattern_name = "my-split".into();
         app.project = dir.clone();
         own.roles.get_mut("planner").unwrap().fallback = Some("backup".into());
+        own.roles.get_mut("planner").unwrap().fallback2 = Some("backup2".into());
+        own.roles.get_mut("planner").unwrap().context = Some(200_000);
         own.roles.get_mut("planner").unwrap().can_spawn_swarm = true;
         std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
         let info = app_info(&app, &Env::default(), &pattern_list(&dir));
@@ -1864,6 +1880,8 @@ pub(crate) mod tests {
         let roles = json["pattern_roles"].as_array().unwrap();
         let planner = roles.iter().find(|r| r["name"] == "planner").unwrap();
         assert_eq!(planner["fallback"], "backup");
+        assert_eq!((planner["fallbacks"].clone(), planner["context"].clone()), (serde_json::json!(["backup", "backup2"]), serde_json::json!(200_000)));
+        assert!(json["models"].as_array().unwrap().iter().all(|m| m["provider_color"].as_str().is_some_and(|c| !c.is_empty())), "every model entry carries its provider's colour");
         assert_eq!(planner["can_spawn_swarm"], true);
         assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r.get("fallback").is_none()));
         assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r["can_spawn_swarm"] == false), "the default role snapshot opts out");

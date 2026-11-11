@@ -252,7 +252,7 @@ try {
         const registry = { models: [{ alias: 'codex-main', provider: 'openai', provider_name: 'Codex', model: 'fixture-codex', backend: 'codex', efforts: ['medium'], default_effort: 'medium', note: '' }], providers: [{ id: 'openai', kind: 'codex', account: true, name: 'Codex', models: 1 }], backends: { antigravity: { installed: true, added: false } }, options: { kinds: ['codex', 'antigravity'] } };
         window.configCalls = [];
         window.renderConfig = () => M.patch(document.getElementById('root'), s.ui.route.name === 'pattern' ? M.config.patternEditor(s.ui.route) : M.config.settingsScreen(s.ui.route));
-        M.act = { wide: () => true, motion: () => false, flash: () => {}, changed: () => requestAnimationFrame(renderConfig), request: async (name, args) => {
+        M.act = { wide: () => true, motion: () => false, flash: () => {}, sheet: (sh) => { window.lastSheet = sh; }, changed: () => requestAnimationFrame(renderConfig), request: async (name, args) => {
             configCalls.push({ name, ...args });
             if (name === 'add_backend') {
                 registry.providers.push({ id: 'antigravity', kind: 'antigravity', auth: 'subscription', name: 'Antigravity', models: 0, base_url: '', env_key: '' });
@@ -284,8 +284,16 @@ try {
         s.ui.route = { name: 'pattern', id: 'fixture-pattern' };
         renderConfig();
     });
-    await configPage.getByRole('combobox', { name: 'Model of planner', exact: true }).selectOption('google-main');
-    await configPage.getByRole('combobox', { name: 'Fallback of planner', exact: true }).selectOption('codex-main');
+    // the model and the fallbacks are pick buttons that open the model sheet (WP-5.7)
+    // (this page has no sheet layer: the stubbed sheet() keeps the request and the test answers it)
+    const pickIn = async (button, alias) => {
+        await configPage.getByRole('button', { name: button }).click();
+        await configPage.evaluate((a) => window.lastSheet.onpick(a), alias);
+    };
+    await pickIn(/^Model of planner/, 'google-main');
+    await pickIn(/^Fallback 1 of planner/, 'codex-main');
+    await configPage.getByRole('button', { name: /^Fallback 2 of planner/ }).waitFor();  // a second fallback appears once the first is set
+    assert.equal(await configPage.getByRole('button', { name: /^Fallback 3 of planner/ }).count(), 0);
     assert.deepEqual(await configPage.evaluate(() => ({ model: Mantra.store.S.ui.cfg.editor.work.roles.planner.model, fallback: Mantra.store.S.ui.cfg.editor.work.roles.planner.fallback })), { model: 'google-main', fallback: 'codex-main' });
     assert.equal(await configPage.getByRole('combobox', { name: 'Effort of planner', exact: true }).locator('option[value="max"]').count(), 1);
     await configPage.close();
