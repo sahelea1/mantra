@@ -1381,6 +1381,10 @@ impl App {
     /// recorded (state restored from before this existed), or the remembered zoom is on an agent
     /// that has since gone, which would draw an empty view with no way to tell why.
     pub fn leave_screen(&mut self) {
+        // a pattern saved in the Studio reaches the run that was started from it
+        if self.screen == Screen::Studio && !self.studio.dirty {
+            self.sync_run_pattern("the Studio");
+        }
         let back = self.screen_before.take();
         let back = back.filter(|s| match s {
             Screen::Zoom(id) => self.agents.contains_key(id),
@@ -1615,6 +1619,84 @@ impl App {
         }
     }
 
+    /// The saved pattern of the active run was just written (Studio, web editor, a role's model):
+    /// if the run was started from it, it adopts what changed (`pattern::adopt`) — at once, for
+    /// the current phase too: live agents of a role whose model or effort changed are switched.
+    /// Returns the number of changes adopted.
+    pub(crate) fn sync_run_pattern(&mut self, origin: &str) -> Option<usize> {
+        let (name, base, ours) = {
+            let run = self.run.as_ref().filter(|r| r.is_active())?;
+            (run.pattern.name.clone(), run.pattern_base.clone()?, run.pattern.clone())
+        };
+        let saved = Pattern::load(&name, &self.project).ok()?;
+        let a = match crate::engine::pattern::adopt(&base, &ours, &saved) {
+            Ok(Some(a)) => a,
+            Ok(None) => return None,
+            Err(e) => {
+                self.toast(format!("the run keeps its own pattern: {e}"), Level::Warn);
+                return None;
+            }
+        };
+        if let Some(p) = self.preflight(&a.pattern).first() {
+            self.toast(format!("the run keeps its own pattern: {p}"), Level::Warn);
+            return None;
+        }
+        self.registry_changed();
+        let n = a.changes.len();
+        let effort_roles: Vec<String> = a.pattern.roles.iter().filter(|(r, x)| ours.roles.get(*r).is_some_and(|o| o.effort != x.effort)).map(|(r, _)| r.clone()).collect();
+        let new_pattern = a.pattern.clone();
+        let roles = match self.with_run(|r, c| r.adopt_pattern(c, a, saved.to_toml(), origin)) {
+            Some(Ok(roles)) => roles,
+            Some(Err(e)) => {
+                self.toast(format!("the run keeps its own pattern: {e}"), Level::Warn);
+                return None;
+            }
+            None => return None,
+        };
+        self.toast(format!("run updated: {n} change(s) from the pattern"), Level::Ok);
+        for role in &roles {
+            let alias = new_pattern.roles[role].model.clone();
+            if let Err(e) = self.switch_live_agents_of_role(role, &alias, true) {
+                self.toast(format!("{role}: {e}"), Level::Warn);
+            }
+        }
+        for role in &effort_roles {
+            let e = new_pattern.roles[role].effort.clone();
+            let ids: Vec<AgentId> = self.live_agents_of_role(role).into_iter().filter(|id| self.in_run(*id)).collect();
+            for id in ids {
+                self.set_effort(id, &e);
+            }
+        }
+        Some(n)
+    }
+
+    /// Agents of `role` that will run again. An archived one, or a worker whose attempt is over
+    /// (done, failed, cancelled), is kept for its card and its log: it ran on the model it ran
+    /// on, and rewriting its alias would make a finished card claim the role's new model.
+    fn live_agents_of_role(&self, role: &str) -> Vec<AgentId> {
+        let over = |id: AgentId, a: &Agent| {
+            a.status == Status::Stopped
+                || self.run.as_ref().map(|r| r.workers.iter().any(|w| w.agent == Some(id) && matches!(w.state, crate::engine::run::WState::Done | crate::engine::run::WState::Failed(_) | crate::engine::run::WState::Cancelled))).unwrap_or(false)
+        };
+        self.agents.iter().filter(|(id, a)| a.role == role && !over(**id, a)).map(|(id, _)| *id).collect()
+    }
+
+    /// Switch the live agents of `role` to `alias` (a role-level model change). `include_run`
+    /// false leaves the active run's own agents alone.
+    pub(crate) fn switch_live_agents_of_role(&mut self, role: &str, alias: &str, include_run: bool) -> Result<(), String> {
+        for id in self.live_agents_of_role(role) {
+            let in_run = self.in_run(id);
+            if (in_run && !include_run) || self.agents.get(&id).is_some_and(|a| a.model_alias == alias) {
+                continue;
+            }
+            self.set_model(id, alias)?;
+            if in_run {
+                self.model_switched_for_run_agent(id);
+            }
+        }
+        Ok(())
+    }
+
     /// Compact an agent's context now, or right after its current turn.
     pub fn compact_agent(&mut self, a: AgentId) {
         let Some(ag) = self.agents.get_mut(&a) else { return };
@@ -1696,6 +1778,8 @@ impl App {
                 return;
             }
         };
+        // what the saved pattern said when this run started: the base of later adoptions
+        let base_toml = pattern.to_toml();
         // The shipped patterns keep their familiar role aliases for existing installations.
         // A new installation has no model presets, so bind only missing built-in aliases to
         // the user's chosen model in this run's saved pattern copy. User-edited patterns retain
@@ -1751,6 +1835,7 @@ impl App {
             return;
         }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
+        run.pattern_base = Some(base_toml);
         if rebound_roles > 0 {
             run.log("⚙", "blue", format!("{rebound_roles} built-in roles use configured models; see this run's pattern copy"));
         }
@@ -1842,6 +1927,9 @@ impl App {
             .and_then(|s| Pattern::from_toml(&s).ok())
             .or_else(|| Pattern::load(&st.pattern, &self.project).ok())
             .unwrap_or_else(Pattern::builtin);
+        // The saved pattern as it is now (it may be a built-in), and as the run last saw it.
+        let saved = Pattern::load(&st.pattern, &self.project).ok();
+        let base = std::fs::read_to_string(r.dir.join("pattern.base.toml")).ok().unwrap_or_else(|| pattern.to_toml()); // runs from before 0.12
         let problems = self.preflight(&pattern);
         if let Some(p) = problems.first() {
             self.toast(format!("cannot resume: {p}"), Level::Error);
@@ -1850,10 +1938,34 @@ impl App {
         let plan = std::fs::read_to_string(r.dir.join("plan.json")).ok().and_then(|s| serde_json::from_str::<crate::engine::plan::Plan>(&s).ok());
         let label = crate::engine::state::stage_label(&st.stage);
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
+        run.pattern_base = Some(base.clone());
+        let mut st = st;
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
         run.set_known_providers(self.registry.alias_providers());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
+        // what the user changed in the saved pattern since the run last saw it is active now
+        if let Some(saved) = saved {
+            match crate::engine::pattern::adopt(&base, &run.pattern, &saved) {
+                Ok(Some(a)) => {
+                    let problems = self.preflight(&a.pattern);
+                    if let Some(p) = problems.first() {
+                        run.log("⚠", "amber", format!("the saved pattern changed but cannot run here ({p}) — this run keeps its own copy"));
+                    } else {
+                        let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
+                        match run.adopt_pattern(&mut ctx, a, saved.to_toml(), "the saved pattern (on resume)") {
+                            Ok(_) => run.drop_stale_threads(&mut st), // nothing is live yet: resume_boot spawns everything on the new roles
+                            Err(e) => run.log("⚠", "amber", format!("the saved pattern changed but does not fit this run ({e}) — it keeps its own copy")),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => run.log("⚠", "amber", format!("could not compare with the saved pattern: {e}")),
+            }
+        }
+        if !r.dir.join("pattern.base.toml").exists() {
+            run.save_pattern_base();
+        }
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
@@ -5685,4 +5797,184 @@ done"#;
         });
     }
 
+    // ─── WP-3.2: a run adopts changes to its saved pattern ───
+
+    /// A saved pattern whose roles all run on `sol`, a run started from it and left at `stage`
+    /// (with `plan`, if any), closed again: what a resume finds on disk. Returns the run's id.
+    fn closed_run_on_saved_pattern(app: &mut App, name: &str, stage: Stage, plan: Option<crate::engine::plan::Plan>) -> String {
+        let project = crate::config::home().join(format!("{name}-project"));
+        std::fs::create_dir_all(&project).unwrap();
+        app.project = project;
+        let mut p = Pattern::builtin();
+        p.name = name.into();
+        p.flow.manager = String::new();
+        for r in p.roles.values_mut() {
+            r.model = "sol".into();
+            r.fallback = None;
+        }
+        p.save().unwrap();
+        app.pattern_name = name.into();
+        app.start_run("build the parser");
+        let run = app.run.as_mut().expect("the run started");
+        run.stage = stage;
+        run.plan = plan;
+        run.save_state();
+        if let Some(p) = &run.plan {
+            std::fs::write(run.dir.join("plan.json"), serde_json::to_string(p).unwrap()).unwrap();
+        }
+        let id = run.id.clone();
+        app.run = None;
+        id
+    }
+
+    fn change_saved_pattern(app: &App, name: &str, edit: impl FnOnce(&mut Pattern)) {
+        let mut p = Pattern::load(name, &app.project).unwrap();
+        edit(&mut p);
+        p.save().unwrap();
+    }
+
+    fn resume(app: &mut App, id: &str) {
+        let row = crate::engine::state::list_all().into_iter().find(|r| r.id == id).expect("the run is listed");
+        app.resume_run(row);
+    }
+
+    fn said(app: &App) -> Vec<String> {
+        app.run.as_ref().map(|r| r.pulse.iter().map(|p| p.text.clone()).collect()).unwrap_or_default()
+    }
+
+    fn one_task_plan() -> crate::engine::plan::Plan {
+        use crate::engine::plan::{Phase, Plan, Task};
+        Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks: vec![Task { id: "t1".into(), role: "worker-small".into(), prompt: "Write the one function that is asked for and test it.".into(), ..Default::default() }], ..Default::default() }], ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_run_has_the_pattern_as_it_was_changed_meanwhile() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-on-resume", Stage::Planning, None);
+            change_saved_pattern(&app, "adopt-on-resume", |p| {
+                p.roles.get_mut("qa").unwrap().model = "luna".into();
+                p.settings.context_cap = 150_000;
+            });
+            resume(&mut app, &id);
+            let run = app.run.as_ref().expect("resumed");
+            assert_eq!((run.pattern.roles["qa"].model.as_str(), run.pattern.settings.context_cap), ("luna", 150_000));
+            let lines = said(&app);
+            assert!(lines.iter().any(|l| l.starts_with("pattern updated from the saved pattern (on resume) (2 change(s)): ")), "{lines:?}");
+            let saved = Pattern::load("adopt-on-resume", &app.project).unwrap();
+            assert_eq!(std::fs::read_to_string(run.dir.join("pattern.base.toml")).unwrap(), saved.to_toml(), "the run is in step with the saved pattern now");
+            assert!(std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap().contains("150000"), "and its own copy says so");
+            // a second resume has nothing to adopt
+            let dir = run.dir.clone();
+            app.stop_run();
+            app.run = None;
+            let _ = dir;
+            resume(&mut app, &id);
+            assert!(!said(&app).iter().any(|l| l.starts_with("pattern updated")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_from_before_the_base_file_adopts_every_difference() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-legacy", Stage::Planning, None);
+            let dir = crate::engine::state::list_all().into_iter().find(|r| r.id == id).unwrap().dir;
+            std::fs::remove_file(dir.join("pattern.base.toml")).unwrap();
+            change_saved_pattern(&app, "adopt-legacy", |p| p.roles.get_mut("qa").unwrap().model = "luna".into());
+            resume(&mut app, &id);
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["qa"].model, "luna");
+            // without a base every difference counts (here also the demo's own `mcp` tweak, which the saved pattern lacks)
+            assert!(said(&app).iter().any(|l| l.starts_with("pattern updated from the saved pattern (on resume) (") && l.contains("roles.qa.model: sol → luna")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_keeps_its_copy_when_the_saved_pattern_took_away_a_role_the_plan_needs() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-refused", Stage::Review, Some(one_task_plan()));
+            change_saved_pattern(&app, "adopt-refused", |p| {
+                p.roles.remove("worker-small");
+                p.groups.clear();
+            });
+            resume(&mut app, &id);
+            let run = app.run.as_ref().expect("resumed");
+            assert!(run.pattern.roles.contains_key("worker-small"), "it keeps its own copy");
+            let lines = said(&app);
+            assert!(lines.iter().any(|l| l.starts_with("the saved pattern changed but does not fit this run (") && l.contains("worker-small") && l.ends_with("it keeps its own copy")), "{lines:?}");
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_planner_pinned_before_the_restart_comes_back_on_the_roles_new_model() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-pin", Stage::Planning, None);
+            let dir = crate::engine::state::list_all().into_iter().find(|r| r.id == id).unwrap().dir;
+            // the user had put the planner on astra by hand
+            let mut st = crate::engine::state::RunState::load(&dir).unwrap();
+            st.agents.retain(|a| a.slot != "planner");
+            st.agents.push(crate::engine::state::AgentState { slot: "planner".into(), name: "planner".into(), role: "planner".into(), model_alias: "astra".into(), thread_id: Some("old-session".into()), ..Default::default() });
+            st.save(&dir);
+            change_saved_pattern(&app, "adopt-pin", |p| p.roles.get_mut("planner").unwrap().model = "luna".into());
+            resume(&mut app, &id);
+            let planner = app.agents.values().find(|a| a.name == "planner").expect("the planner is back");
+            assert_eq!(planner.model_alias, "luna");
+            assert!(said(&app).iter().any(|l| l == "planner: your per-agent model astra gives way to the role's new model luna"), "{:?}", said(&app));
+            assert!(!said(&app).iter().any(|l| l.contains("comes back on astra")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_pattern_saved_in_the_studio_reaches_the_live_run_at_once() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            closed_run_on_saved_pattern(&mut app, "adopt-live", Stage::Planning, None);
+            app.start_run_with("build the parser", None, Some(8));
+            let run = app.run.as_mut().expect("a run on the saved pattern, 8 at once");
+            run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+            run.plan = Some(one_task_plan());
+            let agent = |app: &mut App, name: &str, role: &str| {
+                let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts {
+                    name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(), model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
+                    approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture".into(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
+                    context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
+                });
+                app.agents.get_mut(&id).unwrap().status = Status::Idle;
+                id
+            };
+            let (orch, done) = (agent(&mut app, "orchestrator", "orchestrator"), agent(&mut app, "t0", "worker-small"));
+            let run = app.run.as_mut().unwrap();
+            run.orchestrator = Some(orch);
+            let mut w = crate::web::snapshot::tests::worker("t0", 1, Some(done), crate::engine::run::WState::Done);
+            w.task.role = "worker-small".into();
+            run.workers.push(w);
+            // a change that is not about models, and one that is
+            change_saved_pattern(&app, "adopt-live", |p| {
+                p.roles.get_mut("orchestrator").unwrap().model = "luna".into();
+                p.roles.get_mut("worker-small").unwrap().model = "luna".into();
+                p.settings.context_cap = 99_000;
+            });
+            assert_eq!(app.sync_run_pattern("the Studio"), Some(3));
+            let run = app.run.as_ref().unwrap();
+            assert_eq!(run.pattern.settings.max_parallel, 8, "--parallel is the run's own and stays");
+            assert_eq!(run.pattern.settings.context_cap, 99_000);
+            assert_eq!(app.agents[&orch].model_alias, "luna", "the live orchestrator is switched");
+            assert_eq!(app.agents[&done].model_alias, "sol", "a worker that is done keeps the model it ran on");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("run updated: 3 change(s) from the pattern"));
+            assert_eq!(app.sync_run_pattern("the Studio"), None, "nothing more to adopt");
+            // leaving the Studio with a saved pattern does the same
+            change_saved_pattern(&app, "adopt-live", |p| p.settings.context_cap = 77_000);
+            app.set_screen(Screen::Studio);
+            app.studio.dirty = false;
+            app.leave_screen();
+            assert_eq!(app.run.as_ref().unwrap().pattern.settings.context_cap, 77_000);
+            app.run = None;
+        });
+    }
 }

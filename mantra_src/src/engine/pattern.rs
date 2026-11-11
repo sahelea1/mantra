@@ -1133,6 +1133,130 @@ fn builtin_thorough() -> Pattern {
     p
 }
 
+/// Do two definitions of a role start the same process? (model, effort, sandbox, permission,
+/// instructions, tools-relevant flags) — description, glyph, colour, budget and fallbacks
+/// change nothing about a running agent.
+pub fn role_spawn_eq(a: &Role, b: &Role) -> bool {
+    a.kind == b.kind && a.model == b.model && a.effort == b.effort && a.sandbox == b.sandbox
+        && a.permission == b.permission && a.instructions.trim() == b.instructions.trim()
+        && a.mcp == b.mcp && a.can_spawn_swarm == b.can_spawn_swarm && a.parallel == b.parallel
+        && a.context == b.context
+}
+
+/// What `theirs` changed relative to `base`, applied on top of `ours`. Tables are merged key by
+/// key; arrays and scalars are taken whole. A key `theirs` removed is removed; a key only `ours`
+/// has (or changed) is kept.
+pub fn merge3(base: &toml::Value, ours: &toml::Value, theirs: &toml::Value) -> toml::Value {
+    use toml::Value;
+    if let (Value::Table(b), Value::Table(o), Value::Table(t)) = (base, ours, theirs) {
+        return Value::Table(merge3_tables(b, o, t));
+    }
+    if theirs == base { ours.clone() } else { theirs.clone() }
+}
+
+fn merge3_tables(base: &toml::Table, ours: &toml::Table, theirs: &toml::Table) -> toml::Table {
+    use toml::Value;
+    let mut keys: Vec<&String> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let empty = toml::Table::new();
+    let mut out = toml::Table::new();
+    for k in keys {
+        let (b, o, t) = (base.get(k), ours.get(k), theirs.get(k));
+        let present = [b, o, t];
+        let all_tables = present.iter().flatten().all(|v| v.is_table());
+        let taken = if all_tables && present.iter().any(|v| v.is_some()) {
+            let sub = merge3_tables(b.and_then(Value::as_table).unwrap_or(&empty), o.and_then(Value::as_table).unwrap_or(&empty), t.and_then(Value::as_table).unwrap_or(&empty));
+            if t.is_none() && b.is_some() { None } // theirs removed the whole table
+            else if sub.is_empty() && o.is_none() { None } else { Some(Value::Table(sub)) }
+        } else if t == b {
+            o.cloned()
+        } else {
+            t.cloned()
+        };
+        if let Some(v) = taken {
+            out.insert(k.clone(), v);
+        }
+    }
+    out
+}
+
+/// A run copy after adopting what changed in the saved pattern (`adopt`).
+pub struct Adoption {
+    pub pattern: Pattern,
+    /// One line per changed field: `roles.qa.model: sol → astra`.
+    pub changes: Vec<String>,
+    /// Roles (present before and after) whose model changed: their live agents are switched.
+    pub model_roles: Vec<String>,
+}
+
+fn render_change_value(v: Option<&toml::Value>) -> String {
+    match v {
+        None => "—".into(),
+        Some(toml::Value::String(s)) => crate::util::trunc(s, 40),
+        Some(v) => crate::util::trunc(&v.to_string(), 40),
+    }
+}
+
+fn diff_values(path: &str, ours: Option<&toml::Value>, merged: Option<&toml::Value>, out: &mut Vec<String>) {
+    use toml::Value;
+    if ours == merged {
+        return;
+    }
+    match (ours, merged) {
+        (Some(Value::Table(o)), Some(Value::Table(m))) => {
+            let mut keys: Vec<&String> = o.keys().chain(m.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                diff_values(&format!("{path}.{k}"), o.get(k), m.get(k), out);
+            }
+        }
+        (None, Some(Value::Table(_))) => out.push(format!("{path}: added")),
+        (Some(Value::Table(_)), None) => out.push(format!("{path}: removed")),
+        _ => {
+            let leaf = path.rsplit('.').next().unwrap_or(path);
+            if matches!(leaf, "instructions" | "description" | "task") {
+                out.push(format!("{path}: changed"));
+            } else {
+                out.push(format!("{path}: {} → {}", render_change_value(ours), render_change_value(merged)));
+            }
+        }
+    }
+}
+
+/// The run copy `ours` after adopting what changed in the saved pattern (`theirs`) since `base`.
+/// `Ok(None)` when nothing is to adopt. The name always stays `ours.name`.
+pub fn adopt(base_toml: &str, ours: &Pattern, theirs: &Pattern) -> std::result::Result<Option<Adoption>, String> {
+    use toml::Value;
+    let base: Value = toml::from_str(base_toml).map_err(|_| "the run's pattern base is unreadable".to_string())?;
+    let o = Value::try_from(ours).map_err(|e| e.to_string())?;
+    let t = Value::try_from(theirs).map_err(|e| e.to_string())?;
+    if t == base {
+        return Ok(None);
+    }
+    let mut merged = merge3(&base, &o, &t);
+    if let Value::Table(tbl) = &mut merged {
+        tbl.insert("name".into(), Value::String(ours.name.clone()));
+    }
+    let mut pattern: Pattern = merged.clone().try_into().map_err(|e: toml::de::Error| e.to_string())?;
+    pattern.source_dir = ours.source_dir.clone();
+    for role in pattern.roles.values_mut() {
+        role.normalize_fallbacks();
+    }
+    pattern.validate().map_err(|e| e.join("; "))?;
+    // compare after normalising, so a fallback gap closed by the merge is not reported twice
+    let merged = Value::try_from(&pattern).map_err(|e| e.to_string())?;
+    let mut changes = vec![];
+    diff_values("", Some(&o), Some(&merged), &mut changes);
+    let changes: Vec<String> = changes.into_iter().map(|c| c.trim_start_matches('.').to_string()).collect();
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    let model_roles = ours.roles.iter().filter(|(n, r)| pattern.roles.get(*n).is_some_and(|m| m.model != r.model)).map(|(n, _)| n.clone()).collect();
+    Ok(Some(Adoption { pattern, changes, model_roles }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,5 +1846,84 @@ mod tests {
             let e = parse_parallel(bad).unwrap_err();
             assert!(e.contains("from 1 to 128"), "{bad}: {e}");
         }
+    }
+    fn adopt_base() -> Pattern {
+        Pattern::builtin_lean()
+    }
+
+    #[test]
+    fn adopt_keeps_the_runs_own_changes_and_takes_the_saved_ones() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.set_parallel(8);
+        let mut theirs = a.clone();
+        let old = theirs.roles["qa"].model.clone();
+        theirs.roles.get_mut("qa").unwrap().model = "x".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().expect("something to adopt");
+        assert_eq!(got.pattern.settings.max_parallel, 8, "the run's --parallel stays");
+        assert_eq!(got.pattern.roles["qa"].model, "x");
+        assert_eq!(got.changes, vec![format!("roles.qa.model: {old} → x")]);
+        assert_eq!(got.model_roles, vec!["qa".to_string()]);
+    }
+
+    #[test]
+    fn adopt_lets_the_saved_pattern_win_where_both_changed_the_same_field() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.roles.get_mut("qa").unwrap().model = "mine".into();
+        let mut theirs = a.clone();
+        theirs.roles.get_mut("qa").unwrap().model = "theirs".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().unwrap();
+        assert_eq!(got.pattern.roles["qa"].model, "theirs");
+    }
+
+    #[test]
+    fn adopt_nothing_when_the_saved_pattern_is_unchanged() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.roles.get_mut("qa").unwrap().model = "mine".into();
+        assert!(adopt(&a.to_toml(), &ours, &a).unwrap().is_none());
+        assert!(adopt("not [ toml", &ours, &a).is_err());
+    }
+
+    #[test]
+    fn adopt_follows_a_deleted_and_an_added_role() {
+        let a = adopt_base();
+        let mut theirs = a.clone();
+        theirs.roles.remove("worker-swarm");
+        theirs.groups.clear(); // a group may not name a role that is gone
+        theirs.roles.insert("extra".into(), Role { model: "m".into(), ..Role::default() });
+        let got = adopt(&a.to_toml(), &a, &theirs).unwrap().unwrap();
+        assert!(!got.pattern.roles.contains_key("worker-swarm"));
+        assert!(got.pattern.roles.contains_key("extra"));
+        assert!(got.changes.contains(&"roles.extra: added".to_string()), "{:?}", got.changes);
+        assert!(got.changes.contains(&"roles.worker-swarm: removed".to_string()), "{:?}", got.changes);
+        assert!(got.model_roles.is_empty());
+        assert_eq!(got.pattern.name, a.name);
+    }
+
+    #[test]
+    fn adopt_reports_long_text_as_changed_and_never_renames_the_run_copy() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.name = "renamed-by-run".into();
+        let mut theirs = a.clone();
+        theirs.roles.get_mut("qa").unwrap().instructions = "something entirely different and quite long indeed".into();
+        theirs.name = "other".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().unwrap();
+        assert_eq!(got.changes, vec!["roles.qa.instructions: changed".to_string()]);
+        assert_eq!(got.pattern.name, "renamed-by-run");
+    }
+
+    #[test]
+    fn role_spawn_eq_ignores_what_a_running_agent_does_not_see() {
+        let a = Role::default();
+        let mut b = a.clone();
+        b.description = "other".into();
+        b.glyph = "x".into();
+        b.fallback = Some("f".into());
+        assert!(role_spawn_eq(&a, &b));
+        b.model = "m".into();
+        assert!(!role_spawn_eq(&a, &b));
     }
 }

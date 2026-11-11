@@ -1103,6 +1103,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         match app.studio.pattern.validate() {
             Ok(()) => {
                 if save_pattern(app) {
+                    app.sync_run_pattern("the Studio");
                     let path = app.studio.pattern.source_dir.clone().unwrap_or_else(crate::config::patterns_dir).join(format!("{}.toml", crate::util::slug(&app.studio.pattern.name)));
                     app.toast(format!("saved {}", home_rel(&path)), crate::agent::Level::Ok);
                 }

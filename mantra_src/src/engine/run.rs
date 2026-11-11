@@ -639,6 +639,13 @@ pub struct Run {
     /// Hash of the pattern as last written to the run dir's `pattern.toml` — a resume reloads from
     /// there, so a role-level model change (`set_role_model all`) is written back when it differs.
     pattern_hash: std::sync::atomic::AtomicU64,
+    /// TOML text of the saved pattern as this run last synchronised with it (started from, or
+    /// adopted changes of): the base of the three-way merge in `pattern::adopt`. Kept in
+    /// `<run dir>/pattern.base.toml`, not in `state.json`.
+    pub pattern_base: Option<String>,
+    /// Roles whose model came from an adoption on resume: `restore_slot_models` and
+    /// `restore_workers` do not put a saved per-agent choice back for them.
+    pub(super) adopted_roles: HashSet<String>,
     /// This process, as the run's owner (`<run dir>/owner.json`, see `state::Owner`): written
     /// with every state flush while the run is live, released when it ends or this `Run` is
     /// dropped (a clean quit, `/leave`), left behind by a crash — where a dead pid lets the next
@@ -651,6 +658,7 @@ impl Run {
         let id = format!("{}-{}", crate::util::unix_secs() % 1_000_000, crate::util::slug(&brief).chars().take(24).collect::<String>().trim_matches('-'));
         let dir = crate::config::runs_dir(&project).join(&id);
         let title = title_from_goal(&brief);
+        let base_toml = pattern.to_toml();
         let mut run = Run {
             akasha: std::collections::BTreeMap::new(),
             akasha_live: Default::default(),
@@ -750,6 +758,8 @@ impl Run {
             pin_trouble_warned: HashSet::new(),
             known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
+            pattern_base: Some(base_toml),
+            adopted_roles: HashSet::new(),
             owner: super::state::Owner::this_process(),
         };
         run.sync_akasha_groups();
@@ -905,7 +915,7 @@ impl Run {
         self.known_providers = m;
     }
 
-    fn provider_of(&self, alias: &str) -> Option<&str> {
+    pub(super) fn provider_of(&self, alias: &str) -> Option<&str> {
         self.known_providers.get(alias).map(|p| p.as_str())
     }
 
@@ -1934,6 +1944,7 @@ Then summarize in 2-4 lines.",
         let toml = self.pattern.to_toml();
         self.pattern_hash.store(fnv1a(&toml), std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::write(self.dir.join("pattern.toml"), toml);
+        self.save_pattern_base();
         // the run is ours from here: another Mantra must not resume it while this one lives
         self.owner.write(&self.dir);
         self.log("◈", "saffron", format!("run {} started with pattern {}", self.id, self.pattern.name));
@@ -1941,6 +1952,14 @@ Then summarize in 2-4 lines.",
         let id = self.id.clone();
         let iso = self.pattern.settings.isolation.clone();
         ctx.job(JobTag::Setup, Box::new(move || JobOut::Setup(git::setup(&project, &id, &iso))));
+    }
+
+    /// Write `pattern_base` to `<run dir>/pattern.base.toml`.
+    pub(crate) fn save_pattern_base(&self) {
+        if let Some(b) = &self.pattern_base {
+            let _ = std::fs::create_dir_all(&self.dir);
+            let _ = std::fs::write(self.dir.join("pattern.base.toml"), b);
+        }
     }
 
     pub(super) fn spawn_planner(&mut self, ctx: &mut dyn Ctx) -> AgentId {
@@ -5490,6 +5509,91 @@ Then summarize in 2-4 lines.",
             t if t.starts_with("mantra_akasha_") => self.akasha_tool(ctx, a, t, args),
             other => (format!("tool '{other}' is not available here"), false),
         }
+    }
+
+    /// Replace the run copy by an adopted pattern (`pattern::adopt`). Returns the roles whose model
+    /// changed, for the app to switch live agents. Journals every change.
+    pub fn adopt_pattern(&mut self, ctx: &mut dyn Ctx, a: super::pattern::Adoption, new_base: String, origin: &str) -> Result<Vec<String>, String> {
+        self.validate_pattern_replacement(&a.pattern)?;
+        let previous = std::mem::replace(&mut self.pattern, a.pattern);
+        self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
+        self.sync_akasha_groups();
+        // A per-agent model choice outranks the role's model: for a role whose model the user just
+        // changed in the pattern, the new role model wins over the old choice.
+        let f = self.pattern.flow.clone();
+        let finale_role = match self.stage {
+            Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+            _ => None,
+        };
+        let slots = [("planner", Some(f.planner.clone())), ("manager", Some(f.manager.clone())), ("orchestrator", Some(f.orchestrator.clone())), ("gate", Some(f.phase_gate.clone())), ("finale", finale_role)];
+        let mut dropped: Vec<(String, String, String)> = vec![];
+        for (slot, role_name) in slots {
+            let Some(role_name) = role_name.filter(|r| a.model_roles.contains(r)) else { continue };
+            let new = self.role(&role_name).model;
+            self.fallback_used.remove(slot);
+            if let Some(old) = self.slot_models.remove(slot) {
+                dropped.push((slot.to_string(), old, new));
+            }
+        }
+        for i in 0..self.workers.len() {
+            let w = &mut self.workers[i];
+            if !a.model_roles.contains(&w.task.role) || matches!(w.state, WState::Done | WState::Cancelled) {
+                continue;
+            }
+            let slot = format!("worker:{}#{}", w.task.id, w.attempt);
+            let key = format!("worker:{}", w.task.id);
+            let old = w.model.take();
+            let new = self.pattern.roles.get(&self.workers[i].task.role).map(|r| r.model.clone()).unwrap_or_default();
+            self.fallback_used.remove(&key);
+            if let Some(old) = old {
+                dropped.push((slot, old, new));
+            }
+        }
+        for (slot, old, new) in dropped {
+            self.log("⚙", "blue", format!("{slot}: your per-agent model {old} gives way to the role's new model {new}"));
+        }
+        self.adopted_roles.extend(a.model_roles.iter().cloned());
+        let n = a.changes.len();
+        let mut head = a.changes.iter().take(6).cloned().collect::<Vec<_>>().join(" · ");
+        if n > 6 {
+            head.push_str(" · …");
+        }
+        self.log("⚙", "blue", format!("pattern updated from {origin} ({n} change(s)): {head}"));
+        for c in &a.changes {
+            self.journal_line("⚙", c);
+        }
+        self.pattern_base = Some(new_base);
+        self.save_pattern_base();
+        self.save_state();
+        // Supervisors whose definition changed in more than the model are started again on the new
+        // definition (a model change alone is switched live by the app). Nothing is live on resume.
+        if !self.all_agents().is_empty() {
+            let differs = |old_name: &str, new_name: &str, new: &Pattern| {
+                let model_aside = |r: &Role, like: &Role| Role { model: like.model.clone(), ..r.clone() };
+                !(old_name == new_name && matches!((previous.roles.get(old_name), new.roles.get(new_name)), (Some(x), Some(y)) if super::pattern::role_spawn_eq(x, &model_aside(y, x))))
+            };
+            let p = self.pattern.clone();
+            if self.manager.is_some() && differs(&previous.flow.manager, &p.flow.manager, &p) {
+                if let Some(m) = self.manager.take() { ctx.stop(m, true); }
+                if self.phase_idx().is_some() { self.ensure_manager(ctx); }
+            }
+            if self.orchestrator.is_some() && differs(&previous.flow.orchestrator, &p.flow.orchestrator, &p) {
+                if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
+                    self.respawn_orchestrator(ctx, Some("The workflow was updated by the user; continue the phase.".into()));
+                } else if let Some(o) = self.orchestrator.take() {
+                    ctx.stop(o, true);
+                }
+            }
+            if let Some(pl) = self.planner {
+                let (x, y) = (previous.roles.get(&previous.flow.planner), p.roles.get(&p.flow.planner));
+                let planner_changed = previous.flow.planner != p.flow.planner || !matches!((x, y), (Some(x), Some(y)) if x.instructions.trim() == y.instructions.trim() && x.sandbox == y.sandbox && x.permission == y.permission && x.mcp == y.mcp);
+                if planner_changed {
+                    if ctx.agent(pl).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
+                    else { self.respawn_planner(ctx, Some("The workflow was updated by the user; use the updated role instructions and tools.".into())); }
+                }
+            }
+        }
+        Ok(a.model_roles)
     }
 
     pub(crate) fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {

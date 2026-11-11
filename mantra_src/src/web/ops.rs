@@ -682,6 +682,7 @@ impl App {
         p.source_dir = Pattern::load(&p.name, &self.project).ok().and_then(|o| o.source_dir);
         let (saved, path) = p.save_as(name, &self.project).map_err(|errs| errs.join("\n"))?;
         self.patterns_changed();
+        self.sync_run_pattern("the web editor");
         let tag = Pattern::load(&saved.name, &self.project).map(|p| p.tag()).unwrap_or("yours");
         Ok(json!({"name": saved.name, "path": path.display().to_string(), "tag": tag}))
     }

@@ -5139,3 +5139,125 @@ fn the_orchestrator_cannot_prompt_a_worker_through_a_halt() {
     assert!(ctx.prompts.iter().any(|(x, t)| *x == a && t.contains("- [from the orchestrator] carry on")), "{:?}", ctx.prompts);
     let _ = std::fs::remove_dir_all(&run.dir);
 }
+
+// ───────────────────────── WP-3.2: a run adopts changes to its saved pattern ─────────────────────────
+
+fn valid_phase() -> Plan {
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks[0].prompt = "Write the one function that is asked for and test it.".into();
+    plan
+}
+
+/// What a save of the saved pattern does to the run: `edit` applied to the pattern the run last
+/// synchronised with, adopted into the run copy.
+fn adopt_edit(run: &mut Run, ctx: &mut TestCtx, edit: impl FnOnce(&mut Pattern)) -> Result<Vec<String>, String> {
+    let base = run.pattern_base.clone().expect("a base");
+    let mut theirs = Pattern::from_toml(&base).unwrap();
+    edit(&mut theirs);
+    let a = crate::engine::pattern::adopt(&base, &run.pattern, &theirs)?.expect("something to adopt");
+    run.adopt_pattern(ctx, a, theirs.to_toml(), "the Studio")
+}
+
+#[test]
+fn adopting_a_changed_role_model_switches_the_slot_and_drops_the_pin() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-pin");
+    run.stage = Stage::Planning;
+    let planner_role = run.pattern.flow.planner.clone();
+    let old_model = run.role(&planner_role).model;
+    run.slot_models.insert("planner".into(), "nova".into());
+    run.fallback_used.insert("planner".into(), vec![old_model.clone()]);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("planner").unwrap().model = "luna".into()).unwrap();
+    assert_eq!(roles, vec![planner_role.clone()]);
+    assert_eq!(run.pattern.roles[&planner_role].model, "luna");
+    assert!(run.slot_models.get("planner").is_none() && run.fallback_used.get("planner").is_none());
+    let said: Vec<String> = run.pulse.iter().map(|p| p.text.clone()).collect();
+    assert!(said.iter().any(|t| t == "planner: your per-agent model nova gives way to the role's new model luna"), "{said:?}");
+    assert!(said.iter().any(|t| t.starts_with("pattern updated from the Studio (1 change(s)): roles.planner.model:")), "{said:?}");
+    let p = run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner")[0].model, "luna", "the next planner is on the new model ({p})");
+    assert_eq!(run.pattern_base.as_deref().map(|b| Pattern::from_toml(b).unwrap().roles[&planner_role].model.clone()).as_deref(), Some("luna"));
+    assert_eq!(std::fs::read_to_string(run.dir.join("pattern.base.toml")).unwrap(), run.pattern_base.clone().unwrap());
+    assert!(std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap().contains("luna"), "the run copy is saved");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_changes_the_gate_of_the_current_phase_and_keeps_the_runs_own_settings() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-gate");
+    run.pattern.set_parallel(8); // `--parallel 8`: a run-local change
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.pattern.settings.allow_pattern_changes = true;
+    let gate = run.pattern.flow.phase_gate.clone();
+    adopt_edit(&mut run, &mut ctx, |p| {
+        p.roles.get_mut("qa").unwrap().model = "nova".into();
+        p.settings.context_cap = 50_000;
+    }).unwrap();
+    assert_eq!((run.pattern.settings.max_parallel, run.pattern.settings.context_cap), (8, 50_000), "the run's own width stays, the user's cap arrives");
+    assert!(run.pattern.settings.allow_pattern_changes, "the run-level permission is not the pattern's to change");
+    run.spawn_gate_at_round(&mut ctx, 0, 1);
+    assert_eq!(ctx.spawned(&gate).last().map(|s| s.model.clone()).as_deref(), Some("nova"), "the gate of the phase that is running now");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_leaves_a_finished_worker_and_drops_the_pin_of_a_running_one() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-workers");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let (a, b) = (ctx.add_busy(), ctx.add_busy());
+    let mut done = mk_worker("t0", "worker-small", a, WState::Done);
+    done.model = Some("old".into());
+    let mut live = mk_worker("t1", "worker-small", b, WState::Running);
+    live.model = Some("nova".into());
+    run.workers.push(done);
+    run.workers.push(live);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("worker-small").unwrap().model = "zeta".into()).unwrap();
+    assert_eq!(roles, vec!["worker-small".to_string()]);
+    assert_eq!(run.workers[0].model.as_deref(), Some("old"), "a finished attempt keeps its record");
+    assert_eq!(run.workers[1].model, None);
+    assert!(run.pulse.iter().any(|p| p.text == "worker:t1#1: your per-agent model nova gives way to the role's new model zeta"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_refuses_what_the_run_cannot_take_and_keeps_its_copy() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-refuse");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let before = run.pattern.clone();
+    let old_base = run.pattern_base.clone();
+    // the plan still has a task for worker-small
+    let e = adopt_edit(&mut run, &mut ctx, |p| { p.roles.remove("worker-small"); }).unwrap_err();
+    assert!(e.contains("worker-small"), "{e}");
+    assert_eq!(run.pattern, before);
+    assert_eq!(run.pattern_base, old_base, "and the base is where it was");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_an_orchestrator_model_change_leaves_the_agent_to_the_live_switch_but_new_instructions_respawn_it() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-orch");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let o = run.spawn_orchestrator(&mut ctx);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("orchestrator").unwrap().model = "luna".into()).unwrap();
+    assert_eq!(roles, vec!["orchestrator".to_string()]);
+    assert_eq!(run.orchestrator, Some(o), "the app switches the live agent in place");
+    assert!(!ctx.stopped.contains(&o));
+    adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("orchestrator").unwrap().instructions = "Be brief.".into()).unwrap();
+    assert_ne!(run.orchestrator, Some(o), "new instructions need a new process");
+    assert!(ctx.stopped.contains(&o));
+    assert!(ctx.prompts.iter().any(|(_, t)| t.contains("The workflow was updated by the user; continue the phase.")), "{:?}", ctx.prompts);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}

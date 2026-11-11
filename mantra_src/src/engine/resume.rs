@@ -317,6 +317,33 @@ impl Run {
         self.check_phase_done(ctx);
     }
 
+    /// After an adoption on resume: a saved session of an agent whose role changed to a model of
+    /// another provider is not re-attached (a session cannot move to another backend); that agent
+    /// starts fresh on the role's new model.
+    pub fn drop_stale_threads(&self, st: &mut RunState) {
+        let f = &self.pattern.flow;
+        for ag in st.agents.iter_mut() {
+            let role = match ag.slot.as_str() {
+                "planner" => f.planner.clone(),
+                "manager" => f.manager.clone(),
+                "orchestrator" => f.orchestrator.clone(),
+                "gate" => f.phase_gate.clone(),
+                "finale" => match st.stage {
+                    Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()).unwrap_or_default(),
+                    _ => String::new(),
+                },
+                slot => slot.strip_prefix("worker:").and_then(|t| t.split('#').next()).and_then(|t| st.workers.iter().find(|w| w.task == t)).map(|w| w.role.clone()).unwrap_or_default(),
+            };
+            if !self.adopted_roles.contains(&role) || ag.model_alias.trim().is_empty() {
+                continue;
+            }
+            let now = self.role(&role).model;
+            if now != ag.model_alias && self.provider_of(&now).is_none_or(|p| self.provider_of(&ag.model_alias) != Some(p)) {
+                ag.thread_id = None;
+            }
+        }
+    }
+
     /// Workers from `state.json` → `Run.workers` (no agents attached yet). A worktree that no
     /// longer exists on disk is dropped (`wt = None`), so a later merge skips it.
     fn restore_workers(&mut self, st: &RunState) {
@@ -357,11 +384,19 @@ impl Run {
                     idle_prompts: vec![],
                     transient: w.transient && w.state == "failed",
                     // a model switched live for this task — if it still exists in the registry
-                    model: w.model.clone().filter(|m| self.knows_model(m)),
+                    model: w.model.clone().filter(|m| self.knows_model(m) && !self.adopted_roles.contains(&w.role)),
                     status_asked: false,
                 }
             })
             .collect();
+        // a per-agent choice on a role whose model the saved pattern just changed gives way to it
+        let gave_way: Vec<String> = st.workers.iter()
+            .filter(|w| self.adopted_roles.contains(&w.role) && !matches!(w.state.as_str(), "done" | "cancelled"))
+            .filter_map(|w| w.model.as_ref().map(|m| format!("worker:{}#{}: your per-agent model {m} gives way to the role's new model {}", w.task, w.attempt, self.role(&w.role).model)))
+            .collect();
+        for line in gave_way {
+            self.log("⚙", "blue", line);
+        }
     }
 
     /// The models the user switched live on the fixed agents, back from `state.json`: a saved
@@ -378,6 +413,12 @@ impl Run {
         let roles = roles.into_iter().chain(finale_role.map(|r| ("finale", r)));
         for (slot, role_name) in roles {
             let Some(saved) = st.agents.iter().find(|a| a.slot == slot).map(|a| a.model_alias.trim().to_string()).filter(|m| !m.is_empty()) else { continue };
+            if self.adopted_roles.contains(&role_name) {
+                if saved != self.role(&role_name).model {
+                    self.log("⚙", "blue", format!("{slot}: your per-agent model {saved} gives way to the role's new model {}", self.role(&role_name).model));
+                }
+                continue;
+            }
             if saved != self.role(&role_name).model && self.knows_model(&saved) {
                 self.log("⚙", "blue", format!("{slot} comes back on {saved} (switched live before the restart)"));
                 self.slot_models.insert(slot.to_string(), saved);
