@@ -644,6 +644,7 @@ mod tests {
             status_asked: false,
             active: std::time::Duration::ZERO,
             superseded: false,
+            owner_fix_failed: false, owner_fixing: None, fix_started: None,
         });
         app.run = Some(run_);
         assert_eq!(app.auto_effort_for(1), "low", "a small worker");

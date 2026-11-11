@@ -358,6 +358,7 @@ fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
         status_asked: false,
         active: std::time::Duration::ZERO,
         superseded: false,
+        owner_fix_failed: false, owner_fixing: None, fix_started: None,
     }
 }
 impl Ctx for TestCtx {
@@ -5840,4 +5841,315 @@ fn a_fix_that_changed_nothing_is_journaled_and_qa_is_told() {
         assert_eq!(run.pulse.iter().any(|j| j.text.contains("fix-1 changed no file in the workspace")), expect);
         let _ = std::fs::remove_dir_all(&run.dir);
     }
+}
+
+// ---- Milestone 6: a gate fix goes back to the worker that wrote the code ----
+
+/// A run at gate round 1 of a phase with two finished tasks: `t1` owns `src/a.rs`, `t2` owns
+/// `src/b.rs`. Returns the run, the QA agent and the two workers' agents. The run has a worktree
+/// workspace and the workers have worktrees, so the owner path has jobs to run.
+fn owner_run(ctx: &mut TestCtx) -> (Run, AgentId, AgentId, AgentId) {
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = std::env::temp_dir().join(format!("mantra-owner-{}-{}", std::process::id(), ctx.next));
+    let gate = ctx.add_idle();
+    let (a1, a2) = (ctx.add_idle(), ctx.add_idle());
+    for a in [gate, a1, a2] {
+        ready(ctx, a);
+    }
+    let task = |id: &str, scope: &str| Task { id: id.into(), role: "worker-small".into(), scope: vec![scope.into()], prompt: "do the work described for this task".into(), ..Default::default() };
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks = vec![task("t1", "src/a.rs"), task("t2", "src/b.rs")];
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan.clone());
+    let wt = std::env::temp_dir();
+    run.ws = Some(Workspace { worktree: true, repo: wt.clone(), integ: wt.join("integ-nowhere"), branch: "run".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
+    for (t, a) in plan.phases[0].tasks.iter().zip([a1, a2]) {
+        let mut w = mk_worker(&t.id, "worker-small", a, WState::Done);
+        w.task = t.clone();
+        w.wt = Some(wt.clone());
+        w.branch = format!("mantra-w/{}", t.id);
+        w.report = format!("STATUS: done\nSUMMARY: wrote {}", t.id);
+        run.workers.push(w);
+    }
+    run.gate_agent = Some(gate);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    (run, gate, a1, a2)
+}
+
+fn t(run: &Run, id: &str) -> usize {
+    run.workers.iter().position(|w| w.task.id == id).unwrap()
+}
+
+#[test]
+fn the_owner_of_the_findings_is_the_one_task_that_owns_every_file_they_name() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _gate, a1, _a2) = owner_run(&mut ctx);
+    let t1 = t(&run, "t1");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs:3 returns the wrong value"), Some(t1));
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong and src/b.rs too"), None, "two tasks: a fix worker");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "the build is broken somewhere"), None, "no file named");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/zzz.rs does not exist yet"), None, "a file no task owns");
+    assert_eq!(run.fix_owner_for(&ctx, 0, "src/a.rs conflicts"), None, "a merge-conflict fix is never an owner's");
+    // QA names the task, with or without a file
+    run.gate_fix_by = Some("t2".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), Some(t(&run, "t2")), "fix_by replaces the derivation");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "no file here"), Some(t(&run, "t2")));
+    run.gate_fix_by = Some("fix-worker".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.gate_fix_by = Some("nobody".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "an unknown task");
+    run.gate_fix_by = None;
+    // the file was changed by the worker's agent, though its scope does not cover it
+    ctx.agents.get_mut(&a1).unwrap().files.insert("lib/shared.rs".into(), Default::default());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "lib/shared.rs is wrong"), Some(t1));
+    // the setting, a big fix, a failed earlier owner fix
+    run.gate_big = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.gate_big = false;
+    run.workers[t1].owner_fix_failed = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.workers[t1].owner_fix_failed = false;
+    run.pattern.settings.gate_fix = "fix-worker".into();
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.pattern.settings.gate_fix = "owner".into();
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), Some(t1));
+}
+
+#[test]
+fn an_owner_that_cannot_take_the_job_is_not_chosen() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _gate, a1, _a2) = owner_run(&mut ctx);
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Stopped;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "stopped");
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Crashed("x".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "crashed");
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Idle;
+    ctx.agents.get_mut(&a1).unwrap().stopped_by_user = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "stopped by hand");
+    ctx.agents.get_mut(&a1).unwrap().stopped_by_user = false;
+    ctx.agents.get_mut(&a1).unwrap().turn_active = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "busy");
+    ctx.agents.get_mut(&a1).unwrap().turn_active = false;
+    let i = t(&run, "t1");
+    run.workers[i].wt = Some(PathBuf::from("/nonexistent/mantra-worktree"));
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "its worktree is gone");
+    run.workers[i].wt = Some(std::env::temp_dir());
+    run.workers[i].state = WState::Failed("x".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "not Done");
+    run.workers[i].state = WState::Done;
+    run.workers[i].adhoc = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "an ad-hoc worker owns nothing");
+}
+
+#[test]
+fn the_gate_report_carries_fix_by() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, _a1, _a2) = owner_run(&mut ctx);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": false, "summary": "src/b.rs and src/a.rs are inconsistent", "fix_by": "t1"}));
+    assert!(ok);
+    assert_eq!(run.gate_fix_by.as_deref(), Some("t1"));
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert_eq!(run.fix_owner.as_deref(), Some("t1"), "QA named the task");
+    assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"));
+}
+
+/// The owner path from the verdict to the next QA round.
+#[test]
+fn a_failed_round_in_one_tasks_files_goes_back_to_its_own_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert!(!run.halted());
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+    assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"), "no fix worker");
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")), "{:?}", ctx.jobs);
+    assert_eq!(run.fix_owner.as_deref(), Some("t1"));
+    assert!(run.journal_text(60).contains("gate round 1 found problems in t1's work — back to its own worker"));
+    assert!(run.orch_inbox.iter().any(|l| l.contains("t1's own worker")), "{:?}", run.orch_inbox);
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1), "nothing is said to it before its worktree is current");
+    // the worktree is current: it is told
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == a1).expect("the owner got a prompt");
+    assert!(p.starts_with("[mantra:fix]") && p.contains("src/a.rs:3 returns the wrong value") && p.contains("src/a.rs"), "{p}");
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Running);
+    assert_eq!(run.workers[i].owner_fixing, Some(1));
+    assert!(run.expected_active().iter().any(|(a, e)| *a == a1 && *e == Expect::Working("t1".into())));
+    // it finishes
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: returns the right value now".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    assert_eq!(run.workers[i].state, WState::Done);
+    assert_eq!(run.workers[i].owner_fixing, None);
+    assert!(run.gate_notes.iter().any(|n| n.contains("t1 (owner fix r1)")), "{:?}", run.gate_notes);
+    assert!(!ctx.prompts.iter().any(|(a, p)| *a == orch && p.contains("t1 done again")), "the orchestrator is not woken for it");
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerMerge")), "{:?}", ctx.jobs);
+    // its branch merges cleanly: the checks run again, then QA round 2 lists the owner's repair
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec!["t1".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "{:?}", ctx.jobs);
+    assert!(run.orch_inbox.iter().any(|l| l.starts_with("Gate fix r1 by t1 finished: SUMMARY: returns the right value now")), "{:?}", run.orch_inbox);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    let g2 = run.gate_agent.expect("round 2 has a fresh QA agent");
+    let (_, p2) = ctx.prompts.iter().rev().find(|(a, _)| *a == g2).unwrap();
+    assert!(p2.contains("t1 (its own worker, round 1)") && p2.contains("returns the right value now"), "{p2}");
+}
+
+#[test]
+fn an_owner_that_is_blocked_hands_the_round_to_a_fix_worker_with_its_report() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: blocked\nSUMMARY: the spec contradicts itself".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    assert!(!run.halted(), "no halt");
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Done, "its original work is still merged");
+    assert!(run.workers[i].owner_fix_failed);
+    assert_eq!(run.fix_owner, None);
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes it");
+    assert!(fix.prompt.contains("src/a.rs:3 returns the wrong value") && fix.prompt.contains("The task's own worker tried first and reported:") && fix.prompt.contains("the spec contradicts itself"), "{}", fix.prompt);
+    assert!(run.journal_text(60).contains("t1 could not repair it (blocked) — a fix worker takes it"));
+    assert!(run.orch_inbox.iter().any(|l| l.starts_with("Gate fix r1 by t1 could not be completed")), "{:?}", run.orch_inbox);
+    assert!(!run.orch_inbox.iter().any(|l| l.contains("FAILED (blocked)")));
+}
+
+#[test]
+fn an_owner_whose_turn_fails_hands_the_round_to_a_fix_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    run.on_turn_done(&mut ctx, a1, "failed", Some("model said no".into()), None);
+    assert!(!run.halted());
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"));
+    assert_eq!(run.workers[t(&run, "t1")].state, WState::Done);
+}
+
+#[test]
+fn an_owner_that_cannot_sync_hands_the_round_to_a_fix_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Err("the task's worktree does not merge with the integrated copy: CONFLICT".into())));
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1));
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"), "a fix worker takes it");
+    assert_eq!(run.fix_owner, None);
+    assert!(run.journal_text(60).contains("t1's worker cannot take the fix (the task's worktree does not merge with the integrated copy: CONFLICT) — a fix worker takes it"), "{}", run.journal_text(60));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }));
+}
+
+#[test]
+fn an_owner_whose_repair_no_longer_merges_goes_to_a_fix_worker_that_merges_by_hand() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec!["mantra-w/t1".into()], blocked: vec![], log: String::new() }));
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker merges it");
+    assert!(fix.prompt.contains("The task's own worker repaired its files, but its branch no longer merges") && fix.prompt.contains("mantra-w/t1"), "{}", fix.prompt);
+    assert_eq!(fix.task.role, "worker-big");
+}
+
+#[test]
+fn a_blocked_integration_after_an_owner_repair_halts() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec![], blocked: vec!["t1: commit failed".into()], log: String::new() }));
+    assert!(run.halted());
+    assert!(run.halt.as_ref().unwrap().message.contains("integration blocked"));
+}
+
+#[test]
+fn with_gate_fix_set_to_fix_worker_the_round_goes_to_a_fix_worker_as_before() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    run.pattern.settings.gate_fix = "fix-worker".into();
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"));
+    assert!(!ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")), "{:?}", ctx.jobs);
+    assert_eq!(run.fix_owner, None);
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1));
+    assert!(run.orch_inbox.iter().any(|l| l.contains("the fix goes to fix-1")), "{:?}", run.orch_inbox);
+}
+
+#[test]
+fn a_plan_revision_during_an_owner_fix_interrupts_the_owner_and_reruns_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    let planner = ctx.add_idle();
+    run.planner = Some(planner);
+    let _ = gate;
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Running);
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["new-check --flag"]));
+    assert!(ok, "{msg}");
+    assert!(ctx.interrupted.contains(&a1), "the owner is interrupted");
+    assert_eq!(run.workers[i].state, WState::Done);
+    assert_eq!(run.workers[i].owner_fixing, None);
+    assert_eq!(run.fix_owner, None);
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("Checks")), "{:?}", ctx.jobs);
+    // the interrupted turn ending is nobody's news
+    run.on_turn_done(&mut ctx, a1, "interrupted", None, None);
+    assert!(!run.orch_inbox.iter().any(|l| l.contains("interrupted")));
+}
+
+#[test]
+fn a_halt_lifted_in_an_owner_fix_picks_up_where_it_is() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    // still working: nothing new starts
+    ctx.jobs.clear();
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.is_empty() && !run.workers.iter().any(|w| w.task.id == "fix-1"));
+    // an owner that is not repairing any more and never finished: the fix starts over
+    let i = t(&run, "t1");
+    run.workers[i].state = WState::Done;
+    run.workers[i].owner_fixing = None;
+    ctx.agents.get_mut(&a1).unwrap().turn_active = false;
+    run.fix_owner = Some("t1".into());
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "it was done: the checks run {:?}", ctx.jobs);
+}
+
+#[test]
+fn a_generic_fix_also_tells_the_orchestrator_how_it_ended() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let gate = ctx.add_idle();
+    run.gate_agent = Some(gate);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — README needs a usage section");
+    finish_fix(&mut ctx, &mut run, 1);
+    assert!(run.orch_inbox.iter().any(|l| l == "Gate fix r1 by fix-1 finished: SUMMARY: fixed what was listed. Mantra re-runs the checks and QA."), "{:?}", run.orch_inbox);
+}
+
+#[test]
+fn gate_fix_is_a_setting_that_old_pattern_files_default() {
+    let p = Pattern::builtin();
+    assert_eq!(p.settings.gate_fix, "owner");
+    let toml = p.to_toml();
+    let old = toml.replace("gate_fix = \"owner\"\n", "");
+    assert!(!old.contains("gate_fix"), "the fixture must be missing the key");
+    assert_eq!(Pattern::from_toml(&old).unwrap().settings.gate_fix, "owner");
+    let mut bad = Pattern::builtin();
+    bad.settings.gate_fix = "somebody".into();
+    assert!(bad.validate().unwrap_err().iter().any(|e| e.contains("gate_fix")));
+    bad.settings.gate_fix = "fix-worker".into();
+    assert!(bad.validate().is_ok());
 }

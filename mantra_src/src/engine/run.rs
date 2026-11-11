@@ -33,6 +33,11 @@ pub enum JobTag {
     Checks { phase: usize, round: u32, gen: u64 },
     /// The checks re-run after a fix worker finished a gate round (`round` is the round it fixed).
     FixChecks { phase: usize, round: u32, gen: u64 },
+    /// The worktree of the task that repairs a gate finding itself is brought up to the integrated
+    /// state (`JobOut::Text`, `git::sync_worker`).
+    OwnerSync { phase: usize, round: u32, task: String },
+    /// That worker's repair is merged into the integrated copy (`JobOut::Merge`).
+    OwnerMerge { phase: usize, round: u32 },
     Cleanup { phase: usize },
     /// `HEAD` of each nested repository at a phase start (`JobOut::Text`, `repo\tsha` lines).
     PhaseBase { phase: usize },
@@ -327,6 +332,11 @@ pub struct Worker {
     pub active: Duration,
     /// Cancelled by a plan revision after it had finished: its phase report says so.
     pub superseded: bool,
+    /// Gate fixes (WP-6.2): this worker's own repair of a gate finding already failed in this
+    /// phase (a fix worker takes the next one); the round it is repairing right now; since when.
+    pub owner_fix_failed: bool,
+    pub owner_fixing: Option<u32>,
+    pub fix_started: Option<Instant>,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -509,6 +519,14 @@ pub struct Run {
     /// The latest gate report said the fixes are big (`mantra_gate_report big=true`): the fix
     /// worker is then `worker-big`.
     gate_big: bool,
+    /// `mantra_gate_report fix_by`: the task id QA named to repair this round, or `fix-worker`.
+    gate_fix_by: Option<String>,
+    /// The task whose own worker repairs the current gate round (`None` = a generic fix worker),
+    /// the findings the round was started with, and the owners' reports of this phase so far
+    /// (task, round, report) for the next QA agent.
+    pub(super) fix_owner: Option<String>,
+    fix_findings: String,
+    owner_fixes: Vec<(String, u32, String)>,
     gate_plan_defect: bool,
     /// Counts the checks jobs started in this run (their log files are named after it).
     checks_gen: u64,
@@ -733,6 +751,10 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             gate_big: false,
+            gate_fix_by: None,
+            fix_owner: None,
+            fix_findings: String::new(),
+            owner_fixes: vec![],
             gate_plan_defect: false,
             checks_gen: 0,
             qa_ok: false,
@@ -960,6 +982,7 @@ impl Run {
             gate_notes: self.gate_notes.clone(),
             gate_seq: self.gate_seq,
             last_gate_file: self.last_gate_file.clone(),
+            fix_owner: self.fix_owner.clone(),
             workers,
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
@@ -1286,7 +1309,7 @@ impl Run {
     /// would start the agent twice.
     fn resume_for_restart(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, target: AgentId) {
         let in_gate = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
-        let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc).unwrap_or(false);
+        let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc || self.workers[i].owner_fixing.is_some()).unwrap_or(false);
         let replaces = in_gate && (Some(target) == self.gate_agent || fix_worker);
         self.resume_core(ctx, except, !replaces, false);
     }
@@ -1942,7 +1965,7 @@ Then summarize in 2-4 lines.",
                 }
                 PhaseStep::Fix { .. } => {
                     for w in &self.workers {
-                        if w.adhoc && w.state == WState::Running {
+                        if (w.adhoc || w.owner_fixing.is_some()) && w.state == WState::Running {
                             if let Some(a) = w.agent.filter(|a| !asking(*a)) {
                                 v.push((a, Expect::Working(w.task.id.clone())));
                             }
@@ -2197,6 +2220,9 @@ Then summarize in 2-4 lines.",
         self.phase_started = Instant::now();
         self.last_review = Instant::now();
         self.workers.clear();
+        self.fix_owner = None;
+        self.fix_findings.clear();
+        self.owner_fixes.clear();
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
@@ -2304,6 +2330,9 @@ Then summarize in 2-4 lines.",
             status_asked: false,
             active: Duration::ZERO,
             superseded: false,
+            owner_fix_failed: false,
+            owner_fixing: None,
+            fix_started: None,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued ({})", self.class_cap_text(&role)));
@@ -2603,6 +2632,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
         self.gate_big = false;
+        self.gate_fix_by = None;
         self.gate_plan_defect = false;
         self.qa_ok = false;
         self.gate_nudges = 0;
@@ -2621,7 +2651,7 @@ Then summarize in 2-4 lines.",
             "Do not edit anything: you verify and report, Mantra routes every fix to a worker."
         };
         let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, fit_or_point(&w.report, 2_000, None))).collect();
-        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, fit_or_point(&w.report, 4_000, None))).collect();
+        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, fit_or_point(&w.report, 4_000, None))).chain(self.owner_fixes.iter().map(|(t, r, rep)| format!("- {t} (its own worker, round {r}): {}\n", fit_or_point(rep, 4_000, None)))).collect();
         let previous = match &self.prev_gate {
             Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, fit_or_point(sum, 12_000, self.last_gate_file.as_deref())),
             None => String::new(),
@@ -2699,18 +2729,161 @@ Then summarize in 2-4 lines.",
         roles.iter().find(|r| r.to_lowercase().contains(hint)).or_else(|| roles.first()).cloned().unwrap_or_else(|| want.into())
     }
 
-    /// Route what gate round `round` found to a fix worker (`fix-<round>`, scoped to the files the
-    /// findings name) and wait for it: when it is done Mantra re-runs the checks and starts the
-    /// next QA round (`on_fix_done`). The caller has checked `round < gate_max_rounds`.
+    /// Route what gate round `round` found to whoever repairs it and wait for them: the worker
+    /// that wrote the code when every finding is in one task's files (`fix_owner_for`), else a
+    /// fix worker (`fix-<round>`, scoped to the files the findings name). When it is done Mantra
+    /// re-runs the checks and starts the next QA round (`on_fix_done`). The caller has checked
+    /// `round < gate_max_rounds`.
     fn start_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
         if self.halted() {
             self.defer(Pending::Fix { idx, round, findings, big });
             return;
         }
-        let Some(phase) = self.current_phase().cloned() else { return };
+        if self.current_phase().is_none() {
+            return;
+        }
         self.qa_ok = false;
         self.fix_base_print = self.tree_print.clone();
         self.retire_gate_agent(ctx);
+        self.fix_findings = findings.clone();
+        if let Some(wi) = self.fix_owner_for(ctx, round, &findings) {
+            self.start_owner_fix(ctx, idx, round, wi, findings);
+            return;
+        }
+        self.fix_owner = None;
+        self.start_generic_fix(ctx, idx, round, findings, big);
+    }
+
+    /// The task whose worker should repair these findings, if exactly one task of the current
+    /// phase owns every file the findings name and its worker can take the job (index into
+    /// `self.workers`). Never for round 0 (a merge-conflict fix) or a big fix.
+    fn fix_owner_for(&self, ctx: &dyn Ctx, round: u32, findings: &str) -> Option<usize> {
+        if self.pattern.settings.gate_fix != "owner" || round == 0 || self.gate_big {
+            return None;
+        }
+        // the newest attempt of each task of the phase
+        let newest = |id: &str| self.workers.iter().rposition(|w| !w.adhoc && w.task.id == id);
+        let wi = match self.gate_fix_by.as_deref().map(str::trim) {
+            Some("fix-worker") => return None,
+            Some(id) if !id.is_empty() => newest(id)?,
+            _ => {
+                let paths = paths_in(findings, &self.workspace_dir());
+                if paths.is_empty() {
+                    return None;
+                }
+                let owns = |w: &Worker, path: &str| {
+                    w.state == WState::Done
+                        && ((!w.task.scope.is_empty() && crate::util::in_scope(&w.task.scope, path)) || w.agent.and_then(|a| ctx.agent(a)).map(|ag| ag.files.contains_key(path)).unwrap_or(false))
+                };
+                let mut owner: Option<usize> = None;
+                for p in &paths {
+                    let mut ids: Vec<&str> = self.workers.iter().filter(|w| !w.adhoc).map(|w| w.task.id.as_str()).collect();
+                    ids.dedup();
+                    let found = ids.into_iter().filter_map(newest).find(|&i| owns(&self.workers[i], p))?;
+                    if owner.is_some_and(|o| self.workers[o].task.id != self.workers[found].task.id) {
+                        return None;
+                    }
+                    owner = Some(found);
+                }
+                owner?
+            }
+        };
+        let w = &self.workers[wi];
+        if w.state != WState::Done || w.adhoc || w.owner_fix_failed {
+            return None;
+        }
+        let ag = w.agent.and_then(|a| ctx.agent(a))?;
+        if matches!(ag.status, Status::Stopped | Status::Crashed(_) | Status::Failed(_)) || ag.stopped_by_user || ag.busy() {
+            return None;
+        }
+        // a worktree that is gone cannot be repaired in
+        if self.ws.as_ref().is_some_and(|ws| ws.worktree) && !w.wt.as_ref().is_some_and(|d| d.is_dir()) {
+            return None;
+        }
+        Some(wi)
+    }
+
+    /// The worker that wrote the code repairs it: its worktree is first brought up to the
+    /// integrated state (`OwnerSync`), then it gets the findings (`owner_fix_go`).
+    fn start_owner_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize, _findings: String) {
+        let task = self.workers[wi].task.id.clone();
+        self.stage = Stage::Phase { idx, step: PhaseStep::Fix { round } };
+        self.fix_owner = Some(task.clone());
+        self.qa_ok = false;
+        self.fix_base_print = self.tree_print.clone();
+        self.log("⚒", "amber", format!("gate round {round} found problems in {task}'s work — back to its own worker"));
+        match (self.ws.clone(), self.workers[wi].wt.clone()) {
+            (Some(ws), Some(dir)) => {
+                ctx.job(JobTag::OwnerSync { phase: idx, round, task }, Box::new(move || JobOut::Text(git::sync_worker(&ws, &dir).map(|_| String::new()))));
+            }
+            _ => self.owner_fix_go(ctx, idx, round, wi),
+        }
+        self.save_state();
+    }
+
+    /// The owner's worktree is current: hand it the findings.
+    fn owner_fix_go(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize) {
+        let Some(a) = self.workers[wi].agent else {
+            let f = self.fix_findings.clone();
+            self.fix_owner = None;
+            self.start_generic_fix(ctx, idx, round, f, self.gate_big);
+            return;
+        };
+        let w = &mut self.workers[wi];
+        w.state = WState::Running;
+        w.finished = None;
+        w.owner_fixing = Some(round);
+        w.fix_started = Some(Instant::now());
+        let scope = if w.task.scope.is_empty() { "the files you changed".to_string() } else { w.task.scope.join(", ") };
+        let prompt = format!(
+            "[mantra:fix] The QA gate reviewed the merged result of this phase (round {round}) and found problems in your task's work. Fix exactly these — no refactors, no extras — and stop.\n\nFindings:\n{}\n\nYour working copy has been updated to the integrated state of the phase (the other tasks' changes are merged in). Stay within your task's scope ({scope}). Before you finish run only what covers what you touched, once.\n\nThe gate checks as they stand (Mantra re-runs all of them after you):\n{}\n\nEnd with the STATUS and SUMMARY lines.",
+            fit_or_point(self.fix_findings.trim(), 48_000, self.last_gate_file.as_deref()),
+            self.check_summary()
+        );
+        self.mark_edge(a);
+        ctx.prompt(a, self.with_akasha(a, prompt));
+        self.save_state();
+    }
+
+    /// The owner repaired its files: merge that one worker into the integrated copy, then the
+    /// checks run (`OwnerMerge` → `on_fix_done`).
+    fn start_owner_merge(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize) {
+        let w = &self.workers[wi];
+        match (self.ws.clone(), w.wt.clone()) {
+            (Some(ws), Some(dir)) if ws.worktree => {
+                let list = vec![(w.task.id.clone(), dir, w.branch.clone())];
+                ctx.job(JobTag::OwnerMerge { phase: idx, round }, Box::new(move || JobOut::Merge(git::merge_workers(&ws, &list))));
+            }
+            _ => self.on_fix_done(ctx, idx, round),
+        }
+    }
+
+    /// The owner's repair did not happen (blocked, failed, cannot sync): a fix worker takes the
+    /// round, with whatever the owner reported.
+    fn owner_gives_up(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize, why: &str, report: Option<&str>) {
+        let w = &mut self.workers[wi];
+        w.owner_fix_failed = true;
+        w.owner_fixing = None;
+        if matches!(w.state, WState::Running | WState::Failed(_)) {
+            w.state = WState::Done; // its original work is still merged
+        }
+        self.log("⚒", "amber", format!("{why} — a fix worker takes it"));
+        self.fix_owner = None;
+        let mut findings = self.fix_findings.clone();
+        if let Some(r) = report {
+            findings = format!("{findings}\n\nThe task's own worker tried first and reported:\n{r}");
+        }
+        let big = self.gate_big;
+        if self.halted() {
+            self.start_fix(ctx, idx, round, findings, big);
+        } else {
+            self.start_generic_fix(ctx, idx, round, findings, big);
+        }
+    }
+
+    /// A fix worker (`fix-<round>`) takes what gate round `round` found.
+    fn start_generic_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
+        let Some(phase) = self.current_phase().cloned() else { return };
         let role = self.fix_role(big);
         let scope = paths_in(&findings, &self.workspace_dir());
         let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\n\nThe gate checks as they stand (Mantra re-runs all of them after you):\n{}", self.check_summary()) };
@@ -2740,9 +2913,23 @@ Then summarize in 2-4 lines.",
     /// The fix worker of gate round `round` finished: re-run the checks (the next QA round
     /// follows the result, `JobTag::FixChecks`).
     fn on_fix_done(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
-        let report = self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).map(|w| w.report.clone()).unwrap_or_default();
+        let who = self.fix_owner.clone().unwrap_or_else(|| format!("fix-{round}"));
+        let report = match &self.fix_owner {
+            Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).map(|w| w.report.clone()).unwrap_or_default(),
+            None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).map(|w| w.report.clone()).unwrap_or_default(),
+        };
         if !report.trim().is_empty() {
-            self.gate_notes.push(format!("phase {} · fix-{round}: {}", idx + 1, trunc(report.replace('\n', " ").trim(), 300)));
+            // an owner's own note was added when it finished
+            if self.fix_owner.is_none() {
+                self.gate_notes.push(format!("phase {} · fix-{round}: {}", idx + 1, trunc(report.replace('\n', " ").trim(), 300)));
+            }
+            let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
+            self.orch_inbox.push(format!("Gate fix r{round} by {who} finished: {summary}. Mantra re-runs the checks and QA."));
+        } else {
+            self.orch_inbox.push(format!("Gate fix r{round} by {who} finished. Mantra re-runs the checks and QA."));
+        }
+        if let Some(t) = self.fix_owner.clone() {
+            self.owner_fixes.push((t, round, report));
         }
         // a merge-conflict fix has merged the branches by hand
         self.conflicts.clear();
@@ -2751,6 +2938,19 @@ Then summarize in 2-4 lines.",
 
     /// A halt was lifted while a fix worker owned the phase: pick up where it is.
     fn resume_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        if let Some(t) = self.fix_owner.clone() {
+            match self.workers.iter().rev().find(|w| !w.adhoc && w.task.id == t).map(|w| (w.state.clone(), w.owner_fixing)) {
+                // still repairing: the halt's "continue where you left off" re-prompt reaches it
+                Some((WState::Running, Some(_))) => {}
+                Some((WState::Done, None)) => self.on_fix_done(ctx, idx, round),
+                _ => {
+                    self.fix_owner = None;
+                    let (f, big) = (self.fix_findings.clone(), self.gate_big);
+                    self.start_fix(ctx, idx, round, f, big);
+                }
+            }
+            return;
+        }
         let id = format!("fix-{round}");
         let Some(w) = self.workers.iter().rev().find(|w| w.task.id == id) else {
             // never got a worker: nothing to wait for, check what is there
@@ -2786,6 +2986,9 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
+        self.fix_owner = None;
+        self.fix_findings.clear();
+        self.owner_fixes.clear();
         self.log("✓", "green", if self.pattern.settings.planner_loop { "planner verified the goal — saving the phase" } else { "gate passed — archiving workers, writing handoff" });
         // archive workers + gate agent
         self.completed_agents.extend(self.workers.iter().filter(|w| w.state == WState::Done).filter_map(|w| w.agent));
@@ -3093,6 +3296,45 @@ Then summarize in 2-4 lines.",
                 }
                 self.conflicts = m.conflicts;
                 self.run_checks(ctx, phase, 0);
+            }
+            (JobTag::OwnerSync { phase, round, task }, JobOut::Text(r)) => {
+                // a revision or a restart moved the run on: nothing waits for this any more
+                let current = matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) && self.fix_owner.as_deref() == Some(task.as_str());
+                let Some(wi) = self.workers.iter().rposition(|w| !w.adhoc && w.task.id == task).filter(|_| current) else { return };
+                match r {
+                    Ok(_) if !self.halted() => self.owner_fix_go(ctx, phase, round, wi),
+                    // a halt is on: the fix is due when it lifts, and a fix worker will take it
+                    Ok(_) => {
+                        self.fix_owner = None;
+                        let (f, big) = (self.fix_findings.clone(), self.gate_big);
+                        self.start_fix(ctx, phase, round, f, big);
+                    }
+                    Err(e) => self.owner_gives_up(ctx, phase, round, wi, &format!("{task}'s worker cannot take the fix ({})", trunc(&e, 100)), None),
+                }
+            }
+            (JobTag::OwnerMerge { phase, round }, JobOut::Merge(m)) => {
+                if !matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) {
+                    return;
+                }
+                let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), &m.log);
+                if !m.blocked.is_empty() {
+                    self.stage = Stage::Phase { idx: phase, step: PhaseStep::Orchestrating };
+                    let detail = format!("phase {} integration blocked:\n{}\nRestore protected decision headings or fix the project commit policy before explicitly resuming. Worker branches and worktrees are retained; do not bypass the safeguard with a manual merge.", phase + 1, m.blocked.join("\n"));
+                    self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, None, format!("phase {} integration blocked by commit/policy failure", phase + 1), detail, None);
+                    return;
+                }
+                if !m.conflicts.is_empty() {
+                    let list = m.conflicts.join("\n");
+                    self.log("⚠", "amber", format!("{} merge conflict(s) after the owner's repair → handed to a fix worker", m.conflicts.len()));
+                    self.fix_owner = None;
+                    let findings = format!("The task's own worker repaired its files, but its branch no longer merges into the integrated copy. Merge it by hand (`git merge <branch>`), keep both sides' intent, and commit:\n{list}");
+                    self.start_generic_fix(ctx, phase, round, findings, true);
+                    return;
+                }
+                if !m.merged.is_empty() {
+                    self.log("⇲", "green", format!("merged {}", m.merged.join(", ")));
+                }
+                self.on_fix_done(ctx, phase, round);
             }
             (JobTag::Checks { phase, round, gen }, JobOut::Checks(results, dropped, diff, print)) => {
                 if self.checks_result_stale(gen, phase) {
@@ -3609,7 +3851,11 @@ Then summarize in 2-4 lines.",
                             );
                         } else if round < self.pattern.settings.gate_max_rounds {
                             self.gate_report = None;
-                            self.orch_inbox.push(format!("Gate round {round}: QA failed the phase — the fix goes to fix-{round} ({}). Full report: {path}.", self.fix_role(big)));
+                            let who = match self.fix_owner_for(&*ctx, round, &why) {
+                                Some(wi) => format!("{}'s own worker", self.workers[wi].task.id),
+                                None => format!("fix-{round} ({})", self.fix_role(big)),
+                            };
+                            self.orch_inbox.push(format!("Gate round {round}: QA failed the phase — the fix goes to {who}. Full report: {path}."));
                             self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
                             // The fix goes to a worker; Mantra re-runs the checks and starts a
                             // fresh QA round when it is done (deferred if the run is halted).
@@ -3900,6 +4146,8 @@ Then summarize in 2-4 lines.",
             Stage::Phase { step: PhaseStep::Fix { round }, .. } if self.workers[wi].adhoc => Some(*round),
             _ => None,
         };
+        // A task's own worker repairing what a gate round found is Mantra's to follow too.
+        let owner_round = self.workers[wi].owner_fixing.filter(|_| matches!(self.stage, Stage::Phase { step: PhaseStep::Fix { .. }, .. }));
         let w = &mut self.workers[wi];
         if w.paused || w.state == WState::Cancelled {
             return;
@@ -3908,6 +4156,9 @@ Then summarize in 2-4 lines.",
         let tid = w.task.id.clone();
         let agent = w.agent;
         let mut fix_done: Option<(usize, u32)> = None;
+        // the owner could not repair it: (round, what happened, its report)
+        let mut owner_failed: Option<(u32, String, Option<String>)> = None;
+        let mut owner_merge: Option<(usize, u32)> = None;
         let report = w.agent.and_then(|a| ctx.agent(a)).and_then(|a| a.final_message.clone()).unwrap_or_default();
         let waiting = w.agent.map(|a| self.pending_questions.contains_key(&a)).unwrap_or(false);
         match status {
@@ -3940,10 +4191,13 @@ Then summarize in 2-4 lines.",
                 let w = &mut self.workers[wi];
                 w.report = report.clone();
                 w.finished = Some(Instant::now());
-                if blocked {
+                if blocked && owner_round.is_some() {
+                    owner_failed = owner_round.map(|r| (r, format!("{tid} could not repair it (blocked)"), Some(report.clone())));
+                } else if blocked {
                     w.state = WState::Failed("blocked".into());
                     self.log("⚠", "amber", format!("{tid} is blocked"));
                     if let Some(round) = fix_round {
+                        self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(&report, 200)));
                         self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)), format!("{tid} could not fix what gate round {round} found — it is blocked: {report}"), None);
                     } else {
                         self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", fit_or_point(&report, 4_000, None)));
@@ -3951,7 +4205,7 @@ Then summarize in 2-4 lines.",
                 } else {
                     // A done worker the user (or the orchestrator) messaged finishes again: that is
                     // a follow-up answered, not the task completing a second time.
-                    let again = w.state == WState::Done;
+                    let again = w.state == WState::Done && owner_round.is_none();
                     w.state = WState::Done;
                     let el = fmt_dur(w.active + self.last_tick.elapsed().min(Duration::from_secs(1)));
                     let adhoc = w.adhoc;
@@ -3962,13 +4216,26 @@ Then summarize in 2-4 lines.",
                     // the last message before it.
                     let last_ask = agent.and_then(|a| ctx.agent(a)).and_then(|a| a.items.iter().rev().find(|i| matches!(i.kind, crate::agent::Kind::User) && !crate::agent::is_akasha_push(&i.text))).map(|i| i.text.clone()).unwrap_or_default();
                     let by_you = again && (last_ask.starts_with("[from the user]") || !crate::agent::engine_sent(&last_ask));
+                    let owner_el = owner_round.map(|_| fmt_dur(w.fix_started.map(|t| t.elapsed()).unwrap_or_default()));
+                    if let Some(round) = owner_round {
+                        let w = &mut self.workers[wi];
+                        w.owner_fixing = None;
+                        w.fix_started = None;
+                        owner_merge = Some((self.phase_idx().unwrap_or(0), round));
+                        self.log("✓", "green", format!("{tid} repaired its work (gate round {round}) in {}", owner_el.clone().unwrap_or_default()));
+                        self.gate_notes.push(format!("phase {} · {tid} (owner fix r{round}): {}", owner_merge.map(|m| m.0 + 1).unwrap_or(1), trunc(summary.replace('\n', " ").trim(), 300)));
+                    }
                     let what = match (again, by_you) {
                         (false, _) => "done",
                         (true, true) => "done again (after your message)",
                         (true, false) => "done again",
                     };
-                    self.log("✓", "green", format!("{tid} {what} in {el}"));
-                    if again && by_you {
+                    if owner_round.is_none() {
+                        self.log("✓", "green", format!("{tid} {what} in {el}"));
+                    }
+                    if owner_round.is_some() {
+                        // reported above; the merge of its repair follows
+                    } else if again && by_you {
                         // the orchestrator (or the finale) already had this task's completion: the
                         // user's side conversation wakes nobody, and the new report is on the
                         // worker for whoever reads it next
@@ -3996,7 +4263,7 @@ Then summarize in 2-4 lines.",
             }
             "interrupted" => {
                 self.log("■", "amber", format!("{tid} interrupted"));
-                if fix_round.is_none() {
+                if fix_round.is_none() && owner_round.is_none() && before != WState::Done {
                     self.orch_event(ctx, format!("{tid} was interrupted (it is idle now). mantra_prompt it to continue or mantra_retry."));
                 }
             }
@@ -4009,7 +4276,10 @@ Then summarize in 2-4 lines.",
                     // the orchestrator (a retry would fail the same way) nor — for a fix worker —
                     // the manager and the planner are asked. The run waits for the gateway.
                     self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"), GATEWAY_DOWN_HINT);
+                } else if let Some(round) = owner_round {
+                    owner_failed = Some((round, format!("{tid} could not repair it (its turn failed)"), Some(format!("its turn failed: {}", trunc(&e, 300)))));
                 } else if let Some(round) = fix_round {
+                    self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(&e, 200)));
                     let msg = format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200));
                     self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, msg.clone(), msg, Some(&e));
                 } else {
@@ -4017,9 +4287,17 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
+        if let Some((round, what, rep)) = owner_failed {
+            let idx = self.phase_idx().unwrap_or(0);
+            self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(rep.as_deref().unwrap_or(&what), 200)));
+            self.owner_gives_up(ctx, idx, round, wi, &what, rep.as_deref());
+        }
         self.akasha_task_ended(ctx, wi, &before);
         if let Some((idx, round)) = fix_done {
             self.on_fix_done(ctx, idx, round);
+        }
+        if let Some((idx, round)) = owner_merge {
+            self.start_owner_merge(ctx, idx, round, wi);
         }
         self.fill_slots(ctx);
         self.check_phase_done(ctx);
@@ -5709,6 +5987,7 @@ Then summarize in 2-4 lines.",
                     Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
                     _ => false,
                 };
+                self.gate_fix_by = args.get("fix_by").and_then(|v| v.as_str()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
                 self.gate_plan_defect = match args.get("plan_defect") {
                     Some(Value::Bool(b)) => *b,
                     Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
@@ -6061,6 +6340,7 @@ Then summarize in 2-4 lines.",
         for w in self.workers.iter_mut().filter(|w| live(w)) {
             w.state = WState::Cancelled;
         }
+        self.stop_owner_fix(ctx);
         self.checks.clear();
         self.gate_report = None;
         self.prev_gate = None;
@@ -6073,6 +6353,23 @@ Then summarize in 2-4 lines.",
             self.drop_pending(why);
         }
         self.log("◎", "amber", format!("gate round abandoned: {why}"));
+    }
+
+    /// A gate round that no longer stands: a task's own worker still repairing its work is
+    /// interrupted and is `Done` again (its original work stands); the round forgets its owner.
+    fn stop_owner_fix(&mut self, ctx: &mut dyn Ctx) {
+        for w in self.workers.iter_mut().filter(|w| w.owner_fixing.is_some()) {
+            if let Some(a) = w.agent {
+                ctx.interrupt(a);
+            }
+            w.owner_fixing = None;
+            w.fix_started = None;
+            if w.state != WState::Cancelled {
+                w.state = WState::Done;
+            }
+        }
+        self.fix_owner = None;
+        self.fix_findings.clear();
     }
 
     /// Back from merging/checks/gate to building: the gate agent is stopped (it will be spawned
@@ -6092,6 +6389,7 @@ Then summarize in 2-4 lines.",
         for w in self.workers.iter_mut().filter(|w| w.adhoc && matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_) | WState::Queued)) {
             w.state = WState::Cancelled;
         }
+        self.stop_owner_fix(ctx);
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
         self.checks_gen += 1;
         self.qa_ok = false;

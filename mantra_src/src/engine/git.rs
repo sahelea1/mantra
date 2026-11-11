@@ -295,6 +295,21 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Bring a worker's worktree up to the integration branch before it repairs its own work
+/// (other tasks' merges, an earlier fix). Commits what the worker left uncommitted first.
+/// `Err` = it does not merge cleanly (the merge is aborted; the worktree is as before).
+pub fn sync_worker(ws: &Workspace, dir: &Path) -> Result<(), String> {
+    if !ws.worktree || dir == ws.integ {
+        return Ok(());
+    }
+    commit_all(dir, "mantra: before fix")?;
+    if let Err(e) = git_with_identity(dir, &["merge", "--no-edit", &ws.branch]) {
+        let _ = git(dir, &["merge", "--abort"]);
+        return Err(format!("the task's worktree does not merge with the integrated copy: {}", e.lines().next().unwrap_or("")));
+    }
+    Ok(())
+}
+
 pub struct MergeResult {
     pub merged: Vec<String>,
     pub conflicts: Vec<String>,
@@ -1202,5 +1217,36 @@ mod tests {
             let _ = std::fs::remove_dir_all(&plain);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+    #[test]
+    fn sync_worker_brings_in_the_integrated_state_and_a_conflict_leaves_the_worktree_clean() {
+        let dir = temp_repo("sync");
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let mut ws = test_ws(&dir, None);
+        ws.branch = branch;
+        let worker = worker_repo(&dir, "sync");
+        // another task's work lands on the integration branch; this worker has an uncommitted file
+        std::fs::write(dir.join("other.txt"), "theirs\n").unwrap();
+        commit_all(&dir, "other task").unwrap();
+        std::fs::write(worker.join("mine.txt"), "mine\n").unwrap();
+        sync_worker(&ws, &worker).unwrap();
+        assert_eq!(std::fs::read_to_string(worker.join("other.txt")).unwrap(), "theirs\n");
+        assert!(worker.join("mine.txt").exists(), "its own work is kept");
+        assert_eq!(git(&worker, &["status", "--porcelain"]).unwrap(), "", "its leftovers were committed first");
+        // a shared workspace has nothing to sync
+        let mut shared = ws.clone();
+        shared.worktree = false;
+        assert!(sync_worker(&shared, &worker).is_ok());
+        // both sides change the same line: Err, the merge is aborted, nothing is left half-done
+        std::fs::write(dir.join("tracked.txt"), "integrated\n").unwrap();
+        commit_all(&dir, "integrated edit").unwrap();
+        std::fs::write(worker.join("tracked.txt"), "worker\n").unwrap();
+        let e = sync_worker(&ws, &worker).unwrap_err();
+        assert!(e.starts_with("the task's worktree does not merge with the integrated copy"), "{e}");
+        assert_eq!(git(&worker, &["status", "--porcelain"]).unwrap(), "");
+        assert!(git(&worker, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_err(), "no merge in progress");
+        assert_eq!(std::fs::read_to_string(worker.join("tracked.txt")).unwrap(), "worker\n");
+        let _ = git(&dir, &["worktree", "remove", "--force", &worker.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

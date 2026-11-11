@@ -181,6 +181,7 @@ fn gate_report_tool() -> Value {
             "pass": {"type": "boolean"},
             "summary": {"type": "string"},
             "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"},
+            "fix_by": {"type": "string", "description": "fail only, optional: the task id whose worker should repair this (when every finding is in that task's work), or \"fix-worker\" for a fresh fix worker. Leave out to let Mantra decide from the files you name."},
             "plan_defect": {"type": "boolean", "description": "fail only: nothing is wrong with the work — a gate check itself is wrong, or cannot pass in this phase or on this machine. No fix worker is sent; the planner is asked to amend the check. Name the check and say why in the summary."}
         }),
         &["pass", "summary"],
@@ -462,6 +463,7 @@ mantra-role: orchestrator
 - A sandbox/environment error reported by a worker is never transient: never answer retry, never respawn
   for it (Mantra halts on it); if it reaches you anyway, pass it up with mantra_ask at once, quoting the
   error. Keep answers to workers short and decisive.
+- Gate fixes are Mantra's: after a failed QA round the fix goes to the task's own worker or to a fix worker, and you are told who and what came of it. Do not spawn or retry tasks for it; answer the fixing agent's questions like any worker's.
 "#;
 
 pub const MANAGER_PROTOCOL: &str = r#"
@@ -514,6 +516,7 @@ mantra-role: gate
 - When done, call `mantra_gate_report` with pass=true/false and a summary. Then end your turn.
 - On fail the summary is the work order for a fix worker: every finding with file, what is wrong, what to change.
   Set big=true only if the fixes span several files or need design work.
+- If every finding is in one task's work, you may name it with fix_by=<task id>: its own worker repairs it. Otherwise leave fix_by out.
 - Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails.
 - A check that is itself wrong, or cannot pass in this phase or on this machine, is a plan problem, not a failure of the work: report it with mantra_gate_report(pass=false, plan_defect=true) and name the check. Do not use mantra_ask for that and do not wait — the planner gets your report and amends the check.
 - Use mantra_ask only for a real question about the work. After asking, end your turn; you are woken with the answer and report then.

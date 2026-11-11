@@ -23,7 +23,7 @@ const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "context", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
-const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "claude_user_config", "allow_pattern_changes"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "gate_fix", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "claude_user_config", "allow_pattern_changes"];
 const ADD_STEP: &str = "+ add finale step";
 
 /// How a field takes keys (`ui::form`'s rules).
@@ -47,7 +47,7 @@ fn field_kind(entry: &str, field: &str) -> Kind {
     match entry {
         "⚙ settings" => match field {
             "name" | "description" | "writable_roots" => Kind::Text,
-            "isolation" | "orchestrator_context" | "claude_user_config" => Kind::Choice,
+            "isolation" | "orchestrator_context" | "claude_user_config" | "gate_fix" => Kind::Choice,
             "network" | "review_plan" | "allow_pattern_changes" => Kind::Toggle,
             _ => Kind::Step,
         },
@@ -134,7 +134,7 @@ fn flow_fields(app: &App) -> Vec<String> {
 fn fields(app: &App, entry: &str) -> Vec<String> {
     match entry {
         "⚙ settings" => PATTERN_FIELDS.iter().chain(SETTING_FIELDS)
-            .filter(|f| !app.studio.pattern.settings.planner_loop || !matches!(**f, "worker_retries" | "orchestrator_context" | "gate_max_rounds" | "check_timeout_secs" | "max_tasks_per_phase" | "review_minutes" | "manager_minutes"))
+            .filter(|f| !app.studio.pattern.settings.planner_loop || !matches!(**f, "worker_retries" | "orchestrator_context" | "gate_max_rounds" | "gate_fix" | "check_timeout_secs" | "max_tasks_per_phase" | "review_minutes" | "manager_minutes"))
             .map(|s| s.to_string()).collect(),
         "⇢ flow" => flow_fields(app),
         role => {
@@ -169,6 +169,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "orchestrator_context" => s.orchestrator_context.clone(),
                 "stall_minutes" => s.stall_minutes.to_string(),
                 "gate_max_rounds" => s.gate_max_rounds.to_string(),
+                "gate_fix" => s.gate_fix.clone(),
                 "check_timeout_secs" => s.check_timeout_secs.to_string(),
                 "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
                 "watchdog_seconds" => s.watchdog_seconds.to_string(),
@@ -258,6 +259,7 @@ fn choices(app: &App, entry: &str, field: &str) -> Vec<String> {
             "isolation" => list(&["auto", "worktree", "shared"]),
             "orchestrator_context" => list(&["fresh", "compact"]),
             "claude_user_config" => list(&["inherit", "project"]),
+            "gate_fix" => list(&["owner", "fix-worker"]),
             _ => vec![],
         },
         "⇢ flow" => match field {
@@ -302,6 +304,7 @@ pub(crate) fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
             "isolation" => p.settings.isolation = v.into(),
             "orchestrator_context" => p.settings.orchestrator_context = v.into(),
             "claude_user_config" => p.settings.claude_user_config = v.into(),
+            "gate_fix" => p.settings.gate_fix = v.into(),
             _ => return,
         },
         "⇢ flow" => {
@@ -997,6 +1000,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "permission" => "never keeps the sandbox and skips prompts. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox. on-request / untrusted asks you (ctrl+g).",
         "swarm" => "Lets this role start a temporary swarm in Solo. Swarm children cannot spawn another swarm.",
         "claude_user_config" => "inherit = Claude Code agents load your own user settings, hooks and memory. project = only this project's settings — faster starts, and your private rules stay out of the team.",
+        "gate_fix" => "owner = a gate finding goes back to the task's own worker when it is all in that task's files; anything broader goes to a fix worker. fix-worker = always a fresh fix worker.",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",

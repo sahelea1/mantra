@@ -180,6 +180,9 @@ pub struct PatternSettings {
     pub orchestrator_context: String,
     pub stall_minutes: u64,
     pub gate_max_rounds: u32,
+    /// Who repairs what a gate round found: "owner" = the task's own worker when every finding is
+    /// in one task's files (else a fix worker); "fix-worker" = always a fresh fix worker.
+    pub gate_fix: String,
     pub check_timeout_secs: u64,
     pub max_tasks_per_phase: usize,
     /// Watchdog (WP7.2): seconds an expected-active agent may sit idle before the first nudge.
@@ -284,6 +287,7 @@ impl Default for PatternSettings {
             orchestrator_context: "fresh".into(),
             stall_minutes: 6,
             gate_max_rounds: 3,
+            gate_fix: "owner".into(),
             check_timeout_secs: 900,
             max_tasks_per_phase: 8,
             watchdog_seconds: 90,
@@ -569,6 +573,9 @@ impl Pattern {
         }
         if !["inherit", "project"].contains(&self.settings.claude_user_config.as_str()) {
             errs.push(format!("settings.claude_user_config must be inherit or project (got '{}')", self.settings.claude_user_config));
+        }
+        if !["owner", "fix-worker"].contains(&self.settings.gate_fix.as_str()) {
+            errs.push(format!("settings.gate_fix must be owner or fix-worker (got '{}')", self.settings.gate_fix));
         }
         if (1..MIN_CONTEXT).contains(&self.settings.context_cap) {
             errs.push("settings.context_cap must be 0 (no cap) or at least 16k tokens".into());

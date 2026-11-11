@@ -427,6 +427,9 @@ impl Run {
                     status_asked: false,
                     active: Duration::from_secs(w.active_secs),
                     superseded: w.superseded,
+                    owner_fix_failed: false,
+                    owner_fixing: None,
+                    fix_started: None,
                 }
             })
             .collect();

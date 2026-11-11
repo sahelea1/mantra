@@ -1615,6 +1615,7 @@ pub(crate) mod tests {
             status_asked: false,
             active: std::time::Duration::ZERO,
             superseded: false,
+            owner_fix_failed: false, owner_fixing: None, fix_started: None,
         }
     }
 

@@ -60,6 +60,10 @@ pub struct RunState {
     pub gate_seq: u32,
     #[serde(default)]
     pub last_gate_file: Option<PathBuf>,
+    /// `Run::fix_owner` (WP-6.2): the task whose own worker repairs the current gate round. A
+    /// process restart restarts the gate from the merge and forgets it.
+    #[serde(default)]
+    pub fix_owner: Option<String>,
     pub workers: Vec<WorkerState>,
     pub agents: Vec<AgentState>,
     /// Phases already completed (for the summary screen after a resume).
@@ -472,6 +476,7 @@ pub(crate) mod tests {
             gate_notes: vec!["phase 1 · QA round 1: pass — fine".into()],
             gate_seq: 0,
             last_gate_file: None,
+            fix_owner: None,
             project: PathBuf::from("/tmp/proj"),
             brief: "add login".into(),
             pattern: "mantra-default".into(),
