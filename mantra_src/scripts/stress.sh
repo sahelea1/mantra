@@ -37,7 +37,7 @@ import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 source = next(root.glob("runs/*/*/pattern.toml")).read_text()
 source = re.sub(r'^name = "mantra-default"$', 'name = "stress-codex"', source, count=1, flags=re.M)
-source = re.sub(r'^(model|fallback) = "([^"]+)"$', lambda m: f'{m[1]} = "{m[2]}-codex"', source, flags=re.M)
+source = re.sub(r'^(model|fallback[23]?) = "([^"]+)"$', lambda m: f'{m[1]} = "{m[2]}-codex"', source, flags=re.M)
 pathlib.Path(sys.argv[2]).write_text(source)
 PYCODEX
 install_codex_pattern() {

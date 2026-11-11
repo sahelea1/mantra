@@ -240,6 +240,8 @@ On the stage it is the mini-card at the top right, mirroring the planner on the 
 <details>
 <summary>The gate in detail: checks, reports, and who fixes</summary>
 
+<img src="docs/img/gate-fix.png" alt="A failed QA round going back to the worker that wrote the code: a badge on its card and an edge from the gate" width="960">
+
 **Checks.** Every check runs under `bash -c` (`sh` where there is no bash) from the workspace root, exactly as written, with its output merged into one stream. The full output of every check of every run is kept in `<run dir>/checks/phase-<n>-<checks|verify|after-fix>-<k>.log`, with the command, the exit status and the time; QA and the fix worker are shown the summary (`FAIL (exit 1)`, `FAIL (timed out)`) and the path. A check that fails without printing anything is run once more under `bash -x`, so the log shows which clause failed. Checks are re-run every round, so they must be repeatable.
 
 **QA reports are files.** Each verdict is written whole to `<run dir>/gate/phase-<n>-qa-<k>-round-<r>-<pass|fail>.md` (and one line per verdict, with the file name, to `gate-reports.md`). The fix worker gets the findings whole; the next QA agent gets the previous report whole. Only a report past 48,000 characters (12,000 for the QA agent's copy of the last round) is cut — at a line break, with a closing line that names the file. `mantra_log` can still read a QA agent after it has been retired. If a fix changed no file, the journal says so and the next QA agent is told.
