@@ -5492,7 +5492,7 @@ Then summarize in 2-4 lines.",
         }
     }
 
-    fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
+    pub(crate) fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
         pattern.validate().map_err(|e| e.join("; "))?;
         if pattern.is_auto() { return Err("a running workflow cannot be replaced with the Auto bootstrap".into()); }
         if pattern.settings.planner_loop != self.pattern.settings.planner_loop && !self.pattern.is_auto() {

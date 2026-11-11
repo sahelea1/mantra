@@ -387,6 +387,11 @@ pub struct App {
     pub demo: bool,
     pub studio: StudioState,
     pub models_ui: ModelsState,
+    /// models.toml / secrets.toml as this process last read or wrote them, and when `tick` last
+    /// looked (None = look at the next tick): a change made behind our back is reloaded.
+    registry_mtime: Option<std::time::SystemTime>,
+    secrets_mtime: Option<std::time::SystemTime>,
+    registry_checked: Option<Instant>,
     pub settings_ui: SettingsState,
     pub suggest: usize,
     pub notes: Vec<String>,
@@ -450,6 +455,11 @@ pub const DEMO_MCP: &str = "demo";
 /// One journal line per role and MCP server it asks for that settings.toml does not have, or
 /// names in a way that cannot work (`Settings::mcp_refused`): the role runs without it, as it
 /// would if it had never asked — never a halt over a missing extra.
+/// A file's modification time, if it has one.
+fn file_mtime(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
 fn mcp_missing_lines(settings: &Settings, pattern: &Pattern) -> Vec<String> {
     let mut out = vec![];
     for (name, role) in pattern.ordered_roles() {
@@ -1080,6 +1090,9 @@ impl App {
             demo,
             studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None, saved: None },
             models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false, saved: None, keyflow: None },
+            registry_mtime: file_mtime(&Registry::path()),
+            secrets_mtime: file_mtime(&crate::config::home().join("secrets.toml")),
+            registry_checked: Some(Instant::now()),
             settings_ui: SettingsState::default(),
             suggest: 0,
             notes: vec![],
@@ -1592,14 +1605,9 @@ impl App {
             return;
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
-        let known = self.registry.context_windows_for_default(&self.settings.default_model);
-        let providers = self.registry.alias_providers();
-        let sees = crate::engine::run::vision_aliases(&self.registry);
+        // the switch may bring an alias the run has not seen: refresh what it knows first
+        self.registry_changed();
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
-            // the switch may bring an alias the run has not seen: refresh what it knows first
-            run.set_known_models(known);
-            run.set_known_providers(providers);
-            run.set_vision_models(sees);
             run.set_agent_model(a, &alias);
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
@@ -2326,9 +2334,49 @@ impl App {
     /// models.toml written, the `/models` header told — except in the demo, whose registry points
     /// bija at its mock server and holds the mock backends' models: like its settings it is never
     /// saved, and a change there lives until the demo ends.
+    /// The registry changed (an edit here, a discovery, a reload from disk): tell the run.
+    pub(crate) fn registry_changed(&mut self) {
+        let known = self.registry.context_windows_for_default(&self.settings.default_model);
+        let provs = self.registry.alias_providers();
+        let sees = crate::engine::run::vision_aliases(&self.registry);
+        if let Some(run) = self.run.as_mut() {
+            run.set_known_models(known);
+            run.set_known_providers(provs);
+            run.set_vision_models(sees);
+        }
+    }
+
+    /// At most every 2 seconds: models.toml or secrets.toml written by someone else (another
+    /// terminal, an editor) is read again, unless the models screen is being edited.
+    fn reload_registry_if_changed(&mut self) {
+        if self.demo || self.registry_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.registry_checked = Some(Instant::now());
+        let (reg, sec) = (file_mtime(&Registry::path()), file_mtime(&crate::config::home().join("secrets.toml")));
+        if reg == self.registry_mtime && sec == self.secrets_mtime {
+            return;
+        }
+        let editing = self.models_ui.dirty
+            || self.models_ui.keyflow.is_some()
+            || self.edit.as_ref().is_some_and(|e| matches!(e.target, EditTarget::ModelCell(..) | EditTarget::ProviderCell(..)));
+        if editing {
+            return;
+        }
+        self.registry = Registry::load();
+        self.registry_mtime = reg;
+        self.secrets_mtime = sec;
+        self.registry_changed();
+        self.toast("models.toml changed on disk — reloaded", Level::Info);
+        if let Some(run) = self.run.as_mut() {
+            run.log("⚙", "blue", "models reloaded from disk");
+        }
+    }
+
     pub fn save_registry(&mut self) -> Result<(), String> {
         if self.demo {
             self.models_ui.dirty = false;
+            self.registry_changed();
             return Ok(());
         }
         self.registry.assign_provider_colors();
@@ -2336,6 +2384,9 @@ impl App {
             Ok(()) => {
                 self.models_ui.dirty = false;
                 self.models_ui.saved = Some(Instant::now());
+                self.registry_mtime = file_mtime(&Registry::path());
+                self.secrets_mtime = file_mtime(&crate::config::home().join("secrets.toml"));
+                self.registry_changed();
                 Ok(())
             }
             Err(e) => {
@@ -2385,6 +2436,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.reload_registry_if_changed();
         self.with_run(|r, c| r.tick(c));
         if self.run.as_ref().map(|r| r.want_review).unwrap_or(false)
             && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. }))
@@ -5574,6 +5626,63 @@ done"#;
         assert!(app.studio.architect.is_none() && app.agents.is_empty());
         assert!(app.toast.as_ref().unwrap().0.contains("Choose another backend"));
         assert!(app.registry.alias_problem("google").is_none(), "the model remains selectable for supported roles");
+    }
+
+
+    // ─── WP-3.1: the registry the run sees is the registry there is ───
+
+    #[tokio::test]
+    async fn an_alias_added_afterwards_is_known_to_the_run() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("registry-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project;
+            app.start_run("build the parser");
+            let mut candidate = app.run.as_ref().unwrap().pattern.clone();
+            candidate.roles.get_mut("planner").unwrap().fallback = Some("fresh-alias".into());
+            let refused = app.run.as_ref().unwrap().validate_pattern_replacement(&candidate).unwrap_err();
+            assert!(refused.contains("unconfigured"), "{refused}");
+            app.registry.models.push(crate::config::ModelEntry { alias: "fresh-alias".into(), model: "fresh-model".into(), ..Default::default() });
+            app.registry_changed();
+            assert!(app.run.as_ref().unwrap().validate_pattern_replacement(&candidate).is_ok());
+            app.run = None;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn models_toml_changed_on_disk_is_reloaded_unless_it_is_being_edited() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
+            Settings::default().save().unwrap();
+            configured_fixture().save().unwrap();
+            let mut app = App::new(Settings::load_on_disk().unwrap(), configured_fixture(), PathBuf::from("."), hub, tx, false);
+            // another terminal adds a model
+            let mut disk = Registry::load();
+            disk.models.push(crate::config::ModelEntry { alias: "added-on-disk".into(), model: "m".into(), ..Default::default() });
+            disk.save().unwrap();
+            app.registry_mtime = Some(std::time::UNIX_EPOCH); // however coarse the file system's clock is
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_none(), "looked at less than 2 seconds ago");
+            app.registry_checked = None;
+            app.models_ui.dirty = true;
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_none(), "an edit on the models screen is not overwritten");
+            app.models_ui.dirty = false;
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_some());
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("models.toml changed on disk — reloaded"));
+            // our own save is not a change behind our back
+            app.toast = None;
+            app.save_registry().unwrap();
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.toast.is_none(), "{:?}", app.toast);
+            let _ = app.shutdown();
+        });
     }
 
 }
