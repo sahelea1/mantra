@@ -17,6 +17,7 @@ struct TestCtx {
     /// for the vision tools': see `finished`).
     jobs: Vec<String>,
     stopped: Vec<AgentId>,
+    carried: Vec<(AgentId, AgentId)>,
     efforts_set: Vec<(AgentId, String)>,
     renamed: Vec<(AgentId, String)>,
     /// Every `ctx.spawn`'s role model alias, by the id it was given.
@@ -27,6 +28,8 @@ struct TestCtx {
     items: Vec<(AgentId, Vec<Value>, bool)>,
     /// The vision jobs, run as they were asked for (on this thread), waiting for `settle`.
     finished: Vec<(JobTag, JobOut)>,
+    /// Every `ctx.spawn_resumed`: the agent it gave and the thread it was re-attached to.
+    resumed: Vec<(AgentId, String)>,
 }
 #[derive(Clone, Debug)]
 struct Spawned {
@@ -42,11 +45,12 @@ struct Spawned {
     tools: Vec<String>,
     /// The MCP servers it asked for.
     mcp: Vec<String>,
+    git_write: bool,
 }
 impl TestCtx {
     // Tests below exercise the Conductor's decisions without making a provider call.
     fn new() -> TestCtx {
-        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
+        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], carried: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![], resumed: vec![] }
     }
     /// Hands every finished vision job back to `run`, as the app's event loop would.
     fn settle(&mut self, run: &mut Run) {
@@ -149,7 +153,7 @@ fn auto_workflow_requires_user_approval_and_survives_resume() {
     restored.resume_boot(&mut fresh, &st);
     assert!(restored.pending_pattern.is_some() && restored.question.is_some());
     assert!(fresh.prompts.is_empty(), "resume does not poll or imply approval");
-    restored.user_input(&mut fresh, "approve");
+    restored.user_input(&mut fresh, "approve", Send::Queue);
     assert_eq!(restored.pattern.name, proposed.name);
     assert!(restored.pending_pattern.is_none());
     let disk = Pattern::from_toml(&std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap()).unwrap();
@@ -169,7 +173,7 @@ fn workflow_rejection_and_dont_ask_mode_have_distinct_boundaries() {
     next.name = "adapted".into();
     let args = json!({"toml": next.to_toml(), "reason": "The manager topology is unnecessary for this task"});
     assert!(run.handle_tool(&mut ctx, p, "mantra_revise_pattern", &args).1);
-    run.user_input(&mut ctx, "Do not approve this change");
+    run.user_input(&mut ctx, "Do not approve this change", Send::Queue);
     assert_eq!(run.pattern.name, super::super::pattern::NAME_DEFAULT);
     assert!(run.pending_pattern.is_none());
     ctx.agents.get_mut(&p).unwrap().approval = "never".into();
@@ -351,15 +355,24 @@ fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
         idle_prompts: vec![],
         transient: false,
         model: None,
+        status_asked: false,
+        active: std::time::Duration::ZERO,
+        superseded: false,
+        owner_fix_failed: false, owner_fixing: None, fix_started: None,
     }
 }
 impl Ctx for TestCtx {
+    fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
+        let id = self.spawn(r);
+        self.resumed.push((id, thread));
+        id
+    }
     fn spawn(&mut self, r: SpawnReq) -> AgentId {
         let id = self.next;
         self.next += 1;
         self.agents.insert(id, Agent::new(id, "a", "worker", PathBuf::from(".")));
         let tools = r.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from)).collect();
-        self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools, mcp: r.mcp.clone() });
+        self.spawns.push(Spawned { name: r.name.clone(), role_name: r.role_name.clone(), effort: r.effort.clone(), thread_name: r.thread_name.clone(), cwd: r.cwd.clone(), sandbox: r.role.sandbox.clone(), model: r.role.model.clone(), context_override: r.context_override, tools, mcp: r.mcp.clone(), git_write: r.git_write });
         self.spawned_instructions.push((id, r.instructions));
         self.spawned_models.push((id, r.role.model));
         id
@@ -369,6 +382,9 @@ impl Ctx for TestCtx {
     }
     fn prompt_mode(&mut self, a: AgentId, text: String, _mode: Send) {
         self.prompts.push((a, text));
+    }
+    fn carry_over(&mut self, from: AgentId, to: AgentId) {
+        self.carried.push((from, to));
     }
     fn interrupt(&mut self, a: AgentId) {
         self.interrupted.push(a);
@@ -685,6 +701,7 @@ mod akasha {
         run.orchestrator = Some(o);
         let a = member(&mut ctx, &mut run, "p1-a");
         let b = member(&mut ctx, &mut run, "p1-b");
+        ctx.agents.get_mut(&a).unwrap().final_message = Some("STATUS: done".into());
         run.on_turn_done(&mut ctx, a, "completed", None, None);
         assert_eq!(run.workers[0].state, WState::Done);
         // the orchestrator asks the done worker something; it is answering when p1-b's urgent note comes
@@ -837,6 +854,7 @@ fn a_done_worker_finishing_again_is_a_follow_up_not_a_second_completion() {
     run.orchestrator = Some(o);
     run.workers.push(mk_worker("p1-a", "worker-small", a, WState::Running));
     run.workers.push(mk_worker("p1-b", "worker-small", b, WState::Running));
+    ctx.agents.get_mut(&a).unwrap().final_message = Some("STATUS: done".into());
     run.on_turn_done(&mut ctx, a, "completed", None, None);
     assert!(run.pulse.back().unwrap().text.contains("p1-a done in"), "{:?}", run.pulse.back().map(|p| &p.text));
     ctx.agents.get_mut(&a).unwrap().push_user("also add a test for the empty case");
@@ -1071,6 +1089,36 @@ fn a_busy_but_silent_agent_is_journalled_once_per_spell() {
     assert_eq!(lines(&run), 2, "a later silent spell is news again");
     assert!(ctx.prompts.is_empty(), "{:?}", ctx.prompts);
     assert!(!run.halted());
+}
+
+/// An agent idle for 40 minutes and just prompted has a 40-minute-old `last_event`; that is not
+/// silence of the turn that just began.
+#[test]
+fn a_freshly_prompted_agent_is_not_silent_but_a_stale_turn_is() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    let planner = ctx.add_idle();
+    ready(&mut ctx, planner);
+    run.planner = Some(planner);
+    run.stage = Stage::Planning;
+    let stall_secs = run.pattern.settings.stall_minutes * 60;
+    let lines = |r: &Run| r.pulse.iter().filter(|p| p.text.contains("no output for")).count();
+
+    ctx.set_idle_secs(planner, 40 * 60);
+    {
+        let ag = ctx.agents.get_mut(&planner).unwrap();
+        ag.awaiting_start = true;
+        ag.turn_wait_since = Some(Instant::now());
+    }
+    run.watchdog_tick(&mut ctx);
+    assert_eq!(lines(&run), 0, "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+
+    {
+        let ag = ctx.agents.get_mut(&planner).unwrap();
+        ag.turn_wait_since = Some(Instant::now() - Duration::from_secs(stall_secs + 60));
+    }
+    run.watchdog_tick(&mut ctx);
+    assert_eq!(lines(&run), 1);
 }
 
 #[test]
@@ -1581,9 +1629,10 @@ fn checks_failing_after_a_qa_pass_go_to_a_fix_worker() {
     run.orchestrator = Some(orch);
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(!run.halted());
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes the failing checks");
@@ -1648,7 +1697,7 @@ fn merge_conflicts_go_to_a_fix_worker_because_the_gate_cannot_merge() {
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
     run.conflicts = vec!["mantra-w/r/p1-a-1".into()];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: run.checks_gen }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
     assert!(run.gate_agent.is_none(), "no QA agent reads a tree that is not merged yet");
     let w = run.workers.iter().find(|w| w.task.id == "fix-0").expect("a worker merges the branches, before QA round 1");
     assert_eq!(w.task.role, "worker-big");
@@ -1804,6 +1853,198 @@ fn the_big_flag_is_read_leniently() {
     assert!(!run.gate_big);
 }
 
+/// WP-2.5: QA says the check is wrong, not the work: the planner is asked, no fix worker.
+#[test]
+fn a_plan_defect_report_goes_to_the_planner_not_to_a_fix_worker() {
+    for report in [
+        json!({"pass": false, "summary": "check 3 (`cargo foo`) cannot pass here: no such target", "plan_defect": true}),
+        json!({"pass": false, "summary": "PLAN DEFECT: check 3 (`cargo foo`) cannot pass here: no such target"}),
+    ] {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+        let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &report);
+        assert!(ok);
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert_eq!(run.halt.as_ref().expect("halted").reason, HaltReason::GateExhausted);
+        assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"), "no fix worker");
+        assert!(ctx.spawned("fix-1").is_empty());
+        assert!(ctx.prompts.iter().any(|(a, p)| *a == planner && p.contains("cannot pass here: no such target") && p.contains("plan defect")), "{:?}", ctx.prompts);
+    }
+}
+
+/// WP-2.6: the orchestrator answered QA and passed the question up; QA is waiting, not silent.
+#[test]
+fn qa_waiting_for_the_planner_is_not_nudged_for_a_report() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    // QA's own question was answered; the orchestrator's question to the planner is open
+    run.pending_questions.insert(orch, "may the check use network?".into());
+    gate_says(&mut ctx, &mut run, gate, "I asked; waiting.");
+    assert!(!ctx.prompts.iter().any(|(a, p)| *a == gate && p.contains("[mantra:gate]")), "{:?}", ctx.prompts);
+    assert_eq!(run.gate_nudges, 0);
+    assert!(!run.halted());
+    assert!(run.expected_active().iter().all(|(a, _)| *a != gate), "the watchdog leaves the waiting QA agent alone");
+    // without the open question it is expected to act
+    run.pending_questions.clear();
+    assert!(run.expected_active().iter().any(|(a, _)| *a == gate));
+}
+
+/// WP-2.6: a fix worker that asked and then wrote `STATUS: blocked` waits; after the answer and
+/// a `STATUS: done` turn the fix is over.
+#[test]
+fn a_fix_worker_that_asked_and_wrote_blocked_waits_instead_of_halting() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+    run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+    let agent = run.workers.iter().find(|w| w.task.id == "fix-1").and_then(|w| w.agent).unwrap();
+    run.pending_questions.insert(agent, "which module?".into());
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: blocked\nSUMMARY: need an answer".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert!(!run.halted(), "{:?}", run.halt.as_ref().map(|h| &h.message));
+    assert!(run.pulse.iter().any(|p| p.text.contains("waits for an answer")));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { .. }, .. }));
+    assert!(ctx.jobs.is_empty());
+    // the answer arrives and the worker finishes
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert!(!run.halted());
+    assert!(!run.pending_questions.contains_key(&agent));
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "on_fix_done ran: {:?}", ctx.jobs);
+}
+
+/// The plan with the current phase's gate checks replaced.
+fn revised_checks(run: &Run, checks: &[&str]) -> serde_json::Value {
+    let mut plan = run.plan.clone().unwrap();
+    plan.phases[0].gate.checks = checks.iter().map(|c| c.to_string()).collect();
+    json!({"plan": serde_json::to_value(&plan).unwrap(), "reason": "the check was wrong"})
+}
+
+/// The plan's tasks with prompts long enough for a revision to be accepted.
+fn give_prompts(run: &mut Run) {
+    for p in run.plan.iter_mut().flat_map(|p| p.phases.iter_mut()) {
+        for t in &mut p.tasks {
+            t.prompt = "do the work described for this task".into();
+        }
+    }
+}
+
+fn ok_check(cmd: &str) -> Vec<CheckResult> {
+    vec![CheckResult { cmd: cmd.into(), ok: true, code: Some(0), output: String::new(), secs: 0 }]
+}
+
+/// WP-2.7: a blocked fix worker of a gate whose check was revised is not restarted with its old
+/// brief; the revised checks run and a fresh QA round sees them.
+#[test]
+fn a_gate_revision_cancels_a_blocked_fix_worker_and_reruns_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let fa = ctx.add_idle();
+    {
+        let w = run.workers.iter_mut().find(|w| w.task.id == "fix-1").unwrap();
+        w.agent = Some(fa);
+        w.state = WState::Failed("blocked".into());
+    }
+    let _ = gate;
+    run.halt = Some(Halt { reason: HaltReason::AttemptsExhausted, agent: Some(fa), message: "fix-1 blocked".into(), full: "fix-1 blocked".into(), since: Instant::now() });
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["new-check --flag"]));
+    assert!(ok, "{msg}");
+    assert!(!run.halted());
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+    assert_eq!(fix.state, WState::Cancelled);
+    assert!(ctx.stopped.contains(&fa));
+    assert!(ctx.spawned("fix-1").len() <= 1, "not respawned: {:?}", ctx.spawns);
+    assert_eq!(run.workers.iter().filter(|w| w.task.id == "fix-1" && w.state != WState::Cancelled).count(), 0);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("Checks"), "{:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("new-check --flag"), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
+    let g = run.gate_agent.expect("a fresh QA agent");
+    assert!(ctx.prompts.iter().any(|(a, p)| *a == g && p.contains("new-check --flag")), "{:?}", ctx.prompts);
+}
+
+/// WP-2.7: a live QA round is abandoned when its gate is revised.
+#[test]
+fn a_gate_revision_stops_the_live_qa_agent_and_starts_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    let gen = run.checks_gen;
+    run.qa_ok = true;
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["other-check"]));
+    assert!(ok, "{msg}");
+    assert!(ctx.stopped.contains(&gate));
+    assert!(run.gate_agent.is_none());
+    assert!(!run.qa_ok);
+    assert!(run.checks_gen > gen);
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Checks { round: 1 }, .. }), "{:?}", run.stage);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+}
+
+/// WP-2.7: a gate round deferred during a halt is dropped by a gate revision; the QA prompt
+/// after the re-run shows fresh results.
+#[test]
+fn a_gate_revision_drops_a_deferred_gate_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    halt_by_hand(&mut run);
+    run.spawn_gate_at_round(&mut ctx, 0, 2);
+    assert!(matches!(run.pending, Some(Pending::Gate { .. })), "{:?}", run.pending);
+    run.checks = vec![CheckResult { cmd: "stale-check".into(), ok: false, code: Some(1), output: "x".into(), secs: 0 }];
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["fresh-check"]));
+    assert!(ok, "{msg}");
+    assert!(run.pending.is_none());
+    assert!(run.pulse.iter().any(|p| p.text.contains("dropped")));
+    assert!(run.checks.is_empty());
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(ok_check("fresh-check"), vec![], git::ReviewDiff::default(), None));
+    let g = run.gate_agent.expect("QA started");
+    let p = ctx.prompts.iter().rev().find(|(a, _)| *a == g).map(|(_, p)| p.clone()).unwrap();
+    assert!(p.contains("fresh-check") && !p.contains("stale-check"), "{p}");
+}
+
+/// WP-2.7: a revision of a later phase leaves the gate alone.
+#[test]
+fn a_revision_of_a_later_phase_leaves_the_gate_alone() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let mut plan = two_phase_plan();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    give_prompts(&mut run);
+    let mut plan = run.plan.clone().unwrap();
+    plan.phases[1].gate.checks = vec!["later-check".into()];
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &json!({"plan": serde_json::to_value(&plan).unwrap(), "reason": "later"}));
+    assert!(ok, "{msg}");
+    assert_eq!(run.gate_agent, Some(gate));
+    assert!(!ctx.stopped.contains(&gate));
+    assert!(ctx.jobs.is_empty(), "{:?}", ctx.jobs);
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "{:?}", run.stage);
+}
+
+/// WP-2.7: the revision's notes reach the orchestrator before the "no attempt yet" list.
+#[test]
+fn the_kick_carries_the_queued_notes_first() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.orch_inbox.push("The planner revised the current phase:\n- task t1 was ADDED".into());
+    run.kick_orchestrator(&mut ctx, &[]);
+    let (_, t) = ctx.prompts.last().expect("kicked");
+    assert!(t.find("ADDED").unwrap() < t.find("no attempt yet").unwrap(), "{t}");
+    assert!(run.orch_inbox.is_empty());
+}
+
 #[test]
 fn paths_in_finds_the_files_a_report_names() {
     let dir = std::env::temp_dir().join(format!("mantra-paths-{}", std::process::id()));
@@ -1916,7 +2157,7 @@ fn ask_user_shows_a_question_and_the_reply_answers_it() {
     assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("haven't submitted")));
     assert!(run.is_active());
 
-    run.user_input(&mut ctx, "SQLite, keep it simple");
+    run.user_input(&mut ctx, "SQLite, keep it simple", Send::Queue);
     assert!(run.question.is_none());
     assert!(run.alerts.is_empty());
     let (a, t) = ctx.prompts.last().expect("the answer is a prompt");
@@ -1964,15 +2205,17 @@ fn identical_verify_failures_escalate_before_the_rounds_run_out() {
     run.planner = Some(planner);
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
     // QA passed, the checks still fail: fix-1 takes the output…
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(!run.halted());
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
     assert!(w.prompt.contains("Permission denied"), "{}", w.prompt);
     // …and when the very same failure is still there afterwards, nobody is fixing it
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default(), None));
     assert!(run.halted(), "the identical failure twice means nobody is fixing it");
     assert!(run.halt.as_ref().unwrap().message.contains("identically"));
     assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));
@@ -1986,10 +2229,12 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     let gate = ctx.add_idle();
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.qa_ok = true; // QA passed this round; these are its verify checks
     let fail = |out: &str| vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: out.into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default(), None));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }, None));
     assert!(!run.halted());
     let g2 = run.gate_agent.expect("round 2");
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
@@ -1998,8 +2243,9 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     // the last round has no fix after it: a failure there halts
     let mut r2 = Run::new(PathBuf::from("."), no_manager(), "test".into());
     r2.plan = Some(one_task_phase());
-    r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 3 } };
-    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3 }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
+    r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 3 } };
+    r2.qa_ok = true;
+    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3, gen: run.checks_gen }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default(), None));
     assert!(r2.halted());
     assert_eq!(r2.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
     assert!(r2.workers.is_empty(), "no fix worker after the last round");
@@ -2587,7 +2833,7 @@ fn a_failed_turn_goes_to_the_manager_and_then_to_the_user_not_the_planner() {
     assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::AgentTurnFailed);
     let manager = run.manager.expect("the manager gets the failed turn");
     let esc = ctx.prompts.iter().find(|(a, t)| *a == manager && t.contains("[mantra:escalation]")).map(|(_, t)| t.clone()).unwrap();
-    assert!(esc.contains("mantra_respawn") && esc.contains("left for the user") && !esc.contains("mantra_revise_plan"), "{esc}");
+    assert!(esc.contains("mantra_respawn") && esc.contains("left for the user") && !esc.contains("- mantra_revise_plan"), "{esc}");
     assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]")));
     // the manager respawns the gate: that lifts the halt
     ctx.prompts.clear();
@@ -2737,7 +2983,7 @@ fn manager_status_journal_and_ask_user() {
     assert!(ok);
     assert!(run.alerts.iter().any(|a| a.starts_with("the manager asks:")));
     ctx.prompts.clear();
-    run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2");
+    run.user_input(&mut ctx, "use OPENROUTER_API_KEY_2", Send::Queue);
     assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[from the user]") && t.contains("mantra_prompt")), "{:?}", ctx.prompts);
     assert!(ctx.prompts.iter().all(|(a, _)| *a != manager), "user answers enter through the planner");
     assert!(run.question.is_none() && run.alerts.is_empty());
@@ -2776,6 +3022,35 @@ fn mixed_phase() -> Plan {
         }],
         ..Default::default()
     }
+}
+
+/// The user's queued messages follow an agent to its replacement on every respawn path.
+#[test]
+fn a_respawned_orchestrator_and_a_retried_worker_inherit_the_queue() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "carry-orch-worker");
+    let old = run.spawn_orchestrator(&mut ctx);
+    run.orchestrator = Some(old);
+    run.respawn_orchestrator(&mut ctx, None);
+    let new = run.orchestrator.unwrap();
+    assert_ne!(new, old);
+    assert!(ctx.carried.contains(&(old, new)), "{:?}", ctx.carried);
+    assert!(run.replaced.contains(&(old, new)));
+    // a worker retry: the next attempt's agent gets the queue once it is launched
+    ctx.carried.clear();
+    run.workers.clear();
+    run.replaced.clear();
+    let task = Task { id: "tq".into(), title: "q".into(), role: "worker-small".into(), prompt: "do the thing well enough".into(), ..Default::default() };
+    launch(&mut ctx, &mut run, task, None);
+    let w1 = run.workers.iter().find(|w| w.task.id == "tq").and_then(|w| w.agent).unwrap();
+    run.retry_worker(&mut ctx, w1, None);
+    let wi = run.workers.iter().rposition(|w| w.task.id == "tq").unwrap();
+    run.launch_worker(&mut ctx, wi, PathBuf::from("/tmp/wt-tq2"), String::new());
+    let w2 = run.workers[wi].agent.unwrap();
+    assert_ne!(w1, w2);
+    assert_eq!(ctx.carried, [(w1, w2)]);
+    assert_eq!(run.replaced, [(w1, w2)]);
+    let _ = std::fs::remove_dir_all(&run.dir);
 }
 
 /// Start `task` and let its workspace come back, so its agent is spawned (in `/tmp/wt-<id>`).
@@ -2828,7 +3103,7 @@ fn refused_history_merge_halts_without_an_automatic_merge_fixer() {
     let mut ctx = TestCtx::new();
     let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
     run.plan = Some(one_task_phase());
-    run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+    run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
     let agent = ctx.add_idle();
     run.workers.push(mk_worker("t1", "worker-small", agent, WState::Done));
@@ -3055,7 +3330,7 @@ fn the_planner_finale_names_what_it_may_do_when_read_only() {
 fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
     let dir = std::env::temp_dir().join(format!("mantra-jobs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
+    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] };
     let mut ctx = TestCtx::new();
     let mut run = Run::new(dir.clone(), Pattern::builtin(), "test".into());
     run.ws = Some(ws);
@@ -3066,15 +3341,21 @@ fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
     run.run_checks(&mut ctx, 0, 0);
     run.run_checks(&mut ctx, 0, 1);
     run.run_checks_after_fix(&mut ctx, 0, 1);
-    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }", "Checks { phase: 0, round: 1 }", "FixChecks { phase: 0, round: 1 }"]);
+    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0, gen: 1 }", "Checks { phase: 0, round: 1, gen: 2 }", "FixChecks { phase: 0, round: 1, gen: 3 }"]);
     // with no checks defined: the first round still needs the diff (a job); a verify has nothing to do
     run.plan.as_mut().unwrap().phases[0].gate.checks.clear();
     ctx.jobs.clear();
     run.run_checks(&mut ctx, 0, 0);
-    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }"]);
+    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0, gen: 4 }"]);
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.qa_ok = true; // a verify follows a QA pass
     run.run_checks(&mut ctx, 0, 1);
     assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, "a verify with no checks hands off");
+    // without a QA pass behind it (a resume, a revision) the same call asks QA instead of handing off
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.qa_ok = false;
+    run.run_checks(&mut ctx, 0, 1);
+    assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } }, "no handoff without a QA pass");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3090,7 +3371,7 @@ fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
     sh(&["add", "-A"]);
     sh(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
     std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false };
+    let ws = crate::engine::git::Workspace { worktree: false, repo: dir.clone(), integ: dir.clone(), branch: String::new(), base_branch: String::new(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] };
     struct Capture(Vec<JobOut>);
     impl Capture {
         fn run(&mut self, f: Box<dyn FnOnce() -> JobOut + std::marker::Send>) {
@@ -3121,13 +3402,144 @@ fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
     run.run_checks(&mut ctx, 0, 0);
     match ctx.1 .0.pop() {
-        Some(JobOut::Checks(results, _, diff)) => {
+        Some(JobOut::Checks(results, _, diff, _)) => {
             assert_eq!(results.iter().map(|c| c.ok).collect::<Vec<_>>(), vec![true, false]);
             assert!(diff.stat.contains("a.txt") && diff.diff.contains("+two"), "{diff:?}");
         }
         _ => panic!("expected the checks job's result"),
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_summary_prints_the_exit_code_plainly_and_points_at_the_log() {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    run.dir = PathBuf::from("/tmp/run-x");
+    run.checks = vec![
+        CheckResult { cmd: "false".into(), ok: false, code: Some(1), output: "boom".into(), secs: 1 },
+        CheckResult { cmd: "sleep 99".into(), ok: false, code: None, output: String::new(), secs: 5 },
+    ];
+    run.checks_label = "phase-1-checks-3".into();
+    let s = run.check_summary();
+    assert!(s.contains("$ false → FAIL (exit 1)"), "{s}");
+    assert!(s.contains("FAIL (timed out)"), "{s}");
+    assert!(s.contains("(full output of every check: /tmp/run-x/checks/phase-1-checks-3.log)"), "{s}");
+}
+
+#[test]
+fn only_the_newest_checks_run_counts() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
+    run.run_checks(&mut ctx, 0, 0);
+    let first = run.checks_gen;
+    run.run_checks(&mut ctx, 0, 0);
+    assert_eq!(run.checks_gen, first + 1);
+    let said = |run: &Run| run.pulse.iter().filter(|p| p.text.contains("superseded")).count();
+    // the older run lands first: nothing happens
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
+    assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } });
+    assert!(run.gate_agent.is_none());
+    assert_eq!(said(&run), 1);
+    // the newest one is handled
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first + 1 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
+    assert!(run.gate_agent.is_some(), "the current run's result starts QA");
+    assert_eq!(said(&run), 1);
+    // a result for a run that a stage change made meaningless is ignored too
+    run.checks_gen += 1;
+    let g = run.checks_gen;
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: g }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default(), None));
+    assert_eq!(said(&run), 2, "the stage is no longer Checks");
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }));
+}
+
+/// A halt by hand, the way a stage-level test needs one.
+fn halt_by_hand(run: &mut Run) {
+    run.halt = Some(Halt { reason: HaltReason::GateExhausted, agent: None, message: "test halt".into(), full: "test halt".into(), since: Instant::now() });
+}
+
+#[test]
+fn a_fix_worker_finishing_during_a_halt_defers_the_checks_until_the_resume() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    halt_by_hand(&mut run);
+    finish_fix(&mut ctx, &mut run, 1);
+    assert!(ctx.jobs.is_empty(), "nothing starts while halted: {:?}", ctx.jobs);
+    assert_eq!(run.pending, Some(Pending::Checks { idx: 0, round: 1, after_fix: true }));
+    run.resume(&mut ctx);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("FixChecks"), "{:?}", ctx.jobs);
+    assert!(run.pending.is_none());
+}
+
+fn green() -> Vec<CheckResult> {
+    vec![CheckResult { cmd: "true".into(), ok: true, code: Some(0), output: String::new(), secs: 0 }]
+}
+
+fn gate_run_with_checks(ctx: &mut TestCtx, round: u32) -> (Run, AgentId, AgentId) {
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let planner = ctx.add_idle();
+    let gate = ctx.add_idle();
+    run.planner = Some(planner);
+    run.gate_agent = Some(gate);
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round } };
+    (run, planner, gate)
+}
+
+#[test]
+fn green_checks_after_a_resumed_failed_round_start_qa_instead_of_a_handoff() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 2);
+    run.prev_gate = Some((2, false, "src/a.rs is wrong".into()));
+    halt_by_hand(&mut run);
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_resume_run", &json!({"note": ""}));
+    assert!(ok, "{msg}");
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }), "QA decides, the green checks alone do not: {:?}", run.stage);
+    assert!(run.gate_agent.is_some());
+    assert!(run.pending.is_none());
+}
+
+#[test]
+fn green_checks_after_a_qa_pass_hand_off() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+    assert!(ok);
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(run.qa_ok);
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(!matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { .. }, .. }), "{:?}", run.stage);
+    assert!(run.gate_agent.is_none(), "the passing QA agent is archived by the handoff");
+}
+
+/// The 22:14 race: the fix worker finished during a halt and the resume's own verify both ran
+/// checks; the second (green) result handed the phase off although QA had not seen the fix.
+#[test]
+fn a_fix_finished_during_a_halt_leads_to_one_checks_run_and_a_qa_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    halt_by_hand(&mut run);
+    finish_fix(&mut ctx, &mut run, 1);
+    run.resume(&mut ctx);
+    assert_eq!(ctx.jobs.len(), 1, "exactly one checks run: {:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    assert!(run.gate_agent.is_some());
 }
 
 // Pause boundary --------------------------------------------------------------------------
@@ -3574,10 +3986,9 @@ fn first_token_deadline_restarts_once_then_falls_back_to_the_roles_model() {
     let third = run.planner.unwrap();
     assert_ne!(third, second);
     assert_eq!(ctx.spawned_models.last().unwrap().1, "luna", "respawned on the fallback alias");
-    assert!(run.pulse.iter().any(|p| p.glyph == "↻" && p.text == "planner: no output twice — falling back to luna"), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
-    assert_eq!(run.pattern.roles["planner"].model, "luna", "later spawns of the role stay on it");
-    let saved = std::fs::read_to_string(dir.join("pattern.toml")).unwrap();
-    assert!(saved.contains("model = \"luna\""), "a resume must see the switch: {saved}");
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text == format!("planner: {primary} → fallback luna (no output)")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    assert_eq!(run.pattern.roles["planner"].model, primary, "the role's model is not rewritten");
+    assert_eq!(run.slot_models.get("planner").map(String::as_str), Some("luna"), "the slot is pinned to the fallback: its respawns and a resume keep it");
     assert!(!run.halted());
 
     // the fallback gets its own restart; if it is silent too there is nobody left to fall back to
@@ -3935,6 +4346,60 @@ fn retrying_a_gateway_failed_worker_does_not_spend_an_attempt() {
 }
 
 #[test]
+fn a_replaced_attempts_agent_is_stopped_at_once() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let w = ctx.add_idle();
+    run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+    run.retry_worker(&mut ctx, w, None);
+    assert!(ctx.stopped.contains(&w), "the cancelled attempt's agent got stop: {:?}", ctx.stopped);
+    assert_eq!(run.workers[0].state, WState::Cancelled);
+}
+
+#[test]
+fn a_workers_active_time_counts_busy_ticks_only() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let (busy, idle) = (ctx.add_busy(), ctx.add_idle());
+    run.workers.push(mk_worker("t1", "worker-small", busy, WState::Running));
+    run.workers.push(mk_worker("t2", "worker-small", idle, WState::Running));
+    run.last_tick = Instant::now() - Duration::from_secs(3);
+    run.tick(&mut ctx);
+    assert!(run.workers[0].active >= Duration::from_secs(3) && run.workers[0].active < Duration::from_secs(5), "{:?}", run.workers[0].active);
+    assert_eq!(run.workers[1].active, Duration::ZERO, "an idle agent is not at work");
+}
+
+#[test]
+fn a_phase_report_comes_from_the_newest_attempt_and_says_superseded() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("phase-report-newest");
+    run.plan = Some(class_phase(1, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 0 } };
+    let (a1, a2, c) = (ctx.add_idle(), ctx.add_idle(), ctx.add_idle());
+    run.workers.push(mk_worker("b0", "worker-big", a1, WState::Cancelled));
+    let mut second = mk_worker("b0", "worker-big", a2, WState::Done);
+    second.attempt = 2;
+    run.workers.push(second);
+    let mut gone = mk_worker("b1", "worker-big", c, WState::Cancelled);
+    gone.superseded = true;
+    run.workers.push(gone);
+    run.begin_handoff(&mut ctx, 0);
+    let b0 = std::fs::read_to_string(run.dir.join("phase-1/b0.md")).unwrap();
+    assert!(b0.contains("state: Done\nattempt: 2"), "{b0}");
+    let b1 = std::fs::read_to_string(run.dir.join("phase-1/b1.md")).unwrap();
+    assert!(b1.contains("state: Done (superseded by a plan revision)"), "{b1}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn an_exit_code_reads_as_a_word_and_a_number() {
+    assert_eq!(crate::util::exit_label(Some(0i64)), "exit 0");
+    assert_eq!(crate::util::exit_label(Some(137i32)), "exit 137");
+    assert_eq!(crate::util::exit_label::<i64>(None), "exit ?");
+}
+
+#[test]
 fn a_rejected_effort_is_remapped_and_the_turn_retried_once() {
     let mut ctx = TestCtx::new();
     let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
@@ -4076,7 +4541,7 @@ fn run_in_fix_round(ctx: &mut TestCtx, integ: &Path) -> (Run, AgentId, AgentId) 
     run.planner = Some(planner);
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
-    run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.to_path_buf(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false });
+    run.ws = Some(crate::engine::git::Workspace { worktree: true, repo: PathBuf::from("."), integ: integ.to_path_buf(), branch: "mantra/r".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
     let w = ctx.add_idle();
     let mut fix = mk_worker("fix-1", "worker-small", w, WState::Running);
     fix.adhoc = true;
@@ -4127,7 +4592,7 @@ fn a_fix_worker_the_gateway_failed_halts_without_waking_anyone_and_is_respawned_
     let spawned = jobs.0.spawned("fix-1");
     assert_eq!(spawned.len(), 1, "{:?}", jobs.0.spawns.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
     assert_eq!(spawned[0].cwd, integ);
-    assert_eq!(spawned[0].sandbox, "danger-full-access", "a fix worker on the integration copy runs unsandboxed");
+    assert!(spawned[0].git_write, "a fix worker on the integration copy asks for a writable .git (the app lifts Codex's sandbox)");
     let fresh = run.workers.iter().rev().find(|w| w.task.id == "fix-1").unwrap();
     assert!(fresh.state == WState::Running && fresh.wt.as_ref() == Some(&integ));
     assert!(jobs.0.prompts.iter().any(|(a, _)| Some(*a) == fresh.agent), "the fresh fix worker is given its task");
@@ -4217,7 +4682,7 @@ fn a_live_model_switch_sticks_to_that_task_and_not_to_its_role() {
     ready(&mut ctx, w);
     run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
     run.on_ready(&mut ctx, w, false, false);
-    run.set_agent_model(w, "nova");
+    run.set_agent_model(w, "nova", "by you");
     assert_eq!(run.workers[0].model.as_deref(), Some("nova"));
     assert_eq!(run.pattern.role("worker-small").unwrap().model, role_model, "the role is not rewritten");
     assert_eq!(run.agent_meta[&w].model_alias, "nova", "state.json carries it");
@@ -4233,7 +4698,7 @@ fn a_live_model_switch_sticks_to_that_task_and_not_to_its_role() {
     assert_eq!(ctx.spawned("t2").last().unwrap().model, role_model);
     // switching back to the role's model is no longer a choice of its own
     let a2 = run.workers.iter().rev().find(|w| w.task.id == "t1").and_then(|w| w.agent).unwrap();
-    run.set_agent_model(a2, &role_model);
+    run.set_agent_model(a2, &role_model, "by you");
     assert_eq!(run.workers.iter().rev().find(|w| w.task.id == "t1").unwrap().model, None);
     let _ = std::fs::remove_dir_all(&run.dir);
 }
@@ -4250,7 +4715,7 @@ fn a_fixed_agents_model_switch_survives_its_respawn() {
     let p = run.spawn_planner(&mut ctx);
     let role_model = run.role(&run.pattern.flow.planner.clone()).model.clone();
     assert_eq!(ctx.spawned("planner")[0].model, role_model);
-    run.set_agent_model(p, "nova");
+    run.set_agent_model(p, "nova", "by you");
     run.respawn(&mut ctx, p, None).unwrap();
     assert_eq!(ctx.spawned("planner").last().unwrap().model, "nova", "the respawned planner keeps the switch");
     // the orchestrator slot is its own
@@ -4258,7 +4723,7 @@ fn a_fixed_agents_model_switch_survives_its_respawn() {
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
     let o = run.spawn_orchestrator(&mut ctx);
     assert_eq!(ctx.spawned("orchestrator")[0].model, run.role("orchestrator").model, "untouched by the planner's switch");
-    run.set_agent_model(o, "nova");
+    run.set_agent_model(o, "nova", "by you");
     run.respawn(&mut ctx, o, None).unwrap();
     assert_eq!(ctx.spawned("orchestrator").last().unwrap().model, "nova");
     let _ = std::fs::remove_dir_all(&run.dir);
@@ -4275,7 +4740,7 @@ fn a_backend_switch_checkpoint_never_pairs_new_model_with_old_session() {
     ctx.agents.get_mut(&planner).unwrap().thread_id = Some("old-backend-only".into());
     run.on_ready(&mut ctx, planner, false, false);
     run.forget_agent_session(planner);
-    run.set_agent_model(planner, "nova");
+    run.set_agent_model(planner, "nova", "by you");
     let saved = RunState::load(&run.dir).unwrap();
     let slot = saved.agents.iter().find(|a| a.slot == "planner").unwrap();
     assert_eq!(slot.model_alias, "nova");
@@ -4298,7 +4763,7 @@ fn a_finale_switch_does_not_carry_over_to_the_next_step() {
     run.plan = Some(one_task_phase());
     run.start_finale(&mut ctx, 0);
     let f = run.finale_agent.expect("a finale agent");
-    run.set_agent_model(f, "nova");
+    run.set_agent_model(f, "nova", "by you");
     run.respawn(&mut ctx, f, None).unwrap();
     assert_eq!(ctx.spawned("qa").last().unwrap().model, "nova", "the respawned step keeps the switch");
     run.start_finale(&mut ctx, 1);
@@ -4318,13 +4783,13 @@ fn the_fallback_replaces_a_switched_model_that_went_silent() {
     run.dir = scratch_dir("slot-fallback");
     run.stage = Stage::Planning;
     let p = run.spawn_planner(&mut ctx);
-    run.set_agent_model(p, "nova");
+    run.set_agent_model(p, "nova", "by you");
     ctx.agents.get_mut(&p).unwrap().model_alias = "nova".into();
     let key = run.first_token_key(p).unwrap();
     run.first_token_strikes.insert(key, 1);
     run.on_first_token_deadline(&mut ctx, p, Duration::from_secs(300));
     assert_eq!(ctx.spawned("planner").last().unwrap().model, "luna", "on the fallback, not back on the switch");
-    assert!(run.slot_models.is_empty());
+    assert_eq!(run.slot_models.get("planner").map(String::as_str), Some("luna"), "the fallback replaces the switch as the slot's pin");
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
@@ -4359,7 +4824,7 @@ fn billing_fallback_keeps_worker_files_and_attempt_and_alerts_the_owner() {
     assert_eq!(run.workers[0].model.as_deref(), Some("claude-fallback"));
     assert!(run.continue_queue.is_empty() && !run.retry_counts.contains_key(&a));
     assert!(run.alerts.iter().any(|alert| alert.contains("fallback claude-fallback")));
-    assert!(ctx.notified.iter().any(|alert| alert.contains("billing or usage limit")));
+    assert!(ctx.notified.iter().any(|alert| alert.contains("openrouter-primary → fallback claude-fallback (usage limit)")), "{:?}", ctx.notified);
     // A late error from the stopped primary cannot restore the halt.
     run.on_turn_done(&mut ctx, a, "failed", Some("HTTP 402: Insufficient credits".into()), Some(ErrKind::UsageLimit));
     assert!(!run.halted());
@@ -4441,18 +4906,51 @@ fn the_context_cap_bounds_the_window_a_spawn_is_told() {
     run.on_job(&mut ctx, JobTag::WorkerWt { task: "t1".into(), attempt: 1 }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
     assert_eq!(ctx.spawned("t1")[0].context_override, Some(128_000), "a 128k model keeps its window");
     // a halved assumption from an earlier attempt is still capped
-    assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
-    assert_eq!(run.context_for(&planner_model, Some(400_000)), Some(200_000));
-    assert_eq!(run.context_for("unknown-alias", None), Some(200_000), "nothing known: the cap stands");
+    let role_of = |model: &str| Role { model: model.into(), ..Role::default() };
+    let (planner_role, worker_role, unknown_role) = (role_of(&planner_model), role_of(&worker_model), role_of("unknown-alias"));
+    assert_eq!(run.context_for(&planner_role, Some(100_000)), Some(100_000));
+    assert_eq!(run.context_for(&planner_role, Some(400_000)), Some(200_000));
+    assert_eq!(run.context_for(&unknown_role, None), Some(200_000), "nothing known: the cap stands");
     // 0 = the model's own window, whatever it is
     run.pattern.settings.context_cap = 0;
-    assert_eq!(run.context_for(&planner_model, None), Some(1_000_000));
-    assert_eq!(run.context_for(&planner_model, Some(100_000)), Some(100_000));
-    assert_eq!(run.context_for(&worker_model, Some(400_000)), Some(128_000), "an override cannot inflate the model's limit");
-    assert_eq!(run.context_for("unknown-alias", None), None);
-    let orchestrator_window = run.context_for(&run.role(&run.pattern.flow.orchestrator).model, None);
+    assert_eq!(run.context_for(&planner_role, None), Some(1_000_000));
+    assert_eq!(run.context_for(&planner_role, Some(100_000)), Some(100_000));
+    assert_eq!(run.context_for(&worker_role, Some(400_000)), Some(128_000), "an override cannot inflate the model's limit");
+    assert_eq!(run.context_for(&unknown_role, None), None);
+    let orchestrator_window = run.context_for(&run.role(&run.pattern.flow.orchestrator), None);
     run.respawn_orchestrator(&mut ctx, None);
     assert_eq!(ctx.spawned("orchestrator")[0].context_override, orchestrator_window);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A role's `context` joins the cap and the model's window: the smallest of the three wins, on
+/// whatever model the spawn really uses, and `context_ceiling` reports it for a live switch.
+#[test]
+fn a_role_context_limit_is_one_more_ceiling() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("role-context");
+    run.set_known_models(known(&[("big", 1_000_000), ("small", 128_000)]));
+    run.pattern.settings.context_cap = 500_000;
+    let role = |model: &str, context: Option<u64>| Role { model: model.into(), context, ..Role::default() };
+    assert_eq!(run.context_for(&role("big", Some(250_000)), None), Some(250_000));
+    assert_eq!(run.context_for(&role("small", Some(250_000)), None), Some(128_000), "the model's window is smaller");
+    assert_eq!(run.context_for(&role("big", None), None), Some(500_000));
+    run.pattern.settings.context_cap = 0;
+    assert_eq!(run.context_for(&role("big", None), None), Some(1_000_000));
+    assert_eq!(run.context_for(&role("nope", Some(250_000)), None), Some(250_000), "unknown alias: the role limit stands");
+    run.pattern.settings.context_cap = 300_000;
+    assert_eq!(run.context_for(&role("nope", Some(250_000)), None), Some(250_000));
+    // the planner's role limit reaches the spawn and the ceiling
+    let planner = run.pattern.flow.planner.clone();
+    run.pattern.roles.get_mut(&planner).unwrap().context = Some(64_000);
+    run.stage = Stage::Planning;
+    run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner")[0].context_override, Some(64_000));
+    let pa = run.planner.unwrap();
+    assert_eq!(run.context_ceiling(pa), Some(64_000));
+    run.pattern.roles.get_mut(&planner).unwrap().context = None;
+    assert_eq!(run.context_ceiling(pa), Some(300_000));
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
@@ -4648,4 +5146,1389 @@ fn a_screenshot_and_an_image_come_back_as_input_images() {
     let (_, items, ok) = ctx.items.last().cloned().unwrap();
     assert!(!ok && items[0]["text"].as_str().unwrap_or_default().contains("does not take images"), "{items:?}");
     assert!(!run.dir.join("screenshots").join("p1-api-1.png").exists());
+}
+
+/// A planner whose role has the chain `pa` → `pb` → `pc` (`fallback`, `fallback2`).
+fn chain_run(tag: &str) -> (Run, TestCtx) {
+    let mut pat = no_manager();
+    {
+        let r = pat.roles.get_mut("planner").unwrap();
+        r.model = "pa".into();
+        r.fallback = Some("pb".into());
+        r.fallback2 = Some("pc".into());
+    }
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir(tag);
+    run.stage = Stage::Planning;
+    (run, TestCtx::new())
+}
+
+#[test]
+fn a_usage_limit_walks_the_fallback_chain_then_halts() {
+    let (mut run, mut ctx) = chain_run("chain-walk");
+    let a = run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pa");
+    run.on_turn_done(&mut ctx, a, "failed", Some("You've hit your 5-hour limit · resets 9:20pm (UTC)".into()), Some(ErrKind::UsageLimit));
+    let b = run.planner.unwrap();
+    assert_ne!(b, a);
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb", "respawned on the first fallback");
+    assert!(!run.halted());
+    assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("[mantra:retry]")), "a usage limit is not retried: {:?}", ctx.prompts);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == b && t.contains("[mantra:fallback] The previous model (pa) hit its provider's usage limit") && t.contains("replacement on pb")), "{:?}", ctx.prompts);
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text == "planner: pa → fallback pb (usage limit)"), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    assert_eq!(run.pattern.roles["planner"].model, "pa", "the role's model is not rewritten");
+    run.on_turn_done(&mut ctx, b, "failed", Some("You've hit your weekly limit".into()), Some(ErrKind::UsageLimit));
+    let c = run.planner.unwrap();
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "the second fallback");
+    assert!(!run.halted());
+    run.on_turn_done(&mut ctx, c, "failed", Some("You've hit your weekly limit".into()), Some(ErrKind::UsageLimit));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::UsageLimit), "the chain is spent");
+    assert_eq!(run.fallback_used.get("planner").cloned().unwrap_or_default(), ["pa", "pb", "pc"]);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_fallback_tries_the_next_model_of_the_same_provider_and_later_spawns_avoid_the_one_that_failed() {
+    let (mut run, mut ctx) = chain_run("chain-provider");
+    run.set_known_providers(HashMap::from([("pa".to_string(), "P1".to_string()), ("pb".into(), "P1".into()), ("pc".into(), "P2".into())]));
+    let gate = run.pattern.flow.phase_gate.clone();
+    {
+        let r = run.pattern.roles.get_mut(&gate).unwrap();
+        r.model = "pa".into();
+        r.fallback = Some("pc".into());
+    }
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("usage limit".into()), Some(ErrKind::UsageLimit));
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb", "a limit is often one model's: its sibling on the same provider is tried next");
+    assert!(!run.halted());
+    // a gate on the model that just failed starts on its fallback
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.spawn_gate_at_round(&mut ctx, 0, 1);
+    assert_eq!(ctx.spawned(&gate).last().map(|s| s.model.clone()).as_deref(), Some("pc"));
+    assert!(run.pulse.iter().any(|p| p.glyph == "⇄" && p.text.contains("starts on fallback pc") && p.text.contains("pa hit its usage limit")), "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn silence_marks_the_whole_provider_and_the_chain_skips_its_other_models() {
+    let (mut run, mut ctx) = chain_run("chain-silent");
+    run.set_known_providers(HashMap::from([("pa".to_string(), "P1".to_string()), ("pb".into(), "P1".into()), ("pc".into(), "P2".into())]));
+    let a = run.spawn_planner(&mut ctx);
+    assert!(run.try_fallback(&mut ctx, a, FallbackWhy::Silent, ""));
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pc", "an outage is the provider's: pb would only wait out the same deadline");
+    assert_eq!(run.troubled("pb").as_deref(), Some("pb's provider gave no output"));
+    assert_eq!(run.troubled("pc"), None);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_pinned_worker_keeps_its_model_in_trouble_and_is_warned_once() {
+    let mut ctx = TestCtx::new();
+    let mut pat = no_manager();
+    pat.roles.get_mut("worker-small").unwrap().fallback = Some("other".into());
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir("pinned-trouble");
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.set_known_providers(HashMap::from([("x".to_string(), "P1".to_string()), ("other".into(), "P2".into())]));
+    let a = ctx.add_busy();
+    let mut w = mk_worker("t1", "worker-small", a, WState::Running);
+    w.model = Some("x".into());
+    run.workers.push(w);
+    run.mark_trouble("x", 3600, "hit its usage limit", false);
+    for _ in 0..2 {
+        run.launch_worker(&mut ctx, 0, PathBuf::from("wt"), "b".into());
+    }
+    assert!(ctx.spawned("t1").iter().all(|s| s.model == "x"), "the user's pin wins");
+    let warned = run.pulse.iter().filter(|p| p.glyph == "⚠" && p.text == "worker:t1: runs on x as you chose, although x hit its usage limit").count();
+    assert_eq!(warned, 1, "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_rejected_request_falls_back_when_the_chain_has_a_model() {
+    let (mut run, mut ctx) = chain_run("chain-rejected");
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("Unexpected message role.".into()), Some(ErrKind::ProviderRejected));
+    assert!(!run.halted());
+    assert_eq!(ctx.spawned("planner").last().unwrap().model, "pb");
+    assert!(run.pulse.iter().any(|p| p.text == "planner: pa → fallback pb (rejected)"));
+    assert!(ctx.prompts.iter().any(|(_, t)| t.contains("was rejected by its provider (Unexpected message role.)")), "{:?}", ctx.prompts);
+    // without a chain: the existing halt
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("chain-rejected-none");
+    run.stage = Stage::Planning;
+    let a = run.spawn_planner(&mut ctx);
+    run.on_turn_done(&mut ctx, a, "failed", Some("Unexpected message role.".into()), Some(ErrKind::ProviderRejected));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::ProviderRejected));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_halt_about_one_agents_provider_lets_the_others_finish_their_turn() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("soft-halt");
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let p = ctx.add_idle();
+    run.planner = Some(p);
+    let w = ctx.add_busy();
+    run.workers.push(mk_worker("t1", "worker-small", w, WState::Running));
+    run.on_turn_done(&mut ctx, p, "failed", Some("invalid api key".into()), Some(ErrKind::Auth));
+    assert_eq!(run.halt.as_ref().map(|h| h.reason), Some(HaltReason::Auth));
+    assert!(!ctx.interrupted.contains(&w), "the healthy worker keeps its turn");
+    assert!(run.pulse.iter().any(|x| x.glyph == "‖" && x.text == "1 agent(s) keep working until their turn ends — the halt is about planner only"), "{:?}", run.pulse.iter().map(|x| x.text.clone()).collect::<Vec<_>>());
+    // a user pause still stops everyone
+    run.resume(&mut ctx);
+    run.halt(&mut ctx, HaltReason::User, None, "paused".into());
+    assert!(ctx.interrupted.contains(&w));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn fallback_used_survives_a_resume() {
+    let (mut run, _ctx) = chain_run("fallback-used-state");
+    run.fallback_used.insert("planner".into(), vec!["pa".into(), "pb".into()]);
+    run.save_state();
+    let st = RunState::load(&run.dir).unwrap();
+    assert_eq!(st.fallback_used.get("planner").cloned().unwrap_or_default(), ["pa", "pb"]);
+    let back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+    assert_eq!(back.fallback_used, run.fallback_used);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A slot's pinned model (a fallback, or the user's choice) is saved even while the slot has no
+/// live agent — the planner during plan review — so a second restart does not lose it.
+#[test]
+fn a_slot_pin_survives_a_restart_without_a_live_agent() {
+    let (mut run, _ctx) = chain_run("slot-pin-state");
+    run.stage = Stage::Review;
+    run.slot_models.insert("planner".into(), "pb".into());
+    assert!(run.planner.is_none(), "no agent is live for the slot");
+    run.save_state();
+    let st = RunState::load(&run.dir).unwrap();
+    assert_eq!(st.slot_models.get("planner").map(String::as_str), Some("pb"));
+    let mut back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+    back.resume_boot(&mut TestCtx::new(), &st);
+    assert_eq!(back.slot_models.get("planner").map(String::as_str), Some("pb"));
+    assert!(back.pulse.iter().any(|p| p.text == "planner comes back on pb (switched live before the restart)"), "{:?}", back.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+fn empty_turn_setup(tag: &str, fallback: bool) -> (Run, TestCtx, AgentId) {
+    let mut ctx = TestCtx::new();
+    let mut pat = no_manager();
+    if fallback {
+        pat.roles.get_mut("worker-small").unwrap().fallback = Some("claude-fallback".into());
+    }
+    let mut run = Run::new(PathBuf::from("."), pat, "test".into());
+    run.dir = scratch_dir(tag);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let a = ctx.add_busy();
+    ctx.agents.get_mut(&a).unwrap().model_alias = "primary".into();
+    let mut w = mk_worker("t1", "worker-small", a, WState::Running);
+    w.wt = Some(PathBuf::from("existing-worktree"));
+    run.workers.push(w);
+    (run, ctx, a)
+}
+
+fn empty_turn(ctx: &mut TestCtx, a: AgentId) {
+    let ag = ctx.agents.get_mut(&a).unwrap();
+    ag.last_turn_empty = true;
+    ag.final_message = None;
+}
+
+#[test]
+fn an_empty_worker_turn_is_asked_again_once() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-retry", false);
+    empty_turn(&mut ctx, a);
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert!(matches!(run.workers[0].state, WState::Retrying(_)), "not done");
+    assert!(run.pulse.iter().any(|p| p.text.contains("empty turn from primary (no text, no tool call) — asking again")));
+    assert_eq!(run.continue_queue.len(), 1);
+    assert!(run.continue_queue[0].2.starts_with("[mantra:retry] Your previous turn ended without any output"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_second_empty_turn_falls_back_or_fails_the_task() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-chain", true);
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert_ne!(run.workers[0].agent, Some(a));
+    assert_eq!(ctx.spawned("t1").last().unwrap().model, "claude-fallback");
+    assert!(run.pulse.iter().any(|p| p.text.contains("fallback claude-fallback (empty turns)")));
+    let _ = std::fs::remove_dir_all(&run.dir);
+
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-nochain", false);
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert!(matches!(run.workers[0].state, WState::Failed(ref e) if e.contains("empty turn twice from primary")), "{:?}", run.workers[0].state);
+    let told = run.orch_inbox.iter().chain(ctx.prompts.iter().map(|(_, t)| t)).any(|t| t.contains("t1 FAILED"));
+    assert!(told, "{:?} {:?}", run.orch_inbox, ctx.prompts);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn two_empty_fix_worker_turns_halt_without_running_checks() {
+    let (mut run, mut ctx, a) = empty_turn_setup("empty-fix", false);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 1 } };
+    run.workers[0].task.id = "fix-1".into();
+    run.workers[0].adhoc = true;
+    for _ in 0..2 {
+        empty_turn(&mut ctx, a);
+        run.on_turn_done(&mut ctx, a, "completed", None, None);
+    }
+    assert!(run.halted(), "escalated");
+    assert!(!ctx.jobs.iter().any(|j| j.to_lowercase().contains("check")), "{:?}", ctx.jobs);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn an_empty_planner_turn_is_retried_not_nudged_for_a_plan() {
+    let (mut run, mut ctx, p) = planner_feature_run("empty-planner", Pattern::builtin());
+    empty_turn(&mut ctx, p);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert!(run.continue_queue.iter().any(|(a, _, m)| *a == p && m.starts_with("[mantra:retry]")));
+    assert!(!ctx.prompts.iter().any(|(_, t)| t.contains("You haven't submitted a valid plan")));
+    assert_eq!(run.planner_nudges, 0);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_worker_without_a_status_line_is_asked_once() {
+    let (mut run, mut ctx, a) = empty_turn_setup("no-status", false);
+    ctx.agents.get_mut(&a).unwrap().final_message = Some("I changed some files.".into());
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert_ne!(run.workers[0].state, WState::Done);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == a && t.starts_with("[mantra] Your turn ended without the closing lines")));
+    assert!(run.pulse.iter().any(|p| p.text.contains("t1 ended its turn without a STATUS line")));
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert_eq!(run.workers[0].state, WState::Done);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A soft halt leaves the other agents finishing their turn: the one-time ask would start a new one.
+#[test]
+fn no_status_ask_is_sent_while_the_run_is_halted() {
+    let (mut run, mut ctx, a) = empty_turn_setup("no-status-halted", false);
+    ctx.agents.get_mut(&a).unwrap().final_message = Some("I changed some files.".into());
+    halt_by_hand(&mut run);
+    run.on_turn_done(&mut ctx, a, "completed", None, None);
+    assert!(!ctx.prompts.iter().any(|(x, _)| *x == a), "{:?}", ctx.prompts);
+    assert!(!run.workers[0].status_asked);
+    assert_eq!(run.workers[0].state, WState::Done, "treated as before the ask existed");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// Held messages of a paused agent that the resume skips (`except`) still arrive, as a plain prompt.
+#[test]
+fn held_messages_of_a_skipped_paused_agent_are_delivered_on_resume() {
+    let (mut run, mut ctx, a) = empty_turn_setup("held-skipped", false);
+    halt_by_hand(&mut run);
+    run.paused_agents = vec![a];
+    run.redeliver.entry(a).or_default().push("[from the user] use the new parser".into());
+    ctx.prompts.clear();
+    run.resume_core(&mut ctx, Some(a), true, false, None);
+    let got: Vec<&String> = ctx.prompts.iter().filter(|(x, _)| *x == a).map(|(_, t)| t).collect();
+    assert!(got.iter().any(|t| t.contains("use the new parser") && !t.starts_with("[mantra:resume]")), "{got:?}");
+    assert!(run.redeliver.is_empty());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn respawning_the_planner_carries_the_queue_and_records_the_replacement() {
+    let (mut run, mut ctx, p) = planner_feature_run("carry-over", Pattern::builtin());
+    run.respawn_planner(&mut ctx, None);
+    let new = run.planner.unwrap();
+    assert_ne!(new, p);
+    assert_eq!(ctx.carried, [(p, new)]);
+    assert_eq!(run.replaced, [(p, new)]);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_prompt_sent_just_before_a_halt_comes_back_with_the_resume_prompt() {
+    let (mut run, mut ctx, a) = empty_turn_setup("redeliver", false);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    let name = run.name_of(a);
+    let (_, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": name, "message": "use the new parser"}));
+    assert!(ok);
+    run.halt_full(&mut ctx, HaltReason::AgentTurnFailed, Some(a), "x".into(), "x".into());
+    ctx.prompts.clear();
+    run.resume(&mut ctx);
+    let resume = ctx.prompts.iter().find(|(x, t)| *x == a && t.starts_with("[mantra:resume]")).expect("resume prompt").1.clone();
+    assert!(resume.contains("Sent to you just before the pause") && resume.contains("- [from the orchestrator] use the new parser"), "{resume}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn the_orchestrator_cannot_prompt_a_worker_through_a_halt() {
+    let (mut run, mut ctx, a) = empty_turn_setup("hold", false);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    let name = run.name_of(a);
+    run.halt_full(&mut ctx, HaltReason::AgentTurnFailed, Some(a), "x".into(), "x".into());
+    ctx.prompts.clear();
+    let (text, ok) = run.handle_tool(&mut ctx, orch, "mantra_prompt", &json!({"agent": name, "message": "carry on"}));
+    assert!(ok && text.starts_with("held — the run is halted"), "{text}");
+    assert!(ctx.prompts.is_empty());
+    run.resume(&mut ctx);
+    assert!(ctx.prompts.iter().any(|(x, t)| *x == a && t.contains("- [from the orchestrator] carry on")), "{:?}", ctx.prompts);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// ───────────────────────── WP-3.2: a run adopts changes to its saved pattern ─────────────────────────
+
+fn valid_phase() -> Plan {
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks[0].prompt = "Write the one function that is asked for and test it.".into();
+    plan
+}
+
+/// What a save of the saved pattern does to the run: `edit` applied to the pattern the run last
+/// synchronised with, adopted into the run copy.
+fn adopt_edit(run: &mut Run, ctx: &mut TestCtx, edit: impl FnOnce(&mut Pattern)) -> Result<Vec<String>, String> {
+    let base = run.pattern_base.clone().expect("a base");
+    let mut theirs = Pattern::from_toml(&base).unwrap();
+    edit(&mut theirs);
+    let a = crate::engine::pattern::adopt(&base, &run.pattern, &theirs)?.expect("something to adopt");
+    run.adopt_pattern(ctx, a, theirs.to_toml(), "the Studio")
+}
+
+#[test]
+fn adopting_a_changed_role_model_switches_the_slot_and_drops_the_pin() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-pin");
+    run.stage = Stage::Planning;
+    let planner_role = run.pattern.flow.planner.clone();
+    let old_model = run.role(&planner_role).model;
+    run.slot_models.insert("planner".into(), "nova".into());
+    run.fallback_used.insert("planner".into(), vec![old_model.clone()]);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("planner").unwrap().model = "luna".into()).unwrap();
+    assert_eq!(roles, vec![planner_role.clone()]);
+    assert_eq!(run.pattern.roles[&planner_role].model, "luna");
+    assert!(run.slot_models.get("planner").is_none() && run.fallback_used.get("planner").is_none());
+    let said: Vec<String> = run.pulse.iter().map(|p| p.text.clone()).collect();
+    assert!(said.iter().any(|t| t == "planner: your per-agent model nova gives way to the role's new model luna"), "{said:?}");
+    assert!(said.iter().any(|t| t.starts_with("pattern updated from the Studio (1 change(s)): roles.planner.model:")), "{said:?}");
+    let p = run.spawn_planner(&mut ctx);
+    assert_eq!(ctx.spawned("planner")[0].model, "luna", "the next planner is on the new model ({p})");
+    assert_eq!(run.pattern_base.as_deref().map(|b| Pattern::from_toml(b).unwrap().roles[&planner_role].model.clone()).as_deref(), Some("luna"));
+    assert_eq!(std::fs::read_to_string(run.dir.join("pattern.base.toml")).unwrap(), run.pattern_base.clone().unwrap());
+    assert!(std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap().contains("luna"), "the run copy is saved");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_changes_the_gate_of_the_current_phase_and_keeps_the_runs_own_settings() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-gate");
+    run.pattern.set_parallel(8); // `--parallel 8`: a run-local change
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.pattern.settings.allow_pattern_changes = true;
+    let gate = run.pattern.flow.phase_gate.clone();
+    adopt_edit(&mut run, &mut ctx, |p| {
+        p.roles.get_mut("qa").unwrap().model = "nova".into();
+        p.settings.context_cap = 50_000;
+    }).unwrap();
+    assert_eq!((run.pattern.settings.max_parallel, run.pattern.settings.context_cap), (8, 50_000), "the run's own width stays, the user's cap arrives");
+    assert!(run.pattern.settings.allow_pattern_changes, "the run-level permission is not the pattern's to change");
+    run.spawn_gate_at_round(&mut ctx, 0, 1);
+    assert_eq!(ctx.spawned(&gate).last().map(|s| s.model.clone()).as_deref(), Some("nova"), "the gate of the phase that is running now");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_leaves_a_finished_worker_and_drops_the_pin_of_a_running_one() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-workers");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let (a, b) = (ctx.add_busy(), ctx.add_busy());
+    let mut done = mk_worker("t0", "worker-small", a, WState::Done);
+    done.model = Some("old".into());
+    let mut live = mk_worker("t1", "worker-small", b, WState::Running);
+    live.model = Some("nova".into());
+    run.workers.push(done);
+    run.workers.push(live);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("worker-small").unwrap().model = "zeta".into()).unwrap();
+    assert_eq!(roles, vec!["worker-small".to_string()]);
+    assert_eq!(run.workers[0].model.as_deref(), Some("old"), "a finished attempt keeps its record");
+    assert_eq!(run.workers[1].model, None);
+    assert!(run.pulse.iter().any(|p| p.text == "worker:t1#1: your per-agent model nova gives way to the role's new model zeta"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_refuses_what_the_run_cannot_take_and_keeps_its_copy() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-refuse");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let before = run.pattern.clone();
+    let old_base = run.pattern_base.clone();
+    // the plan still has a task for worker-small
+    let e = adopt_edit(&mut run, &mut ctx, |p| { p.roles.remove("worker-small"); }).unwrap_err();
+    assert!(e.contains("worker-small"), "{e}");
+    assert_eq!(run.pattern, before);
+    assert_eq!(run.pattern_base, old_base, "and the base is where it was");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn adopting_an_orchestrator_model_change_leaves_the_agent_to_the_live_switch_but_new_instructions_respawn_it() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = scratch_dir("adopt-orch");
+    run.plan = Some(valid_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let o = run.spawn_orchestrator(&mut ctx);
+    let roles = adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("orchestrator").unwrap().model = "luna".into()).unwrap();
+    assert_eq!(roles, vec!["orchestrator".to_string()]);
+    assert_eq!(run.orchestrator, Some(o), "the app switches the live agent in place");
+    assert!(!ctx.stopped.contains(&o));
+    adopt_edit(&mut run, &mut ctx, |p| p.roles.get_mut("orchestrator").unwrap().instructions = "Be brief.".into()).unwrap();
+    assert_ne!(run.orchestrator, Some(o), "new instructions need a new process");
+    assert!(ctx.stopped.contains(&o));
+    assert!(ctx.prompts.iter().any(|(_, t)| t.contains("The workflow was updated by the user; continue the phase.")), "{:?}", ctx.prompts);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// ── WP-3.3: the planner keeps its memory across restarts and respawns ──
+
+/// A run in phase 1 `Orchestrating` of a two-task plan, saved to disk and reopened the way
+/// `resume_run` does; `thread` is the saved planner session (None: no session was saved).
+fn resumed_in_phase(tag: &str, thread: Option<&str>, model: Option<&str>) -> (Run, TestCtx) {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "build the thing".into());
+    run.dir = scratch_dir(tag);
+    run.plan = Some(class_phase(2, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.save_state();
+    let mut st = RunState::load(&run.dir).unwrap();
+    if let Some(t) = thread {
+        let alias = model.map(String::from).unwrap_or_else(|| run.role(&run.pattern.flow.planner.clone()).model);
+        st.agents.push(AgentState { slot: "planner".into(), name: "planner".into(), role: run.pattern.flow.planner.clone(), provider: "openai".into(), model_alias: alias, effort: "high".into(), thread_id: Some(t.into()), cwd: "/tmp".into() });
+    }
+    let mut again = Run::from_state(&st, Pattern::builtin(), run.plan.clone(), run.dir.clone());
+    if model.is_some() {
+        // the saved alias is no longer configured: it cannot come back as a pin
+        let own = again.role(&again.pattern.flow.planner.clone()).model;
+        again.set_known_models(HashMap::from([(own, 100_000)]));
+    }
+    let mut ctx = TestCtx::new();
+    again.resume_boot(&mut ctx, &st);
+    (again, ctx)
+}
+
+#[test]
+fn a_planner_with_a_saved_session_is_reattached_on_its_first_use_after_a_phase_resume() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-reattach", Some("t-plan"), None);
+    assert!(run.planner.is_none() && ctx.spawned("planner").is_empty(), "no planner at boot");
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    let p = run.planner.expect("spawned lazily");
+    assert_eq!(ctx.resumed, vec![(p, "t-plan".to_string())]);
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1;
+    assert!(prompt.starts_with("[mantra:resume] Mantra restarted; you are re-attached"), "{prompt}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_planner_saved_on_another_model_is_not_reattached() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-other-model", Some("t-plan"), Some("some-other-alias"));
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    assert!(ctx.resumed.is_empty());
+    let p = run.planner.unwrap();
+    assert!(ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1.starts_with("[mantra:respawn] You are this run's planner"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_planner_without_a_saved_session_starts_with_a_context_pack() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-pack", None, None);
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    let p = run.planner.unwrap();
+    assert!(ctx.resumed.is_empty());
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1;
+    assert!(prompt.starts_with("[mantra:respawn] You are this run's planner"), "{prompt}");
+    assert!(prompt.contains("build the thing") && prompt.contains("\"id\": \"b0\"") && prompt.contains("CURRENT") && prompt.contains("[mantra:escalation]"), "{prompt}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_change_that_does_not_concern_the_planner_does_not_respawn_it() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "planner-desc");
+    let p = run.spawn_planner(&mut ctx);
+    let mut pattern = run.pattern.clone();
+    let name = pattern.flow.planner.clone();
+    pattern.roles.get_mut(&name).unwrap().description = "a different description".into();
+    run.install_pattern(&mut ctx, PatternProposal { pattern, reason: "wording".into() });
+    assert_eq!(run.planner, Some(p));
+    assert!(!ctx.stopped.contains(&p));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_respawned_planner_inherits_the_queue_and_its_predecessors_last_words() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "planner-continuity");
+    let old = run.spawn_planner(&mut ctx);
+    ctx.agents.get_mut(&old).unwrap().push_user("decide about the cache layer");
+    run.respawn_planner(&mut ctx, Some("[mantra:watchdog] stalled".into()));
+    let new = run.planner.unwrap();
+    assert_ne!(new, old);
+    assert!(ctx.carried.contains(&(old, new)));
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == new).unwrap().1;
+    assert!(prompt.contains("For continuity, what the previous planner session held:") && prompt.contains("decide about the cache layer"), "{prompt}");
+    assert!(run.pulse.iter().any(|p| p.text == "planner respawned (watchdog)"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn respawn_reasons_are_told() {
+    assert_eq!(respawn_why(None), "by you");
+    assert_eq!(respawn_why(Some("[mantra:fallback] x")), "fallback model");
+    assert_eq!(respawn_why(Some("The workflow was updated by the user; continue")), "workflow changed");
+    assert_eq!(respawn_why(Some("Your previous process lost its session")), "session lost");
+    assert_eq!(respawn_why(Some("try again")), "requested");
+}
+
+// ── WP-3.4: a halted, quit or resumed run says so everywhere ──
+
+#[test]
+fn a_halted_runs_status_text_starts_with_the_halt() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "status-halted");
+    let calm = run.status_fingerprint(&ctx);
+    assert!(!run.status_text(&ctx).contains("RUN HALTED"));
+    run.halt(&mut ctx, HaltReason::GateExhausted, None, "the gate gave up".into());
+    let text = run.status_text(&ctx);
+    assert!(text.starts_with("RUN HALTED (gate exhausted) for "), "{text}");
+    assert!(text.contains("the gate gave up") && text.contains("Nothing starts until it is resumed"), "{text}");
+    assert_ne!(calm, run.status_fingerprint(&ctx), "a halt is a change a status reader must see");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn runs_are_labelled_halted_closed_or_live_with_the_state_first() {
+    use crate::engine::state::RunSummary;
+    let dir = scratch_dir("labels");
+    std::fs::create_dir_all(&dir).unwrap();
+    let st = |halted: Option<&str>, stage: Stage| RunState { stage, halted: halted.map(String::from), ..Default::default() };
+    let row = |s: RunState| RunSummary { id: "1-x".into(), dir: dir.clone(), project_key: "p".into(), state: Ok(s), updated_unix: 0 };
+    let working = Stage::Phase { idx: 1, step: PhaseStep::Orchestrating };
+    assert_eq!(row(st(Some("gate gave up"), working.clone())).stage_label(), "halted · phase 2 · working");
+    assert_eq!(row(st(None, working.clone())).stage_label(), "closed · phase 2 · working", "no owner.json: nobody has it open");
+    assert_eq!(row(st(None, Stage::Done)).stage_label(), "done");
+    crate::engine::state::Owner::this_process().write(&dir);
+    assert_eq!(row(st(None, working)).stage_label(), "phase 2 · working", "a live owner");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resuming_a_paused_run_says_you_had_paused_it_and_lists_the_roles() {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+    run.dir = scratch_dir("resume-roles");
+    run.plan = Some(class_phase(1, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.save_state();
+    let mut st = RunState::load(&run.dir).unwrap();
+    st.halted = Some("paused by you".into());
+    st.closed_unix = Some(5);
+    let mut again = Run::from_state(&st, Pattern::builtin(), run.plan.clone(), run.dir.clone());
+    again.closed_unix = st.closed_unix;
+    let mut ctx = TestCtx::new();
+    again.resume_boot(&mut ctx, &st);
+    let lines: Vec<String> = again.pulse.iter().map(|p| p.text.clone()).collect();
+    assert!(lines.iter().any(|l| l.ends_with("(you had paused it)")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("roles: planner ") && l.contains(" · orchestrator ")), "{lines:?}");
+    assert!(again.closed_unix.is_none() && RunState::load(&again.dir).unwrap().closed_unix.is_none());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// WP-2.8 / 2.9 / 2.10 -------------------------------------------------------------------------
+
+#[test]
+fn fit_or_point_keeps_whole_lines_and_says_where_the_rest_is() {
+    use helpers::fit_or_point;
+    assert_eq!(fit_or_point("short\ntext", 100, None), "short\ntext");
+    let text = "line one\nline two\nline three";
+    let cut = fit_or_point(text, 20, None);
+    assert_eq!(cut, "line one\nline two\n[cut here]");
+    let pointed = fit_or_point(text, 20, Some(Path::new("/x/gate/r.md")));
+    assert!(pointed.ends_with("[cut here — the full text is in /x/gate/r.md]") && !pointed.contains("three"), "{pointed}");
+    // no line break before the limit: cut at a char boundary, still marked
+    assert!(fit_or_point(&"é".repeat(40), 11, None).ends_with("[cut here]"));
+}
+
+#[test]
+fn fix_ids_are_fix_and_digits_only() {
+    assert!(helpers::is_fix_id("fix-1") && helpers::is_fix_id("fix-12"));
+    assert!(!helpers::is_fix_id("fix-login") && !helpers::is_fix_id("fix-") && !helpers::is_fix_id("xfix-1"));
+}
+
+#[test]
+fn a_plan_may_not_use_a_fix_worker_id() {
+    let pattern = Pattern::builtin();
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks[0].prompt = "do the thing described here".into();
+    plan.phases[0].tasks[0].id = "fix-2".into();
+    let errs = plan.validate(&pattern).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("'fix-2' is reserved for Mantra's fix workers")), "{errs:?}");
+    plan.phases[0].tasks[0].id = "fix-login".into();
+    assert!(plan.validate(&pattern).is_ok());
+    // and such a task is an ordinary worker, not an ad-hoc one on the integration copy
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.spawn_task(&mut ctx, plan.phases[0].tasks[0].clone(), None, None);
+    assert!(!run.workers.last().unwrap().adhoc);
+}
+
+#[test]
+fn paths_in_drops_what_lies_outside_the_workspace() {
+    let dir = std::env::temp_dir().join(format!("mantra-paths-out-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let t = format!("see /etc/x.conf and ~/a/b.txt and {}/src/x.rs and src/x.rs", dir.display());
+    assert_eq!(paths_in(&t, &dir), vec!["src/x.rs".to_string()]);
+    assert!(paths_in("/home/u/.mantra/runs/r1/gate.md ~/notes/a.md", &dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_long_gate_report_reaches_the_fix_worker_and_the_next_qa_round_by_file() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("long-gate-report");
+    let findings = format!("{}\nLAST-FINDING-LINE src/a.rs is wrong", "filler line of the report ".repeat(600));
+    assert!(findings.len() > 15_000);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": false, "summary": findings}));
+    assert!(ok);
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    let file = run.last_gate_file.clone().expect("the report was written");
+    assert!(file.starts_with(run.dir.join("gate")) && file.file_name().unwrap().to_string_lossy().ends_with("-round-1-fail.md"), "{file:?}");
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(body.starts_with("# phase 1 · QA round 1 · fail · plan v") && body.contains("LAST-FINDING-LINE"));
+    assert!(std::fs::read_to_string(run.dir.join("gate-reports.md")).unwrap().contains("→ gate/phase-1-qa-01-round-1-fail.md"));
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
+    assert!(fix.prompt.contains("LAST-FINDING-LINE"), "the fix worker gets the whole report");
+    assert!(run.orch_inbox.iter().any(|m| m.starts_with("Gate round 1: QA failed the phase — the fix goes to fix-1 (") && m.contains(&file.display().to_string())), "{:?}", run.orch_inbox);
+    // the next QA round: the report is past 12k, so it is cut at a line and points to the file
+    finish_fix(&mut ctx, &mut run, 1);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    let g2 = run.gate_agent.expect("round 2");
+    let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == g2).unwrap();
+    assert!(p.contains(&format!("[cut here — the full text is in {}]", file.display())), "{p}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_qa_pass_tells_the_orchestrator_without_waking_it() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("qa-pass-inbox");
+    run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": true, "summary": "coherent"}));
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert!(run.orch_inbox.contains(&"Gate round 1: QA passed — Mantra verifies the checks.".to_string()), "{:?}", run.orch_inbox);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn mantra_log_still_reads_the_retired_gate_agent() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("log-retired-gate");
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    assert!(run.gate_agent.is_none());
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_log", &json!({"agent": "gate"}));
+    assert!(ok, "{msg}");
+    assert!(!msg.contains("unknown agent"), "{msg}");
+    assert_eq!(run.resolve("gate"), Some(gate));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn mantra_log_cuts_at_an_entry_and_says_so() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let ag = ctx.agents.get_mut(&gate).unwrap();
+    for i in 0..40 {
+        ag.items.push(crate::agent::Item { id: format!("i{i}"), kind: crate::agent::Kind::Agent, text: format!("entry {i} {}", "x".repeat(1000)), done: true, version: 0, expanded: false, started: None, cache: None });
+    }
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_log", &json!({"agent": "gate", "lines": 40}));
+    assert!(ok);
+    assert!(msg.starts_with("[earlier entries omitted]\n[agent] entry "), "{}", &msg[..60]);
+    assert!(msg.len() <= 16_100 && msg.contains("entry 39"));
+}
+
+#[test]
+fn the_fix_prompt_shows_the_check_results() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("fix-prompt-checks");
+    run.checks = vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: "assertion failed: left == right".into(), secs: 1 }];
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap();
+    assert!(fix.prompt.contains("The gate checks as they stand") && fix.prompt.contains("assertion failed: left == right"), "{}", fix.prompt);
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+/// A fix worker's `SpawnReq` as the engine builds it (the fix runs, then its workspace job lands).
+fn fix_spawn(worktree: bool) -> Spawned {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.dir = scratch_dir("fix-sandbox");
+    if worktree {
+        run.ws = Some(git::Workspace { worktree: true, repo: PathBuf::from("."), integ: PathBuf::from("."), branch: "mantra/test".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
+    }
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    finish_fix(&mut ctx, &mut run, 1);
+    let _ = std::fs::remove_dir_all(&run.dir);
+    ctx.spawned("fix-1").pop().expect("the fix worker was spawned")
+}
+
+#[test]
+fn a_fix_worker_keeps_the_role_sandbox_and_asks_for_git_only_in_worktree_mode() {
+    let role_sandbox = Pattern::builtin().roles.get("worker-small").map(|r| r.sandbox.clone()).unwrap_or_default();
+    let shared = fix_spawn(false);
+    assert!(!shared.git_write);
+    assert_eq!(shared.sandbox, role_sandbox, "the role's own sandbox, never forced");
+    let wt = fix_spawn(true);
+    assert!(wt.git_write);
+    assert_eq!(wt.sandbox, role_sandbox, "the engine leaves the sandbox alone; the app lifts it for Codex");
+}
+
+#[test]
+fn a_fix_that_changed_nothing_is_journaled_and_qa_is_told() {
+    for (same, expect) in [(true, true), (false, false)] {
+        let mut ctx = TestCtx::new();
+        let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+        run.dir = scratch_dir("fix-no-change");
+        run.tree_print = Some("print-a".into());
+        run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+        assert_eq!(run.fix_base_print.as_deref(), Some("print-a"));
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+        let after = if same { "print-a" } else { "print-b" };
+        run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), Some(after.into())));
+        let qa = run.gate_agent.expect("round 2");
+        let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == qa).unwrap();
+        assert_eq!(p.contains("the fix worker of the last round changed no file in the workspace"), expect, "{p}");
+        assert_eq!(run.pulse.iter().any(|j| j.text.contains("fix-1 changed no file in the workspace")), expect);
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+}
+
+// ---- Milestone 6: a gate fix goes back to the worker that wrote the code ----
+
+/// A run at gate round 1 of a phase with two finished tasks: `t1` owns `src/a.rs`, `t2` owns
+/// `src/b.rs`. Returns the run, the QA agent and the two workers' agents. The run has a worktree
+/// workspace and the workers have worktrees, so the owner path has jobs to run.
+fn owner_run(ctx: &mut TestCtx) -> (Run, AgentId, AgentId, AgentId) {
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    run.dir = std::env::temp_dir().join(format!("mantra-owner-{}-{}", std::process::id(), ctx.next));
+    let gate = ctx.add_idle();
+    let (a1, a2) = (ctx.add_idle(), ctx.add_idle());
+    for a in [gate, a1, a2] {
+        ready(ctx, a);
+    }
+    let task = |id: &str, scope: &str| Task { id: id.into(), role: "worker-small".into(), scope: vec![scope.into()], prompt: "do the work described for this task".into(), ..Default::default() };
+    let mut plan = one_task_phase();
+    plan.phases[0].tasks = vec![task("t1", "src/a.rs"), task("t2", "src/b.rs")];
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan.clone());
+    let wt = std::env::temp_dir();
+    run.ws = Some(Workspace { worktree: true, repo: wt.clone(), integ: wt.join("integ-nowhere"), branch: "run".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: None, initial_commit: false, nested: vec![] });
+    for (t, a) in plan.phases[0].tasks.iter().zip([a1, a2]) {
+        let mut w = mk_worker(&t.id, "worker-small", a, WState::Done);
+        w.task = t.clone();
+        w.wt = Some(wt.clone());
+        w.branch = format!("mantra-w/{}", t.id);
+        w.report = format!("STATUS: done\nSUMMARY: wrote {}", t.id);
+        run.workers.push(w);
+    }
+    run.gate_agent = Some(gate);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    (run, gate, a1, a2)
+}
+
+fn t(run: &Run, id: &str) -> usize {
+    run.workers.iter().position(|w| w.task.id == id).unwrap()
+}
+
+#[test]
+fn the_owner_of_the_findings_is_the_one_task_that_owns_every_file_they_name() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _gate, a1, _a2) = owner_run(&mut ctx);
+    let t1 = t(&run, "t1");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs:3 returns the wrong value"), Some(t1));
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong and src/b.rs too"), None, "two tasks: a fix worker");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "the build is broken somewhere"), None, "no file named");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/zzz.rs does not exist yet"), None, "a file no task owns");
+    assert_eq!(run.fix_owner_for(&ctx, 0, "src/a.rs conflicts"), None, "a merge-conflict fix is never an owner's");
+    // QA names the task, with or without a file
+    run.gate_fix_by = Some("t2".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), Some(t(&run, "t2")), "fix_by replaces the derivation");
+    assert_eq!(run.fix_owner_for(&ctx, 1, "no file here"), Some(t(&run, "t2")));
+    run.gate_fix_by = Some("fix-worker".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.gate_fix_by = Some("nobody".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "an unknown task");
+    run.gate_fix_by = None;
+    // the file was changed by the worker's agent, though its scope does not cover it
+    ctx.agents.get_mut(&a1).unwrap().files.insert("lib/shared.rs".into(), Default::default());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "lib/shared.rs is wrong"), Some(t1));
+    // the setting, a big fix, a failed earlier owner fix
+    run.gate_big = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.gate_big = false;
+    run.workers[t1].owner_fix_failed = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.workers[t1].owner_fix_failed = false;
+    run.pattern.settings.gate_fix = "fix-worker".into();
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None);
+    run.pattern.settings.gate_fix = "owner".into();
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), Some(t1));
+}
+
+#[test]
+fn an_owner_that_cannot_take_the_job_is_not_chosen() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _gate, a1, _a2) = owner_run(&mut ctx);
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Stopped;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "stopped");
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Crashed("x".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "crashed");
+    ctx.agents.get_mut(&a1).unwrap().status = Status::Idle;
+    ctx.agents.get_mut(&a1).unwrap().stopped_by_user = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "stopped by hand");
+    ctx.agents.get_mut(&a1).unwrap().stopped_by_user = false;
+    ctx.agents.get_mut(&a1).unwrap().turn_active = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "busy");
+    ctx.agents.get_mut(&a1).unwrap().turn_active = false;
+    let i = t(&run, "t1");
+    run.workers[i].wt = Some(PathBuf::from("/nonexistent/mantra-worktree"));
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "its worktree is gone");
+    run.workers[i].wt = Some(std::env::temp_dir());
+    run.workers[i].state = WState::Failed("x".into());
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "not Done");
+    run.workers[i].state = WState::Done;
+    run.workers[i].adhoc = true;
+    assert_eq!(run.fix_owner_for(&ctx, 1, "src/a.rs is wrong"), None, "an ad-hoc worker owns nothing");
+}
+
+#[test]
+fn the_gate_report_carries_fix_by() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, _a1, _a2) = owner_run(&mut ctx);
+    let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &json!({"pass": false, "summary": "src/b.rs and src/a.rs are inconsistent", "fix_by": "t1"}));
+    assert!(ok);
+    assert_eq!(run.gate_fix_by.as_deref(), Some("t1"));
+    run.on_turn_done(&mut ctx, gate, "completed", None, None);
+    assert_eq!(run.fix_owner.as_deref(), Some("t1"), "QA named the task");
+    assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"));
+}
+
+/// The owner path from the verdict to the next QA round.
+#[test]
+fn a_failed_round_in_one_tasks_files_goes_back_to_its_own_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    let orch = ctx.add_idle();
+    ready(&mut ctx, orch);
+    run.orchestrator = Some(orch);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert!(!run.halted());
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
+    assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"), "no fix worker");
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")), "{:?}", ctx.jobs);
+    assert_eq!(run.fix_owner.as_deref(), Some("t1"));
+    assert!(run.journal_text(60).contains("gate round 1 found problems in the work of t1 — back to its own worker"));
+    assert!(run.orch_inbox.iter().any(|l| l.contains("t1's own worker")), "{:?}", run.orch_inbox);
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1), "nothing is said to it before its worktree is current");
+    // the worktree is current: it is told
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    let (_, p) = ctx.prompts.iter().rev().find(|(a, _)| *a == a1).expect("the owner got a prompt");
+    assert!(p.starts_with("[mantra:fix]") && p.contains("src/a.rs:3 returns the wrong value") && p.contains("src/a.rs"), "{p}");
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Running);
+    assert_eq!(run.workers[i].owner_fixing, Some(1));
+    assert!(run.expected_active().iter().any(|(a, e)| *a == a1 && *e == Expect::Working("t1".into())));
+    // it finishes
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: returns the right value now".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    assert_eq!(run.workers[i].state, WState::Done);
+    assert_eq!(run.workers[i].owner_fixing, None);
+    assert!(run.gate_notes.iter().any(|n| n.contains("t1 (owner fix r1)")), "{:?}", run.gate_notes);
+    assert!(!ctx.prompts.iter().any(|(a, p)| *a == orch && p.contains("t1 done again")), "the orchestrator is not woken for it");
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerMerge")), "{:?}", ctx.jobs);
+    // its branch merges cleanly: the checks run again, then QA round 2 lists the owner's repair
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec!["t1".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "{:?}", ctx.jobs);
+    assert!(run.orch_inbox.iter().any(|l| l.starts_with("Gate fix r1 by t1 finished: SUMMARY: returns the right value now")), "{:?}", run.orch_inbox);
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    let g2 = run.gate_agent.expect("round 2 has a fresh QA agent");
+    let (_, p2) = ctx.prompts.iter().rev().find(|(a, _)| *a == g2).unwrap();
+    assert!(p2.contains("t1 (its own worker, round 1)") && p2.contains("returns the right value now"), "{p2}");
+}
+
+/// WP-5.5: what the canvas draws follows the fix: the owner while it repairs, the way back while
+/// the checks re-run, nothing once the next QA round or the hand-off is reached.
+#[test]
+fn the_fix_view_follows_an_owner_fix_from_the_verdict_to_the_next_round() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    assert_eq!(run.fix_view(), None);
+    assert_eq!(run.gate_rounds(), (1, run.pattern.settings.gate_max_rounds));
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: Some("t1".into()), agent: Some(a1), returning: false }));
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec!["t1".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Checks { round: 1 }, .. }), "{:?}", run.stage);
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: Some("t1".into()), agent: Some(a1), returning: true }));
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(green(), vec![], git::ReviewDiff::default(), None));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
+    assert_eq!(run.fix_view(), None, "the next QA round draws no fix");
+    assert_eq!(run.gate_rounds().0, 2);
+}
+
+#[test]
+fn the_fix_view_of_a_generic_fix_worker_names_its_agent() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let v = run.fix_view().expect("a fix");
+    assert_eq!((v.round, v.owner.clone(), v.returning), (1, None, false));
+    let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+    run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+    let agent = run.workers.iter().find(|w| w.task.id == "fix-1").and_then(|w| w.agent).unwrap();
+    assert_eq!(run.fix_view().and_then(|v| v.agent), Some(agent));
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert_eq!(run.fix_view(), Some(FixView { round: 1, owner: None, agent: Some(agent), returning: true }));
+}
+
+#[test]
+fn an_owner_that_is_blocked_hands_the_round_to_a_fix_worker_with_its_report() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: blocked\nSUMMARY: the spec contradicts itself".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    assert!(!run.halted(), "no halt");
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Done, "its original work is still merged");
+    assert!(run.workers[i].owner_fix_failed);
+    assert_eq!(run.fix_owner, None);
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes it");
+    assert!(fix.prompt.contains("src/a.rs:3 returns the wrong value") && fix.prompt.contains("The task's own worker tried first and reported:") && fix.prompt.contains("the spec contradicts itself"), "{}", fix.prompt);
+    assert!(run.journal_text(60).contains("t1 could not repair it (blocked) — a fix worker takes it"));
+    assert!(run.orch_inbox.iter().any(|l| l.starts_with("Gate fix r1 by t1 could not be completed")), "{:?}", run.orch_inbox);
+    assert!(!run.orch_inbox.iter().any(|l| l.contains("FAILED (blocked)")));
+}
+
+#[test]
+fn an_owner_whose_turn_fails_hands_the_round_to_a_fix_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    run.on_turn_done(&mut ctx, a1, "failed", Some("model said no".into()), None);
+    assert!(!run.halted());
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"));
+    assert_eq!(run.workers[t(&run, "t1")].state, WState::Done);
+}
+
+#[test]
+fn an_owner_that_cannot_sync_hands_the_round_to_a_fix_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Err("the task's worktree does not merge with the integrated copy: CONFLICT".into())));
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1));
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"), "a fix worker takes it");
+    assert_eq!(run.fix_owner, None);
+    assert!(run.journal_text(60).contains("t1's worker cannot take the fix (the task's worktree does not merge with the integrated copy: CONFLICT) — a fix worker takes it"), "{}", run.journal_text(60));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }));
+}
+
+#[test]
+fn an_owner_whose_repair_no_longer_merges_goes_to_a_fix_worker_that_merges_by_hand() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec!["mantra-w/t1".into()], blocked: vec![], log: String::new() }));
+    let fix = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker merges it");
+    assert!(fix.prompt.contains("The task's own worker repaired its files, but its branch no longer merges") && fix.prompt.contains("mantra-w/t1"), "{}", fix.prompt);
+    assert_eq!(fix.task.role, "worker-big");
+}
+
+#[test]
+fn a_blocked_integration_after_an_owner_repair_halts() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec![], blocked: vec!["t1: commit failed".into()], log: String::new() }));
+    assert!(run.halted());
+    assert!(run.halt.as_ref().unwrap().message.contains("integration blocked"));
+}
+
+#[test]
+fn with_gate_fix_set_to_fix_worker_the_round_goes_to_a_fix_worker_as_before() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    run.pattern.settings.gate_fix = "fix-worker".into();
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert!(run.workers.iter().any(|w| w.task.id == "fix-1"));
+    assert!(!ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")), "{:?}", ctx.jobs);
+    assert_eq!(run.fix_owner, None);
+    assert!(!ctx.prompts.iter().any(|(a, _)| *a == a1));
+    assert!(run.orch_inbox.iter().any(|l| l.contains("the fix goes to fix-1")), "{:?}", run.orch_inbox);
+}
+
+#[test]
+fn a_plan_revision_during_an_owner_fix_interrupts_the_owner_and_reruns_the_checks() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    let planner = ctx.add_idle();
+    run.planner = Some(planner);
+    let _ = gate;
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    let i = t(&run, "t1");
+    assert_eq!(run.workers[i].state, WState::Running);
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_revise_plan", &revised_checks(&run, &["new-check --flag"]));
+    assert!(ok, "{msg}");
+    assert!(ctx.interrupted.contains(&a1), "the owner is interrupted");
+    assert_eq!(run.workers[i].state, WState::Done);
+    assert_eq!(run.workers[i].owner_fixing, None);
+    assert_eq!(run.fix_owner, None);
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("Checks")), "{:?}", ctx.jobs);
+    // the interrupted turn ending is nobody's news
+    run.on_turn_done(&mut ctx, a1, "interrupted", None, None);
+    assert!(!run.orch_inbox.iter().any(|l| l.contains("interrupted")));
+}
+
+#[test]
+fn a_halt_lifted_in_an_owner_fix_picks_up_where_it_is() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    // still working: nothing new starts
+    ctx.jobs.clear();
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.is_empty() && !run.workers.iter().any(|w| w.task.id == "fix-1"));
+    // an owner that is not repairing any more and never finished: the fix starts over
+    let i = t(&run, "t1");
+    run.workers[i].state = WState::Done;
+    run.workers[i].owner_fixing = None;
+    ctx.agents.get_mut(&a1).unwrap().turn_active = false;
+    run.fix_owner = Some("t1".into());
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "it was done: the checks run {:?}", ctx.jobs);
+}
+
+/// A pause and resume while the owner's worktree sync or branch merge runs must not conclude the
+/// fix: the job's result continues the flow.
+#[test]
+fn a_halt_lifted_during_the_owner_sync_or_merge_waits_for_the_job() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerSync")));
+    ctx.jobs.clear();
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.is_empty() && run.fix_owner.as_deref() == Some("t1"), "{:?}", ctx.jobs);
+    assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"));
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    ctx.agents.get_mut(&a1).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, a1, "completed", None, None);
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("OwnerMerge")), "{:?}", ctx.jobs);
+    ctx.jobs.clear();
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.is_empty(), "no checks before the merge is back: {:?}", ctx.jobs);
+    run.on_job(&mut ctx, JobTag::OwnerMerge { phase: 0, round: 1 }, JobOut::Merge(git::MergeResult { merged: vec!["t1".into()], conflicts: vec![], blocked: vec![], log: String::new() }));
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "{:?}", ctx.jobs);
+}
+
+/// An owner waiting out a retry of its repair turn is still the owner: no generic fix next to it.
+#[test]
+fn a_halt_lifted_while_the_owner_retries_starts_no_fix_worker() {
+    let mut ctx = TestCtx::new();
+    let (mut run, gate, _a1, _a2) = owner_run(&mut ctx);
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — src/a.rs:3 returns the wrong value");
+    run.on_job(&mut ctx, JobTag::OwnerSync { phase: 0, round: 1, task: "t1".into() }, JobOut::Text(Ok(String::new())));
+    let i = t(&run, "t1");
+    run.workers[i].state = WState::Retrying(Instant::now());
+    ctx.jobs.clear();
+    run.resume_fix(&mut ctx, 0, 1);
+    assert!(ctx.jobs.is_empty() && !run.workers.iter().any(|w| w.task.id == "fix-1"));
+    assert_eq!(run.fix_owner.as_deref(), Some("t1"));
+}
+
+#[test]
+fn a_generic_fix_also_tells_the_orchestrator_how_it_ended() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let gate = ctx.add_idle();
+    run.gate_agent = Some(gate);
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    gate_says(&mut ctx, &mut run, gate, "GATE: fail — README needs a usage section");
+    finish_fix(&mut ctx, &mut run, 1);
+    assert!(run.orch_inbox.iter().any(|l| l == "Gate fix r1 by fix-1 finished: SUMMARY: fixed what was listed. Mantra re-runs the checks and QA."), "{:?}", run.orch_inbox);
+}
+
+#[test]
+fn gate_fix_is_a_setting_that_old_pattern_files_default() {
+    let p = Pattern::builtin();
+    assert_eq!(p.settings.gate_fix, "owner");
+    let toml = p.to_toml();
+    let old = toml.replace("gate_fix = \"owner\"\n", "");
+    assert!(!old.contains("gate_fix"), "the fixture must be missing the key");
+    assert_eq!(Pattern::from_toml(&old).unwrap().settings.gate_fix, "owner");
+    let mut bad = Pattern::builtin();
+    bad.settings.gate_fix = "somebody".into();
+    assert!(bad.validate().unwrap_err().iter().any(|e| e.contains("gate_fix")));
+    bad.settings.gate_fix = "fix-worker".into();
+    assert!(bad.validate().is_ok());
+}
+
+fn two_task_plan(scope_b: &str) -> serde_json::Value {
+    json!({"plan": {"title": "Patchable", "summary": "S", "phases": [{"name": "A", "tasks": [
+        {"id": "a", "title": "x", "role": "worker-small", "prompt": "do the first thing well", "scope": ["src/a/**"]},
+        {"id": "b", "title": "y", "role": "worker-small", "prompt": "do the second thing well", "scope": [scope_b]}], "gate": {"checks": ["true"]}}]}})
+}
+
+/// WP-8.1: a rejected plan is kept as a draft and a patch fixes it without re-sending it.
+#[test]
+fn a_rejected_plan_is_patched_not_resent() {
+    let (mut run, mut ctx, p) = planner_feature_run("patch-draft", Pattern::builtin());
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_submit_plan", &two_task_plan("src/a/**"));
+    assert!(!ok && msg.contains("kept as a draft") && msg.contains("mantra_patch_plan"), "{msg}");
+    assert!(run.plan.is_none() && run.plan_draft.is_some());
+    // a patch that is itself invalid keeps the patched draft; the next one fixes the rest
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "set_task", "task": "b", "value": {"prompt": "x"}}], "reason": "shorter"}));
+    assert!(!ok && msg.contains("prompt is missing or too short") && msg.contains("both claim"), "{msg}");
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "set_task", "task": "b", "value": {"scope": ["src/b/**"], "prompt": "do the second thing well"}}], "reason": "disjoint"}));
+    assert!(ok && msg.starts_with("ACCEPTED"), "{msg}");
+    assert!(run.plan_draft.is_none());
+    assert_eq!(run.plan_version, 1);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    assert_eq!(run.stage, Stage::Review);
+    // no reason, bad op: nothing changes
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "remove_task", "task": "zz"}], "reason": "r"}));
+    assert!(!ok && msg.contains("op 1 (remove_task): no task 'zz'") && msg.contains("Nothing was changed"), "{msg}");
+    assert!(!run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [], "reason": " "})).1);
+}
+
+/// A draft left by a rejected revise belongs to the plan version and phase it was made in.
+#[test]
+fn a_stale_plan_draft_is_dropped_when_the_run_has_moved_on() {
+    let (mut run, mut ctx, p) = planner_feature_run("stale-draft", Pattern::builtin());
+    let two_phases = |c_prompt: &str| json!({"plan": {"title": "Two", "summary": "S", "phases": [
+        {"name": "A", "tasks": [{"id": "a", "title": "x", "role": "worker-small", "prompt": "do the first thing well", "scope": ["src/a/**"]}], "gate": {"checks": ["true"]}},
+        {"name": "B", "tasks": [{"id": "c", "title": "z", "role": "worker-small", "prompt": c_prompt, "scope": ["src/c/**"]}], "gate": {"checks": ["true"]}}]}});
+    assert!(run.handle_tool(&mut ctx, p, "mantra_submit_plan", &two_phases("do the third thing well")).1);
+    run.on_turn_done(&mut ctx, p, "completed", None, None);
+    run.pattern.settings.allow_pattern_changes = true;
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    // a revise in phase 1 is rejected (a prompt that is too short) and kept as a draft
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_revise_plan", &two_phases("x"));
+    assert!(!ok && msg.contains("kept as a draft"), "{msg}");
+    assert!(run.plan_draft.is_some());
+    // the run moves on to phase 2: a patch applies to the live plan, not to the stale draft
+    run.stage = Stage::Phase { idx: 1, step: PhaseStep::Orchestrating };
+    let (msg, ok) = run.handle_tool(&mut ctx, p, "mantra_patch_plan", &json!({"ops": [{"op": "set_task", "task": "c", "value": {"title": "patched"}}], "reason": "rename"}));
+    assert!(ok, "{msg}");
+    assert!(run.plan_draft.is_none());
+    let c = &run.plan.as_ref().unwrap().phases[1].tasks[0];
+    assert_eq!(c.title, "patched");
+    assert_eq!(c.prompt, "do the third thing well", "the draft's edit is not in the live plan");
+}
+
+/// WP-8.1: at the gate, a patched check resumes the run with the checks re-run.
+#[test]
+fn a_patched_gate_check_resumes_a_halted_gate() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    run.plan.as_mut().unwrap().phases[0].gate.checks = vec!["one".into(), "two".into(), "bad-check".into()];
+    run.plan_version = 1;
+    halt_by_hand(&mut run);
+    ctx.jobs.clear();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "set_check", "phase": "p1", "index": 3, "value": "true"}], "reason": "the check cannot pass here"}));
+    assert!(ok, "{msg}");
+    assert!(!run.halted());
+    assert_eq!(run.plan_version, 2);
+    assert_eq!(run.plan.as_ref().unwrap().phases[0].gate.checks, vec!["one", "two", "true"]);
+    assert_eq!(ctx.jobs.len(), 1, "{:?}", ctx.jobs);
+    assert!(ctx.jobs[0].starts_with("Checks"), "{:?}", ctx.jobs);
+    assert!(run.journal_text(10).contains("plan patched: 1 operation(s)"), "{}", run.journal_text(10));
+}
+
+/// WP-8.1: a patch may not touch a finished phase.
+#[test]
+fn a_patch_cannot_change_a_finished_phase() {
+    let mut ctx = TestCtx::new();
+    let (mut run, planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    give_prompts(&mut run);
+    let mut second = run.plan.as_ref().unwrap().phases[0].clone();
+    second.id = "p2".into();
+    second.tasks[0].id = "t2".into();
+    run.plan.as_mut().unwrap().phases.push(second);
+    run.plan.as_mut().unwrap().normalize();
+    run.stage = Stage::Phase { idx: 1, step: PhaseStep::Gate { round: 1 } };
+    run.plan_version = 1;
+    let before = run.plan.clone();
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "add_check", "phase": "p1", "value": "echo hi"}], "reason": "r"}));
+    assert!(!ok && msg.contains("phase 'p1' is already finished"), "{msg}");
+    assert_eq!(run.plan, before);
+    assert_eq!(run.plan_version, 1);
+    let (msg, ok) = run.handle_tool(&mut ctx, planner, "mantra_patch_plan", &json!({"ops": [{"op": "add_check", "phase": "p2", "value": "echo hi"}], "reason": "r"}));
+    assert!(ok, "{msg}");
+}
+
+fn big_plan(run: &mut Run) {
+    let mut plan = Plan { title: "Big".into(), summary: "a big plan".into(), orchestrator_brief: "b".repeat(100), ..Default::default() };
+    for n in 1..=3 {
+        plan.phases.push(Phase { id: format!("p{n}"), name: format!("Phase {n}"), tasks: vec![Task { id: format!("t{n}"), role: "worker-small".into(), prompt: "x".repeat(12_000), ..Default::default() }], ..Default::default() });
+    }
+    run.plan = Some(plan);
+    run.plan_version = 4;
+    run.stage = Stage::Phase { idx: 1, step: PhaseStep::Checks { round: 0 } };
+}
+
+/// WP-8.2: a large plan is read as an outline, one phase at a time.
+#[test]
+fn read_plan_outlines_a_large_plan_and_returns_one_phase_on_request() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let planner = ctx.add_idle();
+    run.planner = Some(planner);
+    big_plan(&mut run);
+    let (out, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+    assert!(ok && out.contains("Phases:") && out.len() < 6_000, "{}", out.len());
+    assert!(out.contains("Plan v4: Big") && out.contains("p1 · Phase 1 — done") && out.contains("p2 · Phase 2 — CURRENT") && out.contains("p3 · Phase 3 — pending") && out.contains("mantra_read_plan(phase="), "{out}");
+    for arg in ["p2", "2"] {
+        let (ph, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"phase": arg}));
+        assert!(ok && ph.contains("\"id\": \"p2\"") && ph.contains("\"t2\"") && !ph.contains("\"t1\""), "{arg}");
+    }
+    let (err, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"phase": "zz"}));
+    assert!(!ok && err.contains("p1, p2, p3"), "{err}");
+    let (all, ok) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({"full": true}));
+    assert!(ok && all.len() > 36_000 && all.contains("\"t3\""));
+    // a small plan comes back whole
+    run.plan = Some(one_task_phase());
+    let (small, _) = run.handle_tool(&mut ctx, planner, "mantra_read_plan", &json!({}));
+    assert!(small.contains("\"t1\"") && !small.contains("Phases:"), "{small}");
+}
+
+/// WP-7.2: a line that quotes someone's words keeps them whole in journal.jsonl, and only there.
+#[test]
+fn log_full_keeps_the_whole_text_in_the_journal_file() {
+    let (mut run, mut ctx, p) = planner_feature_run("log-full", Pattern::builtin());
+    let long = "the question ".repeat(30);
+    run.log_full("?", "amber", "short form…", &long);
+    run.log("?", "amber", "plain line");
+    run.log_full("?", "amber", "same", "same");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(run.dir.join("journal.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let q = lines.iter().find(|l| l["text"] == "short form…").unwrap();
+    assert_eq!(q["full"], long.as_str());
+    assert!(lines.iter().find(|l| l["text"] == "plain line").unwrap().get("full").is_none());
+    assert!(lines.iter().find(|l| l["text"] == "same").unwrap().get("full").is_none(), "no copy of an unshortened text");
+    let journal = run.journal_text(10);
+    assert!(journal.contains("short form…") && !journal.contains("the question the question"), "{journal}");
+    // a real call site: the user's feedback on the plan
+    let text = "an answer that is a good deal longer than sixty characters, so that it is cut in the feed";
+    run.stage = Stage::Review;
+    let _ = p;
+    run.user_input(&mut ctx, text, Send::Queue);
+    let last = std::fs::read_to_string(run.dir.join("journal.jsonl")).unwrap();
+    assert!(last.lines().any(|l| l.contains(&format!("\"full\":\"plan feedback: {text}\""))), "{last}");
+}
+
+/// WP-7.2: the user's pause, resume and plan approval say so in the journal.
+#[test]
+fn pause_resume_and_approval_name_the_user() {
+    let (mut run, mut ctx, _p) = planner_feature_run("by-you", Pattern::builtin());
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.toggle_pause(&mut ctx);
+    assert!(run.journal_text(5).contains("run paused (by you)"));
+    run.toggle_pause(&mut ctx);
+    assert!(run.journal_text(5).contains("run resumed (by you)"), "{}", run.journal_text(5));
+    run.stage = Stage::Review;
+    run.approve_plan(&mut ctx);
+    assert!(run.journal_text(5).contains("plan approved (by you)"));
+}
+
+/// WP-5.6: the task counters and `mantra_status` count each task once, by its newest attempt.
+#[test]
+fn phase_progress_and_status_text_count_a_twice_attempted_task_once() {
+    let (mut run, mut ctx, _p) = planner_feature_run("progress", Pattern::builtin());
+    run.plan = Some(one_task_phase());
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    let id = run.plan.as_ref().unwrap().phases[0].tasks[0].id.clone();
+    let mut w1 = crate::web::snapshot::tests::worker(&id, 1, None, WState::Cancelled);
+    let mut w2 = crate::web::snapshot::tests::worker(&id, 2, None, WState::Running);
+    w1.task.title = "t".into();
+    w2.task.title = "t".into();
+    run.workers.push(w1);
+    run.workers.push(w2);
+    assert_eq!(run.phase_progress(), (0, 1));
+    assert_eq!(run.phase_running(), 1);
+    let text = run.status_text(&ctx);
+    assert_eq!(text.matches(&format!("- {id} ")).count(), 1, "{text}");
+    assert!(text.contains("(attempt 2)") && text.contains("running, activity:"), "{text}");
+    assert!(!text.contains("steps -"), "{text}");
+    run.workers[1].state = WState::Done;
+    assert_eq!(run.phase_progress(), (1, 1));
+    let text = run.status_text(&ctx);
+    assert!(text.contains("done, tokens") && !text.contains("activity:"), "{text}");
+    let _ = &mut ctx;
+}
+
+/// WP-5.6: the halt hints and `halt_touched`.
+#[test]
+fn halt_touched_is_set_by_a_model_change_while_halted_and_cleared_by_resume() {
+    let (mut run, mut ctx, planner) = planner_feature_run("touched", Pattern::builtin());
+    run.set_role_model("planner", "sol", None).ok();
+    assert!(!run.halt_touched, "nothing halted yet");
+    run.halt(&mut ctx, HaltReason::User, None, "stopped".into());
+    assert_eq!(run.halt_hint(), "space resumes");
+    run.set_role_model("planner", "sol", None).ok();
+    assert!(run.halt_touched);
+    run.resume(&mut ctx);
+    assert!(!run.halt_touched);
+    let _ = planner;
 }

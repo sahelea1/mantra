@@ -20,6 +20,8 @@
 //!
 //! Knobs: `MANTRA_MOCK_SPEED` scales every delay like `mock.rs`; `MANTRA_MOCK_FLAKY=<n>` answers
 //! every n-th request with a 503 (`retry-after: 1`), to watch bija's retries in the demo.
+//! `MANTRA_MOCK_GATE_FAIL=1` fails the first QA round of phase 1 with a finding in one task's file (its
+//! own worker repairs it); `MANTRA_MOCK_GATE_FAIL=fix-worker` names no file (a fix worker does).
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
@@ -408,6 +410,12 @@ fn worker(turn: &Turn) -> Reply {
         return Reply::say(format!("Noted — nothing in {dir}/ depends on it.\n\nSTATUS: done\nSUMMARY: {title} — unchanged by the note."));
     }
     let file = format!("{dir}/{}.rs", id.replace('-', "_"));
+    // A gate fix (`MANTRA_MOCK_GATE_FAIL`): the repair is a real change to the task's file.
+    if turn.prompt.contains("[mantra:fix]") {
+        let fixed = format!("//! {title}\n\npub struct {camel};\n\nimpl {camel} {{\n    pub fn new() -> Self {{ {camel} }}\n    pub fn run(&self) -> Result<(), String> {{ Ok(()) }}\n    pub fn validate(title: &str) -> Result<(), String> {{\n        if title.trim().is_empty() {{ Err(\"empty title\".into()) }} else {{ Ok(()) }}\n    }}\n}}\n");
+        let write = Reply::call("write_file", json!({"path": file, "content": fixed})).thinking("**The gate's finding**\n\nAn empty title must be rejected.").after(1500);
+        return sequence(turn, vec![write], Reply::say(format!("Repaired what QA found in `{file}`.\n\nSTATUS: done\nSUMMARY: an empty title is now rejected.")));
+    }
     let content = format!("//! {title}\n\npub struct {camel};\n\nimpl {camel} {{\n    pub fn new() -> Self {{ {camel} }}\n    pub fn run(&self) -> Result<(), String> {{ Ok(()) }}\n}}\n");
     // Each task takes its own time, so a phase's workers report one by one, as they would.
     let h: u64 = id.bytes().map(u64::from).sum();
@@ -458,6 +466,16 @@ fn what_i_saw(turn: &Turn) -> String {
 }
 
 fn gate(turn: &Turn) -> Reply {
+    // `MANTRA_MOCK_GATE_FAIL=1`: the first QA round of phase 1 fails with one finding in the
+    // models task's file, so the fix goes back to that task's own worker and round 2 passes.
+    // `MANTRA_MOCK_GATE_FAIL=fix-worker` names no file: a fix worker takes the round.
+    if let Ok(mode) = std::env::var("MANTRA_MOCK_GATE_FAIL") {
+        if turn.prompt.contains("[mantra:gate] Phase 1:") && turn.prompt.contains("QA round 1/") {
+            let summary = if mode == "fix-worker" { "1. Nothing rejects an empty title when a model is built — add the validation." } else { "1. src/models/p1_models.rs: nothing rejects an empty title — add the validation." };
+            let report = Reply::call("mantra_gate_report", json!({"pass": false, "summary": summary})).thinking("**Reviewing the merged result**\n\nOne finding: an empty title is accepted.").after(600);
+            return sequence(turn, vec![report], Reply::say("GATE: fail — one finding."));
+        }
+    }
     let report = Reply::call("mantra_gate_report", json!({"pass": true, "summary": "Coherent, checks green."})).thinking("**Reviewing the merged result**\n\nThe parallel changes fit together: names, interfaces, no duplicated logic.").after(600);
     sequence(turn, vec![report], Reply::say("GATE: pass — everything is coherent and the checks are green."))
 }

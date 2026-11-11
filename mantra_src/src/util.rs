@@ -49,6 +49,11 @@ pub(crate) fn tz_offset_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// `exit 0` / `exit ?` for a command's exit code, never the `Some(0)` of a debug print.
+pub fn exit_label<T: std::fmt::Display>(code: Option<T>) -> String {
+    code.map(|c| format!("exit {c}")).unwrap_or_else(|| "exit ?".into())
+}
+
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
@@ -106,6 +111,32 @@ pub fn trunc(s: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Truncate to a display width keeping the END, adding an ellipsis in front: a model id's
+/// distinguishing part is its tail (`…opus-5-5`).
+pub fn trunc_start(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return String::new();
+    }
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
+        return s.to_string();
+    }
+    let mut kept: Vec<char> = vec![];
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw + 1 > width {
+            break;
+        }
+        kept.push(c);
+        w += cw;
+    }
+    kept.push('…');
+    kept.reverse();
+    kept.into_iter().collect()
 }
 
 pub fn width(s: &str) -> usize {
@@ -178,6 +209,45 @@ pub fn in_scope(scope: &[String], rel_path: &str) -> bool {
         let dir = g.trim_end_matches('/');
         !dir.contains('*') && (rel_path == dir || rel_path.starts_with(&format!("{}/", dir)))
     })
+}
+
+/// Is `path` (as an agent reported it, relative to `cwd` or absolute) inside one of `scope`'s
+/// globs, when both are read against `cwd`? Also true when the glob matches the path's tail
+/// starting at any directory boundary below `cwd` that is a git repository root or the first
+/// path component (a scope written relative to a nested repository).
+pub fn in_scope_from(scope: &[String], path: &str, cwd: &Path) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    let p = Path::new(path);
+    let rel = if p.is_absolute() {
+        match p.strip_prefix(cwd) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => {
+                // Outside cwd: only a scope glob written as an absolute / `~` path can cover it.
+                let home = dirs::home_dir();
+                let abs: Vec<String> = scope.iter().map(|g| expand_tilde(g.trim(), home.as_deref())).filter(|g| g.is_absolute()).map(|g| g.to_string_lossy().into_owned()).collect();
+                return !abs.is_empty() && in_scope(&abs, path);
+            }
+        }
+    } else {
+        path.trim_start_matches("./").to_string()
+    };
+    if in_scope(scope, &rel) {
+        return true;
+    }
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    let mut prefix = PathBuf::new();
+    for (i, c) in comps.iter().take(3).enumerate() {
+        if i + 1 >= comps.len() {
+            break; // the last component is the file itself, not a directory
+        }
+        prefix.push(c);
+        if cwd.join(&prefix).join(".git").exists() && in_scope(scope, &comps[i + 1..].join("/")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Count added/removed lines in a unified diff.
@@ -879,6 +949,21 @@ pub(crate) mod tests {
         assert!(in_scope(&[], "anything"));
     }
     #[test]
+    fn scope_from_reads_both_sides_against_cwd() {
+        let cwd = std::env::temp_dir().join(format!("mantra-scope-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(cwd.join("repo/tools")).unwrap();
+        let scope = vec!["tools/x.sh".to_string()];
+        assert!(!in_scope_from(&scope, "repo/tools/x.sh", &cwd), "no repository below cwd: the path is simply elsewhere");
+        std::fs::create_dir_all(cwd.join("repo/.git")).unwrap();
+        assert!(in_scope_from(&scope, "repo/tools/x.sh", &cwd));
+        assert!(in_scope_from(&scope, &cwd.join("repo/tools/x.sh").to_string_lossy(), &cwd), "absolute under cwd");
+        assert!(!in_scope_from(&scope, "repo/tools/y.sh", &cwd));
+        assert!(!in_scope_from(&scope, "/elsewhere/tools/x.sh", &cwd), "outside cwd is out of scope");
+        assert!(in_scope_from(&["/elsewhere/**".to_string()], "/elsewhere/tools/x.sh", &cwd), "unless an absolute glob covers it");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+    #[test]
     fn stats() {
         assert_eq!(diff_stats("--- a\n+++ b\n+x\n-y\n+z\n"), (2, 1));
     }
@@ -904,6 +989,14 @@ pub(crate) mod tests {
         assert_eq!(exe_from_argv0("", &path_var, &dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn trunc_start_keeps_the_end_of_a_model_id() {
+        let t = trunc_start("anthropic-creds/claude-opus-5-5", 14);
+        assert!(t.starts_with('…') && t.ends_with("opus-5-5") && width(&t) <= 14, "{t}");
+        assert_eq!(trunc_start("short", 14), "short");
+        assert_eq!(trunc_start("abc", 0), "");
+    }
+
     #[test]
     fn truncation() {
         assert_eq!(trunc("hello world", 6), "hello…");

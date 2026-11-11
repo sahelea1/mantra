@@ -112,7 +112,15 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
         tool("mantra_revise_pattern", "Propose a complete replacement workflow as TOML, with the reason and impact. Use rarely when the current workflow is broken or inappropriate, or to create Auto's first workflow. Mantra asks the user to approve unless they explicitly enabled approve-all. You cannot approve your own proposal.", json!({"toml": {"type": "string"}, "reason": {"type": "string"}}), &["toml", "reason"]),
         tool("mantra_wait_for_external_condition", "Schedule a bounded, nonblocking re-entry, then end your turn. Mantra wakes you once after seconds; inspect the condition then and act on the result. Use for CI, deployment, or another external dependency instead of shell sleep/poll loops. This does not evaluate the condition automatically.", json!({"seconds": {"type": "integer", "minimum": 1, "maximum": 86400}, "condition": {"type": "string"}, "on_reentry": {"type": "string"}}), &["seconds", "condition", "on_reentry"]),
         read_phase_tool(),
-        tool("mantra_read_plan", "Read the full plan (every phase), as last submitted — mantra_read_phase only shows the current one. Use before revising a phase you haven't seen in this thread.", json!({}), &[]),
+        tool(
+            "mantra_read_plan",
+            "Read the plan as last accepted. A large plan comes back as an outline; pass phase=\"<id>\" for one phase in full.",
+            json!({
+                "phase": {"type": "string", "description": "phase id or 1-based number: return only that phase, in full"},
+                "full": {"type": "boolean", "description": "return the whole plan even when it is large"}
+            }),
+            &[],
+        ),
         tool("mantra_submit_plan", "Submit the phased plan. Mantra validates it; on errors fix them and submit again.", super::plan::plan_schema(worker_roles)["properties"].clone(), &["plan"]),
         tool(
             "mantra_revise_plan",
@@ -123,6 +131,21 @@ pub fn planner_tools(worker_roles: &[String]) -> Vec<Value> {
                 p
             },
             &["plan"],
+        ),
+        tool(
+            "mantra_patch_plan",
+            "Change parts of the plan without sending it again. Give a list of operations; Mantra applies them to the current plan (or to the plan it just rejected), validates the result exactly like mantra_revise_plan and, if it is valid, makes it live. Use this for every small change — one gate check, one task prompt, one added task. Use mantra_revise_plan only when most of the plan changes.",
+            json!({
+                "ops": {"type": "array", "items": {"type": "object", "properties": {
+                    "op": {"type": "string", "enum": ["set_task", "add_task", "remove_task", "set_gate", "set_check", "add_check", "remove_check", "set_phase", "set_plan"]},
+                    "phase": {"type": "string", "description": "phase id (as in the plan), or its 1-based number"},
+                    "task": {"type": "string", "description": "task id"},
+                    "index": {"type": "integer", "description": "1-based position of a gate check"},
+                    "value": {"description": "see the operation"}
+                }, "required": ["op"]}},
+                "reason": {"type": "string"}
+            }),
+            &["ops", "reason"],
         ),
         tool("mantra_pause_agents", "Pause (interrupt) agents so they stop working until resumed.", json!({"agents": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"}}), &["agents"]),
         tool("mantra_resume_agents", "Resume paused agents.", json!({"agents": {"type": "array", "items": {"type": "string"}}}), &["agents"]),
@@ -176,11 +199,13 @@ fn read_phase_tool() -> Value {
 fn gate_report_tool() -> Value {
     tool(
         "mantra_gate_report",
-        "Report the gate verdict. pass=true only when the criteria are met and checks are green. On fail, `summary` lists every finding as file, what is wrong, what to change.",
+        "Report the gate verdict. pass=true only when the criteria are met and checks are green. On fail, `summary` lists every finding as file, what is wrong, what to change — or, when the only problem is a wrong check, set plan_defect=true.",
         json!({
             "pass": {"type": "boolean"},
             "summary": {"type": "string"},
-            "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"}
+            "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"},
+            "fix_by": {"type": "string", "description": "fail only, optional: the task id whose worker should repair this (when every finding is in that task's work), or \"fix-worker\" for a fresh fix worker. Leave out to let Mantra decide from the files you name."},
+            "plan_defect": {"type": "boolean", "description": "fail only: nothing is wrong with the work — a gate check itself is wrong, or cannot pass in this phase or on this machine. No fix worker is sent; the planner is asked to amend the check. Name the check and say why in the summary."}
         }),
         &["pass", "summary"],
     )
@@ -422,7 +447,8 @@ mantra-role: planner
 - Carry project and per-ticket rules from the brief into task prompts, including recipient language, status format, decision logs and configured commit trailers; do not copy credentials.
 - For CI, identify the target ref and commit SHA. A superseded pipeline cancelled by GitLab auto-cancel is not a failed build or a passing gate: follow the newest required pipeline for that same target, inspect required jobs, and record its SHA/status. Runner queue time alone is not a failure; schedule re-entry while queued or running.
 - Submit your plan by calling `mantra_submit_plan`. Never just write the plan as text or into a file.
-- Mantra validates the plan and returns errors; fix them and resubmit.
+- Mantra validates the plan and returns errors. Fix them with `mantra_patch_plan` — send only the operations that change something; the rejected plan is kept as a draft, so never send the whole plan a second time.
+- Later changes (a gate check, a task prompt, an added task) also go through `mantra_patch_plan`. `mantra_revise_plan` re-sends everything and is only for a plan that changes in most places.
 - When re-prompted by the user during a run ([mantra:reprompt]): read state with `mantra_status`/`mantra_log`,
   pause agents that would waste work (`mantra_pause_agents`), revise the plan (`mantra_revise_plan`) if needed,
   and tell the orchestrator what changed (`mantra_brief_orchestrator`). Then summarize what you did in 2-4 lines.
@@ -434,7 +460,7 @@ mantra-role: planner
   resumes by itself), `mantra_resume_run` (the plan is right; a note for the stuck agent), `mantra_ask_user`.
 - Plan hygiene: keep the tooling later gates need (virtualenvs, node_modules, build caches) until the last
   phase — cleanup tasks belong in the final phase, never in one whose gate still needs them. Gate `checks`
-  must run as-is on this machine; prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping.
+  run with `bash -c` from the workspace root, exactly as written (several lines and heredocs are fine) and are re-run every gate round, so they must be repeatable. Prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping. Every check must be able to pass at the end of its own phase: never check for something a later phase produces. Checks state facts about the work, not about the current workflow or model names. A zero-hit audit needs an allow-list for real external identifiers; never ask workers to paraphrase real names to satisfy a check. Evidence a check points at must be newer than the last change to what it proves.
 - In the final verification step you may spawn ad-hoc workers (`mantra_spawn_adhoc`), then `mantra_wait`,
   and finish with `mantra_gate_report`.
 - Keep the plan proportional to the goal: a small goal is 1-2 phases, submitted in your first turn. An
@@ -461,6 +487,7 @@ mantra-role: orchestrator
 - A sandbox/environment error reported by a worker is never transient: never answer retry, never respawn
   for it (Mantra halts on it); if it reaches you anyway, pass it up with mantra_ask at once, quoting the
   error. Keep answers to workers short and decisive.
+- Gate fixes are Mantra's: after a failed QA round the fix goes to the task's own worker or to a fix worker, and you are told who and what came of it. Do not spawn or retry tasks for it; answer the fixing agent's questions like any worker's.
 "#;
 
 pub const MANAGER_PROTOCOL: &str = r#"
@@ -513,9 +540,10 @@ mantra-role: gate
 - When done, call `mantra_gate_report` with pass=true/false and a summary. Then end your turn.
 - On fail the summary is the work order for a fix worker: every finding with file, what is wrong, what to change.
   Set big=true only if the fixes span several files or need design work.
-- Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails. A check that is wrong,
-  or cannot pass on this machine, is a plan problem: say so with `mantra_ask` (it goes up the chain; the planner
-  can amend the checks) and wait.
+- If every finding is in one task's work, you may name it with fix_by=<task id>: its own worker repairs it. Otherwise leave fix_by out.
+- Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails.
+- A check that is itself wrong, or cannot pass in this phase or on this machine, is a plan problem, not a failure of the work: report it with mantra_gate_report(pass=false, plan_defect=true) and name the check. Do not use mantra_ask for that and do not wait — the planner gets your report and amends the check.
+- Use mantra_ask only for a real question about the work. After asking, end your turn; you are woken with the answer and report then.
 "#;
 
 /// Appended to a member's instructions together with `akasha_tools`.

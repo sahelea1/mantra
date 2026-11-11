@@ -32,7 +32,13 @@ jobs:
       - name: Install browser test tools
         run: |
           npm install --prefix /tmp/mantra-browser-tools playwright@1.51.1
-          node /tmp/mantra-browser-tools/node_modules/playwright/cli.js install --with-deps chromium
+          pw=/tmp/mantra-browser-tools/node_modules/playwright/cli.js
+          # --with-deps adds system packages through apt; on this image those are fonts only.
+          # When the package mirror cannot be reached, the browser alone is enough for these flows.
+          if ! node "$pw" install --with-deps chromium; then
+            echo "::warning::system packages for the browser could not be installed; continuing with the browser alone"
+            node "$pw" install chromium
+          fi
       - name: Browser integration — desktop and phone
         env:
           MANTRA_BIN: ${{ github.workspace }}/mantra_src/target/debug/mantra

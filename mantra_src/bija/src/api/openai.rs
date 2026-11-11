@@ -179,6 +179,7 @@ fn message_json(m: &Message, plain: bool, no_text: &Value) -> Value {
 /// A tool call being assembled from deltas. `index` is the provider's, when it sent one.
 #[derive(Debug, Default)]
 struct PartialCall {
+    choice: u64,
     index: Option<u64>,
     id: String,
     name: String,
@@ -215,32 +216,38 @@ impl Stream {
         if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
             self.usage = Some(parse_usage(u));
         }
-        let first_choice = v.get("choices").and_then(Value::as_array).and_then(|cs| cs.iter().find(|c| c.get("index").and_then(Value::as_u64).unwrap_or(0) == 0));
-        let Some(choice) = first_choice else {
-            return Ok(false);
-        };
-        if let Some(delta) = choice.get("delta") {
-            if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                self.text.push_str(text);
-                on_delta(Delta::Text(text.to_string()));
+        for choice in v.get("choices").and_then(Value::as_array).into_iter().flatten() {
+            let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if let Some(delta) = choice.get("delta") {
+                // Text and reasoning come from choice 0 only; tool calls from whichever choice carries them.
+                if choice_index == 0 {
+                    if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                        self.text.push_str(text);
+                        on_delta(Delta::Text(text.to_string()));
+                    }
+                    if let Some(thought) = reasoning_of(delta) {
+                        self.reasoning.push_str(thought);
+                        on_delta(Delta::Reasoning(thought.to_string()));
+                    }
+                }
+                for call in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                    self.on_tool_delta(choice_index, call, on_delta);
+                }
             }
-            if let Some(thought) = reasoning_of(delta) {
-                self.reasoning.push_str(thought);
-                on_delta(Delta::Reasoning(thought.to_string()));
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                // first non-null wins, except that a tool-call reason beats an earlier "stop" of another choice
+                let calls = |r: &str| matches!(r, "tool_calls" | "function_call");
+                if self.finish.as_deref().map_or(true, |old| calls(reason) && !calls(old)) {
+                    self.finish = Some(reason.to_string());
+                }
             }
-            for call in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
-                self.on_tool_delta(call, on_delta);
-            }
-        }
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            self.finish = Some(reason.to_string());
         }
         Ok(false)
     }
 
-    fn on_tool_delta(&mut self, delta: &Value, on_delta: &mut dyn FnMut(Delta)) {
+    fn on_tool_delta(&mut self, choice: u64, delta: &Value, on_delta: &mut dyn FnMut(Delta)) {
         let id = str_at(delta, "id");
-        let at = self.slot_for(delta.get("index").and_then(Value::as_u64), id);
+        let at = self.slot_for(choice, delta.get("index").and_then(Value::as_u64), id);
         let call = &mut self.calls[at];
         if call.id.is_empty() {
             call.id = id.to_string();
@@ -269,14 +276,14 @@ impl Stream {
     }
 
     /// Which call a delta continues: by the provider's index, else by id, else the latest one.
-    fn slot_for(&mut self, index: Option<u64>, id: &str) -> usize {
+    fn slot_for(&mut self, choice: u64, index: Option<u64>, id: &str) -> usize {
         let found = match index {
-            Some(i) => self.calls.iter().position(|c| c.index == Some(i)),
+            Some(i) => self.calls.iter().position(|c| c.choice == choice && c.index == Some(i)),
             None if !id.is_empty() => self.calls.iter().position(|c| c.id == id),
             None => self.calls.len().checked_sub(1),
         };
         found.unwrap_or_else(|| {
-            self.calls.push(PartialCall { index, ..PartialCall::default() });
+            self.calls.push(PartialCall { choice, index, ..PartialCall::default() });
             self.calls.len() - 1
         })
     }
@@ -295,6 +302,7 @@ impl Stream {
                 ToolCall { id: c.id, name: c.name, args, raw }
             })
             .collect();
+        no_missing_calls(self.finish.as_deref(), tool_calls.len())?;
         let finish = finish_of(self.finish.as_deref(), !tool_calls.is_empty());
         Ok(Response { message: Message::Assistant { text: self.text, reasoning: self.reasoning, tool_calls }, usage: self.usage.unwrap_or_default(), finish })
     }
@@ -327,6 +335,7 @@ pub fn parse_response(body: &[u8]) -> Result<Response, ApiError> {
         })
         .collect();
     let usage = v.get("usage").filter(|u| u.is_object()).map(parse_usage).unwrap_or_default();
+    no_missing_calls(choice.get("finish_reason").and_then(Value::as_str), tool_calls.len())?;
     let finish = finish_of(choice.get("finish_reason").and_then(Value::as_str), !tool_calls.is_empty());
     Ok(Response { message: Message::Assistant { text, reasoning, tool_calls }, usage, finish })
 }
@@ -353,8 +362,17 @@ fn parse_usage(u: &Value) -> Usage {
     Usage { input, output, cached, estimated: false }
 }
 
+/// A provider that announced tool calls (`finish_reason`) but sent none: not an answer, so it is retried.
+fn no_missing_calls(reason: Option<&str>, parsed: usize) -> Result<(), ApiError> {
+    if parsed == 0 && matches!(reason, Some("tool_calls") | Some("function_call")) {
+        return Err(ApiError::new(ErrorKind::Transient, "the provider announced tool calls but none arrived in the response"));
+    }
+    Ok(())
+}
+
 fn finish_of(reason: Option<&str>, has_calls: bool) -> Finish {
     match reason {
+        Some("stop") if has_calls => Finish::ToolCalls,
         Some("stop") => Finish::Stop,
         Some("tool_calls") | Some("function_call") => Finish::ToolCalls,
         Some("length") => Finish::Length,
@@ -448,6 +466,52 @@ mod tests {
         let (_, _, calls) = assistant(&resp);
         let summary: Vec<(&str, &str, Value)> = calls.iter().map(|c| (c.id.as_str(), c.name.as_str(), c.args.clone())).collect();
         assert_eq!(summary, vec![("a", "read_file", json!({"path": "x"})), ("b", "glob", json!({"pattern": "*.rs"})), ("c", "list_dir", json!({}))]);
+    }
+
+    #[test]
+    fn a_tool_call_choice_wins_over_another_choices_stop() {
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"x","function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":1,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let mut s = Stream::default();
+        for e in events {
+            s.on_event(e, &mut |_| {}).expect("event");
+        }
+        let resp = s.finish(true).expect("finish");
+        assert_eq!(assistant(&resp).2.len(), 1);
+        assert_eq!(resp.finish, Finish::ToolCalls);
+        // without calls the first non-null reason stays
+        let mut s = Stream::default();
+        s.on_event(r#"{"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"},{"index":1,"delta":{"content":"b"},"finish_reason":"length"}]}"#, &mut |_| {}).expect("event");
+        assert_eq!(s.finish(true).expect("finish").finish, Finish::Stop);
+    }
+
+    #[test]
+    fn a_tool_call_under_another_choice_index_is_kept() {
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"content":"Looking."}},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"x","function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":1,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let mut s = Stream::default();
+        for e in events {
+            s.on_event(e, &mut |_| {}).expect("event");
+        }
+        let resp = s.finish(true).expect("finish");
+        let (text, _, calls) = assistant(&resp);
+        assert_eq!(text, "Looking.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].id.as_str(), calls[0].name.as_str()), ("x", "glob"));
+        assert_eq!(resp.finish, Finish::ToolCalls);
+    }
+
+    #[test]
+    fn announced_tool_calls_that_never_arrive_are_transient() {
+        let mut s = Stream::default();
+        s.on_event(r#"{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"tool_calls"}]}"#, &mut |_| {}).expect("event");
+        assert_eq!(s.finish(true).expect_err("no calls").kind, ErrorKind::Transient);
+        let body = br#"{"choices":[{"message":{"content":"ok"},"finish_reason":"function_call"}]}"#;
+        assert_eq!(parse_response(body).expect_err("no calls").kind, ErrorKind::Transient);
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub enum AppEvent {
     Job(JobTag, JobOut),
     /// One discovery source answered (Codex catalog or a provider's /models).
     Discovered { source: String, result: Result<Vec<crate::discover::Candidate>, String> },
+    /// A discovery source fell back to something usable: one line for the overlay's `skipped` list.
+    DiscoverNote(String),
     /// A command from a web client (`--web` / `--remote`), executed by `App::web_command`.
     Web(crate::web::Inbound),
     /// The answer to an agent's tool call worked out off the event loop (Solo's screenshot), for
@@ -100,9 +102,41 @@ pub enum EditTarget {
     McpCommand,
 }
 
+/// What the model picker is choosing a model for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PickTarget {
+    /// `/model` with no agent in view: the default model of new Solo sessions.
+    NewSessions,
+    /// A run or Solo agent (live or not).
+    Agent(AgentId),
+    /// A role of the active run with no agent to hang it on (an empty slot, a task not started).
+    RunRole(String),
+    /// A field of the pattern open in the Studio: `field` is "model", "fallback", "fallback2" or "fallback3".
+    StudioField { role: String, field: String },
+}
+
+/// A selectable card of the stage.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StageNode {
+    Agent(AgentId),
+    /// A fixed slot with no agent right now: "planner" | "manager" | "orchestrator" | "gate" | "finale".
+    Slot(&'static str),
+    /// A task of the current phase whose newest attempt has no agent yet (not started, queued).
+    Task(String),
+}
+
+/// One selectable row of the model picker.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickRow {
+    /// "none": clears a fallback position.
+    None,
+    /// An index into `registry.models`.
+    Model(usize),
+}
+
 pub enum Overlay {
     Help { scroll: usize },
-    ModelPicker { sel: usize, target: Option<AgentId> },
+    ModelPicker { sel: usize, target: PickTarget, role_scope: bool, filter: String },
     Diff { agent: AgentId, file: usize, scroll: usize },
     Inbox { sel: usize },
     Plan { scroll: usize },
@@ -363,7 +397,10 @@ pub struct App {
     pub toast: Option<(String, Instant, Level)>,
     pub sel: usize,
     /// Centers of the cards actually visible in the last overview frame.
-    pub stage_nav: Vec<(AgentId, u16, u16)>,
+    pub stage_nav: Vec<(StageNode, u16, u16)>,
+    /// `r` / `x` / `c` pressed once on a stage card: the key, the card and when. A second press
+    /// of the same key on the same card within 2.5 s does it.
+    pub armed: Option<(char, StageNode, Instant)>,
     /// When the halt the stage selection last jumped to began: a new halt about one agent
     /// selects it once, so the band's `m` / `r` act on the agent it names.
     halt_seen: Option<Instant>,
@@ -385,6 +422,13 @@ pub struct App {
     pub demo: bool,
     pub studio: StudioState,
     pub models_ui: ModelsState,
+    /// models.toml / secrets.toml as this process last read or wrote them, and when `tick` last
+    /// looked (None = look at the next tick): a change made behind our back is reloaded.
+    registry_mtime: Option<std::time::SystemTime>,
+    secrets_mtime: Option<std::time::SystemTime>,
+    /// The mtimes (models.toml, secrets.toml) a failed reload was told about, so it is said once.
+    registry_unreadable: Option<(Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
+    registry_checked: Option<Instant>,
     pub settings_ui: SettingsState,
     pub suggest: usize,
     pub notes: Vec<String>,
@@ -437,6 +481,9 @@ pub struct AgentOpts {
     /// The MCP servers this agent gets, resolved by the caller (`Settings::mcp_for` on Solo's
     /// `solo_mcp` or the role's `mcp`); empty for everything else (architect, probes).
     pub mcp: Vec<(String, crate::config::McpServer)>,
+    /// "project" = a Claude Code agent loads only the project's and local settings (`--setting-sources
+    /// project,local`); anything else = the user's own settings load too.
+    pub claude_user_config: String,
 }
 
 /// The name `--demo` registers its stand-in MCP server under (`mantra mock-mcp`).
@@ -445,6 +492,19 @@ pub const DEMO_MCP: &str = "demo";
 /// One journal line per role and MCP server it asks for that settings.toml does not have, or
 /// names in a way that cannot work (`Settings::mcp_refused`): the role runs without it, as it
 /// would if it had never asked — never a halt over a missing extra.
+/// A file's modification time, if it has one.
+/// Does the saved pattern differ from the base the run last saw (as values, not as text)?
+fn pattern_base_stale(base: &str, saved: &Pattern) -> bool {
+    match (toml::from_str::<toml::Value>(base), toml::Value::try_from(saved)) {
+        (Ok(b), Ok(t)) => b != t,
+        _ => false,
+    }
+}
+
+fn file_mtime(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
 fn mcp_missing_lines(settings: &Settings, pattern: &Pattern) -> Vec<String> {
     let mut out = vec![];
     for (name, role) in pattern.ordered_roles() {
@@ -467,7 +527,7 @@ fn bridge_problem_line(why: &str) -> String {
 /// Whether any role of `pattern` runs on Claude Code — its model, or the fallback it may switch to.
 fn pattern_uses_cli_bridge(registry: &Registry, pattern: &Pattern) -> bool {
     let on_claude = |alias: &str| matches!(registry.backend_of(&registry.resolve(alias)), crate::config::ProviderKind::ClaudeCode | crate::config::ProviderKind::Antigravity);
-    pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback.as_deref().is_some_and(|f| !f.trim().is_empty() && on_claude(f)))
+    pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback_chain().iter().any(|f| on_claude(f)))
 }
 
 /// settings.toml's `[mcp_servers]` when the file is there and parses (`App::refresh_mcp_servers`).
@@ -688,7 +748,7 @@ fn agent_spec(hub: &mut Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, Strin
             }
         }
         let strict_mcp = claude_strict_mcp(&o);
-        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge(), strict_mcp }), None, None)
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge(), strict_mcp, user_config_project: o.claude_user_config == "project" }), None, None)
     } else if backend == crate::hub::Backend::Bija {
         let (spawn, envs) = bija_spawn(reg, &m, &o, cw, compact_pct);
         (vec![], envs, None, Some(spawn), None)
@@ -773,6 +833,9 @@ pub fn spawn_agent(hub: &mut Hub, agents: &mut BTreeMap<AgentId, Agent>, reg: &R
     a.backend = backend;
     a.effort = effort.clone();
     a.ctx_window = (backend != crate::config::ProviderKind::Antigravity).then_some(cw);
+    if backend == crate::config::ProviderKind::ClaudeCode && cw < 100_000 {
+        a.notice(Level::Info, format!("context {}k is below Claude Code's minimum — it compacts at 100k", cw / 1000));
+    }
     a.approval = o.approval.clone();
     a.sandbox = o.sandbox.clone();
     if backend == crate::config::ProviderKind::Antigravity {
@@ -892,11 +955,12 @@ impl Ctx for Ctxt<'_> {
     fn spawn(&mut self, r: SpawnReq) -> AgentId {
         let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
         let sandbox = role_sandbox(&r.role.sandbox, backend);
+        let sandbox = if r.git_write && backend == crate::config::ProviderKind::Codex && sandbox == "workspace-write" { "danger-full-access".to_string() } else { sandbox };
         spawn_agent(
             self.hub,
             self.agents,
             self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: r.claude_user_config.clone(),
                 name: r.name,
                 role: r.role_name,
                 glyph: r.role.glyph.clone(),
@@ -921,11 +985,12 @@ impl Ctx for Ctxt<'_> {
     fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
         let backend = self.registry.backend_of(&self.registry.resolve(&r.role.model));
         let sandbox = role_sandbox(&r.role.sandbox, backend);
+        let sandbox = if r.git_write && backend == crate::config::ProviderKind::Codex && sandbox == "workspace-write" { "danger-full-access".to_string() } else { sandbox };
         spawn_agent(
             self.hub,
             self.agents,
             self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: r.claude_user_config.clone(),
                 name: r.name,
                 role: r.role_name,
                 glyph: r.role.glyph.clone(),
@@ -955,6 +1020,18 @@ impl Ctx for Ctxt<'_> {
     }
     fn interrupt(&mut self, a: AgentId) {
         self.hub.send(a, Cmd::Interrupt);
+    }
+    fn lifts_sandbox_for_git(&self, alias: &str, sandbox: &str) -> bool {
+        let backend = self.registry.backend_of(&self.registry.resolve(alias));
+        backend == crate::config::ProviderKind::Codex && role_sandbox(sandbox, backend) == "workspace-write"
+    }
+    fn carry_over(&mut self, from: AgentId, to: AgentId) {
+        let moved = self.agents.get_mut(&from).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+        if !moved.is_empty() {
+            if let Some(b) = self.agents.get_mut(&to) {
+                b.queued.extend(moved);
+            }
+        }
     }
     fn compact(&mut self, a: AgentId) {
         if let Some(ag) = self.agents.get_mut(&a) {
@@ -1052,6 +1129,7 @@ impl App {
             toast: None,
             sel: 0,
             stage_nav: vec![],
+            armed: None,
             halt_seen: None,
             sel_follow: None,
             canvas_focus: false,
@@ -1064,6 +1142,10 @@ impl App {
             demo,
             studio: StudioState { pattern, sel: sel0, field: 0, focus: 0, errors: vec![], dirty: false, architect: None, input: Input::default(), flash: None, saved: None },
             models_ui: ModelsState { row: 0, col: 0, providers: false, status: HashMap::new(), dirty: false, saved: None, keyflow: None },
+            registry_mtime: file_mtime(&Registry::path()),
+            secrets_mtime: file_mtime(&crate::config::home().join("secrets.toml")),
+            registry_unreadable: None,
+            registry_checked: Some(Instant::now()),
             settings_ui: SettingsState::default(),
             suggest: 0,
             notes: vec![],
@@ -1181,7 +1263,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: "solo".into(),
                 role: "solo".into(),
                 glyph: "●".into(),
@@ -1270,9 +1352,18 @@ impl App {
         }
         // A settings.toml that does not parse is never written over (`Settings::save`): the
         // change holds for this session, and the toast says what to fix.
-        if let Err(e) = s.save() {
+        let saved = s.save();
+        // settings.toml's save rewrites secrets.toml too: Mantra's own write is not a change on disk
+        self.refresh_registry_mtimes();
+        if let Err(e) = saved {
             self.toast(format!("{e}"), Level::Error);
         }
+    }
+
+    /// Records models.toml's and secrets.toml's mtimes as they are now, after a write of Mantra's own.
+    pub(crate) fn refresh_registry_mtimes(&mut self) {
+        self.registry_mtime = file_mtime(&Registry::path());
+        self.secrets_mtime = file_mtime(&crate::config::home().join("secrets.toml"));
     }
 
     /// Takes `[mcp_servers]` from settings.toml as it is now, so a `mantra mcp add|remove|enable|
@@ -1318,6 +1409,10 @@ impl App {
             self.flash_screen = Some(Instant::now());
         }
         if s != self.screen {
+            // a pattern saved in the Studio reaches the run that follows it, however the Studio is left
+            if self.screen == Screen::Studio && !self.studio.dirty {
+                self.sync_run_pattern("the Studio");
+            }
             // an edit and a first Delete belong to the screen they were made on; so does a key
             // still being typed (a probe already under way delivers its models wherever one is)
             self.edit = None;
@@ -1364,8 +1459,8 @@ impl App {
     pub fn land_on_overview(&mut self) {
         self.set_screen(Screen::Stage);
         self.canvas_focus = true;
-        let orch = self.run.as_ref().and_then(|r| r.orchestrator);
-        self.sel = self.stage_nodes().iter().position(|a| Some(*a) == orch).unwrap_or(0);
+        let orch = self.run.as_ref().and_then(|r| r.orchestrator).map(StageNode::Agent);
+        self.sel = self.stage_nodes().iter().position(|n| Some(n) == orch.as_ref()).unwrap_or(0);
     }
 
     /// The agent the current view is about (Solo agent, zoomed agent, or stage selection).
@@ -1373,7 +1468,7 @@ impl App {
         match self.screen {
             Screen::Solo => self.solo,
             Screen::Zoom(a) => Some(a),
-            Screen::Stage => self.stage_nodes().get(self.sel).copied(),
+            Screen::Stage => self.stage_nodes().get(self.sel).and_then(|n| self.node_agent(n)),
             Screen::Studio => self.studio.architect,
             Screen::Models | Screen::Settings => None,
         }
@@ -1397,37 +1492,110 @@ impl App {
     /// same-named cards. Earlier attempts stay reachable through the zoomed view's log and the
     /// pulse. Tasks of the current phase come in plan order; tasks outside it (ad-hoc fix workers,
     /// the finale's fixes) follow in the order they were started.
-    pub fn stage_nodes(&self) -> Vec<AgentId> {
+    pub fn stage_nodes(&self) -> Vec<StageNode> {
         let Some(r) = &self.run else { return vec![] };
-        let mut v = vec![];
-        v.extend(r.planner);
-        if r.pattern.settings.planner_loop {
-            if let Some(group) = r.planner.and_then(|p| self.swarms.get(&p)) { v.extend(&group.children); }
+        let live = r.is_active() && r.stage != Stage::Setup;
+        let looped = r.pattern.settings.planner_loop;
+        let in_phase = matches!(r.stage, Stage::Phase { .. }) && !looped;
+        let mut v: Vec<StageNode> = vec![];
+        match r.planner {
+            Some(p) => v.push(StageNode::Agent(p)),
+            None if live && !looped && matches!(r.stage, Stage::Planning | Stage::Review | Stage::Phase { .. }) => v.push(StageNode::Slot("planner")),
+            None => {}
         }
-        v.extend(r.manager);
-        v.extend(r.orchestrator);
-        let mut tasks: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
+        if looped {
+            if let Some(group) = r.planner.and_then(|p| self.swarms.get(&p)) {
+                v.extend(group.children.iter().map(|c| StageNode::Agent(*c)));
+            }
+        }
+        match r.manager {
+            Some(m) => v.push(StageNode::Agent(m)),
+            None if live && !looped && r.pattern.manager_role().is_some() && matches!(r.stage, Stage::Phase { .. } | Stage::Finale { .. }) => v.push(StageNode::Slot("manager")),
+            None => {}
+        }
+        match r.orchestrator {
+            Some(o) => v.push(StageNode::Agent(o)),
+            None if live && in_phase => v.push(StageNode::Slot("orchestrator")),
+            None => {}
+        }
+        let phase_ids: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
+        let mut tasks = phase_ids.clone();
         for w in &r.workers {
             if !tasks.contains(&w.task.id.as_str()) {
                 tasks.push(&w.task.id);
             }
         }
         for id in tasks {
-            // a newest attempt still queued (no agent yet) has no node, like its card
+            // the newest attempt's agent; a task of the phase without one yet is a card too
             let newest = r.workers.iter().rev().find(|w| w.task.id == id).and_then(|w| w.agent);
-            if let Some(a) = newest {
-                if !v.contains(&a) {
-                    v.push(a);
-                }
+            match newest {
+                Some(a) if !v.contains(&StageNode::Agent(a)) => v.push(StageNode::Agent(a)),
+                Some(_) => {}
+                None if phase_ids.contains(&id) => v.push(StageNode::Task(id.to_string())),
+                None => {}
             }
         }
-        v.extend(r.gate_agent);
-        if let Some(f) = r.finale_agent {
-            if !v.contains(&f) {
-                v.push(f);
-            }
+        match r.gate_agent {
+            Some(g) => v.push(StageNode::Agent(g)),
+            None if live && in_phase => v.push(StageNode::Slot("gate")),
+            None => {}
+        }
+        match r.finale_agent {
+            Some(f) if !v.contains(&StageNode::Agent(f)) => v.push(StageNode::Agent(f)),
+            Some(_) => {}
+            None if live && matches!(r.stage, Stage::Finale { .. }) => v.push(StageNode::Slot("finale")),
+            None => {}
         }
         v
+    }
+
+    /// The agents of the stage cards, in card order (a slot or a task without one has none).
+    pub fn stage_agents(&self) -> Vec<AgentId> {
+        self.stage_nodes().into_iter().filter_map(|n| match n {
+            StageNode::Agent(a) => Some(a),
+            _ => None,
+        }).collect()
+    }
+
+    /// The agent behind a card: its own, or the last one a gate / orchestrator slot had.
+    pub fn node_agent(&self, n: &StageNode) -> Option<AgentId> {
+        match n {
+            StageNode::Agent(a) => Some(*a),
+            StageNode::Slot("gate") => self.run.as_ref().and_then(|r| r.last_gate_agent),
+            StageNode::Slot("orchestrator") => self.run.as_ref().and_then(|r| r.last_orchestrator),
+            _ => None,
+        }
+    }
+
+    /// The pattern role behind a card.
+    pub fn node_role(&self, n: &StageNode) -> Option<String> {
+        let r = self.run.as_ref()?;
+        let f = &r.pattern.flow;
+        let named = |s: &str| Some(s.to_string()).filter(|s| !s.trim().is_empty());
+        match n {
+            StageNode::Agent(a) => r.role_name_of(*a),
+            StageNode::Slot("planner") => named(&f.planner),
+            StageNode::Slot("manager") => named(&f.manager),
+            StageNode::Slot("orchestrator") => named(&f.orchestrator),
+            StageNode::Slot("gate") => named(&f.phase_gate),
+            StageNode::Slot("finale") => match r.stage {
+                Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+                _ => None,
+            },
+            StageNode::Slot(_) => None,
+            StageNode::Task(id) => r.current_phase().and_then(|p| p.tasks.iter().find(|t| &t.id == id)).map(|t| t.role.clone()),
+        }
+    }
+
+    /// What a card is called: the agent's name, the slot, the task id.
+    pub fn node_name(&self, n: &StageNode) -> String {
+        match (n, &self.run) {
+            (StageNode::Agent(a), Some(r)) => r.name_of(*a),
+            (StageNode::Slot("gate"), Some(r)) => format!("gate · {}", r.pattern.flow.phase_gate),
+            (StageNode::Slot(s), _) => s.to_string(),
+            (StageNode::Task(id), _) => id.clone(),
+            (StageNode::Agent(a), None) => a.to_string(),
+        }
     }
 
     /// What `effort = "auto"` means for this agent right now: its role's job in the open run (a
@@ -1471,6 +1639,131 @@ impl App {
         self.set_effort(a, &e);
     }
 
+    /// What the model picker changes for the selected stage card: a live agent, or a stopped one that
+    /// still belongs to a worker or slot of the run (its next start); a card with no agent, or a slot
+    /// whose agent is retired, takes the role's model for this run. `NewSessions` only when the card
+    /// has neither an agent nor a role.
+    pub(crate) fn picker_target_for_node(&self, n: &StageNode) -> PickTarget {
+        if let Some(a) = self.node_agent(n) {
+            let own = matches!(n, StageNode::Agent(_));
+            if self.agents.contains_key(&a) && (own || self.in_run(a)) {
+                if self.agent_alive(a) || self.run.as_ref().is_some_and(|r| !r.slot_of(a).is_empty()) {
+                    return PickTarget::Agent(a);
+                }
+            }
+        }
+        match self.node_role(n) {
+            Some(role) => PickTarget::RunRole(role),
+            None => self.node_agent(n).filter(|a| self.agents.contains_key(a)).map(PickTarget::Agent).unwrap_or(PickTarget::NewSessions),
+        }
+    }
+
+    /// The picker's target for what is in view (ctrl+k, `/model`): on the stage, the selected card.
+    pub(crate) fn picker_target(&self) -> PickTarget {
+        if self.screen == Screen::Stage {
+            if let Some(n) = self.stage_nodes().get(self.sel) {
+                return self.picker_target_for_node(n);
+            }
+        }
+        self.focus_agent().map(PickTarget::Agent).unwrap_or(PickTarget::NewSessions)
+    }
+
+    /// Opens the model picker for `target` on the row of the target's present value.
+    pub fn open_model_picker(&mut self, target: PickTarget) {
+        let cur = self.picker_current(&target);
+        let rows = self.picker_rows(&target, "");
+        let sel = cur.and_then(|c| rows.iter().position(|r| matches!(r, PickRow::Model(i) if self.registry.models[*i].alias == c))).unwrap_or(0);
+        self.overlays.push(Overlay::ModelPicker { sel, target, role_scope: false, filter: String::new() });
+    }
+
+    /// The alias the picker's target runs on now (for a Studio fallback field: its value).
+    pub fn picker_current(&self, target: &PickTarget) -> Option<String> {
+        match target {
+            PickTarget::NewSessions => Some(self.settings.default_model.clone()),
+            PickTarget::Agent(a) => self.agents.get(a).map(|x| x.model_alias.clone()),
+            PickTarget::RunRole(r) => self.run.as_ref().and_then(|run| run.pattern.roles.get(r)).map(|r| r.model.clone()),
+            PickTarget::StudioField { role, field } => {
+                let r = self.studio.pattern.roles.get(role)?;
+                match field.as_str() {
+                    "model" => Some(r.model.clone()),
+                    "fallback" => r.fallback.clone(),
+                    "fallback2" => r.fallback2.clone(),
+                    "fallback3" => r.fallback3.clone(),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The rows of the model picker: every model (for a fallback field: first "none", and not the
+    /// role's own model nor the other fallbacks of the role), narrowed by `filter` (alias, model
+    /// id or provider name contains it, case-insensitive).
+    pub fn picker_rows(&self, target: &PickTarget, filter: &str) -> Vec<PickRow> {
+        let f = filter.trim().to_lowercase();
+        let mut skip: Vec<String> = vec![];
+        let mut rows = vec![];
+        if let PickTarget::StudioField { role, field } = target {
+            if field != "model" {
+                if let Some(r) = self.studio.pattern.roles.get(role) {
+                    skip.push(r.model.clone());
+                    for (name, v) in [("fallback", &r.fallback), ("fallback2", &r.fallback2), ("fallback3", &r.fallback3)] {
+                        if name != field {
+                            skip.extend(v.clone());
+                        }
+                    }
+                }
+                if f.is_empty() {
+                    rows.push(PickRow::None);
+                }
+            }
+        }
+        for (i, m) in self.registry.models.iter().enumerate() {
+            if skip.contains(&m.alias) {
+                continue;
+            }
+            if !f.is_empty() && ![m.alias.to_lowercase(), m.model.to_lowercase(), self.registry.provider_name(&m.provider).to_lowercase()].iter().any(|x| x.contains(&f)) {
+                continue;
+            }
+            rows.push(PickRow::Model(i));
+        }
+        rows
+    }
+
+    /// Is the agent's process one that can take a prompt: not stopped or crashed, and not a
+    /// worker whose attempt is over?
+    pub(crate) fn picker_has_scope(&self, target: &PickTarget) -> bool {
+        matches!(target, PickTarget::Agent(a) if self.in_run(*a) && self.run.as_ref().and_then(|r| r.role_name_of(*a)).is_some_and(|n| self.run.as_ref().is_some_and(|r| r.pattern.roles.contains_key(&n))))
+    }
+
+    pub fn agent_alive(&self, a: AgentId) -> bool {
+        let Some(ag) = self.agents.get(&a) else { return false };
+        if matches!(ag.status, Status::Stopped | Status::Crashed(_)) {
+            return false;
+        }
+        !self.run.as_ref().is_some_and(|r| r.workers.iter().any(|w| w.agent == Some(a) && matches!(w.state, crate::engine::run::WState::Done | crate::engine::run::WState::Failed(_) | crate::engine::run::WState::Cancelled)))
+    }
+
+    /// The picker's apply for a role of the active run (the `tab` scope, or `RunRole`): the run's
+    /// pattern copy gets the model, the saved pattern stays as it is, live agents of the role switch.
+    pub fn set_run_role_model(&mut self, role: &str, alias: &str) -> Result<(), String> {
+        if self.registry.get(alias).is_none() {
+            return Err("unknown model".into());
+        }
+        if let Some(p) = self.registry.alias_problem(alias) {
+            return Err(p);
+        }
+        let effort = self.run.as_ref().and_then(|r| r.pattern.roles.get(role)).filter(|r| r.effort != crate::engine::pattern::EFFORT_AUTO).map(|r| self.registry.resolve(alias).resolve_effort(&r.effort));
+        match self.with_run(|r, _| r.set_role_model(role, alias, effort)) {
+            Some(r) => r?,
+            None => return Err("no run is open".into()),
+        }
+        self.registry_changed();
+        self.switch_live_agents_of_role(role, alias, true)?;
+        let halted = self.run.as_ref().is_some_and(|r| r.halted());
+        self.toast(format!("role {role} → {alias} (this run){}", if halted { " — still halted: space resumes" } else { "" }), Level::Ok);
+        Ok(())
+    }
+
     /// Switch a live agent in place. A provider/backend change gets a fresh compatible session
     /// and an explicit context handoff; the logical agent, launch policy and pending text survive.
     pub fn set_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
@@ -1488,7 +1781,7 @@ impl App {
         let context_window = self.registry.effective_context_window(&new.alias, &self.settings.default_model);
         // a run agent keeps the run's context cap (the backend was told it at spawn): the gauge
         // shows the window it really has, not the new model's whole one
-        let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).map(|r| r.pattern.settings.context_cap).filter(|c| *c > 0);
+        let cap = self.run.as_ref().filter(|r| r.all_agents().contains(&a)).and_then(|r| r.context_ceiling(a));
         let context_window = context_window.min(cap.unwrap_or(u64::MAX));
         // Context limits are launch flags on each backend, so a change must reach the process
         // as well as its gauge. Reuse the fresh-session handoff for that model configuration.
@@ -1576,17 +1869,102 @@ impl App {
             return;
         }
         let alias = self.agents.get(&a).map(|x| x.model_alias.clone());
-        let known = self.registry.context_windows_for_default(&self.settings.default_model);
-        let sees = crate::engine::run::vision_aliases(&self.registry);
+        // the switch may bring an alias the run has not seen: refresh what it knows first
+        self.registry_changed();
         if let (Some(run), Some(alias)) = (self.run.as_mut(), alias) {
-            // the switch may bring an alias the run has not seen: refresh what it knows first
-            run.set_known_models(known);
-            run.set_vision_models(sees);
-            run.set_agent_model(a, &alias);
+            run.set_agent_model(a, &alias, "by you");
         }
         if self.run.as_ref().map(|r| r.halted()).unwrap_or(false) {
             self.toast(MODEL_CHANGED_HALTED, Level::Info);
         }
+    }
+
+    /// The saved pattern of the active run was just written (Studio, web editor, a role's model):
+    /// if the run was started from it, it adopts what changed (`pattern::adopt`) — at once, for
+    /// the current phase too: live agents of a role whose model or effort changed are switched.
+    /// Returns the number of changes adopted.
+    pub(crate) fn sync_run_pattern(&mut self, origin: &str) -> Option<usize> {
+        let (name, base, ours) = {
+            let run = self.run.as_ref().filter(|r| r.is_active())?;
+            (run.pattern.name.clone(), run.pattern_base.clone()?, run.pattern.clone())
+        };
+        let saved = Pattern::load(&name, &self.project).ok()?;
+        let a = match crate::engine::pattern::adopt(&base, &ours, &saved) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                // nothing to adopt: the run already has this. The pattern the run has seen still advances,
+                // or a later change back to the old base would look like no change at all.
+                if pattern_base_stale(&base, &saved) {
+                    if let Some(run) = self.run.as_mut() {
+                        run.pattern_base = Some(saved.to_toml());
+                        run.save_pattern_base();
+                    }
+                }
+                return None;
+            }
+            Err(e) => {
+                self.toast(format!("the run keeps its own pattern: {e}"), Level::Warn);
+                return None;
+            }
+        };
+        if let Some(p) = self.preflight(&a.pattern).first() {
+            self.toast(format!("the run keeps its own pattern: {p}"), Level::Warn);
+            return None;
+        }
+        self.registry_changed();
+        let n = a.changes.len();
+        let effort_roles: Vec<String> = a.pattern.roles.iter().filter(|(r, x)| ours.roles.get(*r).is_some_and(|o| o.effort != x.effort)).map(|(r, _)| r.clone()).collect();
+        let new_pattern = a.pattern.clone();
+        let roles = match self.with_run(|r, c| r.adopt_pattern(c, a, saved.to_toml(), origin)) {
+            Some(Ok(roles)) => roles,
+            Some(Err(e)) => {
+                self.toast(format!("the run keeps its own pattern: {e}"), Level::Warn);
+                return None;
+            }
+            None => return None,
+        };
+        self.toast(format!("run updated: {n} change(s) from the pattern"), Level::Ok);
+        for role in &roles {
+            let alias = new_pattern.roles[role].model.clone();
+            if let Err(e) = self.switch_live_agents_of_role(role, &alias, true) {
+                self.toast(format!("{role}: {e}"), Level::Warn);
+            }
+        }
+        for role in &effort_roles {
+            let e = new_pattern.roles[role].effort.clone();
+            let ids: Vec<AgentId> = self.live_agents_of_role(role).into_iter().filter(|id| self.in_run(*id)).collect();
+            for id in ids {
+                self.set_effort(id, &e);
+            }
+        }
+        Some(n)
+    }
+
+    /// Agents of `role` that will run again. An archived one, or a worker whose attempt is over
+    /// (done, failed, cancelled), is kept for its card and its log: it ran on the model it ran
+    /// on, and rewriting its alias would make a finished card claim the role's new model.
+    fn live_agents_of_role(&self, role: &str) -> Vec<AgentId> {
+        let over = |id: AgentId, a: &Agent| {
+            a.status == Status::Stopped
+                || self.run.as_ref().map(|r| r.workers.iter().any(|w| w.agent == Some(id) && matches!(w.state, crate::engine::run::WState::Done | crate::engine::run::WState::Failed(_) | crate::engine::run::WState::Cancelled))).unwrap_or(false)
+        };
+        self.agents.iter().filter(|(id, a)| a.role == role && !over(**id, a)).map(|(id, _)| *id).collect()
+    }
+
+    /// Switch the live agents of `role` to `alias` (a role-level model change). `include_run`
+    /// false leaves the active run's own agents alone.
+    pub(crate) fn switch_live_agents_of_role(&mut self, role: &str, alias: &str, include_run: bool) -> Result<(), String> {
+        for id in self.live_agents_of_role(role) {
+            let in_run = self.in_run(id);
+            if (in_run && !include_run) || self.agents.get(&id).is_some_and(|a| a.model_alias == alias) {
+                continue;
+            }
+            self.set_model(id, alias)?;
+            if in_run {
+                self.model_switched_for_run_agent(id);
+            }
+        }
+        Ok(())
     }
 
     /// Compact an agent's context now, or right after its current turn.
@@ -1603,6 +1981,12 @@ impl App {
             ag.compacting = true;
             ag.activity = "compacting context".into();
             self.hub.send(a, Cmd::Compact);
+        }
+        if self.in_run(a) {
+            self.with_run(|r, _| {
+                let name = r.name_of(a);
+                r.log("⇣", "amber", format!("{name}: context compaction requested (by you)"));
+            });
         }
     }
 
@@ -1670,6 +2054,8 @@ impl App {
                 return;
             }
         };
+        // what the saved pattern said when this run started: the base of later adoptions
+        let base_toml = pattern.to_toml();
         // The shipped patterns keep their familiar role aliases for existing installations.
         // A new installation has no model presets, so bind only missing built-in aliases to
         // the user's chosen model in this run's saved pattern copy. User-edited patterns retain
@@ -1686,9 +2072,12 @@ impl App {
                         role.model = alias.clone();
                         rebound_roles += 1;
                     }
-                    if role.fallback.as_deref().is_some_and(|f| !f.is_empty() && self.registry.get(f).is_none()) {
-                        role.fallback = Some(alias.clone());
+                    for f in [&mut role.fallback, &mut role.fallback2, &mut role.fallback3] {
+                        if f.as_deref().is_some_and(|f| !f.is_empty() && self.registry.get(f).is_none()) {
+                            *f = Some(alias.clone());
+                        }
                     }
+                    role.normalize_fallbacks();
                 }
             }
         }
@@ -1722,11 +2111,13 @@ impl App {
             return;
         }
         let mut run = Run::new(self.project.clone(), pattern, goal.to_string());
+        run.pattern_base = Some(base_toml);
         if rebound_roles > 0 {
             run.log("⚙", "blue", format!("{rebound_roles} built-in roles use configured models; see this run's pattern copy"));
         }
         // the engine has no registry: what it knows about models (windows, which aliases exist)
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
+        run.set_known_providers(self.registry.alias_providers());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
@@ -1812,6 +2203,9 @@ impl App {
             .and_then(|s| Pattern::from_toml(&s).ok())
             .or_else(|| Pattern::load(&st.pattern, &self.project).ok())
             .unwrap_or_else(Pattern::builtin);
+        // The saved pattern as it is now (it may be a built-in), and as the run last saw it.
+        let saved = Pattern::load(&st.pattern, &self.project).ok();
+        let base = std::fs::read_to_string(r.dir.join("pattern.base.toml")).ok().unwrap_or_else(|| pattern.to_toml()); // runs from before 0.12
         let problems = self.preflight(&pattern);
         if let Some(p) = problems.first() {
             self.toast(format!("cannot resume: {p}"), Level::Error);
@@ -1820,9 +2214,39 @@ impl App {
         let plan = std::fs::read_to_string(r.dir.join("plan.json")).ok().and_then(|s| serde_json::from_str::<crate::engine::plan::Plan>(&s).ok());
         let label = crate::engine::state::stage_label(&st.stage);
         let mut run = Run::from_state(&st, pattern, plan, r.dir.clone());
+        run.pattern_base = Some(base.clone());
+        let mut st = st;
         // before the boot: it decides which saved per-agent models still exist in the registry
         run.set_known_models(self.registry.context_windows_for_default(&self.settings.default_model));
+        run.set_known_providers(self.registry.alias_providers());
         run.set_vision_models(crate::engine::run::vision_aliases(&self.registry));
+        // what the user changed in the saved pattern since the run last saw it is active now
+        if let Some(saved) = saved {
+            match crate::engine::pattern::adopt(&base, &run.pattern, &saved) {
+                Ok(Some(a)) => {
+                    let problems = self.preflight(&a.pattern);
+                    if let Some(p) = problems.first() {
+                        run.log("⚠", "amber", format!("the saved pattern changed but cannot run here ({p}) — this run keeps its own copy"));
+                    } else {
+                        let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
+                        match run.adopt_pattern(&mut ctx, a, saved.to_toml(), "the saved pattern (on resume)") {
+                            Ok(_) => run.drop_stale_threads(&mut st), // nothing is live yet: resume_boot spawns everything on the new roles
+                            Err(e) => run.log("⚠", "amber", format!("the saved pattern changed but does not fit this run ({e}) — it keeps its own copy")),
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if pattern_base_stale(&base, &saved) {
+                        run.pattern_base = Some(saved.to_toml());
+                        run.save_pattern_base();
+                    }
+                }
+                Err(e) => run.log("⚠", "amber", format!("could not compare with the saved pattern: {e}")),
+            }
+        }
+        if !r.dir.join("pattern.base.toml").exists() {
+            run.save_pattern_base();
+        }
         {
             let mut ctx = Ctxt { hub: &mut self.hub, agents: &mut self.agents, registry: &self.registry, settings: &self.settings, tx: &self.tx, notes: &mut self.notes };
             run.resume_boot(&mut ctx, &st);
@@ -1873,7 +2297,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: "architect".into(),
                 role: "architect".into(),
                 glyph: "★".into(),
@@ -1928,7 +2352,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: format!("probe:{alias}"),
                 role: "probe".into(),
                 glyph: "·".into(),
@@ -1964,7 +2388,7 @@ impl App {
     /// (`only` = one provider id). Without Codex nothing asks for it: it is an add-on backend.
     pub fn discover(&mut self, only: Option<String>) {
         let mut sources: Vec<String> = vec![];
-        let codex = only.is_none() && !self.registry.codex_account_models().is_empty();
+        let codex = (only.is_none() || only.as_deref() == Some("openai")) && !self.registry.codex_account_models().is_empty();
         if codex {
             sources.push("codex".into());
         }
@@ -1982,7 +2406,25 @@ impl App {
         skipped.extend(provs.iter().filter(|p| p.kind == crate::config::ProviderKind::Antigravity).map(|p| format!("{}: run `agy models`, then add an available model ID by hand", p.id)));
         self.overlays.push(Overlay::Discover(DiscoverState { items: vec![], loading: sources, hosts, errors: vec![], skipped, sel: 0, filter: Input::default(), origin: None }));
         for p in provs.iter().filter(|p| p.kind == crate::config::ProviderKind::ClaudeCode) {
-            self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+            if p.base_url.trim().is_empty() && !self.demo {
+                // A subscription: ask the installed Claude Code what the account offers.
+                if let Some(Overlay::Discover(st)) = self.overlays.last_mut() {
+                    st.loading.push(p.id.clone());
+                }
+                let (id, cmd, tx) = (p.id.clone(), self.hub.claude_cmd.clone(), self.tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = match crate::discover::claude_cli_models(&cmd, &id) {
+                        Ok(found) => Ok(crate::discover::merge_with_builtins(found, &id)),
+                        Err(why) => {
+                            let _ = tx.send(AppEvent::DiscoverNote(format!("{id}: built-in model list ({why})")));
+                            Ok(crate::discover::claude_defaults(&id))
+                        }
+                    };
+                    let _ = tx.send(AppEvent::Discovered { source: id, result });
+                });
+            } else {
+                self.on_discovered(p.id.clone(), Ok(crate::discover::claude_defaults(&p.id)));
+            }
         }
         if codex {
             let cmd = self.hub.codex_cmd.clone();
@@ -1993,9 +2435,18 @@ impl App {
                 let r = async {
                     let (conn, _inc, mut child) = crate::rpc::spawn(&cmd, &args, &cwd, &[]).map_err(|e| e.to_string())?;
                     crate::rpc::handshake(&conn).await.map_err(|e| e.to_string())?;
-                    let v = conn.request_timeout("model/list", json!({"limit": 100}), Duration::from_secs(20)).await.map_err(|e| e.message)?;
+                    let mut found: Vec<crate::discover::Candidate> = vec![];
+                    let mut params = json!({"limit": 100});
+                    for _ in 0..5 {
+                        let v = conn.request_timeout("model/list", params.clone(), Duration::from_secs(20)).await.map_err(|e| e.message)?;
+                        found.extend(v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(crate::discover::from_codex).collect::<Vec<_>>()).unwrap_or_default());
+                        match v.get("nextCursor").or_else(|| v.get("next_cursor")).and_then(|c| c.as_str()).filter(|c| !c.is_empty()) {
+                            Some(cursor) => params = json!({"limit": 100, "cursor": cursor}),
+                            None => break,
+                        }
+                    }
                     let _ = child.kill().await;
-                    Ok::<_, String>(v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(crate::discover::from_codex).collect()).unwrap_or_default())
+                    Ok::<_, String>(found)
                 }
                 .await;
                 let _ = tx.send(AppEvent::Discovered { source: "codex".into(), result: r });
@@ -2276,15 +2727,75 @@ impl App {
     /// models.toml written, the `/models` header told — except in the demo, whose registry points
     /// bija at its mock server and holds the mock backends' models: like its settings it is never
     /// saved, and a change there lives until the demo ends.
+    /// The registry changed (an edit here, a discovery, a reload from disk): tell the run.
+    pub(crate) fn registry_changed(&mut self) {
+        let known = self.registry.context_windows_for_default(&self.settings.default_model);
+        let provs = self.registry.alias_providers();
+        let sees = crate::engine::run::vision_aliases(&self.registry);
+        if let Some(run) = self.run.as_mut() {
+            run.set_known_models(known);
+            run.set_known_providers(provs);
+            run.set_vision_models(sees);
+        }
+    }
+
+    /// At most every 2 seconds: models.toml or secrets.toml written by someone else (another
+    /// terminal, an editor) is read again, unless the models screen is being edited.
+    fn reload_registry_if_changed(&mut self) {
+        if self.demo || self.registry_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.registry_checked = Some(Instant::now());
+        let (reg, sec) = (file_mtime(&Registry::path()), file_mtime(&crate::config::home().join("secrets.toml")));
+        if reg == self.registry_mtime && sec == self.secrets_mtime {
+            return;
+        }
+        let editing = self.models_ui.dirty
+            || self.models_ui.keyflow.is_some()
+            || self.edit.as_ref().is_some_and(|e| matches!(e.target, EditTarget::ModelCell(..) | EditTarget::ProviderCell(..)));
+        if editing {
+            return;
+        }
+        if reg.is_none() && self.registry_mtime.is_none() {
+            // there never was a models.toml: only secrets.toml changed, and the registry in memory stands
+            self.secrets_mtime = sec;
+            return;
+        }
+        match Registry::try_load() {
+            Ok(r) => self.registry = r,
+            Err(e) => {
+                // half-written or briefly gone: keep the models in memory, look again when the file changes
+                if self.registry_unreadable != Some((reg, sec)) {
+                    self.registry_unreadable = Some((reg, sec));
+                    crate::mlog!("models.toml reload skipped: {e}");
+                    self.toast("models.toml could not be read — keeping the models in memory", Level::Warn);
+                }
+                return;
+            }
+        }
+        self.registry_unreadable = None;
+        // the load may have migrated the files: what is on disk now is what was loaded
+        self.refresh_registry_mtimes();
+        self.registry_changed();
+        self.toast("models.toml changed on disk — reloaded", Level::Info);
+        if let Some(run) = self.run.as_mut() {
+            run.log("⚙", "blue", "models reloaded from disk");
+        }
+    }
+
     pub fn save_registry(&mut self) -> Result<(), String> {
         if self.demo {
             self.models_ui.dirty = false;
+            self.registry_changed();
             return Ok(());
         }
+        self.registry.assign_provider_colors();
         match self.registry.save() {
             Ok(()) => {
                 self.models_ui.dirty = false;
                 self.models_ui.saved = Some(Instant::now());
+                self.refresh_registry_mtimes();
+                self.registry_changed();
                 Ok(())
             }
             Err(e) => {
@@ -2313,6 +2824,11 @@ impl App {
                 }
             }
             AppEvent::Discovered { source, result } => self.on_discovered(source, result),
+            AppEvent::DiscoverNote(note) => {
+                if let Some(Overlay::Discover(st)) = self.overlays.iter_mut().rev().find(|o| matches!(o, Overlay::Discover(_))) {
+                    st.skipped.push(note);
+                }
+            }
             AppEvent::Web(i) => self.web_command(i),
             AppEvent::ToolAnswer { agent, id, result } => self.hub.send(agent, Cmd::Respond { id, result }),
             AppEvent::Probed { provider, host, result } => self.on_probed(provider, host, result),
@@ -2329,6 +2845,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.reload_registry_if_changed();
         self.with_run(|r, c| r.tick(c));
         if self.run.as_ref().map(|r| r.want_review).unwrap_or(false)
             && !self.overlays.iter().any(|o| matches!(o, Overlay::Plan { .. }))
@@ -2339,6 +2856,13 @@ impl App {
             }
             self.overlays.push(Overlay::Plan { scroll: 0 });
         }
+        if let Some(r) = self.run.as_mut() {
+            for (old, new) in std::mem::take(&mut r.replaced) {
+                if self.screen == Screen::Zoom(old) {
+                    self.set_screen(Screen::Zoom(new));
+                }
+            }
+        }
         if self.run.is_some() {
             self.follow_respawned_task();
             let n = self.stage_nodes().len();
@@ -2346,6 +2870,19 @@ impl App {
                 self.sel = n - 1;
             }
             self.select_halted_agent();
+        }
+    }
+
+    /// Journal that queued user messages went to an agent of the run.
+    fn log_delivered(&mut self, agent: AgentId, queued: &[String]) {
+        let Some(first) = queued.first() else { return };
+        if !self.in_run(agent) {
+            return;
+        }
+        let more = if queued.len() > 1 { format!(" (+{} more)", queued.len() - 1) } else { String::new() };
+        if let Some(r) = self.run.as_mut() {
+            let name = r.name_of(agent);
+            r.log("›", "rose", format!("delivered to {name}: {}{more}", crate::util::trunc(first, 60)));
         }
     }
 
@@ -2358,7 +2895,7 @@ impl App {
             return;
         };
         if let Some(a) = newest.agent {
-            if let Some(i) = self.stage_nodes().iter().position(|n| *n == a) {
+            if let Some(i) = self.stage_nodes().iter().position(|n| *n == StageNode::Agent(a)) {
                 self.sel = i;
             }
             self.sel_follow = None;
@@ -2374,7 +2911,7 @@ impl App {
             return;
         }
         let (since, agent) = (h.since, h.agent);
-        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == a)) {
+        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == StageNode::Agent(a))) {
             self.sel = i;
         }
         self.halt_seen = Some(since);
@@ -2407,6 +2944,9 @@ impl App {
                     was_busy = (a.turn_active || a.awaiting_start) && !a.relaunching;
                     a.relaunching = false;
                     a.switching_backend = false;
+                    if a.thread_id.is_none() {
+                        crate::mlog!("agent {agent} ({}, {}) ready: session {thread_id}", a.name, format!("{:?}", a.backend).to_lowercase());
+                    }
                     a.thread_id = Some(thread_id);
                     if !model.is_empty() {
                         a.model = model;
@@ -2437,11 +2977,19 @@ impl App {
                     Some(a) => a.apply(&method, &params),
                     None => return,
                 };
-                if method == "turn/started" {
-                    if let Some(a) = self.agents.get_mut(&agent) {
-                        for q in std::mem::take(&mut a.queued) {
-                            self.hub.send(agent, Cmd::Steer { text: q });
+                if method == "warning" && self.in_run(agent) {
+                    if let Some(msg) = params.get("message").and_then(|m| m.as_str()).filter(|m| m.starts_with("provider rate limit:")) {
+                        let msg = msg.to_string();
+                        if let Some(r) = self.run.as_mut() {
+                            r.log_quota_warning(agent, &msg);
                         }
+                    }
+                }
+                if method == "turn/started" {
+                    let drained = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+                    self.log_delivered(agent, &drained);
+                    for q in drained {
+                        self.hub.send(agent, Cmd::Steer { text: q });
                     }
                 }
                 if method == "thread/tokenUsage/updated" && (Some(agent) == self.solo || self.screen == Screen::Zoom(agent)) {
@@ -2464,8 +3012,11 @@ impl App {
                     if pending {
                         self.compact_agent(agent);
                     }
-                    let queued = self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default();
+                    // a failed turn keeps the queue: the retry's (or the fallback's) first turn takes it
+                    let failed = params.pointer("/turn/status").and_then(|s| s.as_str()) == Some("failed");
+                    let queued = if failed { vec![] } else { self.agents.get_mut(&agent).map(|a| std::mem::take(&mut a.queued)).unwrap_or_default() };
                     if !queued.is_empty() {
+                        self.log_delivered(agent, &queued);
                         prompt_agent(&self.hub, &mut self.agents, agent, queued.join("\n\n"), false, Send::Auto);
                     }
                 }
@@ -2478,6 +3029,14 @@ impl App {
                             }
                         }
                         Signal::Activity => {}
+                        Signal::Compacted { from, to } => {
+                            if self.in_run(agent) {
+                                self.with_run(|r, _| {
+                                    let name = r.name_of(agent);
+                                    r.log("⇣", "amber", format!("{name}: context compacted {}k → {}k", from / 1000, to / 1000));
+                                });
+                            }
+                        }
                         Signal::EnvironmentBroken(msg) => {
                             if self.in_run(agent) {
                                 self.with_run(|r, c| r.on_environment_broken(c, agent, msg));
@@ -2512,6 +3071,8 @@ impl App {
                 "settings" => crate::mlog!("agent {agent}: thread/settings/update not supported ({error}); new policy applies from the next turn"),
                 // naming a thread is a nicety: an older app-server without `thread/name/set` is no reason to bother anyone
                 "name" => crate::mlog!("agent {agent}: thread/name/set not supported ({error})"),
+                // the archive of a task that has ended, after its process is gone: nothing to tell anyone
+                "archive" if self.agents.get(&agent).map(|a| matches!(a.status, Status::Stopped)).unwrap_or(false) => crate::mlog!("agent {agent}: thread/archive after exit ({error})"),
                 other => {
                     if let Some(a) = self.agents.get_mut(&agent) {
                         if other == "compact" {
@@ -2691,7 +3252,7 @@ impl App {
                     let backend = self.registry.backend_of(&model);
                     let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
                     let approval = self.agents.get(&parent).map(|a| a.approval.clone()).unwrap_or_else(|| self.settings.approval_mode.clone());
-                    let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
+                    let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts { claude_user_config: String::new(),
                         name: format!("solo subagent · {alias}"), role: "solo-subagent".into(), glyph: "◇".into(), color: "blue".into(),
                         model_alias: alias.to_string(), effort: args.get("effort").and_then(Value::as_str).map(str::to_string), cwd: self.project.clone(),
                         approval, sandbox: role_sandbox(&self.settings.sandbox, backend),
@@ -3028,10 +3589,8 @@ impl App {
             return;
         }
         if ctrl && k.code == KeyCode::Char('k') && self.overlays.is_empty() {
-            let target = self.focus_agent();
-            let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
-            let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-            self.overlays.push(Overlay::ModelPicker { sel, target });
+            let target = self.picker_target();
+            self.open_model_picker(target);
             return;
         }
         if ctrl && k.code == KeyCode::Char('d') && self.overlays.is_empty() && !self.screen.is_config() {
@@ -3063,7 +3622,7 @@ impl App {
             return;
         }
         // page keys scroll the log in view, unless what is in front pages through its own list
-        let pages_itself = matches!(self.overlays.last(), Some(Overlay::Diff { .. } | Overlay::Plan { .. } | Overlay::Halt { .. } | Overlay::Help { .. } | Overlay::Discover(_))) || (self.overlays.is_empty() && self.screen.is_config());
+        let pages_itself = matches!(self.overlays.last(), Some(Overlay::Diff { .. } | Overlay::Plan { .. } | Overlay::Halt { .. } | Overlay::Help { .. } | Overlay::Discover(_) | Overlay::ModelPicker { .. })) || (self.overlays.is_empty() && self.screen.is_config());
         if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) && !pages_itself {
             self.scroll(if k.code == KeyCode::PageUp { 15 } else { -15 });
             return;
@@ -3123,6 +3682,11 @@ impl App {
         if k.code == KeyCode::Backspace && self.input.is_empty() {
             if let Some(a) = self.composer_agent() {
                 if let Some(text) = self.agents.get_mut(&a).and_then(|ag| ag.queued.pop()) {
+                    if self.in_run(a) {
+                        if let Some(r) = self.run.as_mut() {
+                            r.log("↩", "gray", "a queued message was taken back for editing");
+                        }
+                    }
                     self.input.set(&text);
                     return;
                 }
@@ -3195,6 +3759,8 @@ impl App {
     fn stage_key(&mut self, k: KeyEvent) -> bool {
         let nodes = self.stage_nodes();
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        // a second r / x / c on the same card does it; any other key disarms
+        let armed = self.armed.take();
         if k.code == KeyCode::Tab && self.suggestions().is_empty() {
             self.canvas_focus = !self.canvas_focus;
             return true;
@@ -3204,10 +3770,10 @@ impl App {
             match k.code {
                 KeyCode::Left | KeyCode::Up | KeyCode::Right | KeyCode::Down => {
                     self.sel_follow = None;
-                    let visible: Vec<_> = self.stage_nav.iter().filter(|(id, _, _)| nodes.contains(id)).copied().collect();
+                    let visible: Vec<_> = self.stage_nav.iter().filter(|(id, _, _)| nodes.contains(id)).cloned().collect();
                     if !visible.is_empty() {
-                        let selected = nodes.get(self.sel).copied();
-                        let origin = visible.iter().find(|(id, _, _)| Some(*id) == selected);
+                        let selected = nodes.get(self.sel).cloned();
+                        let origin = visible.iter().find(|(id, _, _)| Some(id) == selected.as_ref());
                         let next = origin.and_then(|(_, x, y)| {
                             visible.iter().filter_map(|(id, nx, ny)| {
                                 let dx = *nx as i32 - *x as i32;
@@ -3219,9 +3785,9 @@ impl App {
                                     _ => (dy, dx.abs()),
                                 };
                                 let distance = if matches!(k.code, KeyCode::Up | KeyCode::Down) { (forward, sideways) } else { (sideways, forward) };
-                                (forward > 0).then_some((distance, *id))
+                                (forward > 0).then_some((distance, id.clone()))
                             }).min_by_key(|(distance, _)| *distance).map(|(_, id)| id)
-                        }).or_else(|| origin.is_none().then(|| visible[0].0));
+                        }).or_else(|| origin.is_none().then(|| visible[0].0.clone()));
                         if let Some(id) = next {
                             if let Some(i) = nodes.iter().position(|a| *a == id) { self.sel = i; }
                         }
@@ -3246,16 +3812,15 @@ impl App {
             }
         }
         if k.code == KeyCode::Enter && (self.canvas_focus || self.input.is_empty()) {
-            if let Some(a) = nodes.get(self.sel) {
-                self.set_screen(Screen::Zoom(*a));
-                self.canvas_focus = false;
+            if let Some(n) = nodes.get(self.sel) {
+                self.zoom_node(n);
             }
             return true;
         }
         if !self.canvas_focus {
             return false;
         }
-        let selected = nodes.get(self.sel).copied();
+        let selected = nodes.get(self.sel).cloned();
         match k.code {
             KeyCode::Char(' ') => {
                 self.with_run(|r, c| r.toggle_pause(c));
@@ -3268,50 +3833,34 @@ impl App {
                     self.land_on_overview();
                 }
             }
-            KeyCode::Char('x') => {
-                if let Some(a) = selected {
-                    self.interrupt_by_user(a);
+            KeyCode::Char(c @ ('x' | 'r' | 'c')) => {
+                if let Some(n) = selected {
+                    self.card_action(c, n, armed);
                 }
             }
-            KeyCode::Char('r') => {
-                if let Some(a) = selected {
-                    let crashed = self.agents.get(&a).map(|x| matches!(x.status, Status::Crashed(_))).unwrap_or(false);
-                    if crashed {
-                        self.hub.send(a, Cmd::Restart);
-                    } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
-                        match res {
-                            Ok(what) => {
-                                // a worker's new attempt has no node until its agent exists
-                                self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
-                                self.toast(what, Level::Info);
-                            }
-                            Err(msg) => self.toast(msg, Level::Warn),
+            KeyCode::Char(c @ ('+' | '=' | '-')) => {
+                if let Some(n) = selected {
+                    match n {
+                        StageNode::Agent(a) if self.agent_alive(a) => self.step_effort(a, if c == '-' { -1 } else { 1 }),
+                        n => {
+                            let name = self.node_name(&n);
+                            self.toast(format!("{name} is not running — its role's effort is set in the Studio"), Level::Info);
                         }
                     }
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                if let Some(a) = selected {
-                    self.step_effort(a, 1);
-                }
-            }
-            KeyCode::Char('-') => {
-                if let Some(a) = selected {
-                    self.step_effort(a, -1);
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(a) = selected {
-                    self.compact_agent(a);
-                }
-            }
             KeyCode::Char('m') => {
                 // On a halted run this is the fix for `ProviderRejected`: pick a different model
-                // for the affected agent (WP6.6). Works on any selected agent, halted or not.
-                if let Some(a) = selected {
-                    let cur = self.agents.get(&a).map(|x| x.model_alias.clone()).unwrap_or_default();
-                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-                    self.overlays.push(Overlay::ModelPicker { sel, target: Some(a) });
+                // for the affected agent (WP6.6). Works on any selected card: an agent's own model,
+                // or the role's model for this run when the card has no agent yet.
+                if let Some(n) = selected {
+                    match self.picker_target_for_node(&n) {
+                        PickTarget::NewSessions => {
+                            let name = self.node_name(&n);
+                            self.toast(format!("{name} has no role to set a model for"), Level::Info);
+                        }
+                        t => self.open_model_picker(t),
+                    }
                 }
             }
             KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
@@ -3325,12 +3874,14 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => {
                 // 1-9 jump: select the nth node and zoom straight in.
                 let idx = (c as usize) - ('1' as usize);
-                if let Some(a) = nodes.get(idx) {
+                if let Some(n) = nodes.get(idx) {
                     // the user chose a card: a respawned task no longer pulls the selection back
                     self.sel_follow = None;
                     self.sel = idx;
-                    self.set_screen(Screen::Zoom(*a));
-                    self.canvas_focus = false;
+                    if let StageNode::Agent(a) = n {
+                        self.set_screen(Screen::Zoom(*a));
+                        self.canvas_focus = false;
+                    }
                 }
             }
             KeyCode::Char(c) if c.is_alphanumeric() => {
@@ -3341,6 +3892,87 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// ⏎ on a stage card: zoom into its agent (a finished or stopped one too — its log is
+    /// read-only), or say why there is nothing to zoom into.
+    fn zoom_node(&mut self, n: &StageNode) {
+        if let Some(a) = self.node_agent(n).filter(|a| self.agents.contains_key(a)) {
+            self.set_screen(Screen::Zoom(a));
+            self.canvas_focus = false;
+            return;
+        }
+        match n {
+            StageNode::Task(id) => self.toast(format!("{id} has not started yet — p shows it in the plan"), Level::Info),
+            n => {
+                let name = self.node_name(n);
+                self.toast(format!("{name} has not started yet"), Level::Info);
+            }
+        }
+    }
+
+    /// `r`, `x` and `c` on a stage card. The first press says what it will do; the second, on the
+    /// same card within 2.5 s, does it. A crashed agent restarts at once (nothing to lose).
+    fn card_action(&mut self, key: char, n: StageNode, armed: Option<(char, StageNode, Instant)>) {
+        let name = self.node_name(&n);
+        // the agent the key acts on: the card's own, or — for `r` — the gate's last one once the stage waits on it
+        let gate_waits = self.run.as_ref().is_some_and(|r| matches!(&r.stage, Stage::Phase { step, .. } if !matches!(step, crate::engine::run::PhaseStep::Orchestrating)));
+        let target = match &n {
+            StageNode::Agent(a) => Some(*a),
+            StageNode::Slot("gate") if key == 'r' && gate_waits => self.node_agent(&n),
+            _ => None,
+        };
+        let Some(a) = target else {
+            return match (&n, key) {
+                (StageNode::Task(id), 'r') => self.toast(format!("the orchestrator starts {id}; r works once it has run"), Level::Info),
+                (_, 'r') => self.toast(format!("{name} is not running — nothing to restart"), Level::Info),
+                _ => self.toast(format!("{name} is not running"), Level::Info),
+            };
+        };
+        if key != 'r' && !self.agent_alive(a) {
+            return self.toast(format!("{name} is not running"), Level::Info);
+        }
+        let crashed = self.agents.get(&a).is_some_and(|x| matches!(x.status, Status::Crashed(_)));
+        if key == 'x' && !self.agents.get(&a).is_some_and(|x| x.busy()) {
+            return self.toast(format!("{name} is not working — nothing to interrupt"), Level::Info);
+        }
+        // `Run::respawn` takes a live agent of the run or a worker of it; a retired one has nothing to restart
+        if key == 'r' && !crashed && !(self.in_run(a) || self.run.as_ref().is_some_and(|r| r.workers.iter().any(|w| w.agent == Some(a)))) {
+            return self.toast(format!("{name} is not running — nothing to restart"), Level::Info);
+        }
+        if !(key == 'r' && crashed) {
+            let again = armed.is_some_and(|(k, an, t)| k == key && an == n && t.elapsed() < Duration::from_millis(2500));
+            if !again {
+                self.armed = Some((key, n, Instant::now()));
+                let what = match key {
+                    'r' => format!("press r again to respawn {name} (it starts over with a fresh session)"),
+                    'x' => format!("press x again to interrupt {name}"),
+                    _ => format!("press c again to compact {name}'s context"),
+                };
+                return self.toast(what, Level::Warn);
+            }
+        }
+        match key {
+            'x' => {
+                self.interrupt_by_user(a);
+            }
+            'c' => {
+                self.compact_agent(a);
+            }
+            _ if crashed => self.hub.send(a, Cmd::Restart),
+            _ => {
+                if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
+                    match res {
+                        Ok(what) => {
+                            // a worker's new attempt has no node until its agent exists
+                            self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
+                            self.toast(what, Level::Info);
+                        }
+                        Err(msg) => self.toast(msg, Level::Warn),
+                    }
+                }
+            }
+        }
     }
 
     /// What the input could become: a command for `/…`, a command's argument for `/akasha …`
@@ -3403,7 +4035,7 @@ impl App {
     /// The run's agents as the stage shows them (card order): name, then role and model.
     pub fn run_agent_choices(&self) -> Vec<Choice> {
         let Some(r) = &self.run else { return vec![] };
-        self.stage_nodes()
+        self.stage_agents()
             .into_iter()
             .map(|a| {
                 let role = r.role_name_of(a).unwrap_or_default();
@@ -3481,6 +4113,12 @@ impl App {
         ag.queued.clear();
         ag.notice(Level::Warn, "stopped by you — type to continue, or r to respawn");
         self.hub.send(a, Cmd::Interrupt);
+        if self.in_run(a) {
+            self.with_run(|r, _| {
+                let name = r.name_of(a);
+                r.log("■", "amber", format!("{name} interrupted (by you)"));
+            });
+        }
         true
     }
 
@@ -3567,7 +4205,7 @@ impl App {
                     }
                     return;
                 }
-                self.with_run(|r, c| r.user_input(c, &text));
+                self.with_run(|r, c| r.user_input(c, &text, Send::Queue));
             }
             _ => {}
         }
@@ -3625,9 +4263,8 @@ impl App {
             "/help" => self.overlays.push(Overlay::Help { scroll: 0 }),
             "/model" => {
                 if arg.is_empty() {
-                    let cur = target.and_then(|a| self.agents.get(&a)).map(|a| a.model_alias.clone()).unwrap_or_default();
-                    let sel = self.registry.models.iter().position(|m| m.alias == cur).unwrap_or(0);
-                    self.overlays.push(Overlay::ModelPicker { sel, target });
+                    let t = self.picker_target();
+                    self.open_model_picker(t);
                 } else if let Some(a) = target {
                     if let Err(e) = self.set_model(a, arg) {
                         self.toast(e, Level::Warn);
@@ -3762,6 +4399,12 @@ impl App {
 
     /// Stops every agent; the caller awaits the result before the runtime goes (`hub::Stopping`).
     pub fn shutdown(&mut self) -> crate::hub::Stopping {
+        if let Some(run) = self.run.as_mut().filter(|r| r.is_active()) {
+            run.closed_unix = Some(crate::util::unix_secs());
+            let (stage, id) = (crate::engine::state::stage_label(&run.stage), run.id.clone());
+            run.log("⏻", "gray", format!("Mantra was closed with the run at {stage} — reopen it with: mantra runs resume {id}"));
+            run.save_state();
+        }
         self.hub.shutdown_all()
     }
 }
@@ -4133,6 +4776,28 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly one Cmd::Steer, not one per message");
     }
 
+    /// WP-5.6: a message typed on the overview does what the footer says: it queues behind the
+    /// planner's busy turn (a queue chip) and sends no steer; ctrl+f sends it now.
+    #[test]
+    fn overview_enter_queues_behind_a_busy_planner_and_sends_no_steer() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let id = 51;
+        let mut agent = Agent::new(id, "planner", "planner", PathBuf::new());
+        agent.status = Status::Busy;
+        agent.turn_active = true;
+        app.agents.insert(id, agent);
+        let mut rx = app.hub.test_register(id);
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), crate::engine::pattern::Pattern::builtin(), "goal".into());
+        run.planner = Some(id);
+        run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+        app.run = Some(run);
+        app.screen = Screen::Stage;
+        app.submit("please also add tests".into());
+        assert_eq!(app.agents[&id].queued.len(), 1, "queued: {:?}", app.agents[&id].queued);
+        assert!(app.agents[&id].queued[0].contains("please also add tests"));
+        assert!(!matches!(rx.try_recv(), Ok(Cmd::Steer { .. })), "no steer for a plain Enter");
+    }
+
     #[test]
     fn solo_ctrl_c_interrupts_a_live_turn_without_discarding_a_draft() {
         let mut app = crate::web::snapshot::tests::test_app();
@@ -4252,7 +4917,7 @@ done"#;
         let mut reg = Registry::defaults();
         reg.add_codex_model("test-codex", "test").unwrap();
         for (permission, resume) in [("never", false), (crate::config::BYPASS_SANDBOX_DANGER, false), (crate::config::BYPASS_SANDBOX_DANGER, true)] {
-            let id = spawn_agent(&mut hub, &mut agents, &reg, AgentOpts {
+            let id = spawn_agent(&mut hub, &mut agents, &reg, AgentOpts { claude_user_config: String::new(),
                 name: "test".into(), role: "worker".into(), glyph: "◇".into(), color: "teal".into(),
                 model_alias: "test-codex".into(), effort: None, cwd: dir.clone(),
                 approval: permission.into(), sandbox: "read-only".into(), instructions: String::new(), tools: vec![],
@@ -4286,7 +4951,7 @@ done"#;
         let mut hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
         let mut agents = BTreeMap::new();
         let reg = Registry::defaults();
-        let opts = |effort: Option<&str>| AgentOpts {
+        let opts = |effort: Option<&str>| AgentOpts { claude_user_config: String::new(),
             name: "w".into(),
             role: "worker-small".into(),
             glyph: "◇".into(),
@@ -4371,7 +5036,7 @@ done"#;
         a.turn_active = true;
         a.queued.push("also check tests".into());
         a.push_user("Build the parser without changing the wire format");
-        a.launch_options = Some(Box::new(AgentOpts {
+        a.launch_options = Some(Box::new(AgentOpts { claude_user_config: String::new(),
             name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(),
             model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
             approval: "never".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(),
@@ -4520,7 +5185,7 @@ done"#;
         reg.providers.push(crate::config::ProviderEntry { id: "local".into(), kind: bija, base_url: "http://127.0.0.1:11434/v1".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "big".into(), provider: "gw".into(), model: "big-1".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "small".into(), provider: "local".into(), model: "local-model".into(), ..Default::default() });
-        let o = AgentOpts {
+        let o = AgentOpts { claude_user_config: String::new(),
             name: "w".into(),
             role: "worker".into(),
             glyph: "·".into(),
@@ -4682,7 +5347,7 @@ done"#;
         run.halt = Some(halt(Some(3)));
         app.run = Some(run);
         app.select_halted_agent();
-        assert_eq!(app.stage_nodes()[app.sel], 3, "the halted agent is selected");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(3), "the halted agent is selected");
         app.sel = 0;
         app.select_halted_agent();
         assert_eq!(app.sel, 0, "the same halt does not pull the selection back");
@@ -4692,7 +5357,50 @@ done"#;
         std::thread::sleep(Duration::from_millis(2));
         app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
         app.select_halted_agent();
-        assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(3), "a new halt moves it again");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_keeps_the_queue_and_a_completed_one_flushes_it() {
+        use crate::web::snapshot::tests::add_agent;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.stage = Stage::Planning;
+        app.run = Some(run);
+        add_agent(&mut app, 1, "planner");
+        let _ = app.hub.alloc_id(); // the replacement planner must not reuse id 1
+        let _rx = app.hub.test_register(1);
+        app.agents.get_mut(&1).unwrap().queued.push("please also add tests".into());
+        app.on_hub(HubEvent::Notif { agent: 1, method: "turn/completed".into(), params: json!({"turn":{"status":"failed","error":{"message":"boom"}}}) });
+        // the engine's free respawn of a failed planner follows; the chips went with it
+        let p = app.run.as_ref().unwrap().planner.unwrap();
+        assert_eq!(app.agents[&p].queued, ["please also add tests"], "a failed turn leaves the chips");
+        app.agents.get_mut(&p).unwrap().turn_active = true;
+        app.agents.get_mut(&p).unwrap().awaiting_start = false;
+        let _rx2 = app.hub.test_register(p);
+        app.on_hub(HubEvent::Notif { agent: p, method: "turn/completed".into(), params: json!({"turn":{"status":"completed"}}) });
+        assert!(!app.agents[&p].queued.iter().any(|q| q.contains("please also add tests")), "a completed turn flushes");
+        assert!(app.run.as_ref().unwrap().pulse.iter().any(|p| p.text.starts_with("delivered to planner: please also add tests")));
+    }
+
+    #[test]
+    fn a_quota_warning_reaches_the_journal_once() {
+        use crate::web::snapshot::tests::add_agent;
+        let mut app = screen_app();
+        let mut run = a_run();
+        run.planner = Some(1);
+        run.stage = Stage::Planning;
+        app.run = Some(run);
+        add_agent(&mut app, 1, "planner");
+        let before = app.run.as_ref().unwrap().pulse.len();
+        app.on_hub(HubEvent::Notif { agent: 1, method: "warning".into(), params: json!({"message": "provider rate limit: the five_hour window is 91% used"}) });
+        app.on_hub(HubEvent::Notif { agent: 1, method: "warning".into(), params: json!({"message": "something else"}) });
+        let run = app.run.as_ref().unwrap();
+        assert_eq!(run.pulse.len() - before, 1);
+        let line = run.pulse.back().unwrap();
+        assert!(line.text.starts_with("planner: provider rate limit: the five_hour window is 91% used"), "{}", line.text);
+        assert!(line.text.ends_with("has no fallback model (Studio → fallback)"), "{}", line.text);
     }
 
     #[test]
@@ -4748,7 +5456,7 @@ done"#;
         app.screen = Screen::Stage;
         // The list is planner, manager, orchestrator, workers, gate. The screen is different:
         // planner -> orchestrator -> manager across the top, then workers, then the gate.
-        app.stage_nav = vec![(1, 10, 0), (3, 40, 0), (2, 70, 0), (10, 25, 7), (11, 55, 7), (20, 40, 15)];
+        app.stage_nav = [(1, 10, 0), (3, 40, 0), (2, 70, 0), (10, 25, 7), (11, 55, 7), (20, 40, 15)].map(|(a, x, y)| (StageNode::Agent(a), x, y)).to_vec();
         app.canvas_focus = true;
         app.stage_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(3), "right follows the screen, not the role list");
@@ -4759,7 +5467,7 @@ done"#;
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(20));
         // A narrow frame only shows the worker list. Fixed roles and offscreen cards are skipped.
-        app.stage_nav = vec![(10, 20, 0), (11, 20, 1)];
+        app.stage_nav = [(10, 20, 0), (11, 20, 1)].map(|(a, x, y)| (StageNode::Agent(a), x, y)).to_vec();
         app.stage_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(10));
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -4790,20 +5498,23 @@ done"#;
         run.workers.push(attempt("p1-tooling", 2, Some(11), WState::Running));
         run.workers.push(attempt("p1-ui", 1, None, WState::Queued));
         app.run = Some(run);
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 12], "one node per task, the newest attempt, in plan order; a queued task has no card and no node");
-        assert_eq!(app.stage_nodes().iter().position(|a| *a == 11), Some(2), "p1-tooling's node is where its card is: right after the fixed roles");
+        assert_eq!(app.stage_agents(), vec![1, 3, 11, 12], "one node per task, the newest attempt, in plan order; a queued task has no card and no node");
+        assert_eq!(app.stage_agents().iter().position(|a| *a == 11), Some(2), "p1-tooling's node is where its card is: right after the fixed roles");
+        // the empty slots and the unstarted task are cards too, in card order
+        assert_eq!(app.stage_nodes(), vec![StageNode::Agent(1), StageNode::Slot("manager"), StageNode::Agent(3), StageNode::Agent(11), StageNode::Agent(12), StageNode::Task("p1-ui".into()), StageNode::Slot("gate")]);
         // ↓ from p1-tooling lands on p1-api, not on p1-tooling's cancelled attempt
-        app.sel = 2;
+        app.sel = 3;
         app.canvas_focus = true;
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.stage_nodes()[app.sel], 12);
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(12));
         // a newest attempt still queued hides the task's older agent as its card would
         app.run.as_mut().unwrap().workers.push(attempt("p1-api", 2, None, WState::Preparing));
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11]);
+        assert_eq!(app.stage_agents(), vec![1, 3, 11]);
+        assert!(app.stage_nodes().contains(&StageNode::Task("p1-api".into())));
         // a fix worker outside the phase's tasks keeps a node after them, so it stays reachable
         app.run.as_mut().unwrap().workers.push(attempt("fix-1", 1, Some(20), WState::Running));
         app.run.as_mut().unwrap().gate_agent = Some(30);
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 20, 30]);
+        assert_eq!(app.stage_agents(), vec![1, 3, 11, 20, 30]);
     }
 
     /// `r` on a worker: its new attempt has no node until its agent exists, so the shorter
@@ -4824,14 +5535,15 @@ done"#;
         run.workers.push(attempt("p1-ui", 1, Some(11), WState::Cancelled));
         run.workers.push(attempt("p1-ui", 2, None, WState::Preparing));
         app.run = Some(run);
-        app.sel = 2;
+        let pos = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).unwrap();
+        app.sel = pos(&app, StageNode::Task("p1-ui".into()));
         app.sel_follow = Some("p1-ui".into());
         app.tick();
-        assert_eq!(app.stage_nodes(), vec![3, 10]);
-        assert_eq!(app.sel, 1, "clamped to the last card while the new attempt has none");
+        assert_eq!(app.stage_agents(), vec![3, 10]);
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Task("p1-ui".into()), "on the task's card while the new attempt has no agent");
         app.run.as_mut().unwrap().workers[2].agent = Some(12);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 12, "and back on p1-ui once it has");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(12), "and back on p1-ui once it has");
         assert_eq!(app.sel_follow, None);
         // an arrow key in between is the user choosing: nothing follows any more
         app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 3, None, WState::Preparing));
@@ -4840,16 +5552,17 @@ done"#;
         app.stage_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         app.run.as_mut().unwrap().workers[3].agent = Some(13);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 10, "the selection stays on p1-api, where ← put it");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10), "the selection stays on p1-api, where ← put it");
         // and so is a 1–9 jump
         app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 4, None, WState::Preparing));
         app.sel_follow = Some("p1-ui".into());
         app.canvas_focus = true;
-        app.stage_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert_eq!(app.stage_nodes()[app.sel], 10);
+        let digit = char::from_digit(pos(&app, StageNode::Agent(10)) as u32 + 1, 10).unwrap();
+        app.stage_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10));
         app.run.as_mut().unwrap().workers[4].agent = Some(14);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 10, "the jump is the user choosing too");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10), "the jump is the user choosing too");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the
@@ -5049,12 +5762,35 @@ done"#;
         let mut app = screen_app();
         let efforts = vec!["low".to_string(), "medium".into(), "high".into()];
         app.registry.models.push(crate::config::ModelEntry { alias: "longalias9".into(), model: "a-rather-long-model-identifier".into(), efforts, default_effort: "medium".into(), ..Default::default() });
-        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
         let rows = frame(&mut app, 80, 30);
-        let keys = rows.iter().find(|l| l.contains("model ") && l.contains("switch")).expect("key line");
+        let keys = rows.iter().find(|l| l.contains("apply")).expect("key line");
         assert!(keys.contains("esc"), "{keys:?}");
         let row = rows.iter().find(|l| l.contains("longalias9")).expect("model row");
         assert!(row.contains("medium") && row.contains("ctx"), "{row:?}");
+    }
+
+    /// Every model row of the picker names its provider with the mark and name in that provider's
+    /// colour, and the picker still fits 80 columns.
+    #[test]
+    fn the_model_picker_shows_each_provider_in_its_colour() {
+        use ratatui::style::Color;
+        let mut app = screen_app();
+        app.registry.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), color: "violet".into(), kind: crate::config::ProviderKind::Bija, ..Default::default() });
+        app.registry.models.push(crate::config::ModelEntry { alias: "glm".into(), model: "z/glm-5.3".into(), provider: "riti".into(), ..Default::default() });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let y = (0..buf.area.height).find(|&y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().contains("glm")).expect("glm row");
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        assert!(row.contains("Riti"), "{row:?}");
+        let x = row.find("Riti").map(|b| row[..b].chars().count()).unwrap() as u16;
+        let want = crate::ui::theme::c(crate::ui::theme::VIOLET);
+        assert_eq!(buf[(x, y)].fg, want, "the name is in the provider's colour");
+        assert_eq!(buf[(x - 2, y)].fg, want, "so is the mark");
+        assert_ne!(buf[(x, y)].fg, Color::Reset);
+        assert!(row.chars().count() <= 80);
     }
 
     fn mcp_server(command: &str, args: &[&str], enabled: bool) -> crate::config::McpServer {
@@ -5208,7 +5944,7 @@ done"#;
     /// the user's own `claude mcp` servers, as it had them before the vision tools came.
     #[test]
     fn claude_is_strict_except_for_solo_with_the_vision_tools_alone() {
-        let o = |tools: Vec<Value>, mcp: Vec<(String, crate::config::McpServer)>| AgentOpts {
+        let o = |tools: Vec<Value>, mcp: Vec<(String, crate::config::McpServer)>| AgentOpts { claude_user_config: String::new(),
             name: "solo".into(),
             role: "solo".into(),
             glyph: "●".into(),
@@ -5331,7 +6067,7 @@ done"#;
         reg.providers.push(crate::config::ProviderEntry { id: "agy".into(), kind: crate::config::ProviderKind::Antigravity, api_key: Some("must-not-leak".into()), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model".into(), efforts: vec!["low".into(), "medium".into(), "high".into()], ..Default::default() });
         let (mut hub, _commands) = test_hub_with(1);
-        let opts = AgentOpts {
+        let opts = AgentOpts { claude_user_config: String::new(),
             name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "google".into(), effort: Some("max".into()), cwd: PathBuf::from("."), approval: "on-request".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(), tools: vec![json!({"name":"mantra_status"})], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(123456), resume_thread: None, thread_name: None, mcp: vec![],
         };
         let (spec, _, lowered) = agent_spec(&mut hub, &reg, &opts);
@@ -5343,6 +6079,45 @@ done"#;
         assert!(spec.envs.is_empty());
         assert!(spec.claude.is_none() && spec.bija.is_none());
         assert_eq!(spec.antigravity.unwrap().system_prompt, opts.instructions);
+    }
+
+    #[tokio::test]
+    async fn a_codex_model_is_told_the_context_override_and_compacts_at_85_percent() {
+        let mut reg = Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "cx".into(), kind: crate::config::ProviderKind::Codex, ..Default::default() });
+        reg.models.push(crate::config::ModelEntry { alias: "cx-big".into(), provider: "cx".into(), model: "cx-big".into(), context_window: Some(1_000_000), ..Default::default() });
+        let (mut hub, _commands) = test_hub_with(1);
+        let opts = AgentOpts { claude_user_config: String::new(),
+            name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "cx-big".into(), effort: None, cwd: PathBuf::from("."), approval: "never".into(), sandbox: "workspace-write".into(), instructions: String::new(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(500_000), resume_thread: None, thread_name: None, mcp: vec![],
+        };
+        let (spec, _, _) = agent_spec(&mut hub, &reg, &opts);
+        assert!(spec.extra_args.contains(&"model_context_window=500000".to_string()), "{:?}", spec.extra_args);
+        assert!(spec.extra_args.contains(&"model_auto_compact_token_limit=425000".to_string()), "{:?}", spec.extra_args);
+    }
+
+    #[tokio::test]
+    async fn a_live_model_switch_keeps_the_roles_context_limit() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let provider = app.registry.providers[0].id.clone();
+        for alias in ["ctx-a", "ctx-b"] {
+            app.registry.models.push(crate::config::ModelEntry { alias: alias.into(), provider: provider.clone(), model: alias.into(), context_window: Some(1_000_000), ..Default::default() });
+        }
+        let mut pattern = Pattern::builtin();
+        let planner = pattern.flow.planner.clone();
+        pattern.roles.get_mut(&planner).unwrap().context = Some(250_000);
+        pattern.settings.context_cap = 0;
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), pattern, "test".into());
+        run.planner = Some(7);
+        app.run = Some(run);
+        let backend = app.registry.backend_of(&app.registry.resolve("ctx-a"));
+        let mut agent = Agent::new(7, "planner", &planner, PathBuf::new());
+        agent.model_alias = "ctx-a".into();
+        agent.backend = backend;
+        agent.ctx_window = Some(250_000);
+        app.agents.insert(7, agent);
+        let _rx = app.hub.test_register(7);
+        assert_eq!(app.set_model(7, "ctx-b"), Ok(()));
+        assert_eq!(app.agents[&7].ctx_window, Some(250_000), "a 1M model under a 250k role limit");
     }
 
     #[test]
@@ -5379,4 +6154,734 @@ done"#;
         assert!(app.registry.alias_problem("google").is_none(), "the model remains selectable for supported roles");
     }
 
+
+    // ─── WP-3.1: the registry the run sees is the registry there is ───
+
+    #[tokio::test]
+    async fn an_alias_added_afterwards_is_known_to_the_run() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let project = crate::config::home().join("registry-project");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.project = project;
+            app.start_run("build the parser");
+            let mut candidate = app.run.as_ref().unwrap().pattern.clone();
+            candidate.roles.get_mut("planner").unwrap().fallback = Some("fresh-alias".into());
+            let refused = app.run.as_ref().unwrap().validate_pattern_replacement(&candidate).unwrap_err();
+            assert!(refused.contains("unconfigured"), "{refused}");
+            app.registry.models.push(crate::config::ModelEntry { alias: "fresh-alias".into(), model: "fresh-model".into(), ..Default::default() });
+            app.registry_changed();
+            assert!(app.run.as_ref().unwrap().validate_pattern_replacement(&candidate).is_ok());
+            app.run = None;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn models_toml_changed_on_disk_is_reloaded_unless_it_is_being_edited() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
+            Settings::default().save().unwrap();
+            configured_fixture().save().unwrap();
+            let mut app = App::new(Settings::load_on_disk().unwrap(), configured_fixture(), PathBuf::from("."), hub, tx, false);
+            // another terminal adds a model
+            let mut disk = Registry::load();
+            disk.models.push(crate::config::ModelEntry { alias: "added-on-disk".into(), model: "m".into(), ..Default::default() });
+            disk.save().unwrap();
+            app.registry_mtime = Some(std::time::UNIX_EPOCH); // however coarse the file system's clock is
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_none(), "looked at less than 2 seconds ago");
+            app.registry_checked = None;
+            app.models_ui.dirty = true;
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_none(), "an edit on the models screen is not overwritten");
+            app.models_ui.dirty = false;
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.registry.get("added-on-disk").is_some());
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("models.toml changed on disk — reloaded"));
+            // our own save is not a change behind our back
+            app.toast = None;
+            app.save_registry().unwrap();
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.toast.is_none(), "{:?}", app.toast);
+            let _ = app.shutdown();
+        });
+    }
+
+    // ─── WP-3.2: a run adopts changes to its saved pattern ───
+
+    /// A saved pattern whose roles all run on `sol`, a run started from it and left at `stage`
+    /// (with `plan`, if any), closed again: what a resume finds on disk. Returns the run's id.
+    fn closed_run_on_saved_pattern(app: &mut App, name: &str, stage: Stage, plan: Option<crate::engine::plan::Plan>) -> String {
+        let project = crate::config::home().join(format!("{name}-project"));
+        std::fs::create_dir_all(&project).unwrap();
+        app.project = project;
+        let mut p = Pattern::builtin();
+        p.name = name.into();
+        p.flow.manager = String::new();
+        for r in p.roles.values_mut() {
+            r.model = "sol".into();
+            r.fallback = None;
+        }
+        p.save().unwrap();
+        app.pattern_name = name.into();
+        app.start_run("build the parser");
+        let run = app.run.as_mut().expect("the run started");
+        run.stage = stage;
+        run.plan = plan;
+        run.save_state();
+        if let Some(p) = &run.plan {
+            std::fs::write(run.dir.join("plan.json"), serde_json::to_string(p).unwrap()).unwrap();
+        }
+        let id = run.id.clone();
+        app.run = None;
+        id
+    }
+
+    fn change_saved_pattern(app: &App, name: &str, edit: impl FnOnce(&mut Pattern)) {
+        let mut p = Pattern::load(name, &app.project).unwrap();
+        edit(&mut p);
+        p.save().unwrap();
+    }
+
+    fn resume(app: &mut App, id: &str) {
+        let row = crate::engine::state::list_all().into_iter().find(|r| r.id == id).expect("the run is listed");
+        app.resume_run(row);
+    }
+
+    fn said(app: &App) -> Vec<String> {
+        app.run.as_ref().map(|r| r.pulse.iter().map(|p| p.text.clone()).collect()).unwrap_or_default()
+    }
+
+    fn one_task_plan() -> crate::engine::plan::Plan {
+        use crate::engine::plan::{Phase, Plan, Task};
+        Plan { phases: vec![Phase { id: "p1".into(), name: "p1".into(), tasks: vec![Task { id: "t1".into(), role: "worker-small".into(), prompt: "Write the one function that is asked for and test it.".into(), ..Default::default() }], ..Default::default() }], ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_run_has_the_pattern_as_it_was_changed_meanwhile() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-on-resume", Stage::Planning, None);
+            change_saved_pattern(&app, "adopt-on-resume", |p| {
+                p.roles.get_mut("qa").unwrap().model = "luna".into();
+                p.settings.context_cap = 150_000;
+            });
+            resume(&mut app, &id);
+            let run = app.run.as_ref().expect("resumed");
+            assert_eq!((run.pattern.roles["qa"].model.as_str(), run.pattern.settings.context_cap), ("luna", 150_000));
+            let lines = said(&app);
+            assert!(lines.iter().any(|l| l.starts_with("pattern updated from the saved pattern (on resume) (2 change(s)): ")), "{lines:?}");
+            let saved = Pattern::load("adopt-on-resume", &app.project).unwrap();
+            assert_eq!(std::fs::read_to_string(run.dir.join("pattern.base.toml")).unwrap(), saved.to_toml(), "the run is in step with the saved pattern now");
+            assert!(std::fs::read_to_string(run.dir.join("pattern.toml")).unwrap().contains("150000"), "and its own copy says so");
+            // a second resume has nothing to adopt
+            let dir = run.dir.clone();
+            app.stop_run();
+            app.run = None;
+            let _ = dir;
+            resume(&mut app, &id);
+            assert!(!said(&app).iter().any(|l| l.starts_with("pattern updated")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_from_before_the_base_file_adopts_every_difference() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-legacy", Stage::Planning, None);
+            let dir = crate::engine::state::list_all().into_iter().find(|r| r.id == id).unwrap().dir;
+            std::fs::remove_file(dir.join("pattern.base.toml")).unwrap();
+            change_saved_pattern(&app, "adopt-legacy", |p| p.roles.get_mut("qa").unwrap().model = "luna".into());
+            resume(&mut app, &id);
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["qa"].model, "luna");
+            // without a base every difference counts (here also the demo's own `mcp` tweak, which the saved pattern lacks)
+            assert!(said(&app).iter().any(|l| l.starts_with("pattern updated from the saved pattern (on resume) (") && l.contains("roles.qa.model: sol → luna")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_keeps_its_copy_when_the_saved_pattern_took_away_a_role_the_plan_needs() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-refused", Stage::Review, Some(one_task_plan()));
+            change_saved_pattern(&app, "adopt-refused", |p| {
+                p.roles.remove("worker-small");
+                p.groups.clear();
+            });
+            resume(&mut app, &id);
+            let run = app.run.as_ref().expect("resumed");
+            assert!(run.pattern.roles.contains_key("worker-small"), "it keeps its own copy");
+            let lines = said(&app);
+            assert!(lines.iter().any(|l| l.starts_with("the saved pattern changed but does not fit this run (") && l.contains("worker-small") && l.ends_with("it keeps its own copy")), "{lines:?}");
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_planner_pinned_before_the_restart_comes_back_on_the_roles_new_model() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let id = closed_run_on_saved_pattern(&mut app, "adopt-pin", Stage::Planning, None);
+            let dir = crate::engine::state::list_all().into_iter().find(|r| r.id == id).unwrap().dir;
+            // the user had put the planner on astra by hand
+            let mut st = crate::engine::state::RunState::load(&dir).unwrap();
+            st.agents.retain(|a| a.slot != "planner");
+            st.agents.push(crate::engine::state::AgentState { slot: "planner".into(), name: "planner".into(), role: "planner".into(), model_alias: "astra".into(), thread_id: Some("old-session".into()), ..Default::default() });
+            st.save(&dir);
+            change_saved_pattern(&app, "adopt-pin", |p| p.roles.get_mut("planner").unwrap().model = "luna".into());
+            resume(&mut app, &id);
+            let planner = app.agents.values().find(|a| a.name == "planner").expect("the planner is back");
+            assert_eq!(planner.model_alias, "luna");
+            assert!(said(&app).iter().any(|l| l == "planner: your per-agent model astra gives way to the role's new model luna"), "{:?}", said(&app));
+            assert!(!said(&app).iter().any(|l| l.contains("comes back on astra")), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_pattern_saved_in_the_studio_reaches_the_live_run_at_once() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            closed_run_on_saved_pattern(&mut app, "adopt-live", Stage::Planning, None);
+            app.start_run_with("build the parser", None, Some(8));
+            let run = app.run.as_mut().expect("a run on the saved pattern, 8 at once");
+            run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+            run.plan = Some(one_task_plan());
+            let agent = |app: &mut App, name: &str, role: &str| {
+                let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts { claude_user_config: String::new(),
+                    name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(), model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
+                    approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture".into(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
+                    context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
+                });
+                app.agents.get_mut(&id).unwrap().status = Status::Idle;
+                id
+            };
+            let (orch, done) = (agent(&mut app, "orchestrator", "orchestrator"), agent(&mut app, "t0", "worker-small"));
+            let run = app.run.as_mut().unwrap();
+            run.orchestrator = Some(orch);
+            let mut w = crate::web::snapshot::tests::worker("t0", 1, Some(done), crate::engine::run::WState::Done);
+            w.task.role = "worker-small".into();
+            run.workers.push(w);
+            // a change that is not about models, and one that is
+            change_saved_pattern(&app, "adopt-live", |p| {
+                p.roles.get_mut("orchestrator").unwrap().model = "luna".into();
+                p.roles.get_mut("worker-small").unwrap().model = "luna".into();
+                p.settings.context_cap = 99_000;
+            });
+            assert_eq!(app.sync_run_pattern("the Studio"), Some(3));
+            let run = app.run.as_ref().unwrap();
+            assert_eq!(run.pattern.settings.max_parallel, 8, "--parallel is the run's own and stays");
+            assert_eq!(run.pattern.settings.context_cap, 99_000);
+            assert_eq!(app.agents[&orch].model_alias, "luna", "the live orchestrator is switched");
+            assert_eq!(app.agents[&done].model_alias, "sol", "a worker that is done keeps the model it ran on");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("run updated: 3 change(s) from the pattern"));
+            assert_eq!(app.sync_run_pattern("the Studio"), None, "nothing more to adopt");
+            // leaving the Studio with a saved pattern does the same
+            change_saved_pattern(&app, "adopt-live", |p| p.settings.context_cap = 77_000);
+            app.set_screen(Screen::Studio);
+            app.studio.dirty = false;
+            app.leave_screen();
+            assert_eq!(app.run.as_ref().unwrap().pattern.settings.context_cap, 77_000);
+            app.run = None;
+        });
+    }
+
+    // ─── WP-5.2: one model picker ───
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// A live run on a saved pattern whose roles all run on `sol`, with a live orchestrator and a
+    /// worker `t0` whose attempt is `state`. Returns `(orchestrator, worker agent)`.
+    fn picker_run(app: &mut App, name: &str, state: crate::engine::run::WState) -> (AgentId, AgentId) {
+        closed_run_on_saved_pattern(app, name, Stage::Planning, None);
+        app.start_run_with("build the parser", None, Some(8));
+        let run = app.run.as_mut().expect("a run");
+        run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Orchestrating };
+        run.plan = Some(one_task_plan());
+        let agent = |app: &mut App, name: &str, role: &str| {
+            let id = spawn_agent(&mut app.hub, &mut app.agents, &app.registry, AgentOpts { claude_user_config: String::new(),
+                name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(), model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
+                approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture".into(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![],
+                context_override: None, resume_thread: None, thread_name: None, mcp: vec![],
+            });
+            app.agents.get_mut(&id).unwrap().status = Status::Idle;
+            id
+        };
+        let (orch, worker) = (agent(app, "orchestrator", "orchestrator"), agent(app, "t0", "worker-small"));
+        let run = app.run.as_mut().unwrap();
+        run.orchestrator = Some(orch);
+        let mut w = crate::web::snapshot::tests::worker("t0", 1, Some(worker), state);
+        w.task.role = "worker-small".into();
+        run.workers.push(w);
+        (orch, worker)
+    }
+
+    #[tokio::test]
+    async fn a_fallback_field_offers_none_first_and_leaves_out_the_roles_own_models() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        let mut p = Pattern::builtin();
+        p.roles.get_mut("qa").unwrap().model = "sol".into();
+        p.roles.get_mut("qa").unwrap().fallback = Some("luna".into());
+        p.roles.get_mut("qa").unwrap().fallback2 = Some("terra".into());
+        app.studio.pattern = p;
+        let alias = |app: &App, r: &PickRow| match r {
+            PickRow::None => "none".to_string(),
+            PickRow::Model(i) => app.registry.models[*i].alias.clone(),
+        };
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "fallback2".into() }, "");
+        let names: Vec<String> = rows.iter().map(|r| alias(&app, r)).collect();
+        assert_eq!(names[0], "none");
+        assert!(!names.contains(&"sol".to_string()), "the role's own model is not a fallback: {names:?}");
+        assert!(!names.contains(&"luna".to_string()), "another fallback of the role is taken: {names:?}");
+        assert!(names.contains(&"terra".to_string()), "this field's own value stays: {names:?}");
+        // the model field offers everything and no none row
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "model".into() }, "");
+        assert_eq!(rows.len(), app.registry.models.len());
+        assert!(rows.iter().all(|r| matches!(r, PickRow::Model(_))));
+        // a filter drops the none row
+        let rows = app.picker_rows(&PickTarget::StudioField { role: "qa".into(), field: "fallback".into() }, "openai");
+        assert!(!rows.is_empty() && rows.iter().all(|r| matches!(r, PickRow::Model(_))), "the provider's name is matched");
+    }
+
+    /// 24-character alias whole at 132 columns; a provider name wider than the old column keeps a
+    /// space before the backend tag; the rows scroll and the composer is left alone.
+    #[tokio::test]
+    async fn the_picker_keeps_a_long_alias_whole_and_a_space_after_the_provider() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.registry.models.push(crate::config::ModelEntry { alias: "a-very-long-alias-of-24-c".chars().take(24).collect(), model: "x/model".into(), ..Default::default() });
+        let long: String = "a-very-long-alias-of-24-c".chars().take(24).collect();
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
+        let rows = frame(&mut app, 132, 40);
+        let row = rows.iter().find(|l| l.contains(&long)).expect("its row");
+        assert!(row.contains(&format!("{long} ")), "{row:?}");
+        let codex = rows.iter().find(|l| l.contains("OpenAI (Codex)")).expect("a codex row");
+        let at = codex.find("OpenAI (Codex)").unwrap() + "OpenAI (Codex)".len();
+        assert!(codex[at..].starts_with(' '), "{codex:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tall_picker_scrolls_and_leaves_the_composer_whole() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        for i in 0..30 {
+            app.registry.models.push(crate::config::ModelEntry { alias: format!("extra{i:02}"), model: format!("x/extra-{i}"), ..Default::default() });
+        }
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: PickTarget::NewSessions, role_scope: false, filter: String::new() });
+        for _ in 0..40 {
+            press(&mut app, KeyCode::Down);
+        }
+        for (w, h) in [(80, 24), (100, 28), (140, 30)] {
+            let rows = frame(&mut app, w, h);
+            assert!(rows.iter().all(|l| l.chars().count() <= w as usize), "{w}x{h}");
+            assert!(rows.iter().any(|l| l.contains("model & effort")), "the box");
+            assert!(rows.iter().any(|l| l.contains(" of ") && l.contains("for: ")), "{w}x{h}: scrolls with a position");
+            assert!(rows.iter().any(|l| l.contains("▶ ") && l.contains("extra")), "{w}x{h}: the selected row is in view\n{}", rows.join("\n"));
+            // the keys line is the box's last content row: the composer and the footer (four rows) are below it, whole
+            let keys = rows.iter().position(|l| l.contains("apply") && l.contains("esc")).expect("keys");
+            assert!(keys + 6 <= h as usize, "{w}x{h}: keys at row {keys}\n{}", rows.join("\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_names_its_target_and_the_scope_switch_fits_every_width() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "pick-draw", crate::engine::run::WState::Failed("rejected".into()));
+            app.open_model_picker(PickTarget::Agent(orch));
+            let rows = frame(&mut app, 140, 36);
+            assert!(rows.iter().any(|l| l.contains("for: orchestrator") && l.contains("apply to:") && l.contains("[ this agent ]") && l.contains("role orchestrator (all its agents)")), "{}", rows.join("\n"));
+            press(&mut app, KeyCode::Tab);
+            let rows = frame(&mut app, 140, 36);
+            assert!(rows.iter().any(|l| l.contains("[ role orchestrator (all its agents) ]")), "{}", rows.join("\n"));
+            for w in [80, 100, 140] {
+                let rows = frame(&mut app, w, 30);
+                assert!(rows.iter().all(|l| l.chars().count() <= w as usize), "{w}");
+                assert!(rows.iter().any(|l| l.contains("for: ") && l.contains("apply to:")), "{w}: {}", rows.join("\n"));
+            }
+            // a failed worker is "not running": its next start
+            app.overlays.clear();
+            app.open_model_picker(PickTarget::Agent(worker));
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("t0 (not running)") && l.contains("its next start")), "{}", rows.join("\n"));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn picking_for_a_finished_worker_sets_its_next_start_and_sends_nothing() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (_orch, worker) = picker_run(&mut app, "pick-done", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::Agent(worker));
+            type_in(&mut app, "luna");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.overlays.is_empty());
+            assert_eq!(app.run.as_ref().unwrap().workers[0].model.as_deref(), Some("luna"));
+            assert_eq!(app.agents[&worker].model_alias, "sol", "no process was switched");
+            assert!(said(&app).iter().any(|l| l == "t0: its next start uses luna (by you)"), "{:?}", said(&app));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn the_role_scope_changes_the_run_copy_and_a_live_agent_but_not_the_saved_pattern() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, _) = picker_run(&mut app, "pick-role", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::Agent(orch));
+            press(&mut app, KeyCode::Tab);
+            type_in(&mut app, "luna");
+            press(&mut app, KeyCode::Enter);
+            let run = app.run.as_ref().unwrap();
+            assert_eq!(run.pattern.roles["orchestrator"].model, "luna");
+            assert_eq!(app.agents[&orch].model_alias, "luna", "the live agent is switched");
+            assert_eq!(Pattern::load("pick-role", &app.project).unwrap().roles["orchestrator"].model, "sol", "the saved pattern is untouched");
+            assert!(said(&app).iter().any(|l| l == "role orchestrator: model → luna for this run (by you) — the saved pattern is unchanged"), "{:?}", said(&app));
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("role orchestrator → luna (this run)"));
+            app.run = None;
+        });
+    }
+
+    /// Every stage card can be selected, agent or not: `m` on an empty slot picks the role's
+    /// model, ⏎ zooms into the slot's last agent (or says there is none), and `r`, `x` and `c` need
+    /// a second press on the same card to act.
+    #[tokio::test]
+    async fn empty_stage_cards_are_selectable_and_r_x_c_press_twice() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "pick-stage", crate::engine::run::WState::Running);
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            let at = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).expect("the card");
+            assert!(app.stage_nodes().contains(&StageNode::Slot("gate")), "{:?}", app.stage_nodes());
+            let gate_role = app.run.as_ref().unwrap().pattern.flow.phase_gate.clone();
+            // m on the gate slot: the role's model for this run
+            app.sel = at(&app, StageNode::Slot("gate"));
+            assert_eq!(app.node_name(&StageNode::Slot("gate")), format!("gate · {gate_role}"));
+            press(&mut app, KeyCode::Char('m'));
+            assert!(matches!(app.overlays.last(), Some(Overlay::ModelPicker { target: PickTarget::RunRole(r), .. }) if *r == gate_role));
+            app.overlays.clear();
+            // ⏎ with no gate agent yet says so; once there was one it zooms into it
+            press(&mut app, KeyCode::Enter);
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.ends_with("has not started yet")), "{:?}", app.toast);
+            assert_eq!(app.screen, Screen::Stage);
+            app.run.as_mut().unwrap().last_gate_agent = Some(worker);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Zoom(worker), "the retired gate agent's log");
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            // r once only arms; the key on another card or another key in between disarms
+            app.agents.get_mut(&orch).unwrap().turn_active = true; // x only arms on an agent that is working
+            app.sel = at(&app, StageNode::Agent(orch));
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again to respawn orchestrator")), "{:?}", app.toast);
+            press(&mut app, KeyCode::Char('x'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "press x again to interrupt orchestrator"), "{:?}", app.toast);
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again")), "x then r does not respawn: {:?}", app.toast);
+            press(&mut app, KeyCode::Char('c'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "press c again to compact orchestrator's context"), "{:?}", app.toast);
+            // the second press acts
+            press(&mut app, KeyCode::Char('c'));
+            assert!(said(&app).iter().any(|l| l == "orchestrator: context compaction requested (by you)"), "{:?}", said(&app));
+            press(&mut app, KeyCode::Char('r'));
+            press(&mut app, KeyCode::Char('r'));
+            assert!(!app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again")), "{:?}", app.toast);
+            // a task nobody started: selectable, and the keys say why they do nothing
+            app.run.as_mut().unwrap().workers.clear();
+            let task = StageNode::Task("t1".into());
+            app.sel = at(&app, task.clone());
+            for (key, said_so) in [('r', "the orchestrator starts t1; r works once it has run"), ('x', "t1 is not running"), ('c', "t1 is not running"), ('+', "t1 is not running — its role's effort is set in the Studio")] {
+                app.toast = None;
+                press(&mut app, KeyCode::Char(key));
+                assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some(said_so));
+            }
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("t1 has not started yet — p shows it in the plan"));
+            press(&mut app, KeyCode::Char('m'));
+            assert!(matches!(app.overlays.last(), Some(Overlay::ModelPicker { target: PickTarget::RunRole(r), .. }) if r == "worker-small"));
+            app.overlays.clear();
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_run_role_without_an_agent_gets_the_model_for_the_run() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            picker_run(&mut app, "pick-runrole", crate::engine::run::WState::Done);
+            app.open_model_picker(PickTarget::RunRole("qa".into()));
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("for: role qa") && l.contains("applies to every agent of the role from now on")), "{}", rows.join("\n"));
+            type_in(&mut app, "terra");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["qa"].model, "terra");
+            assert!(app.set_run_role_model("qa", "no-such-model").is_err());
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_studio_field_takes_a_fallback_and_none_clears_it() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let mut p = Pattern::builtin();
+            p.name = "pick-studio".into();
+            p.roles.get_mut("qa").unwrap().model = "sol".into();
+            app.studio.pattern = p;
+            let target = PickTarget::StudioField { role: "qa".into(), field: "fallback".into() };
+            app.open_model_picker(target.clone());
+            let rows = frame(&mut app, 120, 36);
+            assert!(rows.iter().any(|l| l.contains("qa · fallback 1 — pattern pick-studio")), "{}", rows.join("\n"));
+            assert!(rows.iter().any(|l| l.contains("none") && l.contains("no fallback at this position")));
+            type_in(&mut app, "terra");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["qa"].fallback.as_deref(), Some("terra"));
+            assert_eq!(Pattern::load("pick-studio", &app.project).unwrap().roles["qa"].fallback.as_deref(), Some("terra"), "saved like a committed edit");
+            // the picker opens on the field's value; the none row clears it
+            app.open_model_picker(target);
+            let Some(Overlay::ModelPicker { sel, .. }) = app.overlays.last() else { panic!("no picker") };
+            assert!(*sel > 0);
+            press(&mut app, KeyCode::PageUp);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.studio.pattern.roles["qa"].fallback, None);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_filter_is_typed_cleared_by_esc_and_a_plus_still_steps_the_window() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.open_model_picker(PickTarget::NewSessions);
+        type_in(&mut app, "e");
+        press(&mut app, KeyCode::Char('c'));
+        let Some(Overlay::ModelPicker { filter, .. }) = app.overlays.last() else { panic!() };
+        assert_eq!(filter, "ec", "e and c type into the filter");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Esc);
+        let Some(Overlay::ModelPicker { filter, .. }) = app.overlays.last() else { panic!("esc with a filter only clears it") };
+        assert!(filter.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlays.is_empty());
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn picker_target_of(app: &App) -> PickTarget {
+        match app.overlays.last() {
+            Some(Overlay::ModelPicker { target, .. }) => target.clone(),
+            other => panic!("no picker: {}", other.is_some()),
+        }
+    }
+
+    #[tokio::test]
+    async fn plus_and_minus_type_into_a_filter_and_step_the_window_only_without_one() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let before: Vec<Option<u64>> = app.registry.models.iter().map(|m| m.context_window).collect();
+            app.open_model_picker(PickTarget::NewSessions);
+            type_in(&mut app, "gpt-5");
+            let Some(Overlay::ModelPicker { filter, .. }) = app.overlays.last() else { panic!() };
+            assert_eq!(filter, "gpt-5");
+            assert_eq!(before, app.registry.models.iter().map(|m| m.context_window).collect::<Vec<_>>(), "typing a model id changes no context window");
+            let keys = frame(&mut app, 120, 36).join("\n");
+            assert!(!keys.contains("+/- ctx"), "{keys}");
+            press(&mut app, KeyCode::Esc);
+            assert!(frame(&mut app, 120, 36).join("\n").contains("+/- ctx"));
+            press(&mut app, KeyCode::Char('+'));
+            assert_ne!(before, app.registry.models.iter().map(|m| m.context_window).collect::<Vec<_>>(), "+ with no filter steps the window");
+        });
+    }
+
+    #[tokio::test]
+    async fn a_picker_with_no_match_still_shows_its_key_line() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.open_model_picker(PickTarget::NewSessions);
+        type_in(&mut app, "zzzz");
+        let rows = frame(&mut app, 100, 30).join("\n");
+        assert!(rows.contains("no model matches the filter"), "{rows}");
+        assert!(rows.contains("⏎ apply"), "{rows}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settings_save_is_not_a_change_on_disk_and_a_broken_models_toml_is_kept_out() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
+            Settings::default().save().unwrap();
+            configured_fixture().save().unwrap();
+            let mut app = App::new(Settings::load_on_disk().unwrap(), configured_fixture(), PathBuf::from("."), hub, tx, false);
+            // U2: saving the settings rewrites secrets.toml; that is Mantra's own write
+            app.secrets_mtime = Some(std::time::UNIX_EPOCH);
+            app.save_settings();
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.toast.as_ref().map(|t| t.0.as_str()) != Some("models.toml changed on disk — reloaded"), "{:?}", app.toast);
+            // U3: a half-written models.toml keeps the models in memory and says so once
+            let n = app.registry.models.len();
+            std::fs::write(Registry::path(), "[[model]\nalias = ").unwrap();
+            app.registry_mtime = Some(std::time::UNIX_EPOCH);
+            app.registry_checked = None;
+            app.toast = None;
+            app.tick();
+            assert_eq!(app.registry.models.len(), n, "the registry in memory stands");
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("models.toml could not be read \u{2014} keeping the models in memory"));
+            assert_eq!(app.registry_mtime, Some(std::time::UNIX_EPOCH), "the broken state is not recorded as loaded");
+            app.toast = None;
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.toast.is_none(), "said once per file state: {:?}", app.toast);
+            // a missing file is the same
+            std::fs::remove_file(Registry::path()).unwrap();
+            app.registry_checked = None;
+            app.tick();
+            assert_eq!(app.registry.models.len(), n);
+            assert!(app.toast.is_some());
+            // and once the file is whole again it is read
+            let mut disk = configured_fixture();
+            disk.models.push(crate::config::ModelEntry { alias: "back-again".into(), model: "m".into(), ..Default::default() });
+            disk.save().unwrap();
+            app.registry_checked = None;
+            app.tick();
+            assert!(app.registry.get("back-again").is_some());
+            let _ = app.shutdown();
+        });
+    }
+
+    #[tokio::test]
+    async fn the_picker_target_follows_the_card_not_the_default_model() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "pick-target", crate::engine::run::WState::Done);
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            let at = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).expect("the card");
+            let gate_role = app.run.as_ref().unwrap().pattern.flow.phase_gate.clone();
+            // a slot with no agent: ctrl+k, m and /model all offer the role
+            app.sel = at(&app, StageNode::Slot("gate"));
+            ctrl(&mut app, 'k');
+            assert_eq!(picker_target_of(&app), PickTarget::RunRole(gate_role.clone()));
+            app.overlays.clear();
+            app.command("/model");
+            assert_eq!(picker_target_of(&app), PickTarget::RunRole(gate_role.clone()));
+            app.overlays.clear();
+            // a task nobody started
+            app.run.as_mut().unwrap().workers.clear();
+            app.sel = at(&app, StageNode::Task("t1".into()));
+            ctrl(&mut app, 'k');
+            assert_eq!(picker_target_of(&app), PickTarget::RunRole("worker-small".into()));
+            app.overlays.clear();
+            // a retired gate agent (in no slot, not in the run): the role, not the dead agent
+            app.run.as_mut().unwrap().last_gate_agent = Some(worker);
+            app.sel = at(&app, StageNode::Slot("gate"));
+            ctrl(&mut app, 'k');
+            assert_eq!(picker_target_of(&app), PickTarget::RunRole(gate_role));
+            app.overlays.clear();
+            // a live agent, and a finished worker of the run (its next start)
+            app.sel = at(&app, StageNode::Agent(orch));
+            ctrl(&mut app, 'k');
+            assert_eq!(picker_target_of(&app), PickTarget::Agent(orch));
+            app.overlays.clear();
+            let mut w = crate::web::snapshot::tests::worker("t1", 1, Some(worker), crate::engine::run::WState::Done);
+            w.task.role = "worker-small".into();
+            app.run.as_mut().unwrap().workers.push(w);
+            assert_eq!(app.picker_target_for_node(&StageNode::Agent(worker)), PickTarget::Agent(worker));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_next_start_pick_is_checked_like_the_other_picks() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (_orch, worker) = picker_run(&mut app, "pick-next", crate::engine::run::WState::Done);
+            app.registry.models.push(crate::config::ModelEntry { alias: "orphan".into(), provider: "nope".into(), model: "m".into(), ..Default::default() });
+            app.open_model_picker(PickTarget::Agent(worker));
+            type_in(&mut app, "orphan");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("not in /models")), "{:?}", app.toast);
+            assert_eq!(app.run.as_ref().unwrap().workers[0].model, None, "nothing pinned");
+            app.open_model_picker(PickTarget::Agent(worker));
+            type_in(&mut app, "luna");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.run.as_ref().unwrap().workers[0].model.as_deref(), Some("luna"));
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn r_x_c_say_what_cannot_be_done_instead_of_arming() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "card-keys", crate::engine::run::WState::Running);
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            let at = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).expect("the card");
+            // x on an idle agent: nothing to interrupt, nothing armed
+            app.sel = at(&app, StageNode::Agent(orch));
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("orchestrator is not working \u{2014} nothing to interrupt"));
+            assert!(app.armed.is_none());
+            // a working one: armed, then one journal line, not two
+            app.agents.get_mut(&orch).unwrap().turn_active = true;
+            press(&mut app, KeyCode::Char('x'));
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(said(&app).iter().filter(|l| *l == "orchestrator interrupted (by you)").count(), 1, "{:?}", said(&app));
+            app.agents.get_mut(&orch).unwrap().turn_active = false;
+            app.armed = None;
+            press(&mut app, KeyCode::Char('c'));
+            press(&mut app, KeyCode::Char('c'));
+            assert_eq!(said(&app).iter().filter(|l| l.contains("context compaction requested")).count(), 1, "{:?}", said(&app));
+            // r on a gate slot whose agent is retired: said at the first press
+            let run = app.run.as_mut().unwrap();
+            run.workers.clear();
+            run.stage = Stage::Phase { idx: 0, step: crate::engine::run::PhaseStep::Gate { round: 1 } };
+            run.last_gate_agent = Some(worker);
+            app.sel = at(&app, StageNode::Slot("gate"));
+            app.armed = None;
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.ends_with("is not running \u{2014} nothing to restart")), "{:?}", app.toast);
+            assert!(app.armed.is_none());
+            app.run = None;
+        });
+    }
+
+    #[tokio::test]
+    async fn leaving_the_studio_any_way_syncs_the_run_and_a_change_back_is_adopted() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            picker_run(&mut app, "studio-sync", crate::engine::run::WState::Running);
+            let qa_in_base = |app: &App| Pattern::from_toml(app.run.as_ref().unwrap().pattern_base.as_ref().unwrap()).unwrap().roles["qa"].model.clone();
+            assert_eq!(qa_in_base(&app), "sol");
+            // the user switches the run alone to luna; the Studio then saves luna: nothing to adopt, the base moves
+            app.set_run_role_model("qa", "luna").unwrap();
+            change_saved_pattern(&app, "studio-sync", |p| p.roles.get_mut("qa").unwrap().model = "luna".into());
+            app.set_screen(Screen::Studio);
+            app.studio.dirty = false;
+            app.set_screen(Screen::Models); // not esc, not ctrl+s
+            assert_eq!(qa_in_base(&app), "luna", "the base follows the saved pattern");
+            // saved back to sol: that is a change, and it reaches the run
+            change_saved_pattern(&app, "studio-sync", |p| p.roles.get_mut("qa").unwrap().model = "sol".into());
+            app.set_screen(Screen::Studio);
+            app.studio.dirty = false;
+            app.set_screen(Screen::Settings);
+            assert_eq!(app.run.as_ref().unwrap().pattern.roles["qa"].model, "sol");
+            app.run = None;
+        });
+    }
 }

@@ -562,7 +562,16 @@ pub struct ProviderEntry {
     /// Extra request headers (e.g. anthropic-beta or anthropic-workspace-id). Values are secrets.
     #[serde(default, skip_serializing)]
     pub headers: BTreeMap<String, String>,
+    /// One of `engine::pattern::COLORS`: the colour this provider is marked with wherever a model
+    /// is shown or chosen. Assigned automatically when empty (`Registry::assign_provider_colors`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
 }
+
+/// Colours providers are given, in order. Red and gray are left out (failure, disabled).
+pub const PROVIDER_COLORS: &[&str] = &["cyan", "violet", "saffron", "teal", "rose", "green", "amber", "blue"];
+/// Codex's own account has no [[provider]] entry; its colour is fixed.
+pub const CODEX_ACCOUNT_COLOR: &str = "blue";
 
 impl std::fmt::Debug for ProviderEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -572,7 +581,7 @@ impl std::fmt::Debug for ProviderEntry {
 
 impl Default for ProviderEntry {
     fn default() -> Self {
-        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new(), headers: BTreeMap::new() }
+        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new(), headers: BTreeMap::new(), color: String::new() }
     }
 }
 
@@ -700,6 +709,11 @@ impl BaseUrl {
 
 /// Minimal `scheme://host[:port][/path]` parse — enough to know where a request goes without
 /// pulling in a URL crate. `None` for anything that isn't http(s) with a plausible host.
+/// A role's fallback chain labelled for messages: `fallback`, `fallback 2`, `fallback 3`.
+fn fallback_labels(chain: &[String]) -> Vec<(String, String)> {
+    chain.iter().enumerate().map(|(i, a)| (if i == 0 { "fallback".to_string() } else { format!("fallback {}", i + 1) }, a.clone())).collect()
+}
+
 fn parse_base_url(raw: &str) -> Option<BaseUrl> {
     let (scheme, rest) = raw.trim().split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -815,13 +829,17 @@ pub fn antigravity_available() -> bool {
 /// Sonnet and Fable model runs with a 1M window on Claude Code (only Haiku is 200k), and
 /// `--autocompact` is derived from this figure; the gauge itself follows the window the CLI
 /// reports for the account (`hub/claude.rs`), so an ineligible plan still reads right.
-const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
-    ("opus46", "claude-opus-4-6", 1_000_000, ""),
-    ("opus48", "claude-opus-4-8", 1_000_000, ""),
-    ("opus5", "claude-opus-5", 1_000_000, ""),
-    ("sonnet5", "claude-sonnet-5", 1_000_000, ""),
-    ("fable5", "claude-fable-5", 1_000_000, ""),
+pub(crate) const CLAUDE_MODELS: &[(&str, &str, u64, &str)] = &[
+    ("fable52", "claude-fable-5-2", 1_000_000, ""),
     ("fable51", "claude-fable-5-1", 1_000_000, ""),
+    ("fable5", "claude-fable-5", 1_000_000, ""),
+    ("opus55", "claude-opus-5-5", 1_000_000, ""),
+    ("opus5", "claude-opus-5", 1_000_000, ""),
+    ("opus48", "claude-opus-4-8", 1_000_000, ""),
+    ("opus46", "claude-opus-4-6", 1_000_000, ""),
+    ("sonnet55", "claude-sonnet-5-5", 1_000_000, ""),
+    ("sonnet5", "claude-sonnet-5", 1_000_000, ""),
+    ("haiku55", "claude-haiku-5-5", 1_000_000, "fast & cheap"),
     ("haiku45", "claude-haiku-4-5-20251001", 200_000, "fast & cheap"),
 ];
 
@@ -1025,6 +1043,9 @@ pub(crate) fn codex_default_models() -> Vec<ModelEntry> {
     ]
 }
 
+/// Alias spellings `Registry::get` already logged a fallback for (once per name per process).
+static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 impl Registry {
     /// Advisory only: official endpoints cannot route another vendor's recognizable model IDs.
     /// Check the wire model, never its display alias, and leave gateways and unknown IDs alone.
@@ -1188,28 +1209,34 @@ impl Registry {
     }
 
     pub fn load() -> Registry {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => match toml::from_str::<Registry>(&s) {
-                Ok(mut r) if !r.models.is_empty() => {
-                    let changed = r.migrate(&s, codex_available());
-                    r.restore_secrets_and_migrate(changed);
-                    r
-                }
-                // No models at all: preserve configured providers, but do not create implicit
-                // providers or models.
-                Ok(mut r) => { r.restore_secrets_and_migrate(false); r },
-                Err(_e) => {
-                    // `save` refuses to write over the file while it does not parse (`unparseable`).
-                    crate::mlog!("models.toml invalid; using defaults until it is fixed");
-                    Registry::defaults()
-                }
-            },
-            Err(_) => {
-                // A missing/unreadable public registry must never clear the separate secrets
-                // file. The first explicit model edit will create models.toml.
+        match Self::try_load() {
+            Ok(r) => r,
+            Err(e) => {
+                // `save` refuses to write over a file that does not parse (`unparseable`); a missing
+                // public registry must never clear the separate secrets file. The first explicit
+                // model edit will create models.toml.
+                crate::mlog!("models.toml: {e}; using defaults until it is fixed");
                 Registry::defaults()
             }
         }
+    }
+
+    /// Like `load`, but a missing or unparseable models.toml is an error, not the defaults: the
+    /// reload of a running Mantra keeps what it has rather than replace it with a stand-in.
+    pub fn try_load() -> Result<Registry, String> {
+        let s = std::fs::read_to_string(Self::path()).map_err(|e| format!("cannot read {}: {e}", Self::path().display()))?;
+        let mut r = toml::from_str::<Registry>(&s).map_err(|e| format!("invalid: {e}"))?;
+        if !r.models.is_empty() {
+            let colours_changed = r.assign_provider_colors();
+            let changed = r.migrate(&s, codex_available()) || colours_changed;
+            r.restore_secrets_and_migrate(changed);
+        } else {
+            // No models at all: preserve configured providers, but do not create implicit
+            // providers or models.
+            let colours_changed = r.assign_provider_colors();
+            r.restore_secrets_and_migrate(colours_changed);
+        }
+        Ok(r)
     }
 
     fn restore_secrets_and_migrate(&mut self, changed: bool) {
@@ -1258,6 +1285,38 @@ impl Registry {
         }
     }
 
+    /// Gives every provider without a (valid) colour the first palette colour no other
+    /// provider uses; when all are used, the palette repeats by position. True when changed.
+    pub fn assign_provider_colors(&mut self) -> bool {
+        let valid = |c: &str| crate::engine::pattern::COLORS.contains(&c);
+        let mut used: Vec<String> = self.providers.iter().filter(|p| valid(&p.color)).map(|p| p.color.clone()).collect();
+        let mut changed = false;
+        for (i, p) in self.providers.iter_mut().enumerate() {
+            if valid(&p.color) {
+                continue;
+            }
+            let pick = PROVIDER_COLORS.iter().find(|c| !used.iter().any(|u| u == *c)).copied().unwrap_or(PROVIDER_COLORS[i % PROVIDER_COLORS.len()]);
+            p.color = pick.to_string();
+            used.push(p.color.clone());
+            changed = true;
+        }
+        changed
+    }
+
+    /// The colour name for a provider id ("" or "openai" = the Codex account). An unknown id is
+    /// gray; a provider not given a colour yet (a registry built by hand) takes the palette
+    /// colour of its position, which is what `assign_provider_colors` would give it first.
+    pub fn provider_color(&self, id: &str) -> &str {
+        if id.is_empty() || id == "openai" {
+            return CODEX_ACCOUNT_COLOR;
+        }
+        match self.providers.iter().position(|p| p.id == id) {
+            Some(i) if !self.providers[i].color.is_empty() => &self.providers[i].color,
+            Some(i) => PROVIDER_COLORS[i % PROVIDER_COLORS.len()],
+            None => "gray",
+        }
+    }
+
     /// Display name for a provider id, for pickers and fields that show "via <name>": the built-in
     /// `openai` (Codex's own account, no `[[provider]]` entry) is always "OpenAI (Codex)"; a
     /// configured provider shows its `name` (falling back to the id if that's blank); an unknown id
@@ -1276,7 +1335,6 @@ impl Registry {
     pub fn get(&self, alias: &str) -> Option<&ModelEntry> {
         let (m, fell_back) = self.lookup(alias)?;
         if fell_back {
-            static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
             let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
             if !said.iter().any(|a| a == alias) {
                 said.push(alias.to_string());
@@ -1312,8 +1370,9 @@ impl Registry {
 
     /// An unset model context inherits the configured default model, then the assumed window.
     pub fn effective_context_window(&self, alias: &str, default_alias: &str) -> u64 {
-        self.get(alias).and_then(|m| m.context_window).filter(|n| *n > 0)
-            .or_else(|| self.get(default_alias).and_then(|m| m.context_window).filter(|n| *n > 0))
+        // `lookup`, not `get`: this runs for every alias at every run start and must not log the fallback
+        self.lookup(alias).and_then(|(m, _)| m.context_window).filter(|n| *n > 0)
+            .or_else(|| self.lookup(default_alias).and_then(|(m, _)| m.context_window).filter(|n| *n > 0))
             .unwrap_or(crate::discover::ASSUMED_CONTEXT)
     }
 
@@ -1332,6 +1391,13 @@ impl Registry {
     /// `sol-api` must not read as "alias deleted" once only `sol` is left.
     pub fn context_windows(&self) -> std::collections::HashMap<String, u64> {
         self.names().into_iter().map(|(name, m)| (name, m.effective_context())).collect()
+    }
+
+    /// alias → provider id for every name `get` answers to (the key set of
+    /// `context_windows_for_default`), `"openai"` where an entry names none — what
+    /// `Run::set_known_providers` is handed, so a fallback skips models on a troubled provider.
+    pub fn alias_providers(&self) -> std::collections::HashMap<String, String> {
+        self.names().into_iter().map(|(name, m)| (name, if m.provider.is_empty() { "openai".to_string() } else { m.provider.clone() })).collect()
     }
 
     /// The names whose model takes images — what `Run::set_vision_models` is handed — in both
@@ -1411,7 +1477,8 @@ impl Registry {
         let mut out = vec![];
         for (name, role) in pattern.ordered_roles() {
             if role.sandbox == "read-only" && role.permission != BYPASS_SANDBOX_DANGER {
-                for (label, alias) in std::iter::once(("model", role.model.as_str())).chain(role.fallback.as_deref().filter(|f| !f.trim().is_empty()).map(|f| ("fallback", f))) {
+                for (label, alias) in std::iter::once(("model".to_string(), role.model.clone())).chain(fallback_labels(&role.fallback_chain())) {
+                    let alias = alias.as_str();
                     if self.get(alias).is_some_and(|m| self.backend_of(m) == ProviderKind::Antigravity) {
                         out.push(format!("{name}: {label} '{alias}' uses Antigravity, which cannot enforce read-only; choose another backend or explicitly change the role sandbox"));
                     }
@@ -1422,8 +1489,10 @@ impl Registry {
             }
             // The fallback is only ever used when the primary has already failed twice, so a
             // typo in it must surface here, not at 3 a.m. in the middle of a run.
-            if let Some(why) = role.fallback.as_deref().filter(|f| !f.trim().is_empty()).and_then(|f| self.alias_problem(f)) {
-                out.push(format!("{name}: fallback {why}"));
+            for (label, alias) in fallback_labels(&role.fallback_chain()) {
+                if let Some(why) = self.alias_problem(&alias) {
+                    out.push(format!("{name}: {label} {why}"));
+                }
             }
         }
         out
@@ -1510,6 +1579,33 @@ fn write_restricted(tmp: &Path, body: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_colours_are_distinct_kept_repaired_and_assigned_once() {
+        let mut r = Registry::defaults();
+        r.providers = (0..8).map(|i| ProviderEntry { id: format!("p{i}"), ..Default::default() }).collect();
+        assert!(r.assign_provider_colors());
+        let mut seen: Vec<&str> = r.providers.iter().map(|p| p.color.as_str()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 8, "eight providers, eight colours");
+        assert!(!r.assign_provider_colors(), "nothing to do the second time");
+        // a colour that is set stays; an invalid one is repaired with a colour no one else has
+        let mut r = Registry::defaults();
+        r.providers = vec![
+            ProviderEntry { id: "a".into(), color: "amber".into(), ..Default::default() },
+            ProviderEntry { id: "b".into(), color: "chartreuse".into(), ..Default::default() },
+            ProviderEntry { id: "c".into(), ..Default::default() },
+        ];
+        assert!(r.assign_provider_colors());
+        assert_eq!(r.providers[0].color, "amber");
+        assert_eq!((r.providers[1].color.as_str(), r.providers[2].color.as_str()), ("cyan", "violet"));
+        assert_eq!((r.provider_color("b"), r.provider_color("openai"), r.provider_color(""), r.provider_color("nobody")), ("cyan", "blue", "blue", "gray"));
+        // more providers than colours: the palette repeats by position
+        r.providers = (0..10).map(|i| ProviderEntry { id: format!("p{i}"), ..Default::default() }).collect();
+        r.assign_provider_colors();
+        assert!(r.providers.iter().all(|p| PROVIDER_COLORS.contains(&p.color.as_str())));
+    }
+
     /// Explicitly seeded legacy Bija defaults for tests of their runtime behavior.
     fn legacy_bija_registry() -> Registry {
         Registry { models: bija_default_model_entries("bija"), providers: vec![bija_default_provider()] }
@@ -1565,6 +1661,21 @@ mod tests {
         assert_eq!(r.effective_context_window("unknown", "default"), 64_000);
         assert_eq!(r.context_windows_for_default("default")["other"], 64_000);
         assert_eq!(r.effective_context_window("other", "missing"), crate::discover::ASSUMED_CONTEXT);
+    }
+
+    /// WP-7.2: building the engine's alias maps looks up the other spelling of every alias; that is
+    /// not a user-facing resolution and must not log a fallback.
+    #[test]
+    fn the_engine_alias_maps_do_not_log_the_alias_fallback() {
+        let mut r = Registry::defaults();
+        r.models = vec![ModelEntry { alias: "zsolq".into(), context_window: Some(64_000), ..Default::default() }];
+        let said = || super::SAID.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|a| a == "zsolq-api");
+        assert_eq!(r.effective_context_window("zsolq-api", "zsolq"), 64_000);
+        assert!(r.context_windows_for_default("zsolq").contains_key("zsolq-api"));
+        assert!(r.alias_providers().contains_key("zsolq-api"));
+        assert!(!said(), "nothing was logged");
+        assert!(r.get("zsolq-api").is_some());
+        assert!(said(), "a genuine resolution still logs");
     }
 
     #[test]
@@ -2115,7 +2226,11 @@ mod tests {
             std::fs::write(Registry::path(), format!("{by_hand}[[provider]]\nid = \"bija\"\nkind = \"bija\"\n")).unwrap();
             let hand = Registry::load();
             assert!(hand.models.iter().all(|m| !m.vision), "{:?}", hand.models.iter().map(|m| (&m.alias, m.vision)).collect::<Vec<_>>());
-            assert!(std::fs::read_to_string(Registry::path()).unwrap().contains("[[provider]]\nid = \"bija\"\nkind = \"bija\"\n"), "left as written, not re-saved");
+            // the one write is the providers' colours (WP-5.1); nothing else is switched on, and a second load writes nothing
+            let written = std::fs::read_to_string(Registry::path()).unwrap();
+            assert!(written.contains("color = \"") && !written.contains("vision = true"), "{written}");
+            Registry::load();
+            assert_eq!(std::fs::read_to_string(Registry::path()).unwrap(), written, "not re-saved");
         });
     }
 

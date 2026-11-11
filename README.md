@@ -53,7 +53,7 @@ Already installed: `mantra update`.
 wget -qO- https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh | sh
 
 # pin a release, or force a source build
-MANTRA_VERSION=v0.11.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
+MANTRA_VERSION=v0.12.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 MANTRA_FROM_SOURCE=1  sh -c "$(curl -fsSL https://raw.githubusercontent.com/sahelea1/mantra/master/install.sh)"
 
 # from a clone (Rust ≥ 1.80) — one build makes both binaries
@@ -165,13 +165,13 @@ Team roles have their own `permission` field in the Studio, `never` by default, 
 
 Press `ctrl+o`, describe the goal, and this happens:
 
-**1. The planner writes a phased plan** and you approve it. Phases run in order; tasks inside a phase run in parallel with declared file scopes. Mantra validates the plan before you ever see it — unique ids, known roles, real prompts, and **no overlapping scopes between parallel tasks** — and sends errors back to the planner to fix. An empty project (nothing checked in yet) skips the exploration step — there is nothing to read.
+**1. The planner writes a phased plan** and you approve it. Phases run in order; tasks inside a phase run in parallel with declared file scopes. Mantra validates the plan before you ever see it — unique ids, known roles, real prompts, and **no overlapping scopes between parallel tasks** — and sends errors back to the planner to fix. A rejected plan is kept as a draft: the planner repairs it with `mantra_patch_plan` — a list of small operations (set a task's prompt, add or replace a gate check, add or remove a task, …) validated like a whole plan — instead of writing the plan out again, and uses the same tool for every later change; `mantra_revise_plan` stays for a plan that changes almost everywhere. `mantra_read_plan` returns a large plan as an outline of its phases; `phase="<id or number>"` returns one phase in full. An empty project (nothing checked in yet) skips the exploration step — there is nothing to read.
 
 <img src="docs/img/plan-review.png" alt="The plan review overlay: phases, tasks, scopes, acceptance criteria and gate checks" width="920">
 
 **2. The orchestrator runs the phase.** It spawns each task's worker into its own git worktree, then sleeps until something happens — a worker finished, failed, stalled, edited outside its scope, or **asked a question** — and decides what to do about it. Every few minutes it is also shown what each worker has actually been doing and asked whether the parallel work still fits together. Above it, from the first phase to the end of the finale, a **manager** watches the whole run: anything that stalls or halts reaches it first, and every few minutes it gets a health digest of the whole team.
 
-**3. The gate merges, checks and reviews — and never fixes.** Mantra merges the worker branches, runs the phase's shell checks, and starts a **fresh, read-only QA agent** for the round: a new session that is handed the check results, the merged phase's `git diff --stat` and diff (capped; lockfiles left out) and the previous round's verdict — it starts from the diff instead of re-reading the repo. It verifies and reports with `mantra_gate_report`; on a fail the report is a work order (file, what is wrong, what to change), and `big` marks fixes that span several files. **Mantra routes the fix itself**: it spawns a worker named `fix-<round>` (`worker-small`, or `worker-big` when the report said so; merge conflicts always go to `worker-big`) with the findings as its prompt, scoped to the files the findings name, on the integrated copy. When it is done the checks run again and the next QA round starts — a fresh agent again. The same happens when QA passes but the checks still fail. `gate_max_rounds` bounds the loop; a check that keeps failing identically, a QA agent that reports the same blocker twice, or a fix worker that cannot do its job goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed.
+**3. The gate merges, checks and reviews — and never fixes.** Mantra merges the worker branches, runs the phase's shell checks (each under `bash -c`, from the workspace root, exactly as written — several lines and heredocs are fine), and starts a **fresh, read-only QA agent** for the round: a new session that is handed the check results, the merged phase's `git diff --stat` and diff (capped; lockfiles left out) and the previous round's verdict — it starts from the diff instead of re-reading the repo. It verifies and reports with `mantra_gate_report`; on a fail the report is a work order (file, what is wrong, what to change), and `big` marks fixes that span several files. **Mantra routes the fix itself.** When every file the findings name belongs to one task of the phase and that task's worker is still alive, the fix goes back to that worker (below). Otherwise Mantra spawns a worker named `fix-<round>` (`worker-small`, or `worker-big` when the report said so; merge conflicts always go to `worker-big`) with the findings as its prompt, scoped to the files the findings name, on the integrated copy. When the fix is done the checks run again and the next QA round starts — a fresh agent again. QA is never skipped: checks that did not follow a QA pass (after a resume, say, or a revised gate) start a fresh QA round instead of handing the phase off, and only the newest checks run counts. The same happens when QA passes but the checks still fail. `gate_max_rounds` bounds the loop; a check that keeps failing identically, a QA agent that reports the same blocker twice, or a fix worker that cannot do its job goes to the manager first (a hint, a fresh start) and then to the planner to fix — the plan, the checks — before it ever stops for you. Whatever the checks leave behind (`__pycache__`, build scratch, a formatter's edits) is dropped before the phase commit — the journal notes it — so it is never committed or landed.
 
 **4. The finale** depends on the pattern (below). In the default one: a single QA pass that starts from the run's diff and the gate reports — security is a checklist inside it, defects go to fix workers — then the planner verifying its own plan against the same diff and reports, able to spawn fix workers for real gaps.
 
@@ -198,9 +198,24 @@ Workers, resumed workers and fix workers receive up to 12,000 characters of the 
 
 `⏎` zooms into the selected agent, `1`–`9` jump straight to the *n*th, `esc` goes back. A zoomed agent gets a solid role-coloured header band and a coloured spine down its log, so you always know whether you are looking at one agent or the whole team. A run **starts** zoomed into the planner; approving the plan lands you back on the overview.
 
-You can talk to anyone: plain text on the stage re-prompts the planner, `@p2-api use axum` messages one worker directly.
+You can talk to anyone: plain text on the stage re-prompts the planner, `@p2-api use axum` messages one worker directly. On the overview as in a zoom, `⏎` queues the message behind the agent's running turn (a `⏳ queued` chip; the journal says `you → planner: …` when you type it and `delivered to planner: …` when it arrives) and `ctrl+f` sends it into the turn now. A message you typed is not lost when the agent's turn fails, or the agent is respawned or replaced by a fallback model: it stays queued and goes with the next turn, and backspace on an empty input takes the last queued message back for editing.
 
 Token counts are the backend's running totals — every request's *whole* input plus its output — so a worker that cycles tools in a big context reads millions. Where most of that was the same context served from the cache, the card, the zoom header, the peek strip and the run's `Σ` add `· 5.9M cached` in a muted suffix (the web app's chips and run page do the same), so a big number is read as what it is. A finished card names the model its attempt actually ran on, even after the role's model was changed for the next spawn. The backend's own housekeeping warnings (it could not save its diagnostic logs, say) are a muted line in the agent's log, said once, never the card's line.
+
+</details>
+
+<details>
+<summary>The stage: every card can be selected</summary>
+
+Arrows (or `1`–`9`) select any card on the stage, not only the ones with a live agent: a finished or failed worker, an unstarted or queued task, and the empty slots of the planner, manager, orchestrator, gate and finale (drawn dashed until they exist). A selected card gets the heavy border either way, and the peek strip under the canvas says what it is. What the keys do depends on the card:
+
+| key | a card with an agent (live or not) | an empty slot | an unstarted task |
+|---|---|---|---|
+| `⏎` | zoom in — a finished agent's log is read-only | zoom into the slot's last agent (the retired QA agent, say); else *has not started yet* | *has not started yet — p shows it in the plan* |
+| `m` | the model picker for this agent | the picker for the slot's role, this run | the picker for the task's role, this run |
+| `r` `x` `c` | respawn · interrupt · compact — **press twice** (`x` and `c` need a live agent) | not running — nothing happens (`r` on the gate or finale the stage is waiting on respawns it) | not running (`r`: the orchestrator starts it) |
+
+The first press of `r`, `x` or `c` only says what the second will do (*press r again to respawn …*) and expires after 2.5 seconds, so a stray key, or text typed while the canvas has the focus, cannot stop an agent; a crashed agent is restarted at the first `r`. The journal names the actor (`↻ … respawned (by you)`). `+`/`-` on a card without a live agent says that its role's effort is set in the Studio.
 
 </details>
 
@@ -223,22 +238,39 @@ On the stage it is the mini-card at the top right, mirroring the planner on the 
 </details>
 
 <details>
+<summary>The gate in detail: checks, reports, and who fixes</summary>
+
+<img src="docs/img/gate-fix.png" alt="A failed QA round going back to the worker that wrote the code: a badge on its card and an edge from the gate" width="960">
+
+**Checks.** Every check runs under `bash -c` (`sh` where there is no bash) from the workspace root, exactly as written, with its output merged into one stream. The full output of every check of every run is kept in `<run dir>/checks/phase-<n>-<checks|verify|after-fix>-<k>.log`, with the command, the exit status and the time; QA and the fix worker are shown the summary (`FAIL (exit 1)`, `FAIL (timed out)`) and the path. A check that fails without printing anything is run once more under `bash -x`, so the log shows which clause failed. Checks are re-run every round, so they must be repeatable.
+
+**QA reports are files.** Each verdict is written whole to `<run dir>/gate/phase-<n>-qa-<k>-round-<r>-<pass|fail>.md` (and one line per verdict, with the file name, to `gate-reports.md`). The fix worker gets the findings whole; the next QA agent gets the previous report whole. Only a report past 48,000 characters (12,000 for the QA agent's copy of the last round) is cut — at a line break, with a closing line that names the file. `mantra_log` can still read a QA agent after it has been retired. If a fix changed no file, the journal says so and the next QA agent is told.
+
+**A third verdict: the check is wrong.** QA reports `mantra_gate_report(pass=false, plan_defect=true)` when nothing is wrong with the work but a gate check itself is wrong or cannot pass in this phase or on this machine. No fix worker is sent: the run halts as for any gate halt and the whole report goes up the chain of command — the manager first, if the pattern has one — to the planner, which amends the check with `mantra_patch_plan`; the checks re-run with the revised gate and a fresh QA round starts. Revising the gate while a fix is under way cancels that fix instead of restarting it with a stale brief.
+
+**Who fixes.** With `gate_fix = "owner"` (the default) a failed round goes back to the worker that wrote the code when every file the findings name belongs to one task of the phase (its scope, or a file that worker changed), that worker is still alive and idle, and the report did not ask for a `big` fix. QA can name the task itself with `fix_by=<task id>`, or `fix_by=fix-worker`. Mantra first brings the worker's worktree up to the integrated state of the phase, then prompts it with the findings; when it is done only its branch is merged and the checks and the next QA round follow. If that worker is blocked, its turn fails, its worktree does not merge, or its branch no longer merges, a `fix-<round>` worker takes over in the same round with the original findings and what the owner reported. `gate_fix = "fix-worker"` always uses a fix worker, as before. On the stage the fix is drawn: a fix worker is a card beside the gate with an edge running to it; an owner's own card carries the badge `⚒ r<round>` and an edge runs from the gate back to it; the gate card and the rail name who is fixing.
+
+</details>
+
+<details>
 <summary>When something goes wrong: halts</summary>
 
 <img src="docs/img/halt.png" alt="A halted run: an amber band naming the agent, the provider error and the key that fixes it" width="920">
 
-There is no vague "paused" state. A run that cannot continue **halts** with a typed reason, an amber band naming the agent and the error, and the key that fixes it:
+There is no vague "paused" state. A run that cannot continue **halts** with a typed reason, an amber band naming the agent and the error, and the key that fixes it. The band's second line always begins *the run is stopped — …* (*the run is still stopped — model changed ✓ · space resumes* once you have changed a model during the halt: that alone does not resume it). A multi-line error shows its line breaks as ` ⏎ `; `e` opens the whole message.
 
 | halt | what happened | what the band tells you |
 |---|---|---|
 | paused by you | you pressed `space` — nothing new starts until you resume | `space` to resume |
-| auth / usage limit | 401, 403 or quota | fix credentials, then `space` |
-| provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages | `m` switches that role's model and resumes |
+| auth / usage limit | 401, 403, or a usage limit with no fallback model left in the role's chain | fix credentials or quota, or `m` picks another model — then `space` |
+| provider rejected | HTTP 400/422 — e.g. a gateway that refuses Codex's `developer` messages — and no fallback model left | `m` switches that role's model and resumes |
 | environment | a command died in the sandbox (`bwrap`, user namespaces) — reported once, then Mantra halts right away instead of retrying blind | fix the machine — `mantra doctor` prints the sysctl |
 | gate exhausted | QA ran out of rounds, repeated the same blocker, or the same check failed identically twice (a fix worker that is blocked or whose turn fails is an *attempts exhausted* halt on `fix-<round>`) | the manager has already been handed it, and the planner after it (see *the chain of command* below); `space` retries, or type feedback |
 | attempts exhausted | a task used every attempt | the manager, then the planner, has been handed it; `r` on the task resumes and retries |
 | agent turn failed | a role's turn failed past its retries and one free respawn | the manager has been handed it first (it respawns the agent with a note); if it does nothing the band is yours — `r` respawns the agent |
 | model gateway down | a worker (a fix worker too) failed on a 5xx / reset connection past its free retries, or an escalation's own error is a transport one | nobody is woken — the manager and the planner run through the same gateway; `space` when it is back, and every worker the outage took is respawned where it was, for free |
+
+**A halt about one agent's provider is soft.** When the reason is that agent's credentials, usage limit, rejected request or failed turn, the other agents finish the turn they are in (the journal says how many), and nothing new starts. Any other halt interrupts everyone. The planner and the manager can still prompt during a halt; a message the orchestrator sends to a worker, the gate or a finale agent is held and delivered on resume, and what was sent to an interrupted agent in the last twenty seconds comes back with its resume prompt. `mantra_status` opens with `RUN HALTED` for the agents that ask.
 
 **Pause is a hard boundary.** While a run is paused nothing new starts — no next phase, gate round, handoff or finale step. Results that arrive mid-pause (a QA report, gate checks, a cleanup commit) are recorded; the transition they trigger is kept in `state.json` and performed exactly once on resume, even after a restart. The header's `⏱` counts active time only — it stops on every halt, pause included — and freezes at the final duration when the run completes or stops.
 
@@ -269,7 +301,7 @@ A long reasoning turn used to look exactly like a crashed one. Now it doesn't:
 
 - a Claude agent's thinking label carries its own running count — `thinking · 9.4k`, climbing every second or two;
 - if the stream really does go silent, the status line and the agent's card append an amber `· quiet 1m20s`, counting from the last byte the process sent;
-- a planner, orchestrator or gate agent that is connected but silent past `stall_minutes` gets one journal line (`⏳ … no output for 6m00s — still connected`). Workers already have the stall tripwire, which also wakes the orchestrator.
+- a planner, orchestrator or gate agent that is connected but silent past `stall_minutes` gets one journal line (`⏳ … no output for 6m00s — its turn is still running`; only a turn in flight is measured, so an agent that was idle for an hour and has just been prompted is not reported). Workers already have the stall tripwire, which also wakes the orchestrator.
 
 Nothing here acts on your behalf — it just stops you having to guess.
 
@@ -284,12 +316,12 @@ Decisions travel **up**, never sideways, and only reach you when they have to:
 |---|---|---|---|
 | worker, gate, finale agent | the orchestrator | `mantra_ask` | the orchestrator's `mantra_prompt` |
 | orchestrator | the planner | `mantra_ask` | the planner's `mantra_brief_orchestrator` |
-| manager | the planner — for a change to the plan or the gate checks | `mantra_ask` | the planner's `mantra_prompt("manager", …)`, or a `mantra_revise_plan` that resumes the run |
+| manager | the planner — for a change to the plan or the gate checks | `mantra_ask` | the planner's `mantra_prompt("manager", …)`, or a `mantra_patch_plan` / `mantra_revise_plan` that resumes the run |
 | planner, manager | **you** | `mantra_ask_user` | your next message on the stage |
 
 An agent that stops to wait is shown as *asked a question · waiting for the answer* — never mistaken for "done" — and the rung above it becomes the one the watchdog expects to act. The planner is told to decide by itself whenever the answer keeps the end product and the plan's intent, and to ask you only when it changes what is being built, its scope, or is a trade-off only you can make. The manager asks you only when nobody in the team can decide. A question to you is a saffron band, not a halt: the run keeps going meanwhile.
 
-The same chain carries halts: **manager → planner → you**. *Gate exhausted* and *attempts exhausted* go to the manager first, with the failing checks and their output. It has `watchdog_escalate_seconds` to act — a hint and `mantra_resume_run`, a fresh start with `mantra_retry` / `mantra_respawn` (during an escalated halt that lifts it), `mantra_ask` to the planner when the tasks or the checks themselves are wrong — and one reminder if it ends a turn without acting; then the planner gets the escalation exactly as before, with exactly three moves: `mantra_revise_plan` (the run resumes by itself — a task changed after it was done is re-opened, a phase already gating goes back to building, a changed gate just re-runs its checks), `mantra_resume_run` with a hint for the stuck agent, or `mantra_ask_user`. If it does nothing, one reminder; then the band is yours. A pattern without a manager skips the first rung.
+The same chain carries halts: **manager → planner → you**. *Gate exhausted* and *attempts exhausted* go to the manager first, with the failing checks and their output. It has `watchdog_escalate_seconds` to act — a hint and `mantra_resume_run`, a fresh start with `mantra_retry` / `mantra_respawn` (during an escalated halt that lifts it), `mantra_ask` to the planner when the tasks or the checks themselves are wrong — and one reminder if it ends a turn without acting; then the planner gets the escalation exactly as before, with exactly three moves: `mantra_patch_plan` (or `mantra_revise_plan` for a large change; the run resumes by itself — a task changed after it was done is re-opened, a phase already gating goes back to building, a changed gate just re-runs its checks), `mantra_resume_run` with a hint for the stuck agent, or `mantra_ask_user`. If it does nothing, one reminder; then the band is yours. A pattern without a manager skips the first rung.
 
 `settings.review_minutes` (default 3, `0` off) sets how often the orchestrator gets a digest of every running worker — activity, files touched, recent log — to check that the parallel work stays coherent with each other and with the phase goal.
 
@@ -325,7 +357,28 @@ The web Pattern editor can edit groups. In the terminal, Studio shows them in th
 
 <img src="docs/img/picker.png" alt="The model picker: alias, model, which backend it runs through, effort, context window" width="960">
 
-An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI API • bija`, `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` switches the model for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust its context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
+An alias maps to a model **and the runtime it goes through**, and every picker says which: `via OpenAI API • bija`, `via OpenAI (Codex) ◌ codex`, `via Claude Code ✧ claude`. The same model reached two ways is two clearly-labelled rows. `ctrl+k` (on the stage `m`) opens the model picker for the focused agent — the switch is validated against that agent's actual backend first, so it is refused rather than sent to an agent that cannot run it; `+`/`-` adjust the highlighted model's context window right there. Whatever a model or effort switch — or a respawn — interrupts, nothing you typed is lost: a message queued at the time is held and replayed once the agent is ready again.
+
+<details>
+<summary>The model picker: one list for agents, roles and Studio fields</summary>
+
+Type to filter the list by alias, model id or provider name (`esc` clears the filter first, then closes). Every row names its provider in the provider's colour — `■ Riti` — with the backend beside it. The same picker opens from `ctrl+k`/`/model` on a chat, `m` on the stage, the Studio's `model` and `fallback` rows (`⏎`), and the web app.
+
+| key | does |
+|---|---|
+| `↑` `↓` `PageUp` `PageDown` | move |
+| *type* · `Backspace` | filter |
+| `tab` | in a run: switch between **this agent** and **the role** (all its agents, this run only) |
+| `←` `→` | effort of the agent (a live agent only) |
+| `+` `-` | step the highlighted model's context window |
+| `⏎` | apply and close |
+| `ctrl+e` | open `/models` at this model |
+
+*This agent* changes one agent and survives its respawns and resumes. *The role* changes the role's model in the run's own copy of the pattern for the rest of the run — the saved pattern is untouched — drops per-agent choices on that role, and switches its live agents. The picker also works on a stopped, finished or failed agent: nothing is relaunched, and its next start (a retry, a respawn) uses the model you picked. On a card without an agent (a task not started, an empty gate slot) it sets the role's model for the run, which the agent uses when it is created. In the Studio, a fallback row's list starts with *none* and leaves out the role's own model and the other fallbacks. On a halted run changing a model does not resume it.
+
+</details>
+
+**Provider colours.** Every provider has a colour, assigned automatically the first time it is seen and saved as `color` in its `[[provider]]` table (one of the pattern colours: `cyan`, `violet`, `saffron`, `teal`, `rose`, `green`, `amber`, `blue`…); the Codex account is blue. The provider's name — or its `■` mark where there is no room — appears in that colour wherever a model is shown or chosen: the picker, the Studio, stage cards, the header, `/models`, discovery, and the web app. Edit `color` in `models.toml` to change one.
 
 In Solo, the agent can list configured model aliases and start a separate subagent on any usable alias, including one on a different backend. It can message, inspect, await, and stop each subagent through its tools. Each child is a separate process in the same project; starting a new Solo session shuts down that session's children.
 
@@ -358,7 +411,7 @@ A URL you type always wins over the guess (a `sk-` key for another OpenAI-compat
 
 </details>
 
-**Codex** uses the model IDs you add to `models.toml` in `/models`; Mantra no longer imports a fixed Codex catalogue. Choose *Codex account model*, type the ID, and edit its alias or capabilities in the grid; the Discover action can ask the running Codex app server for its current catalogue. The `openai · Codex (ChatGPT login)` row appears while at least one Codex model is configured. Delete it twice to remove all its models, including when it is the only backend. **Claude Code** offers separate subscription and API key choices; the latter opens the key field and can also read `$ANTHROPIC_API_KEY`.
+**Codex** uses the model IDs you add to `models.toml` in `/models`; Mantra no longer imports a fixed Codex catalogue. Choose *Codex account model*, type the ID, and edit its alias or capabilities in the grid; `ctrl+d` on the Codex row asks the running Codex app server for its current catalogue (every page of it), so the models your account offers now are listed. The `openai · Codex (ChatGPT login)` row appears while at least one Codex model is configured. Delete it twice to remove all its models, including when it is the only backend. **Claude Code** offers separate subscription and API key choices; the latter opens the key field and can also read `$ANTHROPIC_API_KEY`.
 
 **Antigravity (Google subscription).** Install the official [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli), run `agy` once to sign in, and use `agy models` to find model IDs available to your account. In `/models`, add **Antigravity**, then enter a model ID and alias. Use that alias in Solo, Studio roles, Mandala patterns (including Auto), or Akasha. Mantra uses the CLI login; it does not ask for, copy, or extract Google credentials. Set `antigravity_command` in settings or `MANTRA_AGY` if `agy` is not on PATH.
 
@@ -399,7 +452,7 @@ Each agent is one `bija` process speaking NDJSON over stdio, its session in `~/.
 <details>
 <summary>Claude Code as a backend for any role</summary>
 
-With `claude` on your `PATH`, *Claude Code* in the add menu (`ctrl+n` in `/models`) adds a `claude` provider with `opus46`, `opus48`, `opus5`, `sonnet5`, `fable5`, `fable51` at a **1M** context window and `haiku45` at 200k. Claude Code announces your account's real window a second after each agent starts. On a subscription login, the gauge uses the smaller of that reported window and the configured model/run ceiling, so a larger account allowance never raises your configured maximum (an `api_key` gateway keeps the window you configured). An older `models.toml` keeps whatever `context_window` it has — set it to `1000000`, or delete the Claude models and add Claude Code again. Point any role at a Claude model in the Studio, like any other model — the planner and the manager on Claude with the workers on bija, say, is a few edits there, or one sentence to the architect.
+With `claude` on your `PATH`, *Claude Code* in the add menu (`ctrl+n` in `/models`) adds a `claude` provider with `fable52`, `fable51`, `fable5`, `opus55`, `opus5`, `opus48`, `opus46`, `sonnet55`, `sonnet5` and `haiku55` at a **1M** context window and `haiku45` at 200k. `ctrl+d` on a subscription Claude Code provider asks the installed CLI which models the account offers and lists those, then any built-in model it did not mention; if the CLI cannot answer, the built-in list is used and the discovery overlay says so. Claude Code announces your account's real window a second after each agent starts. On a subscription login, the gauge uses the smaller of that reported window and the configured model/run ceiling, so a larger account allowance never raises your configured maximum (an `api_key` gateway keeps the window you configured). An older `models.toml` keeps whatever `context_window` it has — set it to `1000000`, or delete the Claude models and add Claude Code again. Point any role at a Claude model in the Studio, like any other model — the planner and the manager on Claude with the workers on bija, say, is a few edits there, or one sentence to the architect.
 
 Under the hood each agent is one long-lived `claude -p --input-format stream-json …` process. Mantra translates its event stream into the same shapes the UI already renders, so nothing else in the app knows the difference: steering lands at the next tool boundary, `x` sends a real interrupt, `/compact` compacts the session, and a crashed process restarts with `--resume`.
 
@@ -455,7 +508,7 @@ efforts = ["low", "medium", "high"]
 
 On Codex, a custom-provider model with an `efforts` list gets a reasoning effort like any OpenAI model — Codex ≥ 0.150 sends it on its own, nothing extra is configured; one without gets no reasoning block at all, which keeps strict gateways happy.
 
-Press `ctrl+d` on a provider (the key flow does it for you) and Mantra fetches its catalogue: context windows are read from whatever field the provider uses (and marked *assumed* at 200k when it reports none), reasoning effort is enabled only when the model actually supports it, and models you already have are never duplicated.
+Press `ctrl+d` on a provider (the key flow does it for you) and Mantra fetches its catalogue — from `…/models` for an API, from the installed CLI for Claude Code and from the app server for the Codex account: context windows are read from whatever field the provider uses (and marked *assumed* at 200k when it reports none), reasoning effort is enabled only when the model actually supports it, and models you already have are never duplicated. A discovered model's note is `vision` or empty; where its window came from is not written into it.
 
 `ctrl+t` runs a real test turn including a `developer` message — so a gateway that rejects that role fails here, not three minutes into a run. Starting a run also pre-flights every role's provider and refuses with the exact missing variable name.
 
@@ -548,6 +601,8 @@ mantra runs delete 238330          # worktrees, branches and journal, after a y/
 mantra --resume-last               # this project's most recent unfinished run (cwd / --cwd)
 ```
 
+The *stage* column tells a live run from one that needs you: `halted · phase 2 · working` for a run that is stopped, `closed · phase 2 · working` for one whose Mantra is gone (closed cleanly or crashed) and nobody has resumed, and the plain stage for one that is running. A clean quit leaves a journal line with the command to reopen it.
+
 `--resume-last` only ever picks a run of the project you are in (with `--demo`, the last demo run); another project's run is resumed by id, with `mantra runs resume`. **A run has one owner.** The Mantra that has a run open writes `owner.json` (pid, host, since) into the run's directory, refreshes it with every state flush and removes it when the run ends or it quits cleanly. Resuming a run whose owner is still alive on this machine is refused — from `/runs`, the CLI, `--resume-last` and the web UI alike — because two processes driving one run would each save `state.json` over the other's. A dead owner is a crash, and resumes as usual; `mantra runs resume <id> --take-over` is for the rare case the check is wrong.
 
 A run has a **title** people can recognise — the plan's title once the planner has submitted it, the goal's first six words before that. It leads the runs list, the TUI header and the web run header; the id (`<seconds>-<slug of the goal>`) stays the stable key and is shown second. Each Codex agent's thread carries the same name, `<title> · <role>`, so a run is easy to find in Codex's own session list (Claude Code sessions have no title API, so they are left alone).
@@ -567,6 +622,8 @@ A resume never replays what the old process was in the middle of. It restarts at
 | merging / checks / gate | the merge → checks → gate sequence simply runs again (it is idempotent) |
 | finale | that step starts over, the manager re-attached |
 | finished | opens read-only, so `/land` still works |
+
+**What is picked up.** On resume the run adopts what changed in the saved pattern since it last matched it (see *A run follows the pattern it was started from*), before anything is spawned, so every agent comes back on the roles as they are now; the planner's own session, if the model it would run on is unchanged, is re-attached the first time it is needed (otherwise it starts fresh with a context pack: the brief, the plan in outline, the current phase and the recent journal), and the first journal lines say what was adopted and which model each role will run on (`⚙ roles: planner sol · …`, a `*` marking a model you picked for one agent). `models.toml` and `secrets.toml` are read again too — also while Mantra runs, when you edit the file on disk (a toast says so). A resume runs the gate checks once; the result of a checks run that has since been replaced is ignored, and a phase is never handed off without a QA pass.
 
 </details>
 
@@ -602,6 +659,17 @@ Every built-in role prompt is short and says what it owns, what it never does, w
 
 Every built-in also sets `context_cap = 200000`: the context window each agent is told it has is the smaller of its model's window and this cap. A model without its own window inherits the configured default model's window (200k only when neither specifies one). For example, a 1M run ceiling keeps models configured for 250k, 500k and 1M at those respective limits. `0` removes the run ceiling; the Studio edits it (`200k`, `off`) under settings. A live model change applies the new effective window to the backend as well as the gauge. Claude Code accepts auto-compact windows from 100k to 1M, so Mantra bounds its launch argument to that range. The selected model can impose a smaller window.
 
+A role can also set its own limit, `context = "250k"` (a token count or text such as `200k`, `1M`; `off` or `0` for none; at least 16k — in the Studio, the `context` row under the fallbacks). **The smallest of the role's limit, the pattern's `context_cap` and the window of the model the agent actually runs on wins**, and it is worked out again whenever the agent's model changes: a role limit of 250k on a 1M model is 250k, and after a fallback to a 128k model it is 128k. The Studio shows the result for the role's model and each fallback under the row. A Claude Code agent asked for less than 100k is told once that it compacts at 100k.
+
+**Fallback models.** A role can name up to three fallbacks, `fallback`, `fallback2` and `fallback3` (aliases from `/models`; in the Studio *fallback 1–3*, each shown once the one before it is set, picked with `⏎` or `←→`, cleared with `Backspace`). They are tried in order when the role's model cannot go on, one routine for every case:
+
+- a **usage limit** (Claude Code's *You've hit your 5-hour limit …* wording included);
+- **no output twice** — nothing at all within `first_token_minutes`;
+- an **empty turn twice** — a turn that ends with no text, no tool call, no command and no file change; the first one is asked again;
+- a **request its provider rejects** (HTTP 400/422).
+
+The agent restarts on the next model with a note that its files hold the work so far, the journal says `⇄ planner: fable51 → fallback sol (usage limit)`, and what you had queued for it goes with it. A model that just failed is avoided for a while (an hour after a usage limit, a quarter of an hour after empty turns, a day after a rejected request): a role whose model is marked *starts* on its fallback, while another model of the same provider is still tried — a limit or a refusal is often one model's alone. Only silence marks the whole provider (a quarter of an hour), so the chain does not wait out the same deadline on each of its models. The role's own model is never rewritten, and a model you picked for one agent stays yours. When the chain is exhausted — or there is none — the run halts. A provider's rate-limit warning reaches the journal too, and says when the role has no fallback to fall to.
+
 Choose **Mantra Akasha** (`mantra-akasha`) for one execution phase led by the planner. The planner consults a separate read-only advisor, delegates implementation in Akasha batches with disjoint scopes, and verifies the result before completing the run. Set the advisor's model in Studio. The planner can update the live plan and propose workflow changes when enabled. A batch shares the run workspace and is recreated if needed after a restart.
 
 **Live workflow changes** can be set for new runs in Studio. Press **F3**, type `/workflow`, or use the switch on the web Run page to change the permission for the current run. Mantra Akasha starts with this permission locked. Enabling the switch leaves the run's approval policy in effect for workflow proposals.
@@ -612,7 +680,11 @@ The planner can explicitly update an approved task scope with `mantra_set_task_s
 
 Worktree isolation (`isolation = worktree`, or `auto` in a git repository) needs a commit to branch from. A repository that has none yet — `git init` and nothing else — gets an empty `mantra: initial commit` (files you already staged stay staged), and the run says so: `⎇ created the initial commit so workers get isolated worktrees`. Only a directory that is not a git repository at all makes `auto` fall back to one shared directory.
 
-A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions, and for workers `parallel`), settings (parallelism, retries, gate rounds, watchdog timeouts, `review_minutes`, `manager_minutes`, `context_cap`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation, in the same way as `/models` and `/settings`: type over a field and `⏎` saves the pattern when it validates (otherwise it stays unsaved, the error line says why, and `ctrl+s` retries), `ctrl+n` adds a role, `Delete` (twice) removes one, and the pattern's name — the first field of the overview — saves a copy under a new name. Its flow panel shows the manager between the planner and the orchestrator.
+A pattern is the shape of a team: roles (kind — planner, manager, orchestrator, worker, gate — with model, effort, sandbox, permission, instructions, and for workers `parallel`), settings (parallelism, retries, gate rounds, `gate_fix`, watchdog timeouts, `review_minutes`, `manager_minutes`, `context_cap`, `claude_user_config`) and flow (who plans, who manages — `flow.manager`, cyclable down to *none* — who orchestrates, who gates, what the finale chain is). It is a TOML file, and the Studio edits all of it with live validation, in the same way as `/models` and `/settings`: type over a field and `⏎` saves the pattern when it validates (otherwise it stays unsaved, the error line says why, and `ctrl+s` retries), `ctrl+n` adds a role, `Delete` (twice) removes one, and the pattern's name — the first field of the overview — saves a copy under a new name. Its flow panel shows the manager between the planner and the orchestrator.
+
+**A run follows the pattern it was started from.** A run works on its own copy of the pattern (`pattern.toml` in its directory) and remembers the saved pattern it last matched. When the saved pattern changes — you leave the Studio with `esc` or press `ctrl+s`, save in the web editor, or edit the file and resume — the run adopts the fields that changed, in the phase it is in and not only the next one: a live agent of a role whose model or effort changed is switched, a role you changed is used by the next spawn, and per-agent model choices on a role whose model you changed give way to the new one. What the run changed for itself — `--parallel`, a workflow revision by the planner, a model picked for the role from the stage — is kept, unless you changed the same field in the saved pattern. Every adopted change is a journal line (`pattern updated from the Studio (2 change(s)): roles.qa.model: sol → luna · …`). A change the run cannot take (it removes a role the plan still uses, names a model that is not in `/models`) is refused with the reason and the run keeps its own copy. While a run follows the open pattern the Studio's header says so.
+
+Two settings are about agents rather than shape. `gate_fix = "owner"` (default) or `"fix-worker"` decides who repairs a failed gate round (see *The gate in detail* above). `claude_user_config = "inherit"` (default) or `"project"` decides whether Claude Code agents load your own user-level settings, hooks and memory as your sessions do; `project` starts them with `--setting-sources project,local`, so only the project's and local settings load — faster starts, and your private rules stay out of the team. The login still works. Whether a user-level `CLAUDE.md` is also left out is not verified; do not rely on it. Solo and the architect are unaffected.
 
 Or describe what you want and let the **architect agent** edit the pattern while you watch: *"add a docs writer after security"*, *"make workers cheaper"*, *"put the planner on Claude"*, *"run without a manager"*.
 
@@ -641,7 +713,7 @@ It does what the terminal does. Beyond the Team, Run, Pulse, Inbox and Runs scre
 | **Settings → Solo, Runs** | the same fields as `/settings`: model, approvals, sandbox, MCP servers and Akasha for Solo, default pattern and notifications |
 | **Settings → MCP servers** | add a server (a name and a command line), enable or disable it, test it, remove it |
 | **Settings → Models & providers** | the aliases as a table (provider, model, context, effort, vision) edited cell by cell, with delete, add and *Test*; the providers likewise; **Add provider** — paste the key, confirm the URL, *Probe*, tick the models, add — and *Add Codex* / *Add Claude Code* |
-| **Settings → Patterns** | the patterns with their tags; an editor with a card per role (model, effort, sandbox, permission, parallel, fallback, MCP, instructions), the settings, the flow and the groups; *Save* (the errors shown), *Save as copy*, *Delete* (yours only), *Use for new runs* |
+| **Settings → Patterns** | the patterns with their tags; an editor with a card per role (model, effort, sandbox, permission, parallel, up to three fallbacks, context limit, MCP, instructions), each model chosen from the same filterable list with its provider's colour, the settings, the flow and the groups; *Save* (the errors shown), *Save as copy*, *Delete* (yours only), *Use for new runs* |
 | **Settings → Web & remote, Appearance, Notifications, About** | the remote link, QR code and certificate; the look; Web Push; versions and paths |
 | the command palette | Stop run, New run, every settings section, Models, Patterns |
 
@@ -667,7 +739,7 @@ On a phone the settings are a list of sections that open as pages, all of it fro
 
 **Installing it as an app.** Over HTTPS, Android/Chrome offers an *Install* button; on iPhone/iPad use Safari's **Share › Add to Home Screen** — iOS only delivers notifications to an installed app, and the UI says so once, in place. Either way you get a full-screen icon, offline shell caching, and a layout that respects the notch and the home indicator.
 
-**Patterns.** Settings → Patterns lists the patterns and edits their roles — model, effort, the worker caps — and what you save is written straight back into the pattern file, the same file the Studio and `ctrl+k` edit.
+**Patterns.** Settings → Patterns lists the patterns and edits their roles — model, effort, the worker caps — and what you save is written straight back into the pattern file, the same file the Studio and `ctrl+k` edit, and reaches a run that follows it. Choosing a role's model for a running run offers *This run only* (the default while a run is active) or *Save to the pattern*.
 
 **Notifications.** Once installed, Settings → Notifications turns on Web Push — implemented by hand, no third-party push service in the middle — for halts, questions, approvals, plan review, a finished run and a finished Solo turn, each toggle separate, with a *Send a test* button. Subscriptions and push keys live in `$MANTRA_HOME/web/push/`, `0600`; turn it off server-wide with `[web] push = false`.
 
@@ -682,7 +754,7 @@ On a phone the settings are a list of sections that open as pages, all of it fro
 - **Code + password** — the same session as a short code (grouped in dashes) typed in at remote.mantra.codes, plus the password. For reading aloud, or typing into a device you didn't get the link on.
 - **Password** — set your own, or let Mantra generate a four-word one the first time `--remote` runs (`amber-kite-river-nine`, from a fixed 256-word list) and show it in *Web & remote* in `/settings`. It also derives the link's key, so changing it — or rotating — invalidates old links and codes.
 - **What the relay can and cannot see.** Your host and the connecting browser derive a shared key from the password (PBKDF2, then a fresh HKDF key per connection) that never reaches the relay, and every message after that is AES-256-GCM end-to-end encrypted. The relay sees your IP, the browser's IP, and encrypted bytes — never the password, the key, or anything your agents say. A wrong password or code fails to decrypt the very first frame ("Wrong password or code") rather than quietly connecting into someone else's session.
-- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.11.0` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
+- **A relay on its own host.** The relay only forwards bytes; it does not have to be the same machine — or run by the same person — as whatever serves the web app the link opens. `--remote-site URL` (or `[web] remote_site` in settings) points the link at that site explicitly; left unset, it defaults to the relay's own origin. Point `--remote` at a relay you run yourself and Mantra never depends on `remote.mantra.codes` at all. The web app a relay serves is the bundle built from this repository's tag: rebuild a self-hosted relay's `remote-ui` image at `v0.12.0` (`MANTRA_REF`) to get the screens above — an older bundle keeps working with the commands it knows, it just lacks them.
 - **One hosted session per IPv4 address.** `remote.mantra.codes` allows one `mantra --remote` session per IPv4 address at a time — a second one dialing in from behind the same address (the same office, the same home network) is refused until the first disconnects, and Mantra reports that plainly instead of silently taking over.
 - **Behind a proxy.** The relay is dialed through the usual variables: `https_proxy` / `HTTPS_PROXY` for a `wss://` relay, `http_proxy` / `HTTP_PROXY` for `ws://`, `all_proxy` for either (lowercase is read first), `user:pass@` credentials included. `no_proxy` / `NO_PROXY` exempts hosts (`*`, a host or domain suffix, an IPv4 CIDR); a relay on `localhost` or a loopback address is never proxied, whatever the variables say. Only `http://` proxies work — the relay is reached with HTTP `CONNECT`, TLS still runs end to end through the tunnel and the certificate is checked as usual; a `socks5://` or `https://` proxy URL is refused with a hint (an `http://` proxy, or `no_proxy` for the relay host). Behind a TLS-inspecting proxy, or with a self-hosted relay on a private CA, `SSL_CERT_FILE` adds a PEM bundle to the built-in roots, and an untrusted relay certificate points at it. Proxy failures are reported as the proxy's (*refused the CONNECT (HTTP 403)*, *cannot reach the proxy*), not as a dead relay.
 
@@ -727,7 +799,7 @@ Four groups: what works everywhere, in a chat, on the Mandala stage, and on the 
 | key | does |
 |---|---|
 | `ctrl+o` | switch Solo ⇄ Mandala |
-| `ctrl+k` | model picker (`←→` effort, `+/-` context) |
+| `ctrl+k` | model picker — type to filter, `tab` agent ⇄ role, `←→` effort, `+/-` context, `ctrl+e` edit models |
 | `ctrl+g` | inbox: approvals and alerts from every agent |
 | `ctrl+e` | verbose log |
 | `ctrl+c` | close an overlay / **stop** a busy Solo turn while keeping your draft / clear an idle input · three presses quit |
@@ -741,8 +813,8 @@ Four groups: what works everywhere, in a chat, on the Mandala stage, and on the 
 
 | key | does |
 |---|---|
-| `⏎` | send — while the agent works it queues behind the running turn |
-| `ctrl+f` | force-send a queued message into the running turn |
+| `⏎` | send — while the agent works it queues behind the running turn (on the stage's overview too) |
+| `ctrl+f` | send a queued message into the running turn now (the overview too) |
 | `ctrl+x` | discard the queue |
 | `alt+↑/↓` | raise / lower reasoning effort |
 | `shift+tab` | cycle approvals: untrusted → on-request → never ask |
@@ -761,11 +833,11 @@ Four groups: what works everywhere, in a chat, on the Mandala stage, and on the 
 | key | does |
 |---|---|
 | `tab` | switch between typing and navigating |
-| `←→↑↓` | select a card · `1`–`9` jump to the *n*th and zoom (one card per task: a retried task counts once, and the selection is the attempt the card shows) |
-| `⏎` | zoom in · `esc` back to the overview (esc never interrupts) |
+| `←→↑↓` | select any card — finished and failed workers, unstarted tasks and empty slots too · `1`–`9` jump to the *n*th and zoom (one card per task: a retried task counts once, and the selection is the attempt the card shows) |
+| `⏎` | zoom in (a finished agent's log too; an empty slot says it has not started) · `esc` back to the overview (esc never interrupts) |
 | `space` | pause / resume the run |
-| `r` | respawn the selected agent (a respawned worker's card stays selected once its new attempt starts) · `m` switch its model |
-| `x` | interrupt · `c` compact · `+/-` effort |
+| `r` | respawn the selected agent — press twice (a respawned worker's card stays selected once its new attempt starts) · `m` the model picker: this agent, or the role for this run |
+| `x` | interrupt — press twice · `c` compact — press twice · `+/-` effort |
 | `p` | plan · `a` approve |
 | `@name …` | message one agent (`@manager` included); plain text re-prompts the planner — or answers the planner's or the manager's open question |
 
@@ -816,7 +888,7 @@ Nineteen, and none needs its parameter typed: leave it out and a selector opens,
 | `/studio` | the pattern studio: roles, flow, the architect |
 | `/models` | models and providers: add from a key, test, discover |
 | `/settings` | Solo, runs, features, MCP servers, web and remote, appearance |
-| `/model` | switch the model (the picker; `←→` effort) |
+| `/model` | switch the model (the picker: type to filter, `←→` effort) |
 | `/new` | a fresh Solo session |
 | `/compact` | compact the focused agent's context |
 | `/diff` | the changes viewer |
@@ -847,7 +919,7 @@ One process per agent, supervised by a hub: `bija` (the default) and `claude -p`
 | `~/.mantra/settings.toml` | CLI commands, defaults, approvals, UI options (`$MANTRA_HOME` moves the lot) |
 | `~/.mantra/models.toml` | models, context windows, efforts, providers (`0600` when it stores a key) |
 | `~/.mantra/patterns/*.toml` | your patterns |
-| `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs, the agents' `screenshots/` |
+| `~/.mantra/runs/<project>/<id>/` | state, plan, journal, per-phase outputs, merge logs, the gate checks' full output (`checks/`) and QA's reports (`gate/`), the run's pattern copy and the saved pattern it last matched (`pattern.toml`, `pattern.base.toml`), the agents' `screenshots/` |
 | `~/.mantra/screenshots/` | Solo's screenshots |
 | `~/.mantra/worktrees/<id>/` | per-run worktrees, cleaned up as phases complete |
 | `~/.mantra/bija/sessions/<id>/` | one Bija agent's session: `session.json`, `transcript.jsonl`, the `system.md`, `tools.json` and `mcp.json` Mantra hands it, the `images/` its tools returned, background-job logs |
@@ -923,6 +995,6 @@ python3 docs/tools/logo.py              # the mark and the banner
 
 <img src="docs/img/logo.png" alt="" width="72">
 
-**Mantra v0.11.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
+**Mantra v0.12.0** · MIT · [changelog](CHANGELOG.md) · [design notes](DESIGN.md)
 
 </div>

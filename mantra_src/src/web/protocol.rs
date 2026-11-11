@@ -175,6 +175,9 @@ define_commands! {
         alias: String,
         #[serde(default)]
         all: bool,
+        /// "run" = this run only (the saved pattern stays); absent or "pattern" = save the pattern.
+        #[serde(default)]
+        scope: Option<String>,
     } => "set_role_model",
 
     /// A role's fallback model (`Role.fallback`) in the next run's pattern, saved like
@@ -183,7 +186,17 @@ define_commands! {
         role: String,
         #[serde(default)]
         alias: Option<String>,
+        /// Which place of the chain, 0-2 (default 0).
+        #[serde(default)]
+        index: Option<u8>,
     } => "set_role_fallback",
+
+    /// A role's own context limit in tokens (`Role.context`; null = none), saved like the fallback.
+    SetRoleContext {
+        role: String,
+        #[serde(default)]
+        tokens: Option<u64>,
+    } => "set_role_context",
 
     SetEffort {
         agent: u32,
@@ -598,9 +611,11 @@ mod tests {
             Command::Respawn { agent: 2 },
             Command::Compact { agent: 2 },
             Command::SetModel { agent: 2, alias: "sol".into() },
-            Command::SetRoleModel { role: "worker".into(), alias: "sol".into(), all: false },
-            Command::SetRoleFallback { role: "worker".into(), alias: Some("luna".into()) },
-            Command::SetRoleFallback { role: "worker".into(), alias: None },
+            Command::SetRoleModel { role: "worker".into(), alias: "sol".into(), all: false, scope: Some("run".into()) },
+            Command::SetRoleFallback { role: "worker".into(), alias: Some("luna".into()), index: Some(1) },
+            Command::SetRoleContext { role: "worker".into(), tokens: Some(200_000) },
+            Command::SetRoleContext { role: "worker".into(), tokens: None },
+            Command::SetRoleFallback { role: "worker".into(), alias: None, index: None },
             Command::SetEffort { agent: 2, effort: "high".into() },
             Command::StepEffort { agent: 2, delta: -1 },
             Command::Approve { key: "1:5".into(), decision: "yes".into(), answer: Some("a".into()) },

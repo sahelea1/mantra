@@ -195,6 +195,7 @@ mod status_tests {
         let mut a = working();
         a.activity = "$ a command whose very long name would otherwise hide the silence warning".into();
         a.last_event = Instant::now() - Duration::from_secs(90);
+        a.turn_started = Some(Instant::now() - Duration::from_secs(120));
         for width in [20, 32, 48, 80, 120] {
             let line = solo_busy_line(&a, width).unwrap();
             assert!(line.width() <= width, "status overflows {width}: {}", text(&line));

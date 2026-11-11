@@ -59,6 +59,8 @@ pub struct ClaudeSpawn {
     /// Solo agent, which has always had the user's servers. An agent given servers of Mantra's
     /// (`SpawnSpec.mcp`) is strict either way.
     pub strict_mcp: bool,
+    /// `--setting-sources project,local`: the user's own Claude settings, hooks and memory stay out.
+    pub user_config_project: bool,
 }
 
 /// Runs one `claude` process for the lifetime of a single spawn attempt (a crash returns
@@ -463,6 +465,9 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
         a.push("--mcp-config".into());
         a.push(mcp_config_json(id, bridge, &spec.mcp).to_string());
     }
+    if cs.user_config_project {
+        a.extend(["--setting-sources".into(), "project,local".into()]);
+    }
     a.extend(sandbox_args(&spec.sandbox, &spec.cwd));
     if cs.auth == "api_key" {
         a.push("--bare".into());
@@ -609,6 +614,9 @@ struct Translator {
     /// every turn, so without this a single hot window would file one notice per turn; cleared
     /// again the moment the limits read healthy, so a second episode is still announced.
     rate_limit_warned: bool,
+    /// The latest `rate_limit_event` said `status: "rejected"` (a later `allowed` clears it): a
+    /// failing turn meanwhile is the usage limit, whatever its text says.
+    rate_limit_rejected: bool,
 }
 
 fn as_u64(v: &Value) -> Option<u64> {
@@ -646,6 +654,7 @@ impl Translator {
             turn_msgs: 0,
             fatal_auth: None,
             rate_limit_warned: false,
+            rate_limit_rejected: false,
         }
     }
 
@@ -811,6 +820,7 @@ impl Translator {
     /// every subsequent turn and a notice per turn would bury the transcript.
     fn on_rate_limit(&mut self, v: &Value, out: &mut Vec<HubEvent>) {
         let status = v.pointer("/rate_limit_info/status").and_then(|x| x.as_str()).unwrap_or("allowed");
+        self.rate_limit_rejected = status == "rejected";
         // The most-consumed of the plan's windows (`five_hour`, `seven_day`, …), each 0.0..1.0.
         let hottest = v
             .pointer("/rate_limit_info/unifiedWindows")
@@ -978,7 +988,7 @@ impl Translator {
                     .unwrap_or_else(|| v.get("subtype").and_then(|x| x.as_str()).unwrap_or("turn failed").to_string())
             };
             let mut e = json!({"message": msg});
-            if let Some(code) = classify_claude_error(v, &msg) {
+            if let Some(code) = classify_claude_error(v, &msg, self.rate_limit_rejected) {
                 e["codexErrorInfo"] = json!(code);
             }
             e
@@ -996,10 +1006,13 @@ impl Translator {
 /// right `ErrKind`. `ErrKind::ProviderRejected` (WP6) doesn't exist yet in this batch, so 400/422
 /// map to the closest existing bucket, `ErrKind::BadRequest` (`"badRequest"`) — a WP6 follow-up can
 /// widen this once that variant lands, with no change needed here beyond the returned key.
-fn classify_claude_error(v: &Value, msg: &str) -> Option<&'static str> {
+fn classify_claude_error(v: &Value, msg: &str, rate_limited: bool) -> Option<&'static str> {
     let m = msg.to_lowercase();
-    if m.contains("prompt is too long") || (m.contains("context") && (m.contains("too long") || m.contains("exceed"))) {
+    if m.contains("prompt is too long") || (m.contains("context") && (m.contains("too long") || m.contains("exceed") || m.contains("limit reached"))) {
         return Some("contextWindowExceeded");
+    }
+    if rate_limited || crate::agent::subscription_limit_text(&m) {
+        return Some("usageLimitExceeded");
     }
     if m.contains("max_budget") || m.contains("budget exceeded") {
         return Some("usageLimitExceeded");
@@ -1069,6 +1082,15 @@ mod tests {
     use super::*;
     use crate::agent::{Agent, Kind, Signal};
 
+    /// A full context is told apart from the subscription limit, even when the CLI also set the flag.
+    #[test]
+    fn a_context_overflow_is_not_a_usage_limit() {
+        let ctx = "Context limit reached · /compact or /clear to continue";
+        assert_eq!(classify_claude_error(&json!({}), ctx, false), Some("contextWindowExceeded"));
+        assert_eq!(classify_claude_error(&json!({}), "You've hit your 5-hour limit · resets 9:20pm", false), Some("usageLimitExceeded"));
+        assert_eq!(classify_claude_error(&json!({}), "Limit reached · resets 9:20pm", false), Some("usageLimitExceeded"));
+    }
+
     /// The stream CLI may produce init only after its first input. A held prompt must
     /// bootstrap a resumed planner, and a second prompt must still start a real turn.
     #[cfg(unix)]
@@ -1080,7 +1102,7 @@ mod tests {
             developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
             extra_args: vec![], resume_thread: Some("saved-planner".into()), thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
-            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+            claude: Some(ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
             bija: None, antigravity: None, mcp: vec![],
         };
@@ -1141,7 +1163,7 @@ done"#;
             developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
             extra_args: vec![], resume_thread: None, thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
-            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+            claude: Some(ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
             bija: None, antigravity: None, mcp: vec![],
         };
@@ -1192,7 +1214,7 @@ done"#;
             antigravity: None,
             mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
         let args = build_args(1, &spec, &cs, "sonnet5", "high", "abc-123", true, &[]);
         assert!(args.windows(2).any(|w| w == ["--resume".to_string(), "abc-123".to_string()]));
         assert!(!args.contains(&"--session-id".to_string()));
@@ -1204,6 +1226,10 @@ done"#;
         assert!(args.windows(2).any(|w| w == ["--tools".to_string(), "Read,Glob,Grep,WebFetch".to_string()]));
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.windows(2).any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#]), "a strict agent with no servers must receive an empty config");
+        assert!(!args.contains(&"--setting-sources".to_string()), "inherit is today's behaviour");
+        let project = ClaudeSpawn { user_config_project: true, ..cs.clone() };
+        let args_project = build_args(1, &spec, &project, "sonnet5", "", "abc-123", false, &[]);
+        assert!(args_project.windows(2).any(|w| w == ["--setting-sources", "project,local"]));
         let solo = ClaudeSpawn { strict_mcp: false, ..cs.clone() };
         let args_solo = build_args(1, &spec, &solo, "sonnet5", "", "abc-123", false, &[]);
         assert!(!args_solo.contains(&"--mcp-config".to_string()), "ordinary Solo keeps its MCP settings");
@@ -1253,7 +1279,7 @@ done"#;
             antigravity: None,
             mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
         let args = build_args(7, &spec, &cs, "sonnet5", "high", "abc-123", false, &[]);
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         // Solo bridged for its vision tools alone keeps the user's own `claude mcp` servers
@@ -1306,7 +1332,7 @@ done"#;
             serde_json::from_str(&args[i + 1]).expect("valid JSON")
         };
         // no bridge (Solo, or no tools): the servers alone, and no word about mcp__mantra__
-        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false };
         let args = build_args(3, &spec, &cs, "m", "", "s-1", false, &[]);
         assert!(args.contains(&"--strict-mcp-config".to_string()), "servers of Mantra's: strict even for Solo");
         let cfg = config_of(&args);
@@ -1588,6 +1614,27 @@ done"#;
         assert_eq!(warnings(&blocked).len(), 1);
         assert!(warnings(&blocked)[0].contains("rejected"), "{:?}", warnings(&blocked));
         assert!(!is_heartbeat(&ev("allowed", 0.03)), "once per turn: cheap enough to log");
+    }
+
+    /// A failing turn while the subscription's rate limit reads "rejected" is the usage limit,
+    /// whatever its text says; once the limit reads "allowed" again it is classified on its own.
+    #[test]
+    fn a_failed_turn_under_a_rejected_rate_limit_is_a_usage_limit() {
+        let mut tr = Translator::new(1, 200_000, true);
+        let ev = |status: &str| json!({"type": "rate_limit_event", "rate_limit_info": {"status": status, "unifiedWindows": {"five_hour": {"utilization": 0.5}}}});
+        let failed = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 5, "result": "anything"});
+        let code = |out: &[HubEvent]| -> Option<String> {
+            out.iter().find_map(|e| match e {
+                HubEvent::Notif { method, params, .. } if method == "turn/completed" => Some(params.pointer("/turn/error/codexErrorInfo").and_then(|x| x.as_str()).unwrap_or("").to_string()),
+                _ => None,
+            })
+        };
+        tr.on_line(&ev("rejected"), false);
+        assert_eq!(code(&tr.on_line(&failed, false)).as_deref(), Some("usageLimitExceeded"));
+        tr.on_line(&ev("allowed"), false);
+        assert_eq!(code(&tr.on_line(&failed, false)).as_deref(), Some(""), "healthy again: the same failure is not the usage limit");
+        let limit = json!({"type": "result", "is_error": true, "num_turns": 1, "duration_api_ms": 5, "result": "You've hit your 5-hour limit · resets 9:20pm (UTC)"});
+        assert_eq!(code(&tr.on_line(&limit, false)).as_deref(), Some("usageLimitExceeded"), "the subscription wording alone is enough");
     }
 
     #[test]

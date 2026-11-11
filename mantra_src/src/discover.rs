@@ -277,6 +277,133 @@ pub fn claude_defaults(provider_id: &str) -> Vec<Candidate> {
         .collect()
 }
 
+/// The window of a Claude model: the built-in table's, else 200k for Haiku 4.x and 1M for the rest.
+pub fn claude_window_guess(id: &str) -> u64 {
+    crate::config::CLAUDE_MODELS.iter().find(|(_, m, _, _)| *m == id).map(|(_, _, w, _)| *w).unwrap_or(if id.contains("haiku-4") { 200_000 } else { 1_000_000 })
+}
+
+/// The first array under a key named `models` whose elements are objects with a string `value`,
+/// searched through the whole answer. Each element: `value`, `resolvedModel`, `supportedEffortLevels`, `displayName`.
+pub fn models_from_initialize(v: &Value) -> Vec<(String, Option<String>, Vec<String>, String)> {
+    fn find(v: &Value) -> Option<&Vec<Value>> {
+        match v {
+            Value::Object(o) => {
+                if let Some(a) = o.get("models").and_then(Value::as_array).filter(|a| a.iter().any(|m| m.get("value").is_some_and(Value::is_string))) {
+                    return Some(a);
+                }
+                o.values().find_map(find)
+            }
+            Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    let text = |m: &Value, k: &str| m.get(k).and_then(Value::as_str).map(str::to_string);
+    find(v)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let value = text(m, "value")?;
+            let efforts = m.get("supportedEffortLevels").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+            Some((value, text(m, "resolvedModel"), efforts, text(m, "displayName").unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// `models_from_initialize` turned into candidates (see `claude_cli_models`).
+fn claude_candidates(v: &Value, provider_id: &str) -> Vec<Candidate> {
+    let found = models_from_initialize(v);
+    let resolved = found.iter().any(|m| m.1.is_some());
+    let mut out: Vec<Candidate> = vec![];
+    for (value, resolved_model, efforts, display) in found {
+        if value == "default" {
+            continue;
+        }
+        let id = resolved_model.unwrap_or(value);
+        if (resolved && !id.starts_with("claude-")) || out.iter().any(|c| c.model == id) {
+            continue;
+        }
+        let efforts = if efforts.is_empty() { strs(&["low", "medium", "high", "xhigh", "max"]) } else { efforts };
+        let note = if display != id { display } else { String::new() };
+        out.push(Candidate { provider: provider_id.to_string(), context: Some(claude_window_guess(&id)), context_known: true, efforts, default_effort: "high".into(), note, vision: true, state: CState::New, selected: false, model: id });
+    }
+    out
+}
+
+/// What the discover overlay shows for a subscription Claude Code provider: what the CLI
+/// reported, then every built-in whose model id it did not mention.
+pub fn merge_with_builtins(found: Vec<Candidate>, provider_id: &str) -> Vec<Candidate> {
+    let mut out = found;
+    for c in claude_defaults(provider_id) {
+        if !out.iter().any(|f| f.model == c.model) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The models the logged-in Claude Code offers, from its own `initialize` answer. Blocking
+/// (spawns `claude`, waits at most 12 s); call it off the UI task. `Err` = could not ask.
+/// Session markers and credentials of the Mantra that runs this probe are not passed on; the user's
+/// own config directory is, or a custom one never yields the live model list.
+fn drop_env_for_claude_probe(k: &str) -> bool {
+    (k.starts_with("CLAUDE") && k != "CLAUDE_CONFIG_DIR") || k.starts_with("ANTHROPIC_")
+}
+
+pub fn claude_cli_models(claude_cmd: &[String], provider_id: &str) -> Result<Vec<Candidate>, String> {
+    use std::io::{BufRead, BufReader};
+    let (prog, base_args) = claude_cmd.split_first().ok_or("no claude command")?;
+    let dir = std::env::temp_dir().join(format!("mantra-models-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut c = Command::new(prog);
+    c.args(base_args).args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+    for (k, _) in std::env::vars() {
+        if drop_env_for_claude_probe(&k) {
+            c.env_remove(&k);
+        }
+    }
+    if crate::util::effective_uid_is_root() {
+        c.env("IS_SANDBOX", "1");
+    }
+    c.current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let result = (|| {
+        let mut child = c.spawn().map_err(|e| format!("couldn't run `{prog}` ({e})"))?;
+        let mut stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Some(out) = stdout {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let asked = stdin.as_mut().map(|i| writeln!(i, r#"{{"type":"control_request","request_id":"mantra-models","request":{{"subtype":"initialize"}}}}"#).and_then(|_| i.flush()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let mut answer: Result<Vec<Candidate>, String> = Err("this Claude Code version does not list its models".into());
+        if asked.is_some_and(|r| r.is_ok()) {
+            while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+                let Ok(line) = rx.recv_timeout(left) else { break };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                if v.get("type").and_then(Value::as_str) == Some("control_response") {
+                    let found = claude_candidates(&v, provider_id);
+                    answer = if found.is_empty() { Err("this Claude Code version does not list its models".into()) } else { Ok(found) };
+                    break;
+                }
+            }
+        } else {
+            answer = Err("claude did not take the request".into());
+        }
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        answer
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 /// A model found on a custom provider. It takes images when the catalogue says so, or when its id
 /// is of a family that does (`config::takes_images`) — the Messages API's listing, for one, says
 /// nothing about it.
@@ -290,7 +417,7 @@ pub fn from_provider(provider: &str, f: &Found) -> Candidate {
         context_known: f.context.is_some(),
         efforts: if reasoning { strs(&["low", "medium", "high"]) } else { vec![] },
         default_effort: if reasoning { "medium".into() } else { String::new() },
-        note: format!("{provider} · ctx {}{}", if f.context.is_some() { "from API" } else { "assumed 200k" }, if vision { " · vision" } else { "" }),
+        note: if vision { "vision".into() } else { String::new() },
         vision,
         state: CState::New,
         selected: false,
@@ -351,7 +478,7 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
                 // vision only on a new entry: a `false` the user set reads the same as one never set
                 reg.models.push(ModelEntry {
                     vision: c.vision,
-                    alias: unique_alias(&c.model, &c.provider, &taken),
+                    alias: crate::config::CLAUDE_MODELS.iter().find(|(a, m, _, _)| *m == c.model && !taken.iter().any(|t| t == a)).map(|(a, _, _, _)| a.to_string()).unwrap_or_else(|| unique_alias(&c.model, &c.provider, &taken)),
                     provider: c.provider.clone(),
                     model: c.model.clone(),
                     context_window: if custom { c.context } else { None },
@@ -392,6 +519,15 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_claude_probe_keeps_the_config_dir_and_drops_the_session_markers() {
+        assert!(!drop_env_for_claude_probe("CLAUDE_CONFIG_DIR"));
+        for k in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_API_KEY"] {
+            assert!(drop_env_for_claude_probe(k), "{k}");
+        }
+        assert!(!drop_env_for_claude_probe("PATH"));
+    }
+
     use super::*;
     #[test]
     fn discovery_sends_messages_auth_version_and_custom_headers() {
@@ -445,11 +581,11 @@ mod tests {
     #[test]
     fn claude_defaults_are_new_candidates_with_known_context_and_efforts() {
         let cands = claude_defaults("claude2");
-        assert_eq!(cands.len(), 7, "6 1M models + haiku");
+        assert_eq!(cands.len(), crate::config::CLAUDE_MODELS.len());
         assert!(cands.iter().all(|c| c.provider == "claude2" && c.context_known && !c.efforts.is_empty()));
         let sonnet = cands.iter().find(|c| c.model == "claude-sonnet-5").expect("sonnet5");
         assert_eq!(sonnet.context, Some(1_000_000));
-        let haiku = cands.iter().find(|c| c.model.starts_with("claude-haiku")).expect("haiku45");
+        let haiku = cands.iter().find(|c| c.model.starts_with("claude-haiku-4")).expect("haiku45");
         assert_eq!(haiku.context, Some(200_000));
     }
     #[test]
@@ -484,7 +620,7 @@ mod tests {
         let m = parse_models(body).expect("a model list");
         assert_eq!(m.iter().map(|f| (f.id.as_str(), f.context)).collect::<Vec<_>>(), vec![("claude-haiku-4-5-20251001", Some(200_000)), ("claude-sonnet-5", None)]);
         let c = from_provider("anthropic", &m[1]);
-        assert!(c.vision && c.note.ends_with(" · vision"), "{}", c.note);
+        assert!(c.vision && c.note == "vision", "{}", c.note);
         assert!(!from_provider("x", &Found { id: "gpt-oss-20b".into(), context: None, reasoning: None, vision: false }).vision, "open-weight ids read text only");
     }
     #[test]
@@ -548,7 +684,7 @@ mod tests {
         // a candidate carries it into a new entry, and says so in its note
         let vl = m.iter().find(|f| f.id == "or/vl").unwrap();
         let mut c = from_provider("or", vl);
-        assert!(c.vision && c.note.ends_with(" · vision"), "{}", c.note);
+        assert!(c.vision && c.note == "vision" && !c.note.contains("ctx"), "{}", c.note);
         assert!(!from_provider("or", m.iter().find(|f| f.id == "silent").unwrap()).vision);
         let mut reg = Registry::defaults();
         classify(&reg, &mut c);
@@ -567,6 +703,45 @@ mod tests {
         quiet.selected = true;
         apply(&mut reg, &[quiet]);
         assert!(!reg.models.last().unwrap().vision);
+    }
+    const INIT: &str = include_str!("testdata/claude-initialize.jsonl");
+    #[test]
+    fn models_from_initialize_reads_the_recorded_answer_and_tolerates_nesting() {
+        let v: Value = serde_json::from_str(INIT.lines().next().unwrap()).unwrap();
+        let ids: Vec<String> = models_from_initialize(&v).into_iter().filter_map(|m| m.1).collect();
+        assert!(ids.contains(&"claude-opus-5-5".to_string()) && ids.contains(&"claude-fable-5-2".to_string()));
+        let cands = claude_candidates(&v, "claude");
+        assert!(!cands.iter().any(|c| c.model == "default"));
+        assert_eq!(cands.iter().filter(|c| c.model == "claude-fable-5-2").count(), 1);
+        let models = serde_json::json!([{"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5"}]);
+        for wrapped in [serde_json::json!({"response": {"models": models}}), serde_json::json!({"response": {"response": {"models": models}}}), serde_json::json!({"a": {"b": {"c": {"models": models}}}})] {
+            assert_eq!(models_from_initialize(&wrapped).len(), 1);
+        }
+        assert!(models_from_initialize(&serde_json::json!({"models": ["x"]})).is_empty());
+        // older CLIs list aliases only: keep them
+        let aliases = serde_json::json!({"models": [{"value": "default"}, {"value": "opus"}, {"value": "sonnet[1m]"}]});
+        assert_eq!(claude_candidates(&aliases, "claude").iter().map(|c| c.model.as_str()).collect::<Vec<_>>(), vec!["opus", "sonnet[1m]"]);
+    }
+    #[test]
+    fn claude_window_guess_follows_the_table_then_the_family() {
+        assert_eq!(claude_window_guess("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(claude_window_guess("claude-haiku-4-9"), 200_000);
+        assert_eq!(claude_window_guess("claude-opus-9"), 1_000_000);
+        assert_eq!(claude_window_guess("claude-opus-5-5"), 1_000_000);
+    }
+    #[test]
+    fn the_cli_list_merges_with_the_built_ins_one_row_per_model() {
+        let v: Value = serde_json::from_str(INIT.lines().next().unwrap()).unwrap();
+        let merged = merge_with_builtins(claude_candidates(&v, "claude"), "claude");
+        for id in ["claude-opus-5-5", "claude-fable-5-2", "claude-haiku-5-5"] {
+            assert_eq!(merged.iter().filter(|c| c.model == id).count(), 1, "{id}");
+        }
+        let mut seen: Vec<&str> = merged.iter().map(|c| c.model.as_str()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), merged.len());
+        let only = merge_with_builtins(vec![], "claude");
+        assert_eq!(only.len(), crate::config::CLAUDE_MODELS.len());
     }
     #[test]
     fn aliases_are_unique() {

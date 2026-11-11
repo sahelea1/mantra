@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod helpers;
-use helpers::{failing_cmds, failing_sig, fnv1a, join_note, parse_gate_from_text, paths_in, project_is_empty, reason_label, worker_brief_context};
-pub use helpers::{tidy_title, title_from_goal};
+use helpers::{failing_cmds, fit_or_point, failing_sig, fnv1a, join_note, parse_gate_from_text, paths_in, project_is_empty, reason_label, worker_brief_context};
+pub use helpers::{is_fix_id, tidy_title, title_from_goal};
 
 /// How much of a phase's diff the QA agent is shown (the rest is one `git diff` away).
 const GATE_DIFF_BYTES: usize = 30_000;
@@ -30,10 +30,17 @@ pub enum JobTag {
     Setup,
     WorkerWt { task: String, attempt: u32 },
     Merge { phase: usize },
-    Checks { phase: usize, round: u32 },
+    Checks { phase: usize, round: u32, gen: u64 },
     /// The checks re-run after a fix worker finished a gate round (`round` is the round it fixed).
-    FixChecks { phase: usize, round: u32 },
+    FixChecks { phase: usize, round: u32, gen: u64 },
+    /// The worktree of the task that repairs a gate finding itself is brought up to the integrated
+    /// state (`JobOut::Text`, `git::sync_worker`).
+    OwnerSync { phase: usize, round: u32, task: String },
+    /// That worker's repair is merged into the integrated copy (`JobOut::Merge`).
+    OwnerMerge { phase: usize, round: u32 },
     Cleanup { phase: usize },
+    /// `HEAD` of each nested repository at a phase start (`JobOut::Text`, `repo\tsha` lines).
+    PhaseBase { phase: usize },
     Finish,
     Land,
     /// A vision tool call (`mantra_screenshot` / `mantra_view_image`), answered when the capture
@@ -48,7 +55,7 @@ pub enum JobOut {
     Merge(git::MergeResult),
     /// The results, the paths the checks left behind that were discarded before any commit, and
     /// the phase's diff for the gate agent that follows.
-    Checks(Vec<CheckResult>, Vec<String>, git::ReviewDiff),
+    Checks(Vec<CheckResult>, Vec<String>, git::ReviewDiff, Option<String>),
     /// The phase commit's outcome, plus the run's diff so far (what the finale reviews).
     Cleanup(Result<String, String>, git::ReviewDiff),
     Text(Result<String, String>),
@@ -92,6 +99,12 @@ pub struct SpawnReq {
     /// The MCP servers the agent asks for: the role's `mcp` (names, or `"*"`), set by `Run::role_req`
     /// — the one funnel every spawn goes through. The app resolves them against its settings.
     pub mcp: Vec<String>,
+    /// The pattern's `settings.claude_user_config` ("inherit" | "project"), set by `Run::role_req`;
+    /// empty = inherit.
+    pub claude_user_config: String,
+    /// A fix worker on the integration copy of a worktree run: it must write `.git` (merge a
+    /// conflict by hand), which Codex's workspace-write sandbox forbids (`Ctxt::spawn`).
+    pub git_write: bool,
 }
 
 /// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
@@ -120,6 +133,14 @@ pub trait Ctx {
     /// reach an agent that is already busy. Engine call sites always use plain `prompt`.
     fn prompt_mode(&mut self, a: AgentId, text: String, mode: Send);
     fn interrupt(&mut self, a: AgentId);
+    /// `to` replaces `from` in its slot (a respawn, a fallback): what was queued for `from` is
+    /// now `to`'s. Default: nothing to carry.
+    fn carry_over(&mut self, _from: AgentId, _to: AgentId) {}
+    /// Would a worker on `alias` with this role sandbox be started without its backend's sandbox
+    /// so that it can write the git directory (`SpawnReq::git_write`)? Only the app knows backends.
+    fn lifts_sandbox_for_git(&self, _alias: &str, _sandbox: &str) -> bool {
+        false
+    }
     fn compact(&mut self, a: AgentId);
     fn stop(&mut self, a: AgentId, archive: bool);
     fn tool_result(&mut self, a: AgentId, req: Value, text: String, ok: bool);
@@ -199,6 +220,13 @@ pub enum Pending {
         #[serde(default)]
         big: bool,
     },
+    /// The gate checks of phase `idx` (`after_fix`: the run that follows a fix worker).
+    Checks {
+        idx: usize,
+        round: u32,
+        #[serde(default)]
+        after_fix: bool,
+    },
 }
 
 /// Why a run the user stopped (`Run::stop`) is `Failed` — `state::stage_label` shows exactly this
@@ -217,6 +245,7 @@ impl Pending {
             Pending::Gate { idx, round, .. } => format!("phase {} gate round {round}", idx + 1),
             Pending::Handoff { idx } => format!("phase {} handoff", idx + 1),
             Pending::Fix { idx, round, .. } => format!("phase {} fix for gate round {round}", idx + 1),
+            Pending::Checks { idx, .. } => format!("phase {} gate checks", idx + 1),
         }
     }
 }
@@ -234,6 +263,18 @@ pub enum WState {
 
 /// Whether a worker holds one of its class's slots: preparing its worktree, running, or waiting
 /// out a retry delay — what the per-class caps count (`Run::slots_taken`).
+/// Why an agent was respawned, from the note its replacement got.
+fn respawn_why(note: Option<&str>) -> &'static str {
+    match note {
+        Some(n) if n.starts_with("[mantra:watchdog]") => "watchdog",
+        Some(n) if n.starts_with("[mantra:fallback]") => "fallback model",
+        Some(n) if n.starts_with("The workflow") || n.starts_with("Workflow") => "workflow changed",
+        Some(n) if n.contains("lost its session") => "session lost",
+        Some(_) => "requested",
+        None => "by you",
+    }
+}
+
 fn holds_slot(w: &Worker) -> bool {
     matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))
 }
@@ -249,6 +290,11 @@ pub fn worker_state_str(s: &WState) -> &'static str {
         WState::Failed(_) => "failed",
         WState::Cancelled => "cancelled",
     }
+}
+
+/// The `state:` line of a worker's phase report.
+fn worker_report_state(w: &Worker) -> String {
+    if w.superseded && w.state == WState::Cancelled { "Done (superseded by a plan revision)".into() } else { format!("{:?}", w.state) }
 }
 
 pub struct Worker {
@@ -284,6 +330,18 @@ pub struct Worker {
     /// `None` = the role's model. The next attempt of the same task keeps it (`spawn_task`), and
     /// so does a resume — a switch made for one task is not a switch for its whole role.
     pub model: Option<String>,
+    /// The worker was already asked once for its closing STATUS line (never asked twice).
+    pub status_asked: bool,
+    /// Time the agent was at work on this attempt (a turn running, the run not halted), summed by
+    /// `tick`. `spawned.elapsed()` restarts at a re-attach and counts halts; this does neither.
+    pub active: Duration,
+    /// Cancelled by a plan revision after it had finished: its phase report says so.
+    pub superseded: bool,
+    /// Gate fixes (WP-6.2): this worker's own repair of a gate finding already failed in this
+    /// phase (a fix worker takes the next one); the round it is repairing right now; since when.
+    pub owner_fix_failed: bool,
+    pub owner_fixing: Option<u32>,
+    pub fix_started: Option<Instant>,
 }
 
 /// What an agent is expected to be doing right now, per `Run::expected_active` (WP7.1) — the
@@ -377,6 +435,15 @@ pub struct Pulse {
     pub text: String,
 }
 
+/// What made `Run::try_fallback` give up on a model.
+#[derive(Clone, Copy, PartialEq)]
+enum FallbackWhy {
+    UsageLimit,
+    Silent,
+    Empty,
+    Rejected,
+}
+
 /// Why a run stopped making progress on its own and needs a person.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HaltReason {
@@ -415,6 +482,17 @@ pub struct PhaseRecord {
     pub ended: Instant,
 }
 
+/// What the canvas needs to draw the fix of a gate round (WP-5.5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixView {
+    pub round: u32,
+    /// The task id when that task's own worker fixes; `None` for a generic `fix-<round>` worker.
+    pub owner: Option<String>,
+    pub agent: Option<AgentId>,
+    /// The checks that follow the fix are running: the edge points back to the gate.
+    pub returning: bool,
+}
+
 pub struct Run {
     /// Akasha notebooks by group name, configured by the pattern.
     pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
@@ -430,9 +508,16 @@ pub struct Run {
     pub stage: Stage,
     /// `Some` while the run is halted (see `HaltReason`); `None` while running normally.
     pub halt: Option<Halt>,
+    /// A model was changed during this halt (set while halted by the model setters, cleared by `resume_core`): the band says so.
+    pub halt_touched: bool,
     /// A transition deferred by the pause boundary, performed once on resume (see `Pending`).
     pub pending: Option<Pending>,
     pub plan: Option<Plan>,
+    /// The last plan the validator rejected (with any patches applied since): `mantra_patch_plan` builds on it.
+    pub plan_draft: Option<Plan>,
+    /// `(plan_version, phase_idx())` when `plan_draft` was stored: a draft from an earlier plan or
+    /// phase is stale and `mantra_patch_plan` drops it.
+    plan_draft_at: (u32, Option<usize>),
     pub plan_version: u32,
     pub planner: Option<AgentId>,
     /// The run-wide supervisor (`flow.manager`), spawned when the first phase starts and re-spawned
@@ -457,12 +542,47 @@ pub struct Run {
     /// The latest gate report said the fixes are big (`mantra_gate_report big=true`): the fix
     /// worker is then `worker-big`.
     gate_big: bool,
+    /// `mantra_gate_report fix_by`: the task id QA named to repair this round, or `fix-worker`.
+    gate_fix_by: Option<String>,
+    /// The task whose own worker repairs the current gate round (`None` = a generic fix worker),
+    /// the findings the round was started with, and the owners' reports of this phase so far
+    /// (task, round, report) for the next QA agent.
+    pub(crate) fix_owner: Option<String>,
+    /// An `OwnerSync`/`OwnerMerge` job is in flight (runtime only): the owner looks `(Done, None)`
+    /// meanwhile, and the job's result continues the flow.
+    owner_job: bool,
+    /// The fix that just ended while its checks re-run (WP-5.5): what the canvas draws as the
+    /// edge coming back. Cleared when the next QA round spawns or the phase leaves the gate.
+    pub(crate) fix_done: Option<FixView>,
+    fix_findings: String,
+    owner_fixes: Vec<(String, u32, String)>,
+    gate_plan_defect: bool,
+    /// Counts the checks jobs started in this run (their log files are named after it).
+    checks_gen: u64,
+    /// A QA agent passed the phase in the current gate round and the verify checks are what is
+    /// left: only then may green checks hand the phase off. Not persisted.
+    qa_ok: bool,
+    /// The label of the newest checks log (`checks/<label>.log` in the run dir).
+    checks_label: String,
     /// One line per gate report and finale report of the run so far — what later reviewers start
     /// from instead of re-deriving it. Saved with the state.
     pub gate_notes: Vec<String>,
+    /// Gate reports written to `gate/` so far (their file names are numbered by it) and the newest one.
+    pub(super) gate_seq: u32,
+    pub(super) last_gate_file: Option<PathBuf>,
+    /// The gate agent that was retired last: `mantra_log` can still read it.
+    pub(crate) last_gate_agent: Option<AgentId>,
+    /// The orchestrator that was retired last: the stage's empty orchestrator slot zooms into it.
+    pub(crate) last_orchestrator: Option<AgentId>,
+    /// Fingerprint of the workspace after the newest checks run, and as it was when the last fix
+    /// worker started: equal means that fix changed nothing (`on_job`, `FixChecks`).
+    tree_print: Option<String>,
+    fix_base_print: Option<String>,
+    /// The "fix workers run without Codex's sandbox" line was journaled in this run.
+    git_write_said: bool,
     /// The previous gate round's verdict for the phase in progress, shown to the next round's
     /// fresh agent (`pass|fail` and the summary).
-    prev_gate: Option<(u32, bool, String)>,
+    pub(crate) prev_gate: Option<(u32, bool, String)>,
     /// The merged phase's diff as of the last checks run: what the gate agent starts from.
     phase_diff: git::ReviewDiff,
     /// The run's diff as of the last phase commit: what the finale starts from.
@@ -472,6 +592,10 @@ pub struct Run {
     pub pulse_seq: u64,
     pub phase_started: Instant,
     pub ws: Option<Workspace>,
+    /// Nested repositories of a non-repository project: `HEAD` at the start of the current phase,
+    /// and at the start of the first one (the run's base). See `git::review_diff`.
+    pub(super) nested_base: Vec<(PathBuf, String)>,
+    pub(super) nested_run_base: Vec<(PathBuf, String)>,
     pub handoff: String,
     pub alerts: Vec<String>,
     pub edges: HashMap<AgentId, Instant>,
@@ -483,6 +607,8 @@ pub struct Run {
     /// When the run completed or stopped (`Stage::Done` / `Failed`): `elapsed` stops here, so
     /// the duration a finished run shows stays put.
     pub finished_unix: Option<u64>,
+    /// Set by `App::shutdown`, written to `state.json`, cleared by `resume_boot`.
+    pub closed_unix: Option<u64>,
     /// Active (not halted, not finished) run time — see `elapsed`. `active_secs` is the sum of
     /// the closed active spans; `active_since` is the start of the open one (unix secs), `None`
     /// while halted or after the run ends.
@@ -494,6 +620,9 @@ pub struct Run {
     pub(super) planner_wait: Option<PlannerWait>,
     /// Refresh after the current tool result and turn have completed.
     planner_refresh_pending: bool,
+    /// The saved session of the planner of a run resumed in a phase or the finale; the first lazy
+    /// spawn of the planner re-attaches to it (`planner_with_preface`).
+    pub(super) planner_thread: Option<String>,
     /// Emergency stops are deliberate; late process events must not auto-restart them.
     killed_agents: HashSet<AgentId>,
     /// Agents waiting on an answer from the rung above them (worker/gate/finale → orchestrator,
@@ -580,6 +709,29 @@ pub struct Run {
     /// saved alias that still exists from one that was deleted, and gives `settings.context_cap`
     /// a window to be measured against. Empty = never told (tests): every alias is trusted.
     known_models: HashMap<String, u64>,
+    /// alias → provider id, from the app beside `known_models` (`set_known_providers`).
+    known_providers: HashMap<String, String>,
+    /// What just failed for a reason that is not the task's, and until when new agents avoid it.
+    /// A model (`model:<alias>`): usage limit (60 min), empty turns twice (15 min), a rejected
+    /// request (a day) — its siblings on the same provider are still tried, a limit or a refusal
+    /// is often the model's alone. A provider (`provider:<id>`): no output twice (15 min) — an
+    /// outage is the provider's, and waiting out the deadline on each of its models helps nobody.
+    /// key → (until, why). Runtime only.
+    trouble: HashMap<String, (Instant, &'static str)>,
+    /// Per slot (`first_token_key`): aliases already tried and given up on in this run.
+    pub(super) fallback_used: HashMap<String, Vec<String>>,
+    /// Per slot: consecutive empty turns (WP-1.4).
+    empty_strikes: HashMap<String, u8>,
+    /// `(old, new)` for every agent a respawn or fallback replaced; the app drains it so a zoomed
+    /// view follows the replacement.
+    pub replaced: Vec<(AgentId, AgentId)>,
+    /// The last five `mantra_prompt` texts sent to each agent, with when.
+    recent_prompts: HashMap<AgentId, VecDeque<(Instant, String)>>,
+    /// Messages a halt may have swallowed (or held back): shown to the agent on resume.
+    redeliver: HashMap<AgentId, Vec<String>>,
+    /// Slots already warned that they run on a pinned model whose provider is in trouble
+    /// (`model_for_spawn`), so the warning is journalled once per slot. Runtime only.
+    pin_trouble_warned: HashSet<String>,
     /// The aliases whose model takes images (`ModelEntry.vision`), from the app beside
     /// `known_models` (`set_vision_models`). Empty = none: unlike `known_models`, never trusted
     /// blindly — a screenshot tool reaches an agent only when its model is known to see.
@@ -587,6 +739,13 @@ pub struct Run {
     /// Hash of the pattern as last written to the run dir's `pattern.toml` — a resume reloads from
     /// there, so a role-level model change (`set_role_model all`) is written back when it differs.
     pattern_hash: std::sync::atomic::AtomicU64,
+    /// TOML text of the saved pattern as this run last synchronised with it (started from, or
+    /// adopted changes of): the base of the three-way merge in `pattern::adopt`. Kept in
+    /// `<run dir>/pattern.base.toml`, not in `state.json`.
+    pub pattern_base: Option<String>,
+    /// Roles whose model came from an adoption on resume: `restore_slot_models` and
+    /// `restore_workers` do not put a saved per-agent choice back for them.
+    pub(super) adopted_roles: HashSet<String>,
     /// This process, as the run's owner (`<run dir>/owner.json`, see `state::Owner`): written
     /// with every state flush while the run is live, released when it ends or this `Run` is
     /// dropped (a clean quit, `/leave`), left behind by a crash — where a dead pid lets the next
@@ -599,6 +758,7 @@ impl Run {
         let id = format!("{}-{}", crate::util::unix_secs() % 1_000_000, crate::util::slug(&brief).chars().take(24).collect::<String>().trim_matches('-'));
         let dir = crate::config::runs_dir(&project).join(&id);
         let title = title_from_goal(&brief);
+        let base_toml = pattern.to_toml();
         let mut run = Run {
             akasha: std::collections::BTreeMap::new(),
             akasha_live: Default::default(),
@@ -610,8 +770,11 @@ impl Run {
             brief,
             stage: Stage::Setup,
             halt: None,
+            halt_touched: false,
             pending: None,
             plan: None,
+            plan_draft: None,
+            plan_draft_at: (0, None),
             plan_version: 0,
             planner: None,
             manager: None,
@@ -625,9 +788,26 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             gate_big: false,
+            gate_fix_by: None,
+            fix_owner: None,
+            owner_job: false,
+            fix_done: None,
+            fix_findings: String::new(),
+            owner_fixes: vec![],
+            gate_plan_defect: false,
+            checks_gen: 0,
+            qa_ok: false,
+            checks_label: String::new(),
             gate_nudges: 0,
             resume_note: None,
             gate_notes: vec![],
+            gate_seq: 0,
+            last_gate_file: None,
+            last_gate_agent: None,
+            last_orchestrator: None,
+            tree_print: None,
+            fix_base_print: None,
+            git_write_said: false,
             prev_gate: None,
             phase_diff: git::ReviewDiff::default(),
             run_diff: None,
@@ -635,6 +815,8 @@ impl Run {
             pulse_seq: 0,
             phase_started: Instant::now(),
             ws: None,
+            nested_base: vec![],
+            nested_run_base: vec![],
             handoff: String::new(),
             alerts: vec![],
             edges: HashMap::new(),
@@ -642,12 +824,14 @@ impl Run {
             agent_meta: HashMap::new(),
             started_unix: crate::util::unix_secs(),
             finished_unix: None,
+            closed_unix: None,
             active_secs: 0,
             active_since: Some(crate::util::unix_secs()),
             question: None,
             pending_pattern: None,
             planner_wait: None,
             planner_refresh_pending: false,
+            planner_thread: None,
             killed_agents: HashSet::new(),
             pending_questions: HashMap::new(),
             last_review: Instant::now(),
@@ -685,8 +869,18 @@ impl Run {
             last_status: HashMap::new(),
             slot_models: HashMap::new(),
             known_models: HashMap::new(),
+            known_providers: HashMap::new(),
+            trouble: HashMap::new(),
+            fallback_used: HashMap::new(),
+            empty_strikes: HashMap::new(),
+            replaced: vec![],
+            recent_prompts: HashMap::new(),
+            redeliver: HashMap::new(),
+            pin_trouble_warned: HashSet::new(),
             known_vision: HashSet::new(),
             pattern_hash: std::sync::atomic::AtomicU64::new(0),
+            pattern_base: Some(base_toml),
+            adopted_roles: HashSet::new(),
             owner: super::state::Owner::this_process(),
         };
         run.sync_akasha_groups();
@@ -696,13 +890,29 @@ impl Run {
     // ───────────────────────────── bookkeeping ─────────────────────────────
 
     pub fn log(&mut self, glyph: &str, color: &'static str, text: impl Into<String>) {
+        self.log_inner(glyph, color, text.into(), None);
+    }
+
+    /// A pulse line with its unshortened form for the journal file (questions, answers, reports).
+    pub fn log_full(&mut self, glyph: &str, color: &'static str, short: impl Into<String>, full: &str) {
+        self.log_inner(glyph, color, short.into(), Some(full));
+    }
+
+    /// `log_full` for a line that quotes `text`: the feed shows it cut to `n` characters, the
+    /// journal file keeps all of it. `line` builds the whole line around the quoted text.
+    fn log_quote(&mut self, glyph: &str, color: &'static str, n: usize, text: &str, line: impl Fn(&str) -> String) {
+        self.log_full(glyph, color, line(&trunc(text, n)), &line(text));
+    }
+
+    fn log_inner(&mut self, glyph: &str, color: &'static str, text: String, full: Option<&str>) {
         // Defensive: crash reasons and agent-supplied text can carry ANSI from a subprocess's
         // stderr; the journal and pulse feed must never show raw escape codes.
-        let text = crate::util::strip_ansi(&text.into());
+        let text = crate::util::strip_ansi(&text);
         self.pulse_seq += 1;
         let p = Pulse { n: self.pulse_seq, at: Instant::now(), t: clock(), glyph: glyph.to_string(), color, text };
         crate::mlog!("[run {}] {} {}", self.id, p.glyph, p.text);
-        self.journal_line(&p.glyph, &p.text);
+        let full = full.map(crate::util::strip_ansi);
+        self.journal_line_full(&p.glyph, &p.text, full.as_deref().filter(|f| *f != p.text));
         self.pulse.push_back(p);
         while self.pulse.len() > 300 {
             self.pulse.pop_front();
@@ -713,7 +923,16 @@ impl Run {
     /// Append one line to `journal.jsonl` only (no pulse entry): for text too long for the feed
     /// but worth keeping whole, like the backend's complete error behind a halt.
     fn journal_line(&self, glyph: &str, text: &str) {
-        let line = json!({"t": crate::util::unix_secs(), "glyph": glyph, "text": text}).to_string();
+        self.journal_line_full(glyph, text, None);
+    }
+
+    /// A journal line with an optional `full` key: the unshortened text, when `text` is a digest.
+    fn journal_line_full(&self, glyph: &str, text: &str, full: Option<&str>) {
+        let mut line = json!({"t": crate::util::unix_secs(), "glyph": glyph, "text": text});
+        if let Some(f) = full {
+            line["full"] = json!(f);
+        }
+        let line = line.to_string();
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl")) {
             use std::io::Write;
@@ -776,7 +995,7 @@ impl Run {
                     _ => String::new(),
                 };
                 let mut report = w.report.clone();
-                crate::util::tail_bytes(&mut report, 6000);
+                crate::util::tail_bytes(&mut report, 24_000);
                 WorkerState {
                     task: w.task.id.clone(),
                     title: w.task.title.clone(),
@@ -792,6 +1011,8 @@ impl Run {
                     report,
                     transient: w.transient,
                     model: w.model.clone(),
+                    active_secs: w.active.as_secs(),
+                    superseded: w.superseded,
                 }
             })
             .collect();
@@ -818,13 +1039,21 @@ impl Run {
             finished_unix: self.finished_unix,
             active_secs: Some(self.elapsed().as_secs()),
             updated_unix: crate::util::unix_secs(),
+            closed_unix: self.closed_unix,
             ws: self.ws.clone(),
+            nested_base: self.nested_base.clone(),
+            nested_run_base: self.nested_run_base.clone(),
             handoff: self.handoff.clone(),
             gate_notes: self.gate_notes.clone(),
+            gate_seq: self.gate_seq,
+            last_gate_file: self.last_gate_file.clone(),
+            fix_owner: self.fix_owner.clone(),
             workers,
             agents,
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
             akasha: self.akasha.clone(),
+            fallback_used: self.fallback_used.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            slot_models: self.slot_models.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
         .save(&self.dir);
     }
@@ -833,6 +1062,59 @@ impl Run {
     /// resume and after every live model switch — the only times an alias can enter the run.
     pub fn set_known_models(&mut self, models: HashMap<String, u64>) {
         self.known_models = models;
+    }
+
+    /// alias → provider id (`Registry::alias_providers`), from the app beside `set_known_models`:
+    /// which aliases share a provider that went silent, and which saved session can be re-attached.
+    pub fn set_known_providers(&mut self, m: HashMap<String, String>) {
+        self.known_providers = m;
+    }
+
+    pub(super) fn provider_of(&self, alias: &str) -> Option<&str> {
+        self.known_providers.get(alias).map(|p| p.as_str())
+    }
+
+    /// Some("<alias> hit its usage limit" | "<alias>'s provider gave no output" | …) while the
+    /// model, or its whole provider, has an unexpired trouble mark.
+    fn troubled(&self, alias: &str) -> Option<String> {
+        let live = |k: &str| self.trouble.get(k).filter(|(until, _)| Instant::now() < *until).map(|(_, why)| *why);
+        if let Some(why) = live(&format!("model:{alias}")) {
+            return Some(format!("{alias} {why}"));
+        }
+        let p = self.provider_of(alias)?;
+        live(&format!("provider:{p}")).map(|why| format!("{alias}'s provider {why}"))
+    }
+
+    /// Mark `alias` (or, with `whole_provider`, everything on its provider) as in trouble.
+    fn mark_trouble(&mut self, alias: &str, secs: u64, why: &'static str, whole_provider: bool) {
+        let key = match self.provider_of(alias).filter(|_| whole_provider) {
+            Some(p) => format!("provider:{p}"),
+            None => format!("model:{alias}"),
+        };
+        self.trouble.insert(key, (Instant::now() + Duration::from_secs(secs), why));
+    }
+
+    /// The alias a spawn into `slot_key` runs on: the user's pin if any; else the role's model —
+    /// unless that model is in trouble right now and the chain has one that is not.
+    fn model_for_spawn(&mut self, slot_key: &str, role: &Role, pin: Option<&str>) -> String {
+        if let Some(p) = pin.filter(|p| self.knows_model(p)) {
+            if let Some(why) = self.troubled(p) {
+                if self.pin_trouble_warned.insert(slot_key.to_string()) {
+                    self.log("⚠", "amber", format!("{slot_key}: runs on {p} as you chose, although {why}"));
+                }
+            }
+            return p.to_string();
+        }
+        let Some(why) = self.troubled(&role.model) else { return role.model.clone() };
+        let used = self.fallback_used.get(slot_key).cloned().unwrap_or_default();
+        let next = role.fallback_chain().into_iter().find(|f| self.knows_model(f) && self.troubled(f).is_none() && !used.contains(f));
+        match next {
+            Some(alias) => {
+                self.log("⇄", "amber", format!("{slot_key} starts on fallback {alias} — {why}"));
+                alias
+            }
+            None => role.model.clone(),
+        }
     }
 
     /// Which aliases take images (`vision_aliases`), from the app at the same moments as
@@ -853,6 +1135,7 @@ impl Run {
     pub(super) fn role_req(&self, req: SpawnReq) -> SpawnReq {
         let mut req = self.akasha_req(req);
         req.mcp = req.role.mcp.clone();
+        req.claude_user_config = self.pattern.settings.claude_user_config.clone();
         if req.role.can_spawn_swarm {
             req.tools.extend(tools::swarm_tools());
             req.instructions.push_str(tools::SWARM_OWNER_PROTOCOL);
@@ -873,11 +1156,12 @@ impl Run {
     /// resume keep it — and nothing else: the role's other workers go on with the role's model.
     /// A switch back to the role's model forgets the choice. `set_role_model` (one role, or
     /// `all`) is the role-level change and writes the pattern copy instead.
-    pub fn set_agent_model(&mut self, a: AgentId, alias: &str) {
+    pub fn set_agent_model(&mut self, a: AgentId, alias: &str, by: &str) {
         let slot = self.slot_of(a);
         if slot.is_empty() {
             return;
         }
+        self.halt_touched |= self.halt.is_some();
         let role_model = self.role_name_of(a).map(|r| self.role(&r).model).unwrap_or_default();
         let own = (alias != role_model).then(|| alias.to_string());
         let pinned = own.is_some();
@@ -894,7 +1178,7 @@ impl Run {
         }
         let name = self.name_of(a);
         let scope = if pinned { "this agent only — its respawns and a resume keep it" } else { "the role's model" };
-        self.log("⚙", "blue", format!("{name}: model → {alias} ({scope})"));
+        self.log("⚙", "blue", format!("{name}: model → {alias} ({scope}) ({by})"));
         self.save_state();
     }
 
@@ -908,26 +1192,45 @@ impl Run {
     }
 
     /// The role as a spawn into `slot` should see it: with the model the user chose live for
-    /// that slot, if any, in place of the role's (`set_agent_model`).
-    fn role_for_slot(&self, slot: &str, role_name: &str) -> Role {
+    /// that slot, if any, in place of the role's (`set_agent_model`), else the role's model or —
+    /// while its provider is in trouble — the first usable fallback (`model_for_spawn`).
+    fn role_for_slot(&mut self, slot: &str, role_name: &str) -> Role {
         let mut role = self.role(role_name);
-        if let Some(m) = self.slot_models.get(slot) {
-            role.model = m.clone();
-        }
+        let pin = self.slot_models.get(slot).cloned();
+        role.model = self.model_for_spawn(slot, &role, pin.as_deref());
         role
     }
 
     /// The context window a spawn is told it has: the attempt's own override (a halved assumed
-    /// window) or the model's, and never more than `settings.context_cap` (0 = no cap) — the
+    /// window), the role's `context` or the model's, and never more than `settings.context_cap` (0 = no cap) — the
     /// backend then compacts at the cap instead of letting an agent carry a 500k-token context
     /// through hours of tool cycling. An alias the registry does not know is capped as it is.
-    fn context_for(&self, alias: &str, over: Option<u64>) -> Option<u64> {
+    fn context_for(&self, role: &Role, over: Option<u64>) -> Option<u64> {
         let cap = self.pattern.settings.context_cap;
-        self.known_models.get(alias).copied().into_iter()
+        self.known_models.get(&role.model).copied().into_iter()
+            .chain(role.context)
             .chain(over)
             .chain((cap > 0).then_some(cap))
             .filter(|w| *w > 0)
             .min()
+    }
+
+    /// The ceiling the run puts on agent `a`'s context, whatever model it runs on: the smaller of
+    /// the pattern's cap and its role's `context` (and a worker's halved window). None = no ceiling.
+    pub fn context_ceiling(&self, a: AgentId) -> Option<u64> {
+        let cap = self.pattern.settings.context_cap;
+        let role = self.role_name_of(a).and_then(|n| self.pattern.role(&n).and_then(|r| r.context));
+        let halved = self.workers.iter().find(|w| w.agent == Some(a)).and_then(|w| w.context_override);
+        role.into_iter().chain(halved).chain((cap > 0).then_some(cap)).filter(|w| *w > 0).min()
+    }
+
+    /// Takes the orchestrator out of the run, remembering it for `last_orchestrator`.
+    fn take_orchestrator(&mut self) -> Option<AgentId> {
+        let o = self.orchestrator.take();
+        if o.is_some() {
+            self.last_orchestrator = o;
+        }
+        o
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -984,6 +1287,41 @@ impl Run {
         !matches!(self.stage, Stage::Done | Stage::Failed(_))
     }
 
+    /// The fix of a gate round for the canvas: `Some` while the stage is `Fix`, and (returning) while
+    /// the checks that follow that fix run; `None` otherwise.
+    pub fn fix_view(&self) -> Option<FixView> {
+        match &self.stage {
+            Stage::Phase { step: PhaseStep::Fix { round }, .. } => {
+                let agent = match &self.fix_owner {
+                    Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).and_then(|w| w.agent),
+                    None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).and_then(|w| w.agent),
+                };
+                Some(FixView { round: *round, owner: self.fix_owner.clone(), agent, returning: false })
+            }
+            Stage::Phase { step: PhaseStep::Checks { .. }, .. } => self.fix_done.clone(),
+            _ => None,
+        }
+    }
+
+    /// (the gate round in progress or 0, `gate_max_rounds`).
+    pub fn gate_rounds(&self) -> (u32, u32) {
+        let r = match &self.stage {
+            Stage::Phase { step: PhaseStep::Gate { round } | PhaseStep::Fix { round } | PhaseStep::Checks { round }, .. } => *round,
+            _ => 0,
+        };
+        (r, self.pattern.settings.gate_max_rounds)
+    }
+
+    /// The newest QA verdict of this phase: (round, pass, report).
+    pub fn last_gate_verdict(&self) -> Option<&(u32, bool, String)> {
+        self.prev_gate.as_ref()
+    }
+
+    /// The newest QA report called a gate check wrong (the planner is asked).
+    pub fn gate_plan_defect(&self) -> bool {
+        self.gate_plan_defect
+    }
+
     pub fn halted(&self) -> bool {
         self.halt.is_some()
     }
@@ -999,7 +1337,29 @@ impl Run {
     /// message comes in two lengths: `message` for the pulse line, the band and the alert; `full`
     /// — the backend's whole error, nothing cut off — for the journal, `state.json` and whoever
     /// the halt is escalated to.
+    /// A provider's quota warning (once per episode, from the translator) goes to the journal too.
+    pub fn log_quota_warning(&mut self, a: AgentId, message: &str) {
+        let role = self.role_name_of(a).unwrap_or_default();
+        let no_chain = self.pattern.role(&role).map(|r| r.fallback_chain().is_empty()).unwrap_or(false);
+        let suffix = if no_chain { format!(" — role {role} has no fallback model (Studio → fallback)") } else { String::new() };
+        let name = self.name_of(a);
+        self.log("⚠", "amber", format!("{name}: {message}{suffix}"));
+    }
+
+    /// Keep the last five `mantra_prompt` texts sent to `t`, for `halt_full` to hand back on resume.
+    fn remember_prompt(&mut self, t: AgentId, text: &str) {
+        let q = self.recent_prompts.entry(t).or_default();
+        q.push_back((Instant::now(), text.to_string()));
+        while q.len() > 5 {
+            q.pop_front();
+        }
+    }
+
     fn halt_full(&mut self, ctx: &mut dyn Ctx, reason: HaltReason, agent: Option<AgentId>, message: String, full: String) {
+        // A halt about one agent's provider (or its failed turn) is a soft halt: the others finish
+        // the turn they are in, and the pause boundary holds whatever they would start next.
+        let soft = agent.is_some() && matches!(reason, HaltReason::Auth | HaltReason::UsageLimit | HaltReason::ProviderRejected | HaltReason::AgentTurnFailed);
+        let mut left_alone = 0;
         for a in self.all_agents() {
             // The manager is not part of the work being stopped — it is who gets told about the
             // halt next, mid-turn or not (a steer into its running turn is exactly right), and it
@@ -1007,10 +1367,22 @@ impl Run {
             if Some(a) == self.manager && Some(a) != agent {
                 continue;
             }
+            if soft && Some(a) != agent {
+                if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
+                    left_alone += 1;
+                }
+                continue;
+            }
             if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
                 ctx.interrupt(a);
                 if !self.paused_agents.contains(&a) {
                     self.paused_agents.push(a);
+                }
+                // what was sent to it in the last seconds may have died with the interrupted turn
+                let fresh: Vec<String> = self.recent_prompts.get(&a).map(|q| q.iter().filter(|(t, _)| t.elapsed() < Duration::from_secs(20)).map(|(_, m)| m.clone()).collect()).unwrap_or_default();
+                if !fresh.is_empty() {
+                    self.recent_prompts.remove(&a);
+                    self.redeliver.entry(a).or_default().extend(fresh);
                 }
             }
         }
@@ -1022,6 +1394,10 @@ impl Run {
             }
         }
         self.log("⛔", "red", format!("halted: {message}"));
+        if let (true, Some(about)) = (left_alone > 0, agent) {
+            let name = self.name_of(about);
+            self.log("‖", "amber", format!("{left_alone} agent(s) keep working until their turn ends — the halt is about {name} only"));
+        }
         if full != message {
             self.journal_line("⛔", &format!("halted (full): {}", crate::util::strip_ansi(&full)));
         }
@@ -1035,6 +1411,7 @@ impl Run {
     /// Un-halt: re-prompt every agent that was interrupted for this, and pick the run back up
     /// wherever it left off. Always an explicit act — `space` / Resume, a retry, or the
     /// manager/planner acting on an escalation; changing a model never calls it.
+    #[cfg_attr(not(test), allow(dead_code))] // the pause key resumes through `resume_core` with `by`
     pub fn resume(&mut self, ctx: &mut dyn Ctx) {
         self.resume_by(ctx, None);
     }
@@ -1042,7 +1419,7 @@ impl Run {
     /// `resume`, with the agent that caused it (the planner acting on an escalation) left out of
     /// the "continue where you left off" re-prompts — it is mid-turn and knows.
     pub fn resume_by(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>) {
-        self.resume_core(ctx, except, true, true);
+        self.resume_core(ctx, except, true, true, None);
     }
 
     /// Lift a halt so that a restart of `target` (a retry, a respawn) can go ahead. When that
@@ -1051,32 +1428,34 @@ impl Run {
     /// would start the agent twice.
     fn resume_for_restart(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, target: AgentId) {
         let in_gate = matches!(self.stage, Stage::Phase { step: PhaseStep::Gate { .. } | PhaseStep::Checks { .. } | PhaseStep::Fix { .. }, .. });
-        let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc).unwrap_or(false);
+        let fix_worker = self.worker_idx(target).map(|i| self.workers[i].adhoc || self.workers[i].owner_fixing.is_some()).unwrap_or(false);
         let replaces = in_gate && (Some(target) == self.gate_agent || fix_worker);
-        self.resume_core(ctx, except, !replaces, false);
+        self.resume_core(ctx, except, !replaces, false, None);
     }
 
     /// `respawn`: also put the workers the gateway outage failed back to work (not for a restart of
     /// one specific agent, which is its own answer).
-    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool, respawn: bool) {
+    /// `by`: who asked, for the journal (`Some("you")` for the pause key), `None` for the engine or an agent.
+    fn resume_core(&mut self, ctx: &mut dyn Ctx, except: Option<AgentId>, pickup: bool, respawn: bool, by: Option<&str>) {
         if self.halt.is_none() {
             return;
         }
         let resolved = self.halt.take().unwrap();
+        self.halt_touched = false;
         self.clock_start();
         self.escalation_open = false;
         self.manager_escalation = None;
         self.last_verify_sig = None;
         self.alerts.retain(|alert| *alert != resolved.message);
         let paused = std::mem::take(&mut self.paused_agents);
-        self.log("▶", "green", "run resumed");
+        self.log("▶", "green", match by { Some(b) => format!("run resumed (by {b})"), None => "run resumed".into() });
         self.save_state();
         let t0 = Instant::now();
         if respawn {
             self.respawn_after_outage(ctx);
         }
         let pending = self.pending.take();
-        if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. }))) = (pickup, &pending) {
+        if let (false, Some(p @ (Pending::Gate { .. } | Pending::Fix { .. } | Pending::Checks { .. }))) = (pickup, &pending) {
             // the restart that follows replaces the very agent this was waiting to start
             self.log("‖", "amber", format!("{} was due — superseded by the restart", p.label()));
         } else if let Some(p) = pending {
@@ -1092,8 +1471,8 @@ impl Run {
                         if !self.handoff.is_empty() {
                             self.begin_handoff(ctx, idx);
                         } else if self.planner_wait.is_none() && self.question.is_none() {
-                            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
-                            self.prompt_loop_planner(ctx, p, "The phase resumed. Check the workspace and continue from the saved plan.");
+                            let (p, pre) = self.planner_with_preface(ctx);
+                            self.prompt_loop_planner(ctx, p, &format!("{pre}The phase resumed. Check the workspace and continue from the saved plan."));
                         }
                     } else {
                         self.fill_slots(ctx);
@@ -1120,11 +1499,31 @@ impl Run {
         // Re-prompt what the halt interrupted — unless the pick-up above already gave it its
         // next prompt (`edges` is stamped at every engine prompt) or archived it.
         let live = self.all_agents();
-        for a in paused {
+        for a in paused.clone() {
             if Some(a) == except || !live.contains(&a) || self.edges.get(&a).map(|t| *t >= t0).unwrap_or(false) {
+                // skipped, but a message held for it must still arrive (a plain prompt, as below)
+                if live.contains(&a) {
+                    if let Some(held) = self.redeliver.remove(&a).filter(|h| !h.is_empty()) {
+                        self.mark_edge(a);
+                        ctx.prompt(a, self.with_akasha(a, held.join("\n\n")));
+                    }
+                }
                 continue;
             }
-            ctx.prompt(a, self.with_akasha(a, "[mantra:resume] The run was paused and is resuming now. Continue where you left off.".into()));
+            let mut text = String::from("[mantra:resume] The run was paused and is resuming now. Continue where you left off.");
+            if let Some(held) = self.redeliver.remove(&a).filter(|h| !h.is_empty()) {
+                text.push_str("\n\nSent to you just before the pause — it may not have reached you (ignore what you already acted on):");
+                for m in held {
+                    text.push_str(&format!("\n- {m}"));
+                }
+            }
+            ctx.prompt(a, self.with_akasha(a, text));
+        }
+        // messages held for an agent the halt had not interrupted (it was idle): plain delivery
+        let leftover: Vec<(AgentId, Vec<String>)> = std::mem::take(&mut self.redeliver).into_iter().filter(|(a, h)| live.contains(a) && !paused.contains(a) && !h.is_empty()).collect();
+        for (a, held) in leftover {
+            self.mark_edge(a);
+            ctx.prompt(a, self.with_akasha(a, held.join("\n\n")));
         }
         self.wake_orch(ctx);
     }
@@ -1157,6 +1556,7 @@ impl Run {
                 }
             }
             Pending::Fix { idx, round, findings, big } => self.start_fix(ctx, idx, round, findings, big),
+            Pending::Checks { idx, round, after_fix } => self.launch_checks(ctx, idx, round, after_fix),
         }
     }
 
@@ -1187,7 +1587,10 @@ impl Run {
         }
         self.log("◉", "violet", format!("orchestrator idle with {} unstarted task(s) — waking it", missing.len()));
         self.mark_edge(o);
-        ctx.prompt(o, format!("[mantra:resume] The run resumed. These tasks have no attempt yet: {}. Spawn them with mantra_spawn (spawns were refused while the run was paused), then call mantra_wait.", missing.join(", ")));
+        // what was queued for it (a revision's notes) comes before the task list that follows from it
+        let notes = std::mem::take(&mut self.orch_inbox);
+        let lead = if notes.is_empty() { String::new() } else { format!("{}\n\n", notes.join("\n")) };
+        ctx.prompt(o, format!("{lead}[mantra:resume] The run resumed. These tasks have no attempt yet: {}. Spawn them with mantra_spawn (spawns were refused while the run was paused), then call mantra_wait.", missing.join(", ")));
     }
 
     /// Chain of command, top rung before the user: a halt the run could not sort out by itself
@@ -1268,7 +1671,7 @@ impl Run {
         let status = self.status_text(ctx);
         let checks = self.check_summary();
         let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
-        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}\n", if *ok { "pass" } else { "fail" }, trunc(s, 400))).unwrap_or_default();
+        let report = self.gate_report.as_ref().map(|(ok, s)| format!("Last gate report: {} — {}\n", if *ok { "pass" } else { "fail" }, fit_or_point(s, 6_000, self.last_gate_file.as_deref()))).unwrap_or_default();
         (phase, format!("Workers:\n{status}{report}Gate checks (last run):\n{checks}"))
     }
 
@@ -1310,10 +1713,7 @@ impl Run {
     /// (gate exhausted, attempts exhausted) is handed to the planner with everything it needs to
     /// decide — revise the phase, give the stuck agent a hint and resume, or ask the user.
     fn escalate_to_planner(&mut self, ctx: &mut dyn Ctx, message: String) {
-        let p = match self.planner {
-            Some(p) => p,
-            None => self.spawn_planner(ctx),
-        };
+        let (p, pre) = self.planner_with_preface(ctx);
         let (phase, facts) = self.escalation_context(ctx);
         self.escalation_open = true;
         self.log("✦", "saffron", format!("escalated to the planner: {}", trunc(&message, 60)));
@@ -1321,13 +1721,13 @@ impl Run {
         ctx.prompt(
             p,
             format!(
-                "[mantra:escalation] {message}
+                "{pre}[mantra:escalation] {message}
 
 We are in {phase}; the run is halted until you act.
 {facts}
 
 Decide, then act with exactly one of:
-- mantra_revise_plan — fix this phase's tasks or gate checks (a check that cannot pass on this machine is a plan bug, not a QA failure); the run resumes by itself with the revised phase.
+- mantra_patch_plan (or mantra_revise_plan for a large change) — fix this phase's tasks or gate checks (a check that cannot pass on this machine is a plan bug, not a QA failure); the run resumes by itself with the revised phase.
 - mantra_resume_run(note) — the plan is right; give the stuck agent a concrete hint and let it try again.
 - mantra_ask_user(question) — only if this needs a decision that changes what is being built.
 Then summarize in 2-4 lines.",
@@ -1370,8 +1770,8 @@ Then summarize in 2-4 lines.",
             return "space resumes once the gateway is back — the workers the outage took are respawned for free".into();
         }
         match h.reason {
-            HaltReason::User => "space resume".into(),
-            HaltReason::Auth | HaltReason::UsageLimit => "fix credentials or quota, then space".into(),
+            HaltReason::User => "space resumes".into(),
+            HaltReason::Auth | HaltReason::UsageLimit => "fix the credentials or quota, or m picks another model — then space resumes".into(),
             HaltReason::ProviderRejected => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
                 if h.message.to_lowercase().contains("message role") {
@@ -1381,14 +1781,14 @@ Then summarize in 2-4 lines.",
                 }
             }
             HaltReason::Environment => "fix the environment (see the message above), then space resumes".into(),
-            HaltReason::GateExhausted => "the planner has been asked to sort it out · or type feedback · space retries the gate".into(),
+            HaltReason::GateExhausted => "the planner has been asked · type feedback for it · space retries the gate".into(),
             HaltReason::AttemptsExhausted => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the task".into());
-                format!("r retry {who} · type feedback for the planner")
+                format!("r gives {who} one more attempt · type feedback for the planner")
             }
             HaltReason::AgentTurnFailed => {
                 let who = h.agent.map(|a| self.name_of(a)).unwrap_or_else(|| "the agent".into());
-                format!("r respawn {who} · space retries the turn")
+                format!("r respawns {who} · space retries its turn")
             }
         }
     }
@@ -1510,7 +1910,7 @@ Then summarize in 2-4 lines.",
             "planner" => return self.planner,
             "manager" => return self.manager,
             "orchestrator" | "orch" => return self.orchestrator,
-            "gate" | "qa" => return self.gate_agent.or(self.finale_agent),
+            "gate" | "qa" => return self.gate_agent.or(self.finale_agent).or(self.last_gate_agent),
             "finale" => return self.finale_agent,
             _ => {}
         }
@@ -1518,7 +1918,7 @@ Then summarize in 2-4 lines.",
             return w.agent;
         }
         if n == self.pattern.flow.phase_gate {
-            return self.gate_agent;
+            return self.gate_agent.or(self.last_gate_agent);
         }
         None
     }
@@ -1591,16 +1991,52 @@ Then summarize in 2-4 lines.",
         ctx.prompt(o, format!("[mantra:event]\n{}\n\nCurrent status:\n{status}\nDecide what (if anything) to do, then call mantra_wait.", msgs.join("\n")));
     }
 
+    /// Each task's newest attempt (the highest attempt number; the later entry on a tie), in the
+    /// order the tasks first appeared.
+    pub fn newest_workers(&self) -> Vec<&Worker> {
+        let mut out: Vec<&Worker> = vec![];
+        for w in &self.workers {
+            match out.iter().position(|o| o.task.id == w.task.id) {
+                Some(i) if w.attempt >= out[i].attempt => out[i] = w,
+                Some(_) => {}
+                None => out.push(w),
+            }
+        }
+        out
+    }
+
+    /// (tasks of the current phase whose newest attempt is `Done`, tasks in the current phase).
+    pub fn phase_progress(&self) -> (usize, usize) {
+        let Some(p) = self.current_phase() else { return (0, 0) };
+        let newest = self.newest_workers();
+        let done = p.tasks.iter().filter(|t| newest.iter().any(|w| w.task.id == t.id && w.state == WState::Done)).count();
+        (done, p.tasks.len())
+    }
+
+    /// Workers of the current phase's tasks that are `Running` (their newest attempt).
+    pub fn phase_running(&self) -> usize {
+        let Some(p) = self.current_phase() else { return 0 };
+        self.newest_workers().iter().filter(|w| w.state == WState::Running && p.tasks.iter().any(|t| t.id == w.task.id)).count()
+    }
+
     pub(super) fn status_text(&self, ctx: &dyn Ctx) -> String {
         let mut s = String::new();
-        for w in &self.workers {
+        if let Some(h) = &self.halt {
+            s.push_str(&format!(
+                "RUN HALTED ({}) for {}: {}\nNothing starts until it is resumed (planner: mantra_revise_plan or mantra_resume_run; user: space).\n",
+                reason_label(h.reason),
+                fmt_dur(h.since.elapsed()),
+                trunc(&h.message, 300)
+            ));
+        }
+        for w in self.newest_workers() {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, tok, el) = match a {
                 Some(a) => {
                     let (d, t) = a.plan_progress();
-                    (a.activity.clone(), if t > 0 { format!("{d}/{t}") } else { "-".into() }, fmt_tokens(a.tokens_total), fmt_dur(a.created.elapsed()))
+                    (a.activity.clone(), if t > 0 { format!("{d}/{t}") } else { String::new() }, fmt_tokens(a.tokens_total), fmt_dur(a.created.elapsed()))
                 }
-                None => ("-".into(), "-".into(), "0".into(), "-".into()),
+                None => ("-".into(), String::new(), "0".into(), "-".into()),
             };
             let state = match &w.state {
                 WState::Failed(m) => format!("FAILED ({})", trunc(m, 80)),
@@ -1611,8 +2047,13 @@ Then summarize in 2-4 lines.",
             // The user stopped this one by hand: say so, or the orchestrator reads a live worker
             // that has simply gone quiet and keeps prompting it.
             let stopped = w.agent.and_then(|a| ctx.agent(a)).map(|a| a.stopped_by_user).unwrap_or(false);
+            // a finished attempt has nothing left to report but its state
+            let finished = matches!(w.state, WState::Done | WState::Failed(_) | WState::Cancelled);
+            let attempt = if w.attempt > 1 { format!(" (attempt {})", w.attempt) } else { String::new() };
+            let activity = if finished { String::new() } else { format!(", activity: {act}") };
+            let steps = if prog.is_empty() { String::new() } else { format!(", steps {prog}") };
             s.push_str(&format!(
-                "- {} [{}] {}: {state}, activity: {act}, steps {prog}, tokens {tok}, {el}{}{}{}\n",
+                "- {} [{}] {}{attempt}: {state}{activity}{steps}, tokens {tok}, {el}{}{}{}\n",
                 w.task.id,
                 w.task.role,
                 trunc(&w.task.title, 40),
@@ -1630,8 +2071,8 @@ Then summarize in 2-4 lines.",
     /// What a `mantra_status` reader would act on: stage, worker states, activity, step progress and
     /// the waiting/paused/stopped flags. Clocks and token counts are left out on purpose.
     pub(super) fn status_fingerprint(&self, ctx: &dyn Ctx) -> String {
-        let mut s = format!("{:?}|", self.stage);
-        for w in &self.workers {
+        let mut s = format!("{:?}|{}|", self.stage, self.halted());
+        for w in self.newest_workers() {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, stopped) = match a {
                 Some(a) => (a.activity.clone(), a.plan_progress(), a.stopped_by_user),
@@ -1678,13 +2119,14 @@ Then summarize in 2-4 lines.",
                     }
                 }
                 PhaseStep::Gate { .. } => {
-                    if let Some(g) = self.gate_agent.filter(|g| !asking(*g)) {
+                    let chain_busy = self.orchestrator.is_some_and(|o| self.pending_questions.contains_key(&o));
+                    if let Some(g) = self.gate_agent.filter(|g| !asking(*g) && !chain_busy) {
                         v.push((g, Expect::Gating));
                     }
                 }
                 PhaseStep::Fix { .. } => {
                     for w in &self.workers {
-                        if w.adhoc && w.state == WState::Running {
+                        if (w.adhoc || w.owner_fixing.is_some()) && w.state == WState::Running {
                             if let Some(a) = w.agent.filter(|a| !asking(*a)) {
                                 v.push((a, Expect::Working(w.task.id.clone())));
                             }
@@ -1761,6 +2203,7 @@ Then summarize in 2-4 lines.",
         let toml = self.pattern.to_toml();
         self.pattern_hash.store(fnv1a(&toml), std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::write(self.dir.join("pattern.toml"), toml);
+        self.save_pattern_base();
         // the run is ours from here: another Mantra must not resume it while this one lives
         self.owner.write(&self.dir);
         self.log("◈", "saffron", format!("run {} started with pattern {}", self.id, self.pattern.name));
@@ -1770,6 +2213,14 @@ Then summarize in 2-4 lines.",
         ctx.job(JobTag::Setup, Box::new(move || JobOut::Setup(git::setup(&project, &id, &iso))));
     }
 
+    /// Write `pattern_base` to `<run dir>/pattern.base.toml`.
+    pub(crate) fn save_pattern_base(&self) {
+        if let Some(b) = &self.pattern_base {
+            let _ = std::fs::create_dir_all(&self.dir);
+            let _ = std::fs::write(self.dir.join("pattern.base.toml"), b);
+        }
+    }
+
     pub(super) fn spawn_planner(&mut self, ctx: &mut dyn Ctx) -> AgentId {
         self.spawn_planner_with(ctx, None)
     }
@@ -1777,10 +2228,11 @@ Then summarize in 2-4 lines.",
     /// `resume`: a saved thread/session id to re-attach to (`mantra runs resume`).
     pub(super) fn spawn_planner_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         self.planner_refresh_pending = false;
+        self.planner_thread = None;
         let name = self.pattern.flow.planner.clone();
         let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
-        let req = SpawnReq {
+        let req = SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "planner".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -1789,7 +2241,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: if self.pattern.settings.planner_loop { tools::loop_planner_tools() } else { tools::planner_tools(&wr) },
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -1802,6 +2254,44 @@ Then summarize in 2-4 lines.",
         };
         self.planner = Some(id);
         id
+    }
+
+    /// The planner, spawned when there is none: re-attached to its saved session when there is one,
+    /// otherwise fresh with a context pack. Returns its id and the preface its next prompt must
+    /// start with ("" for a planner that was already there).
+    pub(super) fn planner_with_preface(&mut self, ctx: &mut dyn Ctx) -> (AgentId, String) {
+        if let Some(p) = self.planner {
+            return (p, String::new());
+        }
+        let thread = self.planner_thread.take();
+        let attached = thread.is_some();
+        let p = self.spawn_planner_with(ctx, thread);
+        let pre = if attached {
+            format!("[mantra:resume] Mantra restarted; you are re-attached as this run's planner and your earlier conversation still holds. The run is at {}, plan v{}.\n\n", super::state::stage_label(&self.stage), self.plan_version)
+        } else {
+            format!("{}\n\n", self.planner_context_pack())
+        };
+        (p, pre)
+    }
+
+    /// Everything a planner that starts mid-run needs: the brief, the plan in outline, the current
+    /// phase in full, the recent journal.
+    fn planner_context_pack(&self) -> String {
+        let Some(plan) = &self.plan else { return self.planning_prompt() };
+        let cur = self.phase_idx();
+        let mut s = format!(
+            "[mantra:respawn] You are this run's planner, starting with a fresh session (the earlier planner's session is not available). Continue from stage {}, plan v{}.\n\nRun brief:\n{}\n\nPlan: {} — {}\n",
+            super::state::stage_label(&self.stage), self.plan_version, self.brief, plan.title, trunc(&plan.summary, 1500)
+        );
+        for (i, ph) in plan.phases.iter().enumerate() {
+            let state = match cur { Some(c) if i == c => "CURRENT", Some(c) if i > c => "pending", Some(_) => "done", None if matches!(self.stage, Stage::Finale { .. } | Stage::Done) => "done", None => "pending" };
+            s.push_str(&format!("- phase {} [{}]: {} ({} tasks) — {state}\n", i + 1, ph.id, ph.name, ph.tasks.len()));
+        }
+        if let Some(phase) = self.current_phase() {
+            s.push_str(&format!("\nCurrent phase:\n```json\n{}\n```\n", serde_json::to_string_pretty(phase).unwrap_or_default()));
+        }
+        s.push_str(&format!("Recent journal:\n{}\nCall mantra_read_phase for live task states and mantra_read_plan(phase=…) for another phase.", self.journal_text(25)));
+        s
     }
 
     pub(super) fn planning_prompt(&self) -> String {
@@ -1862,7 +2352,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.want_review = false;
-        self.log("✓", "green", "plan approved");
+        self.log("✓", "green", "plan approved (by you)");
         self.start_phase(ctx, 0);
     }
 
@@ -1870,7 +2360,7 @@ Then summarize in 2-4 lines.",
         let Some(p) = self.planner else { return };
         self.want_review = false;
         self.stage = Stage::Planning;
-        self.log("✎", "saffron", format!("plan feedback: {}", trunc(text, 80)));
+        self.log_quote("✎", "saffron", 80, text, |t| format!("plan feedback: {t}"));
         self.mark_edge(p);
         ctx.prompt(p, format!("[mantra:revise] The user reviewed your plan and says:\n{text}\n\nSubmit the updated plan with mantra_submit_plan."));
     }
@@ -1886,9 +2376,17 @@ Then summarize in 2-4 lines.",
             return;
         };
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+        self.checks_gen += 1;
+        self.qa_ok = false;
         self.phase_started = Instant::now();
         self.last_review = Instant::now();
         self.workers.clear();
+        self.plan_draft = None;
+        self.fix_owner = None;
+        self.owner_job = false;
+        self.fix_done = None;
+        self.fix_findings.clear();
+        self.owner_fixes.clear();
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
@@ -1897,11 +2395,16 @@ Then summarize in 2-4 lines.",
         self.handoff_note_done = false;
         self.cleanup_done = false;
         self.log("◆", "saffron", format!("phase {}/{} — {}", idx + 1, plan.phases.len(), phase.name));
+        if let Some(w) = self.ws.clone().filter(|w| !w.worktree && !w.nested.is_empty()) {
+            ctx.job(JobTag::PhaseBase { phase: idx }, Box::new(move || {
+                JobOut::Text(Ok(git::nested_heads(&w).iter().map(|(r, h)| format!("{}\t{h}", r.display())).collect::<Vec<_>>().join("\n")))
+            }));
+        }
 
         if self.pattern.settings.planner_loop {
             self.planner_nudges = 0;
-            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
-            self.prompt_loop_planner(ctx, p, "The plan is ready. Begin the single execution phase.");
+            let (p, pre) = self.planner_with_preface(ctx);
+            self.prompt_loop_planner(ctx, p, &format!("{pre}The plan is ready. Begin the single execution phase."));
             self.save_state();
             return;
         }
@@ -1914,6 +2417,7 @@ Then summarize in 2-4 lines.",
         let fresh = self.pattern.settings.orchestrator_context != "compact";
         let orch = match self.orchestrator {
             Some(o) if !fresh => {
+                self.log("⇣", "amber", "orchestrator: compacting for the next phase");
                 ctx.compact(o);
                 o
             }
@@ -1961,7 +2465,7 @@ Then summarize in 2-4 lines.",
         let queued = self.slots_taken(&task.role) >= self.pattern.cap_of(&task.role);
         let tid = task.id.clone();
         let role = task.role.clone();
-        let adhoc = task.id.starts_with("fix-");
+        let adhoc = is_fix_id(&task.id);
         // A halved context from an earlier attempt of the same task carries forward, and so does
         // the model the user switched that attempt to: a retry or a respawn is the same task.
         let previous = self.workers.iter().rev().find(|w| w.task.id == tid);
@@ -1988,6 +2492,12 @@ Then summarize in 2-4 lines.",
             idle_prompts: vec![],
             transient: false,
             model,
+            status_asked: false,
+            active: Duration::ZERO,
+            superseded: false,
+            owner_fix_failed: false,
+            owner_fixing: None,
+            fix_started: None,
         });
         if queued {
             self.log("…", "gray", format!("{tid} queued ({})", self.class_cap_text(&role)));
@@ -2041,18 +2551,16 @@ Then summarize in 2-4 lines.",
     /// worktree still holds its edits, so the prompt tells it to continue rather than restart.
     pub(super) fn launch_worker_with(&mut self, ctx: &mut dyn Ctx, wi: usize, dir: PathBuf, branch: String, resume: Option<String>) {
         let plan_summary = self.plan.as_ref().map(|p| p.summary.clone()).unwrap_or_default();
-        let w = &self.workers[wi];
-        let mut role = self.role(&w.task.role);
+        let mut role = self.role(&self.workers[wi].task.role);
         // The model the user switched this task to (`set_agent_model`) outranks the role's.
-        if let Some(m) = &w.model {
-            role.model = m.clone();
-        }
+        let (slot_key, pin) = (format!("worker:{}", self.workers[wi].task.id), self.workers[wi].model.clone());
+        role.model = self.model_for_spawn(&slot_key, &role, pin.as_deref());
+        let w = &self.workers[wi];
         // Codex's workspace-write sandbox keeps every `.git` read-only whatever the writable roots
         // say, so a fix worker on the integration copy (merging conflicted branches, unstaging a
-        // file) could not touch the index. It runs unsandboxed; the worktree still isolates it.
-        if w.adhoc && role.sandbox != "read-only" {
-            role.sandbox = "danger-full-access".into();
-        }
+        // file) could not touch the index: the app lifts the sandbox for Codex (`git_write`); other
+        // backends keep the role's own.
+        let git_write = w.adhoc && self.ws.as_ref().is_some_and(|ws| ws.worktree);
         let scope = if w.task.scope.is_empty() { "(not restricted)".to_string() } else { w.task.scope.join(", ") };
         let instructions = format!(
             "{}\n{}\n## Your task: {} — {}\nScope: {scope}\nAcceptance: {}\n",
@@ -2062,7 +2570,7 @@ Then summarize in 2-4 lines.",
             w.task.title,
             if w.task.acceptance.is_empty() { "the task is fully done and verified" } else { &w.task.acceptance }
         );
-        let brief_context = worker_brief_context(&self.brief);
+        let brief_context = format!("{}{}", self.nested_note(), worker_brief_context(&self.brief));
         let prompt = match &resume {
             Some(_) => format!("[mantra:resume] Mantra restarted while you were working on this task; your worktree still holds your changes. Continue exactly where you left off — do not start over.\n\nThe task again:\n{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
             None => format!("{}\n\n(Context — overall project goal: {plan_summary})\n\n{brief_context}", w.prompt),
@@ -2071,19 +2579,33 @@ Then summarize in 2-4 lines.",
         let name = w.task.id.clone();
         let rname = w.task.role.clone();
         let glyph = role.glyph.clone();
-        let context_override = self.context_for(&role.model, w.context_override);
+        let context_override = self.context_for(&role, w.context_override);
         let resumed = resume.is_some();
         // A fix worker shares the integration copy; it needs the git dir writable only to merge
         // branches that conflicted.
         let extra_writable = if w.adhoc { self.integ_writable() } else { vec![] };
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
-        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        let req = SpawnReq { claude_user_config: String::new(), git_write, name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        // said once, and only when it is true of this worker's backend
+        if git_write && !self.git_write_said && ctx.lifts_sandbox_for_git(&req.role.model, &req.role.sandbox) {
+            self.git_write_said = true;
+            self.log("ℹ", "blue", "fix workers on Codex run without Codex's sandbox (it keeps .git read-only, and a merge fix must write it)");
+        }
         let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
         };
+        // the agent this one replaces for the same task (a fallback restarts the same worker, a
+        // retry is the next attempt): the user's queued messages follow it
+        let replaced_agent = if resumed { None } else { self.workers[wi].agent.or_else(|| { let t = &self.workers[wi].task.id; self.workers[..wi].iter().rev().find(|x| x.task.id == *t).and_then(|x| x.agent) }) }.filter(|o| *o != id);
+        if let Some(old) = replaced_agent {
+            ctx.carry_over(old, id);
+            if !self.replaced.contains(&(old, id)) {
+                self.replaced.push((old, id));
+            }
+        }
         let w = &mut self.workers[wi];
         w.agent = Some(id);
         w.wt = Some(dir);
@@ -2172,9 +2694,17 @@ Then summarize in 2-4 lines.",
                 self.spawn_gate_at_round(ctx, idx, round + 1);
             } else if round == 0 {
                 self.spawn_gate(ctx, idx);
-            } else {
+            } else if self.qa_ok {
                 self.begin_handoff(ctx, idx);
+            } else {
+                // nothing to verify with and no QA pass behind this (a resume, a revision): QA decides
+                self.spawn_gate_at_round(ctx, idx, round.max(1));
             }
+            return;
+        }
+        // (the branch above starts no job itself; what it calls defers on its own while halted)
+        if self.halted() {
+            self.defer(Pending::Checks { idx, round, after_fix });
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Checks { round } };
@@ -2184,35 +2714,72 @@ Then summarize in 2-4 lines.",
         let dir = self.workspace_dir();
         let timeout = Duration::from_secs(self.pattern.settings.check_timeout_secs);
         let ws = self.ws.clone();
+        let nested_base = self.nested_base.clone();
         // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
         // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
         let tidy = ws.as_ref().map(|w| w.worktree).unwrap_or(false);
-        let tag = if after_fix { JobTag::FixChecks { phase: idx, round } } else { JobTag::Checks { phase: idx, round } };
+        // only the newest checks run counts: an older one still in flight is ignored when it lands
+        self.checks_gen += 1;
+        let label = format!("phase-{}-{}-{}", idx + 1, if after_fix { "after-fix" } else if round > 0 { "verify" } else { "checks" }, self.checks_gen);
+        self.checks_label = label.clone();
+        let log_dir = self.dir.join("checks");
+        let tag = if after_fix { JobTag::FixChecks { phase: idx, round, gen: self.checks_gen } } else { JobTag::Checks { phase: idx, round, gen: self.checks_gen } };
         ctx.job(
             tag,
             Box::new(move || {
                 let before = if tidy { git::status_snapshot(&dir) } else { None };
-                let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout) };
+                let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout, Some(&log_dir), &label) };
                 let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
-                let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES)).unwrap_or_default();
-                JobOut::Checks(results, dropped, diff)
+                let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES, &nested_base)).unwrap_or_default();
+                let print = git::tree_print(&dir, ws.as_ref()).map(|t| format!("{:016x}", fnv1a(&t)));
+                JobOut::Checks(results, dropped, diff, print)
             }),
         );
+    }
+
+    /// One line for agents when the project directory is not a repository but holds some
+    /// (`Workspace::nested`); empty otherwise. Ends in a blank line, ready to prefix a section.
+    fn nested_note(&self) -> String {
+        match &self.ws {
+            Some(w) if !w.worktree && !w.nested.is_empty() => format!(
+                "The project directory is not a git repository; these repositories are inside it: {}. Run git commands inside the one you work on.\n\n",
+                w.nested.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            ),
+            _ => String::new(),
+        }
+    }
+
+    fn gate_dir(&self) -> PathBuf {
+        self.dir.join("gate")
     }
 
     fn check_summary(&self) -> String {
         if self.checks.is_empty() {
             return "(no gate checks defined)".into();
         }
-        self.checks
+        let list = self
+            .checks
             .iter()
             .map(|c| {
                 let mut o = c.output.clone();
                 crate::util::tail_bytes(&mut o, 1500);
-                format!("$ {} → {}\n{}", c.cmd, if c.ok { "PASS".to_string() } else { format!("FAIL (exit {:?})", c.code) }, if c.ok { String::new() } else { o })
+                let verdict = if c.ok {
+                    "PASS".to_string()
+                } else {
+                    match c.code {
+                        Some(_) => format!("FAIL ({})", crate::util::exit_label(c.code)),
+                        None => "FAIL (timed out)".to_string(),
+                    }
+                };
+                format!("$ {} → {}\n{}", c.cmd, verdict, if c.ok { String::new() } else { o })
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if self.checks_label.is_empty() {
+            list
+        } else {
+            format!("{list}\n(full output of every check: {}/checks/{}.log)", self.dir.display(), self.checks_label)
+        }
     }
 
     fn spawn_gate(&mut self, ctx: &mut dyn Ctx, idx: usize) {
@@ -2222,6 +2789,7 @@ Then summarize in 2-4 lines.",
     /// Archive the gate agent: every QA round is a fresh agent, so the one that reported is done.
     fn retire_gate_agent(&mut self, ctx: &mut dyn Ctx) {
         if let Some(g) = self.gate_agent.take() {
+            self.last_gate_agent = Some(g);
             self.tokens_prev += ctx.agent(g).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(g, true);
         }
@@ -2240,8 +2808,12 @@ Then summarize in 2-4 lines.",
         }
         self.retire_gate_agent(ctx);
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
+        self.fix_done = None;
         self.gate_report = None;
         self.gate_big = false;
+        self.gate_fix_by = None;
+        self.gate_plan_defect = false;
+        self.qa_ok = false;
         self.gate_nudges = 0;
         if round <= 1 {
             // loop protection counts across rounds; only the first round of a run of rounds starts it over
@@ -2257,15 +2829,15 @@ Then summarize in 2-4 lines.",
         } else {
             "Do not edit anything: you verify and report, Mantra routes every fix to a worker."
         };
-        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, trunc(&w.report, 600))).collect();
-        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, trunc(&w.report, 600))).collect();
+        let reports: String = self.workers.iter().filter(|w| w.state == WState::Done && !w.adhoc).map(|w| format!("### {} — {}\n{}\n", w.task.id, w.task.title, fit_or_point(&w.report, 2_000, None))).collect();
+        let fixes: String = self.workers.iter().filter(|w| w.state == WState::Done && w.adhoc).map(|w| format!("- {}: {}\n", w.task.id, fit_or_point(&w.report, 4_000, None))).chain(self.owner_fixes.iter().map(|(t, r, rep)| format!("- {t} (its own worker, round {r}): {}\n", fit_or_point(rep, 4_000, None)))).collect();
         let previous = match &self.prev_gate {
-            Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, trunc(sum, 1200)),
+            Some((r, pass, sum)) => format!("\nPrevious QA round ({r}) said {}: {}\n", if *pass { "pass" } else { "fail" }, fit_or_point(sum, 12_000, self.last_gate_file.as_deref())),
             None => String::new(),
         };
         let previous = if fixes.is_empty() { previous } else { format!("{previous}{}\n{fixes}", if self.prev_gate.is_some() { "Fix workers since then:" } else { "\nFix workers (before this round):" }) };
         let prompt = format!(
-            "[mantra:gate] Phase {}: {} — QA round {round}/{}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nGate checks (run by Mantra just now):\n{}\n\nWorker reports:\n{reports}{previous}\nThe phase's diff (stat, then the diff — start here, read a file in full only if the diff cannot answer):\n{}\n\nVerify the result against the goal and the criteria, then call mantra_gate_report. You do not fix anything: report each problem with file, what is wrong and what to change.",
+            "[mantra:gate] Phase {}: {} — QA round {round}/{}\nGoal: {}\nGate criteria: {}\nQA focus: {}\n\nGate checks (run by Mantra just now):\n{}\n\nWorker reports:\n{reports}{previous}\n{}The phase's diff (stat, then the diff — start here, read a file in full only if the diff cannot answer):\n{}\n\nVerify the result against the goal and the criteria, then call mantra_gate_report. You do not fix anything: report each problem with file, what is wrong and what to change.",
             idx + 1,
             phase.name,
             self.pattern.settings.gate_max_rounds,
@@ -2273,6 +2845,7 @@ Then summarize in 2-4 lines.",
             if phase.gate.criteria.is_empty() { "build + tests pass, code coherent" } else { &phase.gate.criteria },
             if phase.gate.focus.is_empty() { "integration and consistency between the parallel changes" } else { &phase.gate.focus },
             self.check_summary(),
+            self.nested_note(),
             self.phase_diff.render()
         );
         let prompt = format!("{prompt}\n\n{}", worker_brief_context(&self.brief));
@@ -2280,7 +2853,7 @@ Then summarize in 2-4 lines.",
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
         };
-        let id = ctx.spawn(self.role_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
             name: name.clone(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2289,7 +2862,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::gate_tools(false, &self.pattern.worker_roles()),
             extra_writable: self.integ_writable(),
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -2308,10 +2881,18 @@ Then summarize in 2-4 lines.",
         let line = format!("phase {} · QA round {round}: {} — {}", idx + 1, if pass { "pass" } else { "fail" }, trunc(summary.replace('\n', " ").trim(), 400));
         self.gate_notes.push(line.clone());
         self.prev_gate = Some((round, pass, summary.to_string()));
+        // the whole report goes to disk: agents are pointed to it where they get a cut copy
+        self.gate_seq += 1;
+        let fname = format!("phase-{}-qa-{:02}-round-{round}-{}.md", idx + 1, self.gate_seq, if pass { "pass" } else { "fail" });
+        let gate_dir = self.gate_dir();
+        let _ = std::fs::create_dir_all(&gate_dir);
+        let file = gate_dir.join(&fname);
+        let body = format!("# phase {} · QA round {round} · {} · plan v{}\n\n{}\n", idx + 1, if pass { "pass" } else { "fail" }, self.plan_version, summary.trim());
+        self.last_gate_file = std::fs::write(&file, body).is_ok().then_some(file);
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("gate-reports.md")) {
             use std::io::Write;
-            let _ = writeln!(f, "- {line}");
+            let _ = writeln!(f, "- {line} → gate/{fname}");
         }
     }
 
@@ -2327,25 +2908,178 @@ Then summarize in 2-4 lines.",
         roles.iter().find(|r| r.to_lowercase().contains(hint)).or_else(|| roles.first()).cloned().unwrap_or_else(|| want.into())
     }
 
-    /// Route what gate round `round` found to a fix worker (`fix-<round>`, scoped to the files the
-    /// findings name) and wait for it: when it is done Mantra re-runs the checks and starts the
-    /// next QA round (`on_fix_done`). The caller has checked `round < gate_max_rounds`.
+    /// Route what gate round `round` found to whoever repairs it and wait for them: the worker
+    /// that wrote the code when every finding is in one task's files (`fix_owner_for`), else a
+    /// fix worker (`fix-<round>`, scoped to the files the findings name). When it is done Mantra
+    /// re-runs the checks and starts the next QA round (`on_fix_done`). The caller has checked
+    /// `round < gate_max_rounds`.
     fn start_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
         if self.halted() {
-            self.defer(Pending::Fix { idx, round, findings: trunc(&findings, 6000), big });
+            self.defer(Pending::Fix { idx, round, findings, big });
             return;
         }
-        let Some(phase) = self.current_phase().cloned() else { return };
+        if self.current_phase().is_none() {
+            return;
+        }
+        self.qa_ok = false;
+        self.fix_base_print = self.tree_print.clone();
         self.retire_gate_agent(ctx);
+        self.fix_findings = findings.clone();
+        if let Some(wi) = self.fix_owner_for(ctx, round, &findings) {
+            self.start_owner_fix(ctx, idx, round, wi, findings);
+            return;
+        }
+        self.fix_owner = None;
+        self.start_generic_fix(ctx, idx, round, findings, big);
+    }
+
+    /// The task whose worker should repair these findings, if exactly one task of the current
+    /// phase owns every file the findings name and its worker can take the job (index into
+    /// `self.workers`). Never for round 0 (a merge-conflict fix) or a big fix.
+    fn fix_owner_for(&self, ctx: &dyn Ctx, round: u32, findings: &str) -> Option<usize> {
+        if self.pattern.settings.gate_fix != "owner" || round == 0 || self.gate_big {
+            return None;
+        }
+        // the newest attempt of each task of the phase
+        let newest = |id: &str| self.workers.iter().rposition(|w| !w.adhoc && w.task.id == id);
+        let wi = match self.gate_fix_by.as_deref().map(str::trim) {
+            Some("fix-worker") => return None,
+            Some(id) if !id.is_empty() => newest(id)?,
+            _ => {
+                let paths = paths_in(findings, &self.workspace_dir());
+                if paths.is_empty() {
+                    return None;
+                }
+                let owns = |w: &Worker, path: &str| {
+                    w.state == WState::Done
+                        && ((!w.task.scope.is_empty() && crate::util::in_scope(&w.task.scope, path)) || w.agent.and_then(|a| ctx.agent(a)).map(|ag| ag.files.contains_key(path)).unwrap_or(false))
+                };
+                let mut owner: Option<usize> = None;
+                for p in &paths {
+                    let mut ids: Vec<&str> = self.workers.iter().filter(|w| !w.adhoc).map(|w| w.task.id.as_str()).collect();
+                    ids.dedup();
+                    let found = ids.into_iter().filter_map(newest).find(|&i| owns(&self.workers[i], p))?;
+                    if owner.is_some_and(|o| self.workers[o].task.id != self.workers[found].task.id) {
+                        return None;
+                    }
+                    owner = Some(found);
+                }
+                owner?
+            }
+        };
+        let w = &self.workers[wi];
+        if w.state != WState::Done || w.adhoc || w.owner_fix_failed {
+            return None;
+        }
+        let ag = w.agent.and_then(|a| ctx.agent(a))?;
+        if matches!(ag.status, Status::Stopped | Status::Crashed(_) | Status::Failed(_)) || ag.stopped_by_user || ag.busy() {
+            return None;
+        }
+        // a worktree that is gone cannot be repaired in
+        if self.ws.as_ref().is_some_and(|ws| ws.worktree) && !w.wt.as_ref().is_some_and(|d| d.is_dir()) {
+            return None;
+        }
+        Some(wi)
+    }
+
+    /// The worker that wrote the code repairs it: its worktree is first brought up to the
+    /// integrated state (`OwnerSync`), then it gets the findings (`owner_fix_go`).
+    fn start_owner_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize, _findings: String) {
+        let task = self.workers[wi].task.id.clone();
+        self.stage = Stage::Phase { idx, step: PhaseStep::Fix { round } };
+        self.fix_owner = Some(task.clone());
+        self.qa_ok = false;
+        self.fix_base_print = self.tree_print.clone();
+        self.log("⚒", "amber", format!("gate round {round} found problems in the work of {task} — back to its own worker"));
+        match (self.ws.clone(), self.workers[wi].wt.clone()) {
+            (Some(ws), Some(dir)) => {
+                ctx.job(JobTag::OwnerSync { phase: idx, round, task }, Box::new(move || JobOut::Text(git::sync_worker(&ws, &dir).map(|_| String::new()))));
+                self.owner_job = true;
+            }
+            _ => self.owner_fix_go(ctx, idx, round, wi),
+        }
+        self.save_state();
+    }
+
+    /// The owner's worktree is current: hand it the findings.
+    fn owner_fix_go(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize) {
+        let Some(a) = self.workers[wi].agent else {
+            let f = self.fix_findings.clone();
+            self.fix_owner = None;
+            self.start_generic_fix(ctx, idx, round, f, self.gate_big);
+            return;
+        };
+        let w = &mut self.workers[wi];
+        w.state = WState::Running;
+        w.finished = None;
+        w.owner_fixing = Some(round);
+        w.fix_started = Some(Instant::now());
+        let scope = if w.task.scope.is_empty() { "the files you changed".to_string() } else { w.task.scope.join(", ") };
+        let prompt = format!(
+            "[mantra:fix] The QA gate reviewed the merged result of this phase (round {round}) and found problems in your task's work. Fix exactly these — no refactors, no extras — and stop.\n\nFindings:\n{}\n\nYour working copy has been updated to the integrated state of the phase (the other tasks' changes are merged in). Stay within your task's scope ({scope}). Before you finish run only what covers what you touched, once.\n\nThe gate checks as they stand (Mantra re-runs all of them after you):\n{}\n\nEnd with the STATUS and SUMMARY lines.",
+            fit_or_point(self.fix_findings.trim(), 48_000, self.last_gate_file.as_deref()),
+            self.check_summary()
+        );
+        self.mark_edge(a);
+        ctx.prompt(a, self.with_akasha(a, prompt));
+        self.save_state();
+    }
+
+    /// The owner repaired its files: merge that one worker into the integrated copy, then the
+    /// checks run (`OwnerMerge` → `on_fix_done`).
+    fn start_owner_merge(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize) {
+        let w = &self.workers[wi];
+        match (self.ws.clone(), w.wt.clone()) {
+            (Some(ws), Some(dir)) if ws.worktree => {
+                let list = vec![(w.task.id.clone(), dir, w.branch.clone())];
+                ctx.job(JobTag::OwnerMerge { phase: idx, round }, Box::new(move || {
+                    // a generic fix worker's edits of the integrated copy are uncommitted: commit them so the merge cannot trip over them
+                    if let Err(e) = git::commit_all(&ws.integ, "mantra: integrated state before a repair") {
+                        return JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec![], blocked: vec![e], log: String::new() });
+                    }
+                    JobOut::Merge(git::merge_workers(&ws, &list))
+                }));
+                self.owner_job = true;
+            }
+            _ => self.on_fix_done(ctx, idx, round),
+        }
+    }
+
+    /// The owner's repair did not happen (blocked, failed, cannot sync): a fix worker takes the
+    /// round, with whatever the owner reported.
+    fn owner_gives_up(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, wi: usize, why: &str, report: Option<&str>) {
+        let w = &mut self.workers[wi];
+        w.owner_fix_failed = true;
+        w.owner_fixing = None;
+        if matches!(w.state, WState::Running | WState::Failed(_)) {
+            w.state = WState::Done; // its original work is still merged
+        }
+        self.log("⚒", "amber", format!("{why} — a fix worker takes it"));
+        self.fix_owner = None;
+        let mut findings = self.fix_findings.clone();
+        if let Some(r) = report {
+            findings = format!("{findings}\n\nThe task's own worker tried first and reported:\n{r}");
+        }
+        let big = self.gate_big;
+        if self.halted() {
+            self.start_fix(ctx, idx, round, findings, big);
+        } else {
+            self.start_generic_fix(ctx, idx, round, findings, big);
+        }
+    }
+
+    /// A fix worker (`fix-<round>`) takes what gate round `round` found.
+    fn start_generic_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32, findings: String, big: bool) {
+        let Some(phase) = self.current_phase().cloned() else { return };
         let role = self.fix_role(big);
         let scope = paths_in(&findings, &self.workspace_dir());
-        let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\nThe gate will re-run: {}", phase.gate.checks.join(" ; ")) };
+        let checks = if phase.gate.checks.is_empty() { String::new() } else { format!("\n\nThe gate checks as they stand (Mantra re-runs all of them after you):\n{}", self.check_summary()) };
         let prompt = format!(
             "[mantra:fix] Phase {} ({}), {}. The gate found the problems below. Fix exactly these — no refactors, no extras — and stop.\n\nFindings:\n{}\n\nYou work in the integrated copy of the phase: every worker's changes are already merged here. Stay with the files the findings name{}. Before you finish run only what covers what you touched, once.{checks}\nEnd with the STATUS and SUMMARY lines.",
             idx + 1,
             phase.name,
             if round == 0 { "before the first QA round".to_string() } else { format!("gate round {round}") },
-            trunc(findings.trim(), 6000),
+            fit_or_point(findings.trim(), 48_000, self.last_gate_file.as_deref()),
             if scope.is_empty() { String::new() } else { format!(" ({})", scope.join(", ")) }
         );
         let what = if round == 0 { "Merge the conflicting branches".to_string() } else { format!("Fix what gate round {round} found") };
@@ -2366,9 +3100,28 @@ Then summarize in 2-4 lines.",
     /// The fix worker of gate round `round` finished: re-run the checks (the next QA round
     /// follows the result, `JobTag::FixChecks`).
     fn on_fix_done(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
-        let report = self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).map(|w| w.report.clone()).unwrap_or_default();
+        let who = self.fix_owner.clone().unwrap_or_else(|| format!("fix-{round}"));
+        let report = match &self.fix_owner {
+            Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).map(|w| w.report.clone()).unwrap_or_default(),
+            None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).map(|w| w.report.clone()).unwrap_or_default(),
+        };
         if !report.trim().is_empty() {
-            self.gate_notes.push(format!("phase {} · fix-{round}: {}", idx + 1, trunc(report.replace('\n', " ").trim(), 300)));
+            // an owner's own note was added when it finished
+            if self.fix_owner.is_none() {
+                self.gate_notes.push(format!("phase {} · fix-{round}: {}", idx + 1, trunc(report.replace('\n', " ").trim(), 300)));
+            }
+            let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
+            self.orch_inbox.push(format!("Gate fix r{round} by {who} finished: {summary}. Mantra re-runs the checks and QA."));
+        } else {
+            self.orch_inbox.push(format!("Gate fix r{round} by {who} finished. Mantra re-runs the checks and QA."));
+        }
+        let agent = match &self.fix_owner {
+            Some(t) => self.workers.iter().rev().find(|w| !w.adhoc && &w.task.id == t).and_then(|w| w.agent),
+            None => self.workers.iter().rev().find(|w| w.task.id == format!("fix-{round}")).and_then(|w| w.agent),
+        };
+        self.fix_done = Some(FixView { round, owner: self.fix_owner.clone(), agent, returning: true });
+        if let Some(t) = self.fix_owner.clone() {
+            self.owner_fixes.push((t, round, report));
         }
         // a merge-conflict fix has merged the branches by hand
         self.conflicts.clear();
@@ -2377,6 +3130,23 @@ Then summarize in 2-4 lines.",
 
     /// A halt was lifted while a fix worker owned the phase: pick up where it is.
     fn resume_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
+        if let Some(t) = self.fix_owner.clone() {
+            // the sync or the merge is still running: its result continues the flow
+            if self.owner_job {
+                return;
+            }
+            match self.workers.iter().rev().find(|w| !w.adhoc && w.task.id == t).map(|w| (w.state.clone(), w.owner_fixing)) {
+                // still repairing (or waiting out a retry of that turn): the halt's "continue where you left off" re-prompt reaches it
+                Some((WState::Running | WState::Retrying(_), Some(_))) => {}
+                Some((WState::Done, None)) => self.on_fix_done(ctx, idx, round),
+                _ => {
+                    self.fix_owner = None;
+                    let (f, big) = (self.fix_findings.clone(), self.gate_big);
+                    self.start_fix(ctx, idx, round, f, big);
+                }
+            }
+            return;
+        }
         let id = format!("fix-{round}");
         let Some(w) = self.workers.iter().rev().find(|w| w.task.id == id) else {
             // never got a worker: nothing to wait for, check what is there
@@ -2412,6 +3182,10 @@ Then summarize in 2-4 lines.",
             return;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Handoff };
+        self.fix_owner = None;
+        self.fix_done = None;
+        self.fix_findings.clear();
+        self.owner_fixes.clear();
         self.log("✓", "green", if self.pattern.settings.planner_loop { "planner verified the goal — saving the phase" } else { "gate passed — archiving workers, writing handoff" });
         // archive workers + gate agent
         self.completed_agents.extend(self.workers.iter().filter(|w| w.state == WState::Done).filter_map(|w| w.agent));
@@ -2420,7 +3194,7 @@ Then summarize in 2-4 lines.",
             self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(a, true);
         }
-        self.gate_agent = None;
+        self.last_gate_agent = self.gate_agent.take().or(self.last_gate_agent);
         let phase_name = self.current_phase().map(|p| p.name.clone()).unwrap_or_default();
         self.history.push(PhaseRecord {
             name: phase_name.clone(),
@@ -2431,8 +3205,10 @@ Then summarize in 2-4 lines.",
         // write worker outputs
         let pdir = self.dir.join(format!("phase-{}", idx + 1));
         let _ = std::fs::create_dir_all(&pdir);
-        for w in &self.workers {
-            let _ = std::fs::write(pdir.join(format!("{}.md", w.task.id)), format!("# {} — {}\nstate: {:?}\nattempt: {}\n\n{}\n", w.task.id, w.task.title, w.state, w.attempt, w.report));
+        // one file per task, from its newest attempt (an earlier, cancelled one must not stand in for it)
+        let mut written = HashSet::new();
+        for w in self.workers.iter().rev().filter(|w| written.insert(w.task.id.clone())) {
+            let _ = std::fs::write(pdir.join(format!("{}.md", w.task.id)), format!("# {} — {}\nstate: {}\nattempt: {}\n\n{}\n", w.task.id, w.task.title, worker_report_state(w), w.attempt, w.report));
         }
         self.launch_phase_commit(ctx, idx);
         match self.orchestrator {
@@ -2448,6 +3224,7 @@ Then summarize in 2-4 lines.",
     /// Also used on explicit resume after a refused phase commit; no repeated archiving.
     pub(super) fn launch_phase_commit(&mut self, ctx: &mut dyn Ctx, idx: usize) {
         let ws = self.ws.clone();
+        let nested_run_base = self.nested_run_base.clone();
         let wts: Vec<(PathBuf, String)> = self.workers.iter().filter(|w| !w.adhoc).filter_map(|w| w.wt.clone().map(|d| (d, w.branch.clone()))).collect();
         let phase_name = self.current_phase().map(|p| p.name.clone()).unwrap_or_default();
         let msg = format!("mantra: phase {} — {}", idx + 1, phase_name);
@@ -2457,7 +3234,7 @@ Then summarize in 2-4 lines.",
             if committed.is_ok() {
                 for (d, b) in wts { git::remove_worker(&ws, &d, &b, false); }
             }
-            let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES);
+            let diff = git::review_diff(&ws, git::DiffSpan::Run, FINALE_DIFF_BYTES, &nested_run_base);
             JobOut::Cleanup(committed.map(|c| if c { "committed".into() } else { "nothing to commit".into() }), diff)
         }));
     }
@@ -2468,7 +3245,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         if self.pattern.settings.orchestrator_context != "compact" {
-            if let Some(o) = self.orchestrator.take() {
+            if let Some(o) = self.take_orchestrator() {
                 self.tokens_prev += ctx.agent(o).map(|x| x.tokens_total).unwrap_or(0);
                 ctx.stop(o, true);
             }
@@ -2477,7 +3254,7 @@ Then summarize in 2-4 lines.",
         if idx + 1 < n {
             self.start_phase(ctx, idx + 1);
         } else {
-            if let Some(o) = self.orchestrator.take() {
+            if let Some(o) = self.take_orchestrator() {
                 ctx.stop(o, true);
             }
             self.start_finale(ctx, 0);
@@ -2539,7 +3316,7 @@ Then summarize in 2-4 lines.",
             }
             p
         } else {
-            ctx.spawn(self.role_req(SpawnReq {
+            ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
                 name: step.role.clone(),
                 effort,
                 thread_name: self.thread_name(&step.role),
@@ -2548,7 +3325,7 @@ Then summarize in 2-4 lines.",
                 cwd: self.workspace_dir(),
                 tools: tools::gate_tools(step.may_spawn, &self.pattern.worker_roles()),
                 extra_writable: self.integ_writable(),
-                context_override: self.context_for(&role.model, None),
+                context_override: self.context_for(&role, None),
                 network: self.pattern.settings.network,
                 writable_roots: self.pattern.settings.writable_roots.clone(),
                 mcp: vec![],
@@ -2580,7 +3357,10 @@ Then summarize in 2-4 lines.",
             ctx.stop(a, false);
         }
         let branch = self.ws.as_ref().filter(|w| w.worktree).map(|w| format!(" — branch {} is ready; /land merges it into {}", w.branch, w.base_branch)).unwrap_or_default();
-        self.log("✦", "saffron", format!("run complete in {}{branch}", fmt_dur(self.elapsed())));
+        let total = self.total_tokens(|x| ctx.agent(x).map(|g| g.tokens_total).unwrap_or(0));
+        let cached: u64 = self.all_agents().into_iter().map(|x| ctx.agent(x).map(|g| g.tokens_cached).unwrap_or(0)).sum::<u64>().min(total);
+        let tokens = if total > 0 { format!(" · {} tok, {} cached", fmt_tokens(total), fmt_tokens(cached)) } else { String::new() };
+        self.log("✦", "saffron", format!("run complete in {}{tokens}{branch}", fmt_dur(self.elapsed())));
         ctx.notify(&format!("Mantra: run complete{branch}"));
         self.save_state();
     }
@@ -2607,6 +3387,7 @@ Then summarize in 2-4 lines.",
         if !self.is_active() {
             return;
         }
+        self.checks_gen += 1;
         for a in self.all_agents() {
             if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
                 ctx.interrupt(a);
@@ -2636,7 +3417,12 @@ Then summarize in 2-4 lines.",
     }
 
     fn alert(&mut self, ctx: &mut dyn Ctx, text: String) {
-        self.log("⚑", "amber", text.clone());
+        self.alert_as(ctx, "⚑", text);
+    }
+
+    /// `alert` journalled under its own glyph.
+    fn alert_as(&mut self, ctx: &mut dyn Ctx, glyph: &str, text: String) {
+        self.log(glyph, "amber", text.clone());
         self.alerts.push(text.clone());
         ctx.notify(&format!("Mantra needs you: {text}"));
     }
@@ -2708,8 +3494,52 @@ Then summarize in 2-4 lines.",
                 self.conflicts = m.conflicts;
                 self.run_checks(ctx, phase, 0);
             }
-            (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
-                let all_ok = self.record_checks(results, dropped, diff);
+            (JobTag::OwnerSync { phase, round, task }, JobOut::Text(r)) => {
+                self.owner_job = false;
+                // a revision or a restart moved the run on: nothing waits for this any more
+                let current = matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) && self.fix_owner.as_deref() == Some(task.as_str());
+                let Some(wi) = self.workers.iter().rposition(|w| !w.adhoc && w.task.id == task).filter(|_| current) else { return };
+                match r {
+                    Ok(_) if !self.halted() => self.owner_fix_go(ctx, phase, round, wi),
+                    // a halt is on: the fix is due when it lifts, and a fix worker will take it
+                    Ok(_) => {
+                        self.fix_owner = None;
+                        let (f, big) = (self.fix_findings.clone(), self.gate_big);
+                        self.start_fix(ctx, phase, round, f, big);
+                    }
+                    Err(e) => self.owner_gives_up(ctx, phase, round, wi, &format!("{task}'s worker cannot take the fix ({})", trunc(&e, 100)), None),
+                }
+            }
+            (JobTag::OwnerMerge { phase, round }, JobOut::Merge(m)) => {
+                self.owner_job = false;
+                if !matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) {
+                    return;
+                }
+                let _ = std::fs::write(self.dir.join(format!("phase-{}-merge.log", phase + 1)), &m.log);
+                if !m.blocked.is_empty() {
+                    self.stage = Stage::Phase { idx: phase, step: PhaseStep::Orchestrating };
+                    let detail = format!("phase {} integration blocked:\n{}\nRestore protected decision headings or fix the project commit policy before explicitly resuming. Worker branches and worktrees are retained; do not bypass the safeguard with a manual merge.", phase + 1, m.blocked.join("\n"));
+                    self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, None, format!("phase {} integration blocked by commit/policy failure", phase + 1), detail, None);
+                    return;
+                }
+                if !m.conflicts.is_empty() {
+                    let list = m.conflicts.join("\n");
+                    self.log("⚠", "amber", format!("{} merge conflict(s) after the owner's repair → handed to a fix worker", m.conflicts.len()));
+                    self.fix_owner = None;
+                    let findings = format!("The task's own worker repaired its files, but its branch no longer merges into the integrated copy. Merge it by hand (`git merge <branch>`), keep both sides' intent, and commit:\n{list}");
+                    self.start_generic_fix(ctx, phase, round, findings, true);
+                    return;
+                }
+                if !m.merged.is_empty() {
+                    self.log("⇲", "green", format!("merged {}", m.merged.join(", ")));
+                }
+                self.on_fix_done(ctx, phase, round);
+            }
+            (JobTag::Checks { phase, round, gen }, JobOut::Checks(results, dropped, diff, print)) => {
+                if self.checks_result_stale(gen, phase) {
+                    return;
+                }
+                let all_ok = self.record_checks(results, dropped, diff, print);
                 if round == 0 {
                     // Merge conflicts are not for a read-only QA agent to resolve: a fix worker
                     // merges the branches, then the gate runs on the result.
@@ -2721,6 +3551,9 @@ Then summarize in 2-4 lines.",
                     } else {
                         self.spawn_gate(ctx, phase);
                     }
+                } else if !self.qa_ok {
+                    // these checks did not follow a QA pass (a resume, a revision): QA decides, not the checks alone
+                    self.spawn_gate_at_round(ctx, phase, round.max(1));
                 } else if all_ok {
                     self.begin_handoff(ctx, phase);
                 } else if round < self.pattern.settings.gate_max_rounds {
@@ -2757,16 +3590,27 @@ Then summarize in 2-4 lines.",
                     );
                 }
             }
-            (JobTag::FixChecks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
-                let all_ok = self.record_checks(results, dropped, diff);
+            (JobTag::FixChecks { phase, round, gen }, JobOut::Checks(results, dropped, diff, print)) => {
+                if self.checks_result_stale(gen, phase) {
+                    return;
+                }
+                let all_ok = self.record_checks(results, dropped, diff, print);
+                // who repaired this round: the task's own worker, or the fix worker
+                let who = self.fix_owner.clone().unwrap_or_else(|| format!("fix-{round}"));
                 if !all_ok {
                     // A fix that leaves the very same failure behind did nothing: stop here.
                     let sig = failing_sig(&self.checks);
                     if self.last_verify_sig.as_deref() == Some(sig.as_str()) {
-                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, self.gate_agent, format!("phase {} gate: the same check(s) fail identically after fix-{round} — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
+                        self.halt_and_escalate(ctx, HaltReason::GateExhausted, self.gate_agent, format!("phase {} gate: the same check(s) fail identically after {who}'s fix — {}", phase + 1, trunc(&failing_cmds(&self.checks), 80)));
                         return;
                     }
                     self.last_verify_sig = Some(sig);
+                }
+                // the fix worker left the tree exactly as it found it: QA is told, a fix can be an action outside the tree
+                if self.fix_base_print.is_some() && self.fix_base_print == self.tree_print {
+                    self.log("⚠", "amber", format!("{who} changed no file in the workspace"));
+                    let whom = if self.fix_owner.is_some() { format!("{who}'s worker, which repaired the last round's findings,") } else { "the fix worker of the last round".to_string() };
+                    self.resume_note = Some(format!("Note from Mantra: {whom} changed no file in the workspace. If your findings required a change, they still stand."));
                 }
                 self.spawn_gate_at_round(ctx, phase, round + 1);
             }
@@ -2789,16 +3633,39 @@ Then summarize in 2-4 lines.",
                 self.log("▣", "blue", format!("{name} {what}{}", if ok { "" } else { " — failed" }));
                 ctx.tool_result_items(agent, req, items, ok);
             }
+            (JobTag::PhaseBase { phase }, JobOut::Text(Ok(t))) => {
+                if self.phase_idx() != Some(phase) { return; }
+                self.nested_base = t.lines().filter_map(|l| l.split_once('\t')).map(|(r, h)| (PathBuf::from(r), h.to_string())).collect();
+                if self.nested_run_base.is_empty() {
+                    self.nested_run_base = self.nested_base.clone();
+                }
+            }
             (JobTag::Finish, _) => {}
             _ => {}
         }
     }
 
+    /// A checks result that is not the newest run's, or that lands outside its phase's checks
+    /// step, no longer means anything: journal it and let the caller drop it.
+    fn checks_result_stale(&mut self, gen: u64, phase: usize) -> bool {
+        if gen != self.checks_gen || self.phase_idx() != Some(phase) || !matches!(self.stage, Stage::Phase { step: PhaseStep::Checks { .. }, .. }) {
+            self.log("⎔", "gray", "ignored the result of a checks run that was superseded");
+            return true;
+        }
+        false
+    }
+
     /// Take a checks run's results: journal them, keep them and the phase diff for the next gate
     /// agent. True when every check passed (or there were none).
-    fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff) -> bool {
+    fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff, print: Option<String>) -> bool {
         for c in &results {
-            self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s)", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
+            let why = if c.ok {
+                String::new()
+            } else {
+                let first = c.output.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                format!("{}{}", match c.code { Some(n) => format!(", exit {n}"), None => ", timed out".into() }, if first.is_empty() { String::new() } else { format!(": {}", trunc(first, 80)) })
+            };
+            self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s{why})", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
         }
         if !dropped.is_empty() {
             self.log("⌫", "blue", format!("dropped {} file(s) left behind by checks", dropped.len()));
@@ -2806,6 +3673,7 @@ Then summarize in 2-4 lines.",
         let all_ok = results.iter().all(|c| c.ok);
         self.checks = results;
         self.phase_diff = diff;
+        self.tree_print = print;
         all_ok
     }
 
@@ -2893,7 +3761,7 @@ Then summarize in 2-4 lines.",
             // Quota and billing errors are sometimes reported as transient or bad-request
             // failures. A configured replacement gets a fresh process before any retry/halt.
             let kind = if crate::agent::is_usage_limit_error(kind, &msg) { Some(ErrKind::UsageLimit) } else { kind };
-            if kind == Some(ErrKind::UsageLimit) && self.fallback_after_usage_limit(ctx, a, &msg) {
+            if kind == Some(ErrKind::UsageLimit) && self.try_fallback(ctx, a, FallbackWhy::UsageLimit, &msg) {
                 return;
             }
             // A dead or flaky gateway is nobody's fault: it never costs an attempt, so it is
@@ -2926,6 +3794,8 @@ Then summarize in 2-4 lines.",
                 if count <= max {
                     let wait = Duration::from_secs(4 * count as u64);
                     if kind == Some(ErrKind::ContextFull) {
+                        let who = self.name_of(a);
+                        self.log("⇣", "amber", format!("{who}: context full — compacting"));
                         ctx.compact(a);
                         self.shrink_assumed_context(ctx, a);
                     }
@@ -2940,7 +3810,10 @@ Then summarize in 2-4 lines.",
             }
             // ProviderRejected is deterministic (bad model/role for this provider) — never retried,
             // and halts immediately even for a worker (unlike other worker errors, which are
-            // reported to the orchestrator below).
+            // reported to the orchestrator below) — unless the role's chain has another model.
+            if kind == Some(ErrKind::ProviderRejected) && self.try_fallback(ctx, a, FallbackWhy::Rejected, &msg) {
+                return;
+            }
             let reason = match kind {
                 Some(ErrKind::Auth) => Some(HaltReason::Auth),
                 Some(ErrKind::UsageLimit) => Some(HaltReason::UsageLimit),
@@ -3006,6 +3879,13 @@ Then summarize in 2-4 lines.",
             }
             // worker with a non-retryable error or out of retries: falls through → reported to the orchestrator
         } else if status == "completed" {
+            if ctx.agent(a).map(|x| x.last_turn_empty).unwrap_or(false) && !was_yielded {
+                if self.on_empty_turn(ctx, a) {
+                    return;
+                }
+            } else if let Some(key) = self.first_token_key(a) {
+                self.empty_strikes.remove(&key);
+            }
             self.retry_counts.remove(&a);
             self.gateway_streak.remove(&a);
             self.effort_retried.remove(&a);
@@ -3114,15 +3994,20 @@ Then summarize in 2-4 lines.",
         if Some(a) == self.gate_agent {
             if let Stage::Phase { idx, step: PhaseStep::Gate { round } } = self.stage.clone() {
                 let report = self.gate_report.clone().or_else(|| parse_gate_from_text(ctx.agent(a).and_then(|x| x.final_message.clone()).as_deref()));
-                if report.is_none() && self.pending_questions.contains_key(&a) {
-                    self.log("?", "amber", format!("{} waits for an answer", self.name_of(a)));
+                // QA asked; the orchestrator answered and passed the question up to the planner
+                // (so QA's own entry is gone): it is still waiting, not silent
+                let chain_busy = self.orchestrator.is_some_and(|o| self.pending_questions.contains_key(&o));
+                if report.is_none() && (self.pending_questions.contains_key(&a) || chain_busy) {
+                    self.log("?", "amber", format!("{} waits for an answer{}", self.name_of(a), if chain_busy { " (the question is with the planner)" } else { "" }));
                     return;
                 }
                 match report {
                     Some((true, summary)) => {
                         self.last_gate_blocker = None;
                         self.note_gate(idx, round, true, &summary);
-                        self.log("◎", "green", format!("gate report: pass — {}", trunc(&summary, 70)));
+                        self.orch_inbox.push(format!("Gate round {round}: QA passed — Mantra verifies the checks."));
+                        self.log_quote("◎", "green", 70, &summary, |t| format!("gate report: pass — {t}"));
+                        self.qa_ok = true;
                         self.run_checks(ctx, idx, round);
                     }
                     // the halt interrupted the round before a report: the resume picks the same
@@ -3143,6 +4028,16 @@ Then summarize in 2-4 lines.",
                     Some((false, why)) => {
                         let big = self.gate_big;
                         self.note_gate(idx, round, false, &why);
+                        let path = self.last_gate_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                        if self.gate_plan_defect {
+                            self.orch_inbox.push(format!("Gate round {round}: QA reports a plan defect — the planner is asked. Full report: {path}."));
+                            self.log("◎", "amber", format!("gate round {round}: plan defect — the planner is asked, no fix worker"));
+                            self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, Some(a),
+                                format!("phase {} gate: QA reports a plan defect — {}", idx + 1, trunc(&why, 80)),
+                                format!("phase {} gate: QA reports a plan defect (a gate check is wrong or cannot pass here; the work itself is not at fault). Amend the check with mantra_patch_plan (or mantra_revise_plan for a large change).\n\n{why}", idx + 1),
+                                None);
+                            return;
+                        }
                         // L4 loop protection (WP12.4/WP6): two consecutive gate reports blocked on
                         // the same thing will never resolve themselves — halt now instead of
                         // spending the remaining rounds repeating the same failed fix.
@@ -3160,7 +4055,12 @@ Then summarize in 2-4 lines.",
                             );
                         } else if round < self.pattern.settings.gate_max_rounds {
                             self.gate_report = None;
-                            self.log("◎", "amber", format!("gate round {} not passed: {}", round, trunc(&why, 60)));
+                            let who = match self.fix_owner_for(&*ctx, round, &why) {
+                                Some(wi) => format!("{}'s own worker", self.workers[wi].task.id),
+                                None => format!("fix-{round} ({})", self.fix_role(big)),
+                            };
+                            self.orch_inbox.push(format!("Gate round {round}: QA failed the phase — the fix goes to {who}. Full report: {path}."));
+                            self.log_quote("◎", "amber", 60, &why, |t| format!("gate round {round} not passed: {t}"));
                             // The fix goes to a worker; Mantra re-runs the checks and starts a
                             // fresh QA round when it is done (deferred if the run is halted).
                             self.start_fix(ctx, idx, round, why, big);
@@ -3213,7 +4113,7 @@ Then summarize in 2-4 lines.",
             if self.escalation_open && self.halted() && self.question.is_none() && status == "completed" {
                 self.escalation_open = false;
                 self.mark_edge(a);
-                ctx.prompt(a, "[mantra:escalation] The run is still halted and nothing changed. Act now with exactly one of mantra_revise_plan, mantra_resume_run(note) or mantra_ask_user(question).".into());
+                ctx.prompt(a, "[mantra:escalation] The run is still halted and nothing changed. Act now with exactly one of mantra_patch_plan (or mantra_revise_plan for a large change), mantra_resume_run(note) or mantra_ask_user(question).".into());
                 return;
             }
             // reprompt handled — forward any queued orchestrator notes
@@ -3290,25 +4190,41 @@ Then summarize in 2-4 lines.",
         }
     }
 
-    /// A provider's exhausted balance is not a failed implementation attempt. Replace just
-    /// this agent, keeping a worker's current worktree, task, and attempt budget intact.
-    fn fallback_after_usage_limit(&mut self, ctx: &mut dyn Ctx, a: AgentId, error: &str) -> bool {
+    /// Move agent `a` to the next model of its role's chain. `false` when the run is halted, the
+    /// agent has no role, or nothing in the chain is left — the caller then does what it did before.
+    /// A provider's exhausted balance (or silence, empty turns, a rejected request) is not a failed
+    /// implementation attempt: just this agent is replaced, a worker keeping its current worktree,
+    /// task and attempt budget.
+    fn try_fallback(&mut self, ctx: &mut dyn Ctx, a: AgentId, why: FallbackWhy, error: &str) -> bool {
         if self.halted() {
             return false;
         }
         let Some(role_name) = self.role_name_of(a) else { return false };
+        let Some(key) = self.first_token_key(a) else { return false };
         let running = self.worker_idx(a).and_then(|wi| self.workers[wi].model.clone())
             .or_else(|| self.slot_models.get(&self.slot_of(a)).cloned())
             .or_else(|| ctx.agent(a).map(|ag| ag.model_alias.clone()).filter(|m| !m.is_empty()))
-            .unwrap_or_else(|| self.role_for_slot(&self.slot_of(a), &role_name).model);
-        let fallback = self.pattern.role(&role_name).and_then(|role| role.fallback.as_ref())
-            .filter(|alias| !alias.trim().is_empty() && **alias != running && self.knows_model(alias)).cloned();
-        let Some(alias) = fallback else { return false };
+            .unwrap_or_else(|| self.role(&role_name).model);
+        let (secs, trouble, short, reason) = match why {
+            FallbackWhy::UsageLimit => (3600, "hit its usage limit", "usage limit", format!("hit its provider's usage limit ({})", trunc(error, 240))),
+            FallbackWhy::Silent => (900, "gave no output", "no output", "produced no output twice in a row".to_string()),
+            FallbackWhy::Empty => (900, "returned empty turns", "empty turns", "returned an empty turn twice in a row".to_string()),
+            FallbackWhy::Rejected => (86_400, "was rejected by its provider", "rejected", format!("was rejected by its provider ({})", trunc(error, 240))),
+        };
+        // silence is an outage of the provider; a limit, a refusal or empty turns are the model's
+        self.mark_trouble(&running, secs, trouble, matches!(why, FallbackWhy::Silent));
+        self.fallback_used.entry(key.clone()).or_default().push(running.clone());
+        let used = self.fallback_used.get(&key).cloned().unwrap_or_default();
+        let chain = self.pattern.role(&role_name).map(|r| r.fallback_chain()).unwrap_or_default();
+        let next = chain.into_iter().find(|f| !used.contains(f) && *f != running && self.knows_model(f) && self.troubled(f).is_none());
+        let Some(next) = next else {
+            self.save_state();
+            return false;
+        };
         let name = self.name_of(a);
-        let first_token_key = self.first_token_key(a);
-        let note = format!("[mantra:fallback] The previous provider hit its billing or usage limit ({}). You are its replacement on {alias}. Your current files contain the work so far. Continue where it left off.", trunc(error, 240));
+        let note = format!("[mantra:fallback] The previous model ({running}) {reason}. You are its replacement on {next}. Your current files contain the work so far. Continue where it left off.");
         self.forget_agent_session(a);
-        self.set_agent_model(a, &alias);
+        self.set_agent_model(a, &next, "fallback");
         let restarted = if let Some(wi) = self.worker_idx(a) {
             let dir = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone()));
             if let Some(dir) = dir {
@@ -3321,6 +4237,7 @@ Then summarize in 2-4 lines.",
                 self.workers[wi].prompt = join_note(Some(note), task_prompt.clone());
                 self.launch_worker(ctx, wi, dir, branch);
                 self.workers[wi].prompt = task_prompt;
+                // `launch_worker` has carried the queue over and recorded the replacement
                 true
             } else {
                 false
@@ -3332,11 +4249,57 @@ Then summarize in 2-4 lines.",
             return false;
         }
         self.clear_replaced_agent(a);
-        if let Some(key) = first_token_key {
-            self.first_token_strikes.remove(&key);
-        }
-        self.alert(ctx, format!("{name}: {running} hit a provider billing or usage limit — continuing on fallback {alias}. {}", trunc(error, 160)));
+        self.first_token_strikes.remove(&key);
+        self.empty_strikes.remove(&key);
+        self.alert_as(ctx, "⇄", format!("{name}: {running} → fallback {next} ({short})"));
         self.save_state();
+        true
+    }
+
+    /// A turn completed with no text, command, file change, tool call or plan. First time: ask
+    /// again. Second time in a row: the role's fallback, else report a failure.
+    /// `true` = handled (retry scheduled, fallback started, or failure reported).
+    fn on_empty_turn(&mut self, ctx: &mut dyn Ctx, a: AgentId) -> bool {
+        let Some(key) = self.first_token_key(a) else { return false };
+        let n = {
+            let n = self.empty_strikes.entry(key.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let alias = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
+        let name = self.name_of(a);
+        let wi = self.worker_idx(a);
+        if n == 1 {
+            self.log("⚠", "amber", format!("{name}: empty turn from {alias} (no text, no tool call) — asking again"));
+            let wait = Duration::from_secs(2);
+            if let Some(wi) = wi {
+                self.workers[wi].state = WState::Retrying(Instant::now() + wait);
+            }
+            self.continue_queue.push((a, Instant::now() + wait, "[mantra:retry] Your previous turn ended without any output or tool call. Continue the task. If it is finished, end with your report.".into()));
+            return true;
+        }
+        self.empty_strikes.remove(&key);
+        if self.try_fallback(ctx, a, FallbackWhy::Empty, "") {
+            return true;
+        }
+        let text = format!("empty turn twice from {alias} (no text, no tool call)");
+        if let Some(wi) = wi {
+            self.on_worker_done(ctx, wi, "failed", Some(text));
+        } else if Some(a) == self.manager {
+            self.log("◈", "amber", format!("manager: {text} — a fresh manager comes with the next event"));
+            self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(a, true);
+            self.manager = None;
+            self.retry_counts.remove(&a);
+            if let Some(c) = self.manager_watchdog.take() {
+                self.wake_planner_for_idle(ctx, &c.about);
+            }
+            if let Some(e) = self.manager_escalation.take() {
+                self.manager_gave_up(ctx, e, " (it failed itself)");
+            }
+        } else {
+            self.halt_turn_failed(ctx, Some(a), format!("{name}: {text}"));
+        }
         true
     }
 
@@ -3386,6 +4349,8 @@ Then summarize in 2-4 lines.",
             Stage::Phase { step: PhaseStep::Fix { round }, .. } if self.workers[wi].adhoc => Some(*round),
             _ => None,
         };
+        // A task's own worker repairing what a gate round found is Mantra's to follow too.
+        let owner_round = self.workers[wi].owner_fixing.filter(|_| matches!(self.stage, Stage::Phase { step: PhaseStep::Fix { .. }, .. }));
         let w = &mut self.workers[wi];
         if w.paused || w.state == WState::Cancelled {
             return;
@@ -3394,34 +4359,58 @@ Then summarize in 2-4 lines.",
         let tid = w.task.id.clone();
         let agent = w.agent;
         let mut fix_done: Option<(usize, u32)> = None;
+        // the owner could not repair it: (round, what happened, its report)
+        let mut owner_failed: Option<(u32, String, Option<String>)> = None;
+        let mut owner_merge: Option<(usize, u32)> = None;
         let report = w.agent.and_then(|a| ctx.agent(a)).and_then(|a| a.final_message.clone()).unwrap_or_default();
         let waiting = w.agent.map(|a| self.pending_questions.contains_key(&a)).unwrap_or(false);
         match status {
             "completed" => {
                 let status_line = report.lines().map(|l| l.trim().to_lowercase()).find(|l| l.starts_with("status:"));
                 // It asked the orchestrator something and stopped to wait: that is not "done".
-                if waiting && status_line.is_none() {
+                // (also when it wrote `STATUS: blocked` after asking: it waits, it did not fail)
+                let says_done = status_line.as_deref().map(|l| l.contains("done")).unwrap_or(false);
+                if waiting && !says_done {
                     self.log("?", "amber", format!("{tid} waits for an answer"));
                     return;
+                }
+                if waiting {
+                    if let Some(a) = agent {
+                        self.pending_questions.remove(&a);
+                    }
+                }
+                // A first turn that ends without the closing lines is asked for them once; a
+                // second one (or a follow-up on a done worker) counts as done, so this never loops.
+                if status_line.is_none() && self.workers[wi].state != WState::Done && !self.workers[wi].status_asked && !self.halted() {
+                    if let Some(a) = agent {
+                        self.workers[wi].status_asked = true;
+                        self.log("?", "amber", format!("{tid} ended its turn without a STATUS line — asking for it"));
+                        self.mark_edge(a);
+                        ctx.prompt(a, "[mantra] Your turn ended without the closing lines. If the task is finished, reply with exactly: STATUS: done (or blocked) and SUMMARY: <2-5 lines>. If you are waiting for a decision, call mantra_ask and end your turn.".into());
+                        return;
+                    }
                 }
                 let blocked = status_line.map(|l| l.contains("blocked")).unwrap_or(false);
                 let w = &mut self.workers[wi];
                 w.report = report.clone();
                 w.finished = Some(Instant::now());
-                if blocked {
+                if blocked && owner_round.is_some() {
+                    owner_failed = owner_round.map(|r| (r, format!("{tid} could not repair it (blocked)"), Some(report.clone())));
+                } else if blocked {
                     w.state = WState::Failed("blocked".into());
-                    self.log("⚠", "amber", format!("{tid} is blocked"));
+                    self.log_full("⚠", "amber", format!("{tid} is blocked"), &format!("{tid} is blocked: {report}"));
                     if let Some(round) = fix_round {
-                        self.halt_and_escalate(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)));
+                        self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(&report, 200)));
+                        self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, format!("{tid} could not fix what gate round {round} found — it is blocked: {}", trunc(&report, 300)), format!("{tid} could not fix what gate round {round} found — it is blocked: {report}"), None);
                     } else {
-                        self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", trunc(&report, 1200)));
+                        self.orch_event(ctx, format!("{tid} FAILED (blocked). Its report:\n{}\nUse mantra_retry with a better prompt, or mantra_prompt to unblock it.", fit_or_point(&report, 4_000, None)));
                     }
                 } else {
                     // A done worker the user (or the orchestrator) messaged finishes again: that is
                     // a follow-up answered, not the task completing a second time.
-                    let again = w.state == WState::Done;
+                    let again = w.state == WState::Done && owner_round.is_none();
                     w.state = WState::Done;
-                    let el = fmt_dur(w.spawned.elapsed());
+                    let el = fmt_dur(w.active + self.last_tick.elapsed().min(Duration::from_secs(1)));
                     let adhoc = w.adhoc;
                     let summary = report.lines().find(|l| l.trim_start().to_lowercase().starts_with("summary:")).map(|l| l.trim().to_string()).unwrap_or_else(|| trunc(report.lines().last().unwrap_or(""), 90));
                     // Who asked for the follow-up: the user (typed in the zoomed view, or `@name …`,
@@ -3430,13 +4419,26 @@ Then summarize in 2-4 lines.",
                     // the last message before it.
                     let last_ask = agent.and_then(|a| ctx.agent(a)).and_then(|a| a.items.iter().rev().find(|i| matches!(i.kind, crate::agent::Kind::User) && !crate::agent::is_akasha_push(&i.text))).map(|i| i.text.clone()).unwrap_or_default();
                     let by_you = again && (last_ask.starts_with("[from the user]") || !crate::agent::engine_sent(&last_ask));
+                    let owner_el = owner_round.map(|_| fmt_dur(w.fix_started.map(|t| t.elapsed()).unwrap_or_default()));
+                    if let Some(round) = owner_round {
+                        let w = &mut self.workers[wi];
+                        w.owner_fixing = None;
+                        w.fix_started = None;
+                        owner_merge = Some((self.phase_idx().unwrap_or(0), round));
+                        self.log("✓", "green", format!("{tid} repaired its work (gate round {round}) in {}", owner_el.clone().unwrap_or_default()));
+                        self.gate_notes.push(format!("phase {} · {tid} (owner fix r{round}): {}", owner_merge.map(|m| m.0 + 1).unwrap_or(1), trunc(summary.replace('\n', " ").trim(), 300)));
+                    }
                     let what = match (again, by_you) {
                         (false, _) => "done",
                         (true, true) => "done again (after your message)",
                         (true, false) => "done again",
                     };
-                    self.log("✓", "green", format!("{tid} {what} in {el}"));
-                    if again && by_you {
+                    if owner_round.is_none() {
+                        self.log("✓", "green", format!("{tid} {what} in {el}"));
+                    }
+                    if owner_round.is_some() {
+                        // reported above; the merge of its repair follows
+                    } else if again && by_you {
                         // the orchestrator (or the finale) already had this task's completion: the
                         // user's side conversation wakes nobody, and the new report is on the
                         // worker for whoever reads it next
@@ -3464,7 +4466,7 @@ Then summarize in 2-4 lines.",
             }
             "interrupted" => {
                 self.log("■", "amber", format!("{tid} interrupted"));
-                if fix_round.is_none() {
+                if fix_round.is_none() && owner_round.is_none() && before != WState::Done {
                     self.orch_event(ctx, format!("{tid} was interrupted (it is idle now). mantra_prompt it to continue or mantra_retry."));
                 }
             }
@@ -3477,7 +4479,10 @@ Then summarize in 2-4 lines.",
                     // the orchestrator (a retry would fail the same way) nor — for a fix worker —
                     // the manager and the planner are asked. The run waits for the gateway.
                     self.halt_for_outage(ctx, HaltReason::AgentTurnFailed, agent, format!("{tid}: {}", trunc(&e, 120)), format!("{tid}: {e}"), GATEWAY_DOWN_HINT);
+                } else if let Some(round) = owner_round {
+                    owner_failed = Some((round, format!("{tid} could not repair it (its turn failed)"), Some(format!("its turn failed: {}", trunc(&e, 300)))));
                 } else if let Some(round) = fix_round {
+                    self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(&e, 200)));
                     let msg = format!("{tid} could not fix what gate round {round} found — its turn failed: {}", trunc(&e, 200));
                     self.halt_and_escalate_full(ctx, HaltReason::AttemptsExhausted, agent, msg.clone(), msg, Some(&e));
                 } else {
@@ -3485,9 +4490,17 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
+        if let Some((round, what, rep)) = owner_failed {
+            let idx = self.phase_idx().unwrap_or(0);
+            self.orch_inbox.push(format!("Gate fix r{round} by {tid} could not be completed: {}.", trunc(rep.as_deref().unwrap_or(&what), 200)));
+            self.owner_gives_up(ctx, idx, round, wi, &what, rep.as_deref());
+        }
         self.akasha_task_ended(ctx, wi, &before);
         if let Some((idx, round)) = fix_done {
             self.on_fix_done(ctx, idx, round);
+        }
+        if let Some((idx, round)) = owner_merge {
+            self.start_owner_merge(ctx, idx, round, wi);
         }
         self.fill_slots(ctx);
         self.check_phase_done(ctx);
@@ -3496,11 +4509,12 @@ Then summarize in 2-4 lines.",
 
     pub fn on_files_changed(&mut self, ctx: &mut dyn Ctx, a: AgentId, paths: &[String]) {
         let Some(wi) = self.worker_idx(a) else { return };
+        let base = self.workers[wi].wt.clone().or_else(|| ctx.agent(a).map(|ag| ag.cwd.clone())).unwrap_or_else(|| self.project.clone());
         let w = &mut self.workers[wi];
         if w.task.scope.is_empty() {
             return;
         }
-        let outside: Vec<String> = paths.iter().filter(|p| !crate::util::in_scope(&w.task.scope, p)).filter(|p| !w.tripwires.contains(p)).cloned().collect();
+        let outside: Vec<String> = paths.iter().filter(|p| !crate::util::in_scope_from(&w.task.scope, p, &base)).filter(|p| !w.tripwires.contains(p)).cloned().collect();
         if outside.is_empty() {
             return;
         }
@@ -3584,7 +4598,15 @@ Then summarize in 2-4 lines.",
         if self.last_tick.elapsed() < Duration::from_millis(900) {
             return;
         }
+        let dt = self.last_tick.elapsed().min(Duration::from_secs(10));
         self.last_tick = Instant::now();
+        if !self.halted() {
+            for w in self.workers.iter_mut() {
+                if w.agent.and_then(|a| ctx.agent(a)).map(|a| a.busy()).unwrap_or(false) {
+                    w.active += dt;
+                }
+            }
+        }
         // Persistence is event-driven: every journal line marks the state dirty, and this flush —
         // at most once per tick, which is the debounce — writes it out, halted or not.
         if self.state_dirty {
@@ -3616,11 +4638,11 @@ Then summarize in 2-4 lines.",
         let mut events = vec![];
         for w in &mut self.workers {
             let Some(a) = w.agent.and_then(|a| ctx.agent(a)) else { continue };
-            if w.state == WState::Running && a.busy() && !a.swarm_waiting && a.last_event.elapsed() > stall && !w.stall_flagged {
+            if w.state == WState::Running && a.busy() && !a.swarm_waiting && a.turn_silence().is_some_and(|q| q > stall) && !w.stall_flagged {
                 w.stall_flagged = true;
                 events.push(format!("TRIPWIRE: {} has shown no activity for {} minutes (last: {}).", w.task.id, stall.as_secs() / 60, a.activity));
             }
-            if a.last_event.elapsed() < stall {
+            if a.turn_silence().unwrap_or_default() < stall {
                 w.stall_flagged = false;
             }
             let limit = self.pattern.role(&w.task.role).and_then(|r| r.max_tokens);
@@ -3738,7 +4760,7 @@ Then summarize in 2-4 lines.",
         for (a, expect) in self.expected_active() {
             seen.push(a);
             let Some(agent) = ctx.agent(a) else { continue };
-            let quiet = agent.last_event.elapsed();
+            let quiet = agent.turn_silence().unwrap_or_default();
             if quiet < stall {
                 // It spoke: the spell is over, and the next one is worth reporting again.
                 self.silent_flagged.remove(&a);
@@ -3746,7 +4768,7 @@ Then summarize in 2-4 lines.",
                 // Workers are deliberately left out: `tick`'s stall tripwire already reports them,
                 // and does more with it (the orchestrator is told, so it can steer or respawn).
                 let name = self.name_of(a);
-                self.log("⏳", "amber", format!("{name}: no output for {} — still connected", fmt_dur(quiet)));
+                self.log("⏳", "amber", format!("{name}: no output for {} — its turn is still running", fmt_dur(quiet)));
             }
             // A deliberate stop is not idleness: an agent the user stopped by hand is waiting for
             // them, so it is never nudged, respawned or escalated on. Its ladder is dropped too —
@@ -3843,34 +4865,9 @@ Then summarize in 2-4 lines.",
             }
             return;
         }
-        let role_name = self.role_name_of(a);
-        let running = ctx.agent(a).map(|x| x.model_alias.clone()).unwrap_or_default();
-        let fallback = role_name
-            .as_ref()
-            .and_then(|r| self.pattern.role(r))
-            .and_then(|r| r.fallback.clone().filter(|f| !f.trim().is_empty() && *f != r.model && *f != running));
-        if let (Some(alias), Some(role_name)) = (fallback, role_name) {
-            self.log("↻", "amber", format!("{name}: no output twice — falling back to {alias}"));
-            if let Some(r) = self.pattern.roles.get_mut(&role_name) {
-                r.model = alias;
-            }
-            // The fallback is the role's model from now on (a resume rebuilds the pattern from the
-            // run's `pattern.toml`, which `save_state` rewrites below); a model the user had
-            // switched this very agent to is what went silent, so it no longer outranks the role.
-            match self.worker_idx(a) {
-                Some(wi) => self.workers[wi].model = None,
-                None => {
-                    let slot = self.slot_of(a);
-                    self.slot_models.remove(&slot);
-                }
-            }
-            // the new model gets its own restart-then-escalate cycle
-            self.first_token_strikes.remove(&key);
-            let note = format!("[mantra:watchdog] Your previous model produced no output for {quiet}, twice in a row; you are its replacement. Continue where you left off.");
-            if let Err(e) = self.respawn(ctx, a, Some(note)) {
-                self.log("!", "amber", format!("{name}: could not respawn on the fallback ({e})"));
-            }
-            self.save_state();
+        // The role's next model, if its chain has one: the agent (or slot) is pinned to it, and the
+        // trouble mark makes later spawns of the role start on a fallback too (`model_for_spawn`).
+        if self.try_fallback(ctx, a, FallbackWhy::Silent, "") {
             return;
         }
         // The manager is a supervisor, not a step of the run: a fresh one, never a halt.
@@ -3992,7 +4989,7 @@ Then summarize in 2-4 lines.",
     /// every reason, via `resume()`.
     pub fn toggle_pause(&mut self, ctx: &mut dyn Ctx) {
         if self.halted() {
-            self.resume(ctx);
+            self.resume_core(ctx, None, true, true, Some("you"));
             return;
         }
         for a in self.all_agents() {
@@ -4003,7 +5000,7 @@ Then summarize in 2-4 lines.",
                 }
             }
         }
-        self.log("‖", "amber", "run paused");
+        self.log("‖", "amber", "run paused (by you)");
         self.halt = Some(Halt { reason: HaltReason::User, agent: None, message: "paused by you".into(), full: "paused by you".into(), since: Instant::now() });
         self.clock_stop();
         self.save_state();
@@ -4013,8 +5010,9 @@ Then summarize in 2-4 lines.",
         if !self.is_active() { return Err("Start a run to change its workflow permission.".into()); }
         if self.pattern.is_auto() { return Err("Auto needs its first workflow proposal before this can be changed.".into()); }
         self.pattern.settings.allow_pattern_changes = enabled;
+        self.log("⚙", "blue", format!("live workflow changes {} (by you)", if enabled { "allowed" } else { "locked" }));
         if !enabled && self.pending_pattern.is_some() {
-            self.user_input(ctx, "The user turned off live workflow changes.");
+            self.user_input(ctx, "The user turned off live workflow changes.", Send::Auto);
         }
         self.save_state();
         Ok(())
@@ -4036,7 +5034,7 @@ Then summarize in 2-4 lines.",
     }
 
     /// User typed into the Mandala prompt (not addressed to a specific agent).
-    pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str) {
+    pub fn user_input(&mut self, ctx: &mut dyn Ctx, text: &str, mode: Send) {
         self.planner_wait = None;
         if let Some(proposal) = self.pending_pattern.take() {
             self.question = None;
@@ -4046,7 +5044,7 @@ Then summarize in 2-4 lines.",
                 self.install_pattern(ctx, proposal);
             } else if let Some(p) = self.planner {
                 self.mark_edge(p);
-                ctx.prompt(p, format!("[from the user] Workflow proposal was not approved. Feedback: {text}\nKeep the active workflow; revise your proposal if needed."));
+                ctx.prompt_mode(p, format!("[from the user] Workflow proposal was not approved. Feedback: {text}\nKeep the active workflow; revise your proposal if needed."), mode);
             }
             self.save_state();
             return;
@@ -4061,20 +5059,20 @@ Then summarize in 2-4 lines.",
                 // Even an answer to a supervisor enters through the planner. It decides how
                 // to brief the requester and retains the ordinary chain of command.
                 self.pending_questions.insert(q.from, q.text.clone());
-                let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+                let (p, pre) = self.planner_with_preface(ctx);
                 self.mark_edge(p);
-                self.log("›", "rose", format!("you → planner (answer for {who}): {}", trunc(text, 60)));
-                ctx.prompt(p, format!("[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
+                self.log_quote("›", "rose", 60, text, |t| format!("you → planner (answer for {who}): {t}"));
+                ctx.prompt_mode(p, format!("{pre}[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text), mode);
                 return;
             }
-            self.log("›", "rose", format!("you → {who} (answer): {}", trunc(text, 60)));
+            self.log_quote("›", "rose", 60, text, |t| format!("you → {who} (answer): {t}"));
             self.mark_edge(q.from);
             let next = if Some(q.from) == self.manager {
                 "Act on it — resume the run (mantra_resume_run), restart an agent (mantra_retry / mantra_respawn), brief the orchestrator, or hand a plan change to the planner (mantra_ask) — then summarize in 2-4 lines."
             } else {
                 "Act on it — brief the orchestrator (mantra_brief_orchestrator), revise the plan (mantra_revise_plan) or resume the run (mantra_resume_run) as needed — then summarize in 2-4 lines."
             };
-            ctx.prompt(q.from, format!("[from the user] (answering your question: {})\n{text}\n\n{next}", trunc(&q.text, 200)));
+            ctx.prompt_mode(q.from, format!("[from the user] (answering your question: {})\n{text}\n\n{next}", trunc(&q.text, 200)), mode);
             return;
         }
         match self.stage.clone() {
@@ -4082,23 +5080,21 @@ Then summarize in 2-4 lines.",
             Stage::Planning => {
                 if let Some(p) = self.planner {
                     self.mark_edge(p);
-                    ctx.prompt(p, format!("[user] {text}"));
+                    ctx.prompt_mode(p, format!("[user] {text}"), mode);
                 }
             }
             Stage::Review => self.plan_feedback(ctx, text),
             Stage::Phase { .. } | Stage::Finale { .. } => {
-                let p = match self.planner {
-                    Some(p) => p,
-                    None => self.spawn_planner(ctx),
-                };
+                let (p, pre) = self.planner_with_preface(ctx);
                 let orch_last = self.orchestrator.and_then(|o| ctx.agent(o)).map(|o| o.log_text(12)).unwrap_or_default();
                 let status = self.status_text(ctx);
                 let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "finale".into());
-                self.log("✦", "saffron", format!("re-prompt → planner: {}", trunc(text, 70)));
+                self.log_quote("✦", "saffron", 70, text, |t| format!("you → planner: {t}"));
                 self.mark_edge(p);
-                ctx.prompt(
+                ctx.prompt_mode(
                     p,
-                    format!("[mantra:reprompt] The user says:\n{text}\n\nWe are in {phase}.\nWorkers:\n{status}\nOrchestrator's recent log:\n{}\nDecide: pause agents if needed, revise the plan if needed (mantra_revise_plan), brief the orchestrator (mantra_brief_orchestrator). Then summarize.", trunc(&orch_last, 3000)),
+                    format!("{pre}[mantra:reprompt] The user says:\n{text}\n\nWe are in {phase}.\nWorkers:\n{status}\nOrchestrator's recent log:\n{}\nDecide: pause agents if needed, revise the plan if needed (mantra_revise_plan), brief the orchestrator (mantra_brief_orchestrator). Then summarize.", trunc(&orch_last, 3000)),
+                    mode,
                 );
             }
             Stage::Done | Stage::Failed(_) => self.log("ℹ", "gray", "this run is finished — start a new one with /run <goal>"),
@@ -4120,17 +5116,21 @@ Then summarize in 2-4 lines.",
         // Every user message enters through the planner, including a composer focused on a
         // worker. Emergency direct control belongs to the planner's tools.
         if self.pending_pattern.is_some() || self.question.is_some() || matches!(self.stage, Stage::Setup | Stage::Review) {
-            self.user_input(ctx, text);
+            self.user_input(ctx, text, mode);
             return true;
         }
         self.planner_wait = None;
         let _ = name;
-        let target = self.planner.or_else(|| self.is_active().then(|| self.spawn_planner(ctx)));
+        let (target, pre) = match self.planner {
+            Some(p) => (Some(p), String::new()),
+            None if self.is_active() => { let (p, pre) = self.planner_with_preface(ctx); (Some(p), pre) }
+            None => (None, String::new()),
+        };
         match target {
             Some(a) => {
                 self.mark_edge(a);
-                ctx.prompt_mode(a, format!("[from the user] {text}"), mode);
-                self.log("›", "rose", format!("you → planner: {}", trunc(text, 60)));
+                ctx.prompt_mode(a, format!("{pre}[from the user] {text}"), mode);
+                self.log_quote("›", "rose", 60, text, |t| format!("you → planner: {t}"));
                 true
             }
             None => false,
@@ -4148,7 +5148,7 @@ Then summarize in 2-4 lines.",
     pub(super) fn spawn_manager_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.manager.trim().to_string();
         let role = self.role_for_slot("manager", &name);
-        let req = SpawnReq {
+        let req = SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "manager".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4157,7 +5157,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::manager_tools(),
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -4420,11 +5420,17 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_manager(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
-        if let Some(old) = self.manager.take() {
+        let why = respawn_why(note.as_deref());
+        let old_manager = self.manager.take();
+        if let Some(old) = old_manager {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_manager_with(ctx, None);
+        if let Some(old) = old_manager {
+            ctx.carry_over(old, id);
+            self.replaced.push((old, id));
+        }
         self.mark_edge(id);
         let brief = self.manager_brief("[mantra:respawn] You are the new manager of this run (the previous one was respawned).");
         let mut prompt = join_note(note, brief);
@@ -4435,7 +5441,7 @@ Then summarize in 2-4 lines.",
             prompt.push_str(&format!("\n\nOPEN WATCHDOG CASE — {} has been idle and nobody got it moving. Find out why (mantra_log) and get it moving: mantra_prompt, mantra_respawn / mantra_retry, mantra_set_effort, or mantra_brief_orchestrator.", c.about));
         }
         ctx.prompt(id, self.with_akasha(id, prompt));
-        self.log("↻", "violet", "manager respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("manager respawned ({why})"));
     }
 
     /// Spawn a fresh orchestrator agent for the current phase (extracted out of `start_phase` so
@@ -4444,7 +5450,7 @@ Then summarize in 2-4 lines.",
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
         let role = self.role_for_slot("orchestrator", &name);
-        let id = ctx.spawn(self.role_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(), git_write: false,
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4453,7 +5459,7 @@ Then summarize in 2-4 lines.",
             cwd: self.workspace_dir(),
             tools: tools::orchestrator_tools(),
             extra_writable: vec![],
-            context_override: self.context_for(&role.model, None),
+            context_override: self.context_for(&role, None),
             network: self.pattern.settings.network,
             writable_roots: self.pattern.settings.writable_roots.clone(),
             mcp: vec![],
@@ -4490,6 +5496,10 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_inner(&mut self, ctx: &mut dyn Ctx, a: AgentId, note: Option<String>) -> Result<&'static str, String> {
+        // The respawn line shows only why; what an agent or the user wrote goes to the journal whole.
+        if let Some(n) = note.as_deref().filter(|n| respawn_why(Some(n)) == "requested") {
+            self.journal_line("↻", &format!("respawn note: {n}"));
+        }
         if let Some(wi) = self.worker_idx(a) {
             // `r` on the task that exhausted its attempts *is* the decision to try once more.
             if self.halt.as_ref().map(|h| h.reason == HaltReason::AttemptsExhausted
@@ -4527,12 +5537,19 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_planner(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        let why = respawn_why(note.as_deref());
+        let handoff = self.planner.and_then(|old| ctx.agent(old)).map(|a| a.handoff_context());
         let shared_finale = self.planner.is_some() && self.finale_agent == self.planner && matches!(self.stage, Stage::Finale { .. });
-        if let Some(old) = self.planner.take() {
+        let old_planner = self.planner.take();
+        if let Some(old) = old_planner {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_planner(ctx);
+        if let Some(old) = old_planner {
+            ctx.carry_over(old, id);
+            self.replaced.push((old, id));
+        }
         if shared_finale {
             self.finale_agent = Some(id);
             if let Stage::Finale { idx } = self.stage {
@@ -4548,7 +5565,7 @@ Then summarize in 2-4 lines.",
         let resume = if let Some(phase) = self.current_phase() {
             let phase_json = serde_json::to_string_pretty(phase).unwrap_or_default();
             format!(
-                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; call mantra_read_plan first if you must revise other phases.",
+                "[mantra:respawn] Continue from stage {stage_txt} (plan v{}).\nCurrent phase:\n```json\n{phase_json}\n```\nCall mantra_read_phase for live task states; call mantra_read_plan(phase=…) for another phase.",
                 self.plan_version
             )
         } else if let Some(plan) = &self.plan {
@@ -4562,16 +5579,27 @@ Then summarize in 2-4 lines.",
         } else {
             self.planning_prompt()
         };
+        let resume = match handoff.filter(|h| !h.trim().is_empty()) {
+            Some(h) => format!("{resume}\n\nFor continuity, what the previous planner session held:\n{}", trunc(&h, 16_000)),
+            None => resume,
+        };
         ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
-        self.log("↻", "violet", "planner respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("planner respawned ({why})"));
     }
 
     fn respawn_orchestrator(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
-        if let Some(old) = self.orchestrator.take() {
+        let why = respawn_why(note.as_deref());
+        let handoff = self.orchestrator.and_then(|old| ctx.agent(old)).map(|a| a.handoff_context());
+        let old_orch = self.take_orchestrator();
+        if let Some(old) = old_orch {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
         let id = self.spawn_orchestrator(ctx);
+        if let Some(old) = old_orch {
+            ctx.carry_over(old, id);
+            self.replaced.push((old, id));
+        }
         self.mark_edge(id);
         let phase_json = self.current_phase().map(|p| serde_json::to_string_pretty(p).unwrap_or_default()).unwrap_or_default();
         let status = self.status_text(ctx);
@@ -4581,17 +5609,23 @@ Then summarize in 2-4 lines.",
             idx + 1,
             total
         );
+        let resume = match handoff.filter(|h| !h.trim().is_empty()) {
+            Some(h) => format!("{resume}\n\nFor continuity, what the previous orchestrator session held:\n{}", trunc(&h, 6_000)),
+            None => resume,
+        };
         ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
-        self.log("↻", "violet", "orchestrator respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("orchestrator respawned ({why})"));
     }
 
     fn respawn_gate(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let why = respawn_why(note.as_deref());
         let idx = self.phase_idx()?;
         let round = match self.stage {
             Stage::Phase { step: PhaseStep::Gate { round }, .. } => round,
             _ => 1,
         };
-        if let Some(old) = self.gate_agent.take() {
+        let old_gate = self.gate_agent.take();
+        if let Some(old) = old_gate {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
         }
@@ -4602,17 +5636,24 @@ Then summarize in 2-4 lines.",
             return Some(RESPAWN_DEFERRED);
         }
         self.spawn_gate_at_round(ctx, idx, round);
+        if let (Some(old), Some(g)) = (old_gate, self.gate_agent) {
+            ctx.carry_over(old, g);
+            self.replaced.push((old, g));
+        }
         if let (Some(n), Some(g)) = (note, self.gate_agent) {
             ctx.prompt(g, format!("[mantra:respawn] {n}"));
         }
-        self.log("↻", "violet", "gate respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("gate respawned ({why})"));
         Some(RESPAWNED)
     }
 
     fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let why = respawn_why(note.as_deref());
         let Stage::Finale { idx } = self.stage else { return None };
+        let mut old_finale = None;
         if let Some(old) = self.finale_agent.take() {
             if Some(old) != self.planner {
+                old_finale = Some(old);
                 self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
                 ctx.stop(old, true);
             }
@@ -4623,10 +5664,14 @@ Then summarize in 2-4 lines.",
             return Some(RESPAWN_DEFERRED);
         }
         self.start_finale(ctx, idx);
+        if let (Some(old), Some(new)) = (old_finale, self.finale_agent.filter(|n| Some(*n) != old_finale)) {
+            ctx.carry_over(old, new);
+            self.replaced.push((old, new));
+        }
         if let (Some(n), Some(a)) = (note, self.finale_agent) {
             ctx.prompt(a, format!("[mantra:respawn] {n}"));
         }
-        self.log("↻", "violet", "finale agent respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("finale agent respawned ({why})"));
         Some(RESPAWNED)
     }
 
@@ -4683,6 +5728,48 @@ Then summarize in 2-4 lines.",
                 JobOut::Vision(items, ok)
             }),
         );
+    }
+
+    /// Merge (when revising), validate and, if valid, make `plan` live. A rejected plan is kept as
+    /// `plan_draft` so `mantra_patch_plan` can fix it without sending it again.
+    fn accept_plan(&mut self, ctx: &mut dyn Ctx, mut plan: Plan, revising: bool) -> (String, bool) {
+        plan.normalize();
+        if revising {
+            // keep completed phases exactly as they were
+            let cur = self.phase_idx().unwrap_or(0);
+            if let Some(old) = &self.plan {
+                let done_ids: Vec<String> = old.phases[..cur.min(old.phases.len())].iter().map(|p| p.id.clone()).collect();
+                let mut phases: Vec<Phase> = old.phases[..cur.min(old.phases.len())].to_vec();
+                phases.extend(plan.phases.iter().filter(|p| !done_ids.contains(&p.id)).cloned());
+                plan.phases = phases;
+            }
+        }
+        let mut validation_plan = plan.clone();
+        if revising { validation_plan.phases = validation_plan.phases.into_iter().skip(self.phase_idx().unwrap_or(0)).collect(); }
+        if let Err(errs) = validation_plan.validate(&self.pattern) {
+            self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
+            self.plan_draft = Some(plan);
+            self.plan_draft_at = (self.plan_version, self.phase_idx());
+            return (format!("REJECTED — fix these and resubmit:\n- {}\nThe plan you sent is kept as a draft: fix it with mantra_patch_plan (only the changed parts) instead of sending it again.", errs.join("\n- ")), false);
+        }
+        self.plan_draft = None;
+        let old = self.plan.replace(plan.clone());
+        self.plan_version += 1;
+        self.save_plan();
+        self.retitle(ctx, &plan.title);
+        if self.pattern.settings.planner_loop {
+            self.loop_progress();
+            self.log("☰", "saffron", format!("plan v{} · one phase — {}", self.plan_version, trunc(&plan.title, 50)));
+            self.save_state();
+            return (if revising { "ACCEPTED. Continue the single phase using the revised plan." } else { "ACCEPTED. Summarize the plan and end your turn." }.into(), true);
+        }
+        let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
+        self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
+        if revising {
+            let next = self.apply_revision(ctx, old);
+            return (format!("ACCEPTED. The revision is live; completed phases were kept. What happens next: {next}. Brief the orchestrator if it needs more than the diff Mantra gives it, then summarize."), true);
+        }
+        ("ACCEPTED. Reply with a 2-4 line summary of the plan and end your turn.".into(), true)
     }
 
     fn handle_tool(&mut self, ctx: &mut dyn Ctx, a: AgentId, tool: &str, args: &Value) -> (String, bool) {
@@ -4789,7 +5876,11 @@ Then summarize in 2-4 lines.",
                 if let Err(e) = remaining.validate(&self.pattern) { return (format!("REJECTED: {}", e.join("; ")), false); }
                 self.plan = Some(plan);
                 self.plan_version += 1;
-                for w in self.workers.iter_mut().filter(|w| w.task.id == tid) { w.task.scope = scope.clone(); w.tripwires.retain(|p| !crate::util::in_scope(&scope, p)); }
+                for w in self.workers.iter_mut().filter(|w| w.task.id == tid) {
+                    let base = w.wt.clone().or_else(|| w.agent.and_then(|a| ctx.agent(a)).map(|ag| ag.cwd.clone())).unwrap_or_else(|| self.project.clone());
+                    w.task.scope = scope.clone();
+                    w.tripwires.retain(|p| !crate::util::in_scope_from(&scope, p, &base));
+                }
                 self.save_plan();
                 self.log("☰", "saffron", format!("planner updated {tid} scope: {} ({reason})", scope.join(", ")));
                 self.orch_inbox.push(format!("[from the planner] Task {tid} scope is now {}. Reason: {reason}", scope.join(", ")));
@@ -4817,45 +5908,48 @@ Then summarize in 2-4 lines.",
                 if self.loop_executing() && !self.pattern.settings.allow_pattern_changes {
                     return ("REFUSED: the user locked the live plan. Continue with the approved plan or ask the user to enable changes.".into(), false);
                 }
-                let mut plan = match Plan::from_value(args) {
+                let plan = match Plan::from_value(args) {
                     Ok(p) => p,
                     Err(e) => return (format!("REJECTED: {e}"), false),
                 };
-                plan.normalize();
                 let revising = tool == "mantra_revise_plan" && self.phase_idx().is_some();
+                self.accept_plan(ctx, plan, revising)
+            }
+            "mantra_patch_plan" => {
+                if Some(a) != self.planner { return ("REFUSED: only the planner may submit or revise the plan".into(), false); }
+                if self.pattern.is_auto() { return ("REJECTED: Auto needs a concrete approved workflow first; use mantra_revise_pattern".into(), false); }
+                if self.pattern.settings.planner_loop && !(self.stage == Stage::Planning || (self.loop_executing() && self.handoff.is_empty())) {
+                    return ("REFUSED: use mantra_submit_plan while planning and mantra_revise_plan during execution.".into(), false);
+                }
+                if self.loop_executing() && !self.pattern.settings.allow_pattern_changes {
+                    return ("REFUSED: the user locked the live plan. Continue with the approved plan or ask the user to enable changes.".into(), false);
+                }
+                let reason = s("reason");
+                if reason.trim().is_empty() { return ("REJECTED: say why the plan changes".into(), false); }
+                if self.plan_draft.is_some() && self.plan_draft_at != (self.plan_version, self.phase_idx()) {
+                    self.plan_draft = None; // from an earlier plan or phase: patch the live plan
+                }
+                let base = match self.plan_draft.clone().or_else(|| self.plan.clone()) {
+                    Some(p) => p,
+                    None => return ("REFUSED: there is no plan yet — submit one with mantra_submit_plan".into(), false),
+                };
+                let patched = match super::plan::apply_ops(&base, args.get("ops").unwrap_or(&Value::Null)) {
+                    Ok(p) => p,
+                    Err(e) => return (format!("REJECTED: {e}. Nothing was changed."), false),
+                };
+                let revising = self.phase_idx().is_some();
                 if revising {
-                    // keep completed phases exactly as they were
                     let cur = self.phase_idx().unwrap_or(0);
-                    if let Some(old) = &self.plan {
-                        let done_ids: Vec<String> = old.phases[..cur.min(old.phases.len())].iter().map(|p| p.id.clone()).collect();
-                        let mut phases: Vec<Phase> = old.phases[..cur.min(old.phases.len())].to_vec();
-                        phases.extend(plan.phases.iter().filter(|p| !done_ids.contains(&p.id)).cloned());
-                        plan.phases = phases;
+                    for (i, old) in base.phases.iter().enumerate().take(cur) {
+                        if patched.phases.get(i) != Some(old) {
+                            return (format!("REJECTED: phase '{}' is already finished and cannot be changed. Nothing was changed.", old.id), false);
+                        }
                     }
                 }
-                let mut validation_plan = plan.clone();
-                if revising { validation_plan.phases = validation_plan.phases.into_iter().skip(self.phase_idx().unwrap_or(0)).collect(); }
-                if let Err(errs) = validation_plan.validate(&self.pattern) {
-                    self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
-                    return (format!("REJECTED — fix these and resubmit:\n- {}", errs.join("\n- ")), false);
-                }
-                let old = self.plan.replace(plan.clone());
-                self.plan_version += 1;
-                self.save_plan();
-                self.retitle(ctx, &plan.title);
-                if self.pattern.settings.planner_loop {
-                    self.loop_progress();
-                    self.log("☰", "saffron", format!("plan v{} · one phase — {}", self.plan_version, trunc(&plan.title, 50)));
-                    self.save_state();
-                    return (if revising { "ACCEPTED. Continue the single phase using the revised plan." } else { "ACCEPTED. Summarize the plan and end your turn." }.into(), true);
-                }
-                let ntasks: usize = plan.phases.iter().map(|p| p.tasks.len()).sum();
-                self.log("☰", "saffron", format!("plan v{}: {} phases, {ntasks} tasks — {}", self.plan_version, plan.phases.len(), trunc(&plan.title, 50)));
-                if revising {
-                    let next = self.apply_revision(ctx, old);
-                    return (format!("ACCEPTED. The revision is live; completed phases were kept. What happens next: {next}. Brief the orchestrator if it needs more than the diff Mantra gives it, then summarize."), true);
-                }
-                ("ACCEPTED. Reply with a 2-4 line summary of the plan and end your turn.".into(), true)
+                let n = args.get("ops").and_then(|o| o.as_array()).map(|a| a.len()).unwrap_or(0);
+                let (text, ok) = self.accept_plan(ctx, patched, revising);
+                if ok { self.log("☰", "saffron", format!("plan patched: {n} operation(s) — {}", trunc(&reason, 60))); }
+                (text, ok)
             }
             "mantra_pause_agents" => {
                 let mut done = vec![];
@@ -4891,7 +5985,7 @@ Then summarize in 2-4 lines.",
                 // Only the planner's brief answers a question the orchestrator passed up to it;
                 // the manager briefing the orchestrator meanwhile must not swallow that question.
                 let answering = Some(a) == self.planner && self.orchestrator.map(|o| self.pending_questions.remove(&o).is_some()).unwrap_or(false);
-                self.log("✦", "saffron", format!("{from} → orchestrator{}: {}", if answering { " (answer)" } else { "" }, trunc(&m, 60)));
+                self.log_quote("✦", "saffron", 60, &m, |t| format!("{from} → orchestrator{}: {t}", if answering { " (answer)" } else { "" }));
                 if let Some(o) = self.orchestrator {
                     self.mark_edge(o);
                 }
@@ -4942,7 +6036,15 @@ Then summarize in 2-4 lines.",
                 match self.resolve(&n).and_then(|t| ctx.agent(t)) {
                     Some(ag) => {
                         let mut t = ag.log_text(if full { 400 } else { lines });
-                        crate::util::tail_bytes(&mut t, if full { 40_000 } else { 8_000 });
+                        let before = t.len();
+                        crate::util::tail_bytes(&mut t, if full { 40_000 } else { 16_000 });
+                        if t.len() < before {
+                            // cut at the start of a log entry, not mid-sentence
+                            t = match t.find("\n[") {
+                                Some(i) => format!("[earlier entries omitted]\n{}", &t[i + 1..]),
+                                None => format!("[earlier entries omitted]\n{t}"),
+                            };
+                        }
                         (t, true)
                     }
                     None => (format!("unknown agent '{n}'"), false),
@@ -4956,7 +6058,28 @@ Then summarize in 2-4 lines.",
                 None => ("no phase is active".into(), false),
             },
             "mantra_read_plan" => match &self.plan {
-                Some(p) => (serde_json::to_string_pretty(p).unwrap_or_default(), true),
+                Some(p) => {
+                    let want = s("phase");
+                    if !want.is_empty() {
+                        let found = p.phases.iter().position(|ph| ph.id == want).or_else(|| want.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= p.phases.len()).map(|n| n - 1));
+                        return match found {
+                            Some(i) => (serde_json::to_string_pretty(&p.phases[i]).unwrap_or_default(), true),
+                            None => (format!("no phase '{want}' (phases: {})", p.phases.iter().map(|ph| ph.id.clone()).collect::<Vec<_>>().join(", ")), false),
+                        };
+                    }
+                    let full = serde_json::to_string_pretty(p).unwrap_or_default();
+                    if args.get("full").and_then(Value::as_bool).unwrap_or(false) || full.chars().count() <= 30_000 {
+                        return (full, true);
+                    }
+                    let cur = self.phase_idx();
+                    let mut o = format!("Plan v{}: {}\n{}\n\norchestrator_brief: {} characters\nfinal_checks: {}\nPhases:\n", self.plan_version, p.title, p.summary, p.orchestrator_brief.chars().count(), p.final_checks.len());
+                    for (i, ph) in p.phases.iter().enumerate() {
+                        let state = match cur { Some(c) if i == c => "CURRENT", Some(c) if i > c => "pending", Some(_) => "done", None if matches!(self.stage, Stage::Finale { .. } | Stage::Done) => "done", None => "pending" };
+                        o.push_str(&format!("- {} · {} — {state} · {} task(s): {} · {} gate check(s)\n", ph.id, ph.name, ph.tasks.len(), ph.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", "), ph.gate.checks.len()));
+                    }
+                    o.push_str(&format!("\nThe whole plan is {} characters. Read one phase with mantra_read_plan(phase=\"<id>\"), or pass full=true.", full.chars().count()));
+                    (o, true)
+                }
                 None => ("no plan submitted yet".into(), false),
             },
             "mantra_spawn" => {
@@ -4984,11 +6107,23 @@ Then summarize in 2-4 lines.",
                         // An answer to a question the target asked up the chain: it is waiting
                         // for exactly this, so none of the idle-worker guards apply.
                         let answering = self.pending_questions.remove(&t).is_some();
+                        // During a halt the orchestrator's messages to its workers, the gate and the
+                        // finale are held: the interrupted agent would lose them. They arrive with the
+                        // resume prompt. (The planner and the manager keep prompting — that is how
+                        // halts get resolved.)
+                        if self.halted() && Some(a) == self.orchestrator && (self.worker_idx(t).is_some() || Some(t) == self.gate_agent || Some(t) == self.finale_agent) {
+                            let from = self.name_of(a);
+                            let text = if answering { format!("[from the {from}] (answering your question) {m}") } else { format!("[from the {from}] {m}") };
+                            self.redeliver.entry(t).or_default().push(text);
+                            return (format!("held — the run is halted; {n} gets this when it resumes"), true);
+                        }
                         if answering {
                             self.mark_edge(t);
                             let from = self.name_of(a);
-                            ctx.prompt(t, format!("[from the {from}] (answering your question) {m}"));
-                            self.log("›", "rose", format!("{from} → {n} (answer): {}", trunc(&m, 60)));
+                            let text = format!("[from the {from}] (answering your question) {m}");
+                            self.remember_prompt(t, &text);
+                            ctx.prompt(t, text);
+                            self.log_quote("›", "rose", 60, &m, |t| format!("{from} → {n} (answer): {t}"));
                             return (format!("answer sent to {n}"), true);
                         }
                         if let Some(refusal) = self.worker_done_guard(t) {
@@ -5018,8 +6153,10 @@ Then summarize in 2-4 lines.",
                         }
                         self.mark_edge(t);
                         let from = self.name_of(a);
-                        ctx.prompt(t, format!("[from the {from}] {m}"));
-                        self.log("›", "rose", format!("{from} → {n}: {}", trunc(&m, 60)));
+                        let text = format!("[from the {from}] {m}");
+                        self.remember_prompt(t, &text);
+                        ctx.prompt(t, text);
+                        self.log_quote("›", "rose", 60, &m, |t| format!("{from} → {n}: {t}"));
                         (format!("sent to {n}"), true)
                     }
                     _ => (format!("unknown agent '{n}'"), false),
@@ -5094,7 +6231,7 @@ Then summarize in 2-4 lines.",
                 }
                 let who = self.name_of(a);
                 self.question = Some(Question { from: a, text: q.clone(), since: Instant::now() });
-                self.log("?", "saffron", format!("{who} asks you: {}", trunc(&q, 70)));
+                self.log_quote("?", "saffron", 70, &q, |t| format!("{who} asks you: {t}"));
                 self.alerts.push(format!("the {who} asks: {q}"));
                 ctx.notify(&format!("Mantra: the {who} has a question — {}", trunc(&q, 80)));
                 ("the user has been asked; their answer arrives as a [from the user] message. End your turn now — the run continues meanwhile.".into(), true)
@@ -5110,7 +6247,7 @@ Then summarize in 2-4 lines.",
                     self.extra_attempts += 1;
                 }
                 let who = self.name_of(a);
-                self.log(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", format!("{who} resumed the run: {}", trunc(&note, 60)));
+                self.log_quote(if Some(a) == self.manager { "◈" } else { "✦" }, "saffron", 60, &note, |t| format!("{who} resumed the run: {t}"));
                 if !note.trim().is_empty() {
                     // A stuck QA agent or fix worker is replaced by a fresh one on resume: the note
                     // goes to that one instead of waking the old one for a turn it will not finish.
@@ -5134,6 +6271,12 @@ Then summarize in 2-4 lines.",
                     Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
                     _ => false,
                 };
+                self.gate_fix_by = args.get("fix_by").and_then(|v| v.as_str()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                self.gate_plan_defect = match args.get("plan_defect") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
+                    _ => false,
+                } || (!pass && summary.trim().to_lowercase().starts_with("plan defect"));
                 self.gate_report = Some((pass, summary));
                 (format!("recorded: {}. End your turn now.", if pass { "pass" } else { "fail" }), true)
             }
@@ -5163,7 +6306,141 @@ Then summarize in 2-4 lines.",
         }
     }
 
-    fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
+    /// Replace the run copy by an adopted pattern (`pattern::adopt`). Returns the roles whose model
+    /// changed, for the app to switch live agents. Journals every change.
+    pub fn adopt_pattern(&mut self, ctx: &mut dyn Ctx, a: super::pattern::Adoption, new_base: String, origin: &str) -> Result<Vec<String>, String> {
+        self.validate_pattern_replacement(&a.pattern)?;
+        self.halt_touched |= self.halt.is_some();
+        let previous = std::mem::replace(&mut self.pattern, a.pattern);
+        self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
+        self.sync_akasha_groups();
+        // A per-agent model choice outranks the role's model: for a role whose model the user just
+        // changed in the pattern, the new role model wins over the old choice.
+        let dropped = self.drop_role_pins(&a.model_roles);
+        for (slot, old, new) in dropped {
+            self.log("⚙", "blue", format!("{slot}: your per-agent model {old} gives way to the role's new model {new}"));
+        }
+        self.adopted_roles.extend(a.model_roles.iter().cloned());
+        let n = a.changes.len();
+        let mut head = a.changes.iter().take(6).cloned().collect::<Vec<_>>().join(" · ");
+        if n > 6 {
+            head.push_str(" · …");
+        }
+        self.log("⚙", "blue", format!("pattern updated from {origin} ({n} change(s)): {head}"));
+        for c in &a.changes {
+            self.journal_line("⚙", c);
+        }
+        self.pattern_base = Some(new_base);
+        self.save_pattern_base();
+        self.save_state();
+        // Supervisors whose definition changed in more than the model are started again on the new
+        // definition (a model change alone is switched live by the app). Nothing is live on resume.
+        if !self.all_agents().is_empty() {
+            let differs = |old_name: &str, new_name: &str, new: &Pattern| {
+                let model_aside = |r: &Role, like: &Role| Role { model: like.model.clone(), ..r.clone() };
+                !(old_name == new_name && matches!((previous.roles.get(old_name), new.roles.get(new_name)), (Some(x), Some(y)) if super::pattern::role_spawn_eq(x, &model_aside(y, x))))
+            };
+            let p = self.pattern.clone();
+            if self.manager.is_some() && differs(&previous.flow.manager, &p.flow.manager, &p) {
+                if let Some(m) = self.manager.take() { ctx.stop(m, true); }
+                if self.phase_idx().is_some() { self.ensure_manager(ctx); }
+            }
+            if self.orchestrator.is_some() && differs(&previous.flow.orchestrator, &p.flow.orchestrator, &p) {
+                if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
+                    self.respawn_orchestrator(ctx, Some("The workflow was updated by the user; continue the phase.".into()));
+                } else if let Some(o) = self.take_orchestrator() {
+                    ctx.stop(o, true);
+                }
+            }
+            if let Some(pl) = self.planner {
+                let (x, y) = (previous.roles.get(&previous.flow.planner), p.roles.get(&p.flow.planner));
+                let planner_changed = previous.flow.planner != p.flow.planner || !matches!((x, y), (Some(x), Some(y)) if x.instructions.trim() == y.instructions.trim() && x.sandbox == y.sandbox && x.permission == y.permission && x.mcp == y.mcp);
+                if planner_changed {
+                    if ctx.agent(pl).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
+                    else { self.respawn_planner(ctx, Some("The workflow was updated by the user; use the updated role instructions and tools.".into())); }
+                }
+            }
+        }
+        Ok(a.model_roles)
+    }
+
+    /// The role-level model of `roles` just changed: forget the per-agent choices (`slot_models`,
+    /// `Worker::model`) and the fallbacks in use for their slots, so the new role model is what a
+    /// respawn or the next attempt uses. Returns `(slot, old pin, new role model)` for the journal.
+    fn drop_role_pins(&mut self, roles: &[String]) -> Vec<(String, String, String)> {
+        let f = self.pattern.flow.clone();
+        let finale_role = match self.stage {
+            Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+            _ => None,
+        };
+        let slots = [("planner", Some(f.planner.clone())), ("manager", Some(f.manager.clone())), ("orchestrator", Some(f.orchestrator.clone())), ("gate", Some(f.phase_gate.clone())), ("finale", finale_role)];
+        let mut dropped: Vec<(String, String, String)> = vec![];
+        for (slot, role_name) in slots {
+            let Some(role_name) = role_name.filter(|r| roles.contains(r)) else { continue };
+            let new = self.role(&role_name).model;
+            self.fallback_used.remove(slot);
+            if let Some(old) = self.slot_models.remove(slot) {
+                dropped.push((slot.to_string(), old, new));
+            }
+        }
+        for i in 0..self.workers.len() {
+            let w = &mut self.workers[i];
+            if !roles.contains(&w.task.role) || matches!(w.state, WState::Done | WState::Cancelled) {
+                continue;
+            }
+            let slot = format!("worker:{}#{}", w.task.id, w.attempt);
+            let key = format!("worker:{}", w.task.id);
+            let old = w.model.take();
+            let new = self.pattern.roles.get(&self.workers[i].task.role).map(|r| r.model.clone()).unwrap_or_default();
+            self.fallback_used.remove(&key);
+            if let Some(old) = old {
+                dropped.push((slot, old, new));
+            }
+        }
+        dropped
+    }
+
+    /// The user chose `alias` as the model of `role` for this run only (the picker's role scope):
+    /// writes the run's pattern copy — the saved pattern is not touched — re-clamps a named effort
+    /// (`effort`, computed by the caller from the registry), drops the pins of the role and
+    /// journals it. Live agents are switched by the app.
+    pub fn set_role_model(&mut self, role: &str, alias: &str, effort: Option<String>) -> Result<(), String> {
+        let halted = self.halt.is_some();
+        let Some(r) = self.pattern.roles.get_mut(role) else { return Err(format!("no role {role} in this run")) };
+        self.halt_touched |= halted;
+        r.model = alias.to_string();
+        if let Some(e) = effort {
+            r.effort = e;
+        }
+        for (slot, old, new) in self.drop_role_pins(&[role.to_string()]) {
+            self.log("⚙", "blue", format!("{slot}: your per-agent model {old} gives way to the role's new model {new}"));
+        }
+        self.log("⚙", "blue", format!("role {role}: model → {alias} for this run (by you) — the saved pattern is unchanged"));
+        self.save_state();
+        Ok(())
+    }
+
+    /// An agent that is not running (a finished or failed worker, a stopped slot) gets `alias` for
+    /// its next start: the task's newest attempt, or the fixed slot. `Err` for an agent that is in
+    /// no slot any more.
+    pub fn pin_next_model(&mut self, a: AgentId, alias: &str) -> Result<(), String> {
+        let slot = self.slot_of(a);
+        if slot.is_empty() {
+            return Err("that agent is finished — pick the role instead (tab)".into());
+        }
+        let name = self.name_of(a);
+        self.halt_touched |= self.halt.is_some();
+        if let Some(wi) = self.worker_idx(a) {
+            self.workers[wi].model = Some(alias.to_string());
+        } else {
+            self.slot_models.insert(slot, alias.to_string());
+        }
+        self.log("⚙", "blue", format!("{name}: its next start uses {alias} (by you)"));
+        self.save_state();
+        Ok(())
+    }
+
+    pub(crate) fn validate_pattern_replacement(&self, pattern: &Pattern) -> Result<(), String> {
         pattern.validate().map_err(|e| e.join("; "))?;
         if pattern.is_auto() { return Err("a running workflow cannot be replaced with the Auto bootstrap".into()); }
         if pattern.settings.planner_loop != self.pattern.settings.planner_loop && !self.pattern.is_auto() {
@@ -5171,9 +6448,9 @@ Then summarize in 2-4 lines.",
         }
         if !self.known_models.is_empty() {
             for (name, role) in &pattern.roles {
-                if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}'", role.model)); }
-                if let Some(fallback) = &role.fallback {
-                    if !self.known_models.contains_key(fallback) { return Err(format!("role '{name}' names an unconfigured fallback model alias '{fallback}'")); }
+                if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}' (not in /models of this running Mantra)", role.model)); }
+                for alias in role.fallback_chain() {
+                    if !self.known_models.contains_key(&alias) { return Err(format!("role '{name}' names an unconfigured fallback model alias '{alias}' (not in /models of this running Mantra)")); }
                 }
             }
         }
@@ -5205,24 +6482,25 @@ Then summarize in 2-4 lines.",
         self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
         // Existing workers keep their live process, scope and worktree. New spawns use the new
         // role definitions; fixed supervisors are refreshed only when their definition changed.
-        if previous.flow.manager != self.pattern.flow.manager || previous.roles.get(&previous.flow.manager) != self.pattern.roles.get(&self.pattern.flow.manager) {
+        if previous.flow.manager != self.pattern.flow.manager || !matches!((previous.roles.get(&previous.flow.manager), self.pattern.roles.get(&self.pattern.flow.manager)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if let Some(m) = self.manager.take() { ctx.stop(m, true); }
             if self.phase_idx().is_some() { self.ensure_manager(ctx); }
         }
-        if previous.flow.orchestrator != self.pattern.flow.orchestrator || previous.roles.get(&previous.flow.orchestrator) != self.pattern.roles.get(&self.pattern.flow.orchestrator) {
+        if previous.flow.orchestrator != self.pattern.flow.orchestrator || !matches!((previous.roles.get(&previous.flow.orchestrator), self.pattern.roles.get(&self.pattern.flow.orchestrator)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) { self.respawn_orchestrator(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
-            else if let Some(o) = self.orchestrator.take() { ctx.stop(o, true); }
+            else if let Some(o) = self.take_orchestrator() { ctx.stop(o, true); }
         }
-        if previous.flow.phase_gate != self.pattern.flow.phase_gate || previous.roles.get(&previous.flow.phase_gate) != self.pattern.roles.get(&self.pattern.flow.phase_gate) {
+        if previous.flow.phase_gate != self.pattern.flow.phase_gate || !matches!((previous.roles.get(&previous.flow.phase_gate), self.pattern.roles.get(&self.pattern.flow.phase_gate)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if self.gate_agent.is_some() { self.respawn_gate(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
         }
         if let Stage::Finale { idx } = self.stage {
             if previous.flow.finale.get(idx) != self.pattern.flow.finale.get(idx) { self.respawn_finale(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
         }
-        self.log("✦", "saffron", format!("workflow {} → {}: {}", previous.name, self.pattern.name, proposal.reason));
+        let new_name = self.pattern.name.clone();
+        self.log_quote("✦", "saffron", 80, &proposal.reason, |t| format!("workflow {} → {new_name}: {t}", previous.name));
         self.save_state();
         if let Some(p) = self.planner {
-            let changed = previous.flow.planner != self.pattern.flow.planner || previous.roles.get(&previous.flow.planner) != self.pattern.roles.get(&self.pattern.flow.planner) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
+            let changed = previous.flow.planner != self.pattern.flow.planner || !matches!((previous.roles.get(&previous.flow.planner), self.pattern.roles.get(&self.pattern.flow.planner)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
             if changed {
                 if ctx.agent(p).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
                 else { self.respawn_planner(ctx, Some("Workflow approved; use the updated role instructions and tools.".into())); }
@@ -5237,14 +6515,14 @@ Then summarize in 2-4 lines.",
     pub(super) fn planner_wait_tick(&mut self, ctx: &mut dyn Ctx) {
         let due = self.planner_wait.as_ref().is_some_and(|w| w.due_unix <= crate::util::unix_secs());
         if !due || self.halted() || !self.is_active() { return; }
-        let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+        let (p, pre) = self.planner_with_preface(ctx);
         if ctx.agent(p).is_some_and(|ag| ag.busy()) { return; }
         let wait = self.planner_wait.take().unwrap();
         // Clear and persist before dispatch so subsequent ticks cannot enqueue duplicates.
         self.log("◷", "teal", "planner external-condition check is due");
         self.save_state();
         self.mark_edge(p);
-        ctx.prompt(p, format!("[mantra:external-condition] Scheduled re-entry is due. Inspect this condition once: {}\nInstructions: {}\nThe condition has not been evaluated by Mantra. Report the observed result; if still pending schedule a bounded re-entry instead of a sleep/poll loop.", wait.condition, wait.on_reentry));
+        ctx.prompt(p, format!("{pre}[mantra:external-condition] Scheduled re-entry is due. Inspect this condition once: {}\nInstructions: {}\nThe condition has not been evaluated by Mantra. Report the observed result; if still pending schedule a bounded re-entry instead of a sleep/poll loop.", wait.condition, wait.on_reentry));
     }
 
     pub fn pending_pattern_review(&self) -> bool { self.pending_pattern.is_some() }
@@ -5270,6 +6548,7 @@ Then summarize in 2-4 lines.",
                         ctx.stop(a, true);
                     }
                     for w in self.workers.iter_mut().filter(|w| w.task.id == t.id) {
+                        w.superseded = w.state == WState::Done;
                         w.state = WState::Cancelled;
                     }
                     notes.push(format!("task {} was REMOVED (its worker is stopped)", t.id));
@@ -5278,6 +6557,7 @@ Then summarize in 2-4 lines.",
                     let done = self.workers.iter().rev().find(|w| w.task.id == t.id).map(|w| w.state == WState::Done).unwrap_or(false);
                     if done {
                         for w in self.workers.iter_mut().filter(|w| w.task.id == t.id) {
+                            w.superseded = w.state == WState::Done;
                             w.state = WState::Cancelled;
                         }
                         needs_work = true;
@@ -5302,11 +6582,18 @@ Then summarize in 2-4 lines.",
             self.log("☰", "saffron", format!("revision: {}", notes.len()));
             self.orch_inbox.push(format!("The planner revised the current phase:\n- {}", notes.join("\n- ")));
         }
-        let past_build = matches!(self.stage, Stage::Phase { step: PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Handoff, .. });
+        let past_build = matches!(self.stage, Stage::Phase { step: PhaseStep::Merging | PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. } | PhaseStep::Handoff, .. });
+        let gate_changed = op.gate != np.gate;
+        let mut rerun = false;
         let next = if needs_work && past_build {
             self.return_to_orchestrating(ctx);
             "the phase goes back to building — the orchestrator spawns the changed/added tasks, then Mantra merges and runs the gate again"
         } else if past_build {
+            if gate_changed && matches!(self.stage, Stage::Phase { step: PhaseStep::Checks { .. } | PhaseStep::Gate { .. } | PhaseStep::Fix { .. }, .. }) {
+                self.abandon_gate_round(ctx, "the plan's gate was revised");
+                self.stage = Stage::Phase { idx: cur, step: PhaseStep::Checks { round: 1 } };
+                rerun = true;
+            }
             "the gate runs again with the revised checks"
         } else {
             "the orchestrator has been told what changed"
@@ -5314,12 +6601,66 @@ Then summarize in 2-4 lines.",
         let escalated = self.halt.as_ref().map(|h| matches!(h.reason, HaltReason::GateExhausted | HaltReason::AttemptsExhausted | HaltReason::AgentTurnFailed)).unwrap_or(false);
         if escalated {
             let planner = self.planner;
-            self.resume_by(ctx, planner);
+            self.resume_by(ctx, planner); // resume_core sees Checks → run_checks(idx, 1)
+        } else if rerun {
+            // (as `resume_core`: a gate left with no checks has nothing to verify, QA is the gate)
+            if self.current_phase().map(|p| p.gate.checks.is_empty()).unwrap_or(true) {
+                self.spawn_gate_at_round(ctx, cur, 1);
+            } else {
+                self.run_checks(ctx, cur, 1);
+            }
         } else {
             self.check_phase_done(ctx);
             self.wake_orch(ctx);
         }
         next.into()
+    }
+
+    /// The gate round in progress no longer stands (its checks or tasks changed): stop the QA
+    /// agent and any fix worker, forget their results and whatever was due for them.
+    fn abandon_gate_round(&mut self, ctx: &mut dyn Ctx, why: &str) {
+        self.retire_gate_agent(ctx);
+        let live = |w: &Worker| w.adhoc && !matches!(w.state, WState::Done | WState::Cancelled);
+        let fixers: Vec<AgentId> = self.workers.iter().filter(|w| live(w)).filter_map(|w| w.agent).collect();
+        for a in fixers {
+            self.tokens_prev += ctx.agent(a).map(|x| x.tokens_total).unwrap_or(0);
+            ctx.stop(a, true);
+        }
+        for w in self.workers.iter_mut().filter(|w| live(w)) {
+            w.state = WState::Cancelled;
+        }
+        self.stop_owner_fix(ctx);
+        self.checks.clear();
+        self.gate_report = None;
+        self.prev_gate = None;
+        self.last_gate_blocker = None;
+        self.last_verify_sig = None;
+        self.qa_ok = false;
+        self.checks_gen += 1;
+        self.resume_note = None;
+        if matches!(self.pending, Some(Pending::Gate { .. } | Pending::Fix { .. } | Pending::Checks { .. })) {
+            self.drop_pending(why);
+        }
+        self.log("◎", "amber", format!("gate round abandoned: {why}"));
+    }
+
+    /// A gate round that no longer stands: a task's own worker still repairing its work is
+    /// interrupted and is `Done` again (its original work stands); the round forgets its owner.
+    fn stop_owner_fix(&mut self, ctx: &mut dyn Ctx) {
+        for w in self.workers.iter_mut().filter(|w| w.owner_fixing.is_some()) {
+            if let Some(a) = w.agent {
+                ctx.interrupt(a);
+            }
+            w.owner_fixing = None;
+            w.fix_started = None;
+            if w.state != WState::Cancelled {
+                w.state = WState::Done;
+            }
+        }
+        self.fix_owner = None;
+        self.owner_job = false;
+        self.fix_done = None;
+        self.fix_findings.clear();
     }
 
     /// Back from merging/checks/gate to building: the gate agent is stopped (it will be spawned
@@ -5339,7 +6680,10 @@ Then summarize in 2-4 lines.",
         for w in self.workers.iter_mut().filter(|w| w.adhoc && matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_) | WState::Queued)) {
             w.state = WState::Cancelled;
         }
+        self.stop_owner_fix(ctx);
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+        self.checks_gen += 1;
+        self.qa_ok = false;
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
@@ -5370,22 +6714,19 @@ Then summarize in 2-4 lines.",
         let to_planner = Some(a) == self.orchestrator || Some(a) == self.manager || matches!(self.stage, Stage::Finale { .. }) || self.orchestrator.is_none();
         self.pending_questions.insert(a, q.clone());
         if to_planner {
-            let p = match self.planner {
-                Some(p) => p,
-                None => self.spawn_planner(ctx),
-            };
+            let (p, pre) = self.planner_with_preface(ctx);
             let answer_with = if Some(a) == self.orchestrator { "mantra_brief_orchestrator" } else { "mantra_prompt" };
-            self.log("?", "amber", format!("{from} asks the planner: {}", trunc(&q, 70)));
+            self.log_quote("?", "amber", 70, &q, |t| format!("{from} asks the planner: {t}"));
             let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
             let status = self.status_text(ctx);
             self.mark_edge(p);
             ctx.prompt(
                 p,
-                format!("[mantra:question] The {from} asks:\n{q}\n\nWe are in {phase}. Workers:\n{status}\nYou are the top of the chain of command: decide yourself whenever the answer keeps the end product and the plan's intent, and answer with {answer_with}. Ask the user (mantra_ask_user) only if it changes what is being built, its scope, or is a trade-off only they can make."),
+                format!("{pre}[mantra:question] The {from} asks:\n{q}\n\nWe are in {phase}. Workers:\n{status}\nYou are the top of the chain of command: decide yourself whenever the answer keeps the end product and the plan's intent, and answer with {answer_with}. Ask the user (mantra_ask_user) only if it changes what is being built, its scope, or is a trade-off only they can make."),
             );
             ("forwarded to the planner — its answer arrives as a message. Call mantra_wait if you have nothing else to do meanwhile.".into(), true)
         } else {
-            self.log("?", "amber", format!("{from} asks the orchestrator: {}", trunc(&q, 70)));
+            self.log_quote("?", "amber", 70, &q, |t| format!("{from} asks the orchestrator: {t}"));
             self.orch_event(ctx, format!("QUESTION from {from}: {q}\nIt is waiting for you. Answer with mantra_prompt(\"{from}\", …). If the decision is beyond your brief (it changes the plan, the scope or the product), pass it up with mantra_ask instead."));
             ("forwarded to the orchestrator — the answer arrives as a [from the orchestrator] message. If you cannot continue without it, end your turn now (no STATUS line); you will be woken with the answer.".into(), true)
         }

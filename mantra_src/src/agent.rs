@@ -129,6 +129,8 @@ pub enum Signal {
     /// `looks_like_broken_sandbox`): the sandbox itself cannot run commands on this host. Carries
     /// the offending output, truncated.
     EnvironmentBroken(String),
+    /// A compaction finished and the context is known to have shrunk (`from` → `to` tokens).
+    Compacted { from: u64, to: u64 },
 }
 
 /// Recognize diagnostics that the sandbox itself could not start. Mere mentions of bubblewrap,
@@ -173,6 +175,8 @@ pub struct Agent {
     pub sandbox: String,
     /// A Mantra swarm member is doing work for this agent; idle time here is intentional.
     pub swarm_waiting: bool,
+    /// The last completed turn produced no text, command, file change, tool call or plan.
+    pub last_turn_empty: bool,
     pub thread_id: Option<String>,
     pub status: Status,
     pub items: Vec<Item>,
@@ -252,6 +256,7 @@ impl Agent {
             approval: "never".into(),
             sandbox: "workspace-write".into(),
             swarm_waiting: false,
+            last_turn_empty: false,
             thread_id: None,
             status: Status::Starting,
             items: vec![],
@@ -303,6 +308,17 @@ impl Agent {
 
     pub fn busy(&self) -> bool {
         self.turn_active || self.awaiting_start
+    }
+
+    /// How long the turn in flight has been silent: since its last event, but never longer than
+    /// the turn itself has been running. None when no turn is in flight.
+    pub fn turn_silence(&self) -> Option<Duration> {
+        if !self.busy() {
+            return None;
+        }
+        let since_turn = self.turn_wait_since.or(self.turn_started).map(|t| t.elapsed());
+        let since_event = self.last_event.elapsed();
+        Some(since_turn.map(|t| t.min(since_event)).unwrap_or(since_event))
     }
 
     /// How long the turn in flight has produced nothing at all (no tokens, no text, no tool
@@ -591,6 +607,7 @@ impl Agent {
                                 if now_ctx < *from {
                                     *to = Some(now_ctx);
                                     let f = *from;
+                                    out.push(Signal::Compacted { from: f, to: now_ctx });
                                     it.touch();
                                     self.ctx_anim = Some((f, Instant::now()));
                                     self.compact_item = None;
@@ -691,6 +708,12 @@ impl Agent {
                 let turn_items = &self.items[start.min(self.items.len())..];
                 let compact_turn = turn_items.iter().any(|i| matches!(i.kind, Kind::Compaction { .. }))
                     && !turn_items.iter().any(|i| matches!(i.kind, Kind::Agent | Kind::Reasoning | Kind::Command { .. } | Kind::Files { .. } | Kind::Tool { .. }));
+                self.last_turn_empty = status == "completed"
+                    && !turn_items.iter().any(|i| match &i.kind {
+                        Kind::Agent | Kind::Plan => !i.text.trim().is_empty(),
+                        Kind::Command { .. } | Kind::Files { .. } | Kind::Tool { .. } | Kind::Web { .. } => true,
+                        _ => false,
+                    });
                 self.compacting = false;
                 if compact_turn {
                     self.turn_count = self.turn_count.saturating_sub(1);
@@ -1009,7 +1032,7 @@ impl Agent {
                 Kind::Command { cmd, output, exit, .. } => {
                     let mut o = output.clone();
                     crate::util::tail_bytes(&mut o, 1200);
-                    s.push_str(&format!("[cmd] $ {cmd} (exit {:?})\n{o}\n", exit));
+                    s.push_str(&format!("[cmd] $ {cmd} ({})\n{o}\n", crate::util::exit_label(*exit)));
                 }
                 Kind::Files { changes, status } => {
                     for c in changes {
@@ -1147,6 +1170,20 @@ pub fn is_transport_error(kind: Option<ErrKind>, msg: &str) -> bool {
     }
 }
 
+/// Claude Code's subscription wording ("You've hit your 5-hour limit · resets 9:20pm",
+/// "… session limit …", "… weekly limit …", "… Opus limit …") and its close relatives.
+/// `m` is lower-cased by the caller.
+pub fn subscription_limit_text(m: &str) -> bool {
+    // "Context limit reached · /compact or /clear to continue" is a full context, not the plan's quota
+    if m.contains("context") {
+        return false;
+    }
+    (m.contains("hit your") && m.contains("limit"))
+        || m.contains("limit reached")
+        || m.contains("out of extra usage")
+        || m.contains("credits_required")
+}
+
 /// Billing and capacity failures may arrive as a generic bad request or rate-limit error.
 /// Match complete status tokens so token counts and request ids do not look like HTTP errors.
 pub fn is_usage_limit_error(kind: Option<ErrKind>, msg: &str) -> bool {
@@ -1154,6 +1191,9 @@ pub fn is_usage_limit_error(kind: Option<ErrKind>, msg: &str) -> bool {
         return true;
     }
     let m = msg.to_lowercase();
+    if subscription_limit_text(&m) {
+        return true;
+    }
     let status = m.split(|c: char| !c.is_ascii_alphanumeric()).any(|s| matches!(s, "402" | "429"));
     status || ["insufficient_quota", "insufficient quota", "quota exceeded", "quota exhausted", "exceeded your current quota", "usage limit", "usage_limit", "insufficient credits", "requires more credits", "out of credits", "credit balance is too low", "payment required", "rate limit exceeded", "rate limit reached", "rate_limit_exceeded", "resource_exhausted", "resource exhausted", "session budget exceeded"].iter().any(|s| m.contains(s))
 }
@@ -1463,6 +1503,21 @@ mod tests {
         assert!(sig.iter().any(|s| matches!(s, Signal::TurnDone { .. })));
     }
 
+    /// WP-7.2: the compaction's result is a signal, once, when the context is known to have shrunk.
+    #[test]
+    fn a_finished_compaction_signals_its_sizes_once() {
+        use super::*;
+        use serde_json::json;
+        let mut a = Agent::new(1, "t", "solo", std::path::PathBuf::from("."));
+        let usage = |a: &mut Agent, ctx: u64| a.apply("thread/tokenUsage/updated", &json!({"tokenUsage": {"total": {"totalTokens": ctx}, "last": {"inputTokens": ctx, "outputTokens": 0}, "modelContextWindow": 272000}}));
+        usage(&mut a, 180_000);
+        a.apply("item/started", &json!({"item": {"type": "contextCompaction", "id": "c1"}}));
+        a.apply("item/completed", &json!({"item": {"type": "contextCompaction", "id": "c1"}}));
+        let sigs = usage(&mut a, 30_000);
+        assert_eq!(sigs.iter().filter(|s| matches!(s, Signal::Compacted { from: 180_000, to: 30_000 })).count(), 1);
+        assert!(usage(&mut a, 31_000).iter().all(|s| !matches!(s, Signal::Compacted { .. })));
+    }
+
     #[test]
     fn pretty_errors_unwrap_provider_json() {
         use super::*;
@@ -1513,6 +1568,20 @@ mod tests {
         for msg in ["used 1402 tokens", "request req429abc failed", "HTTP 503 Service Unavailable", "context window exceeded"] {
             assert!(!is_usage_limit_error(None, msg), "{msg}");
         }
+    }
+
+    /// Claude Code's subscription wording is a usage limit, not a transient error to retry.
+    #[test]
+    fn claude_subscription_limits_are_usage_limits() {
+        for msg in ["You've hit your 5-hour limit · resets 9:20pm (UTC)", "You've hit your session limit · resets 9:20pm (UTC)", "You've hit your weekly limit · resets 9:20pm (UTC)"] {
+            assert!(is_usage_limit_error(None, msg), "{msg}");
+            assert!(!is_transport_error(None, msg), "{msg}");
+        }
+        assert!(!is_usage_limit_error(None, "hit the limit of 3 retries"));
+        let ctx_full = "Context limit reached · /compact or /clear to continue";
+        assert!(!subscription_limit_text(&ctx_full.to_lowercase()));
+        assert!(!is_usage_limit_error(None, ctx_full));
+        assert!(subscription_limit_text("limit reached · resets 9:20pm"));
     }
 
     #[test]

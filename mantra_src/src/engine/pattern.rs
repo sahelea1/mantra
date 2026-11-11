@@ -34,6 +34,16 @@ pub struct Role {
     /// `settings.first_token_minutes` with no output at all (a gateway that accepts the turn and
     /// never answers). Unset: the second time goes to the manager like any other watchdog case.
     pub fallback: Option<String>,
+    /// Second and third fallback, tried in order after `fallback`. Each is optional; a later one
+    /// without the earlier ones is moved up on load (`normalize_fallbacks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback3: Option<String>,
+    /// Optional ceiling (tokens) on the context window of this role's agents, on top of the
+    /// pattern's `context_cap` and the model's own window: the smallest wins. None = no role limit.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_role_context")]
+    pub context: Option<u64>,
     /// MCP servers this role's agents get (names from `settings.mcp_servers`, or `"*"` for every
     /// enabled one). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -64,9 +74,45 @@ impl Default for Role {
             instructions: String::new(),
             max_tokens: None,
             fallback: None,
+            fallback2: None,
+            context: None,
+            fallback3: None,
             parallel: None,
             can_spawn_swarm: false,
         }
+    }
+}
+
+impl Role {
+    /// The fallbacks in order: non-empty, without duplicates, without the role's own model.
+    pub fn fallback_chain(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for f in [&self.fallback, &self.fallback2, &self.fallback3].into_iter().flatten() {
+            let f = f.trim();
+            if !f.is_empty() && f != self.model && !out.iter().any(|o| o == f) {
+                out.push(f.to_string());
+            }
+        }
+        out
+    }
+
+    /// Rewrites the three fields from `fallback_chain()` (so gaps close and duplicates go).
+    pub fn normalize_fallbacks(&mut self) {
+        let mut chain = self.fallback_chain().into_iter();
+        self.fallback = chain.next();
+        self.fallback2 = chain.next();
+        self.fallback3 = chain.next();
+    }
+
+    /// Sets position `i` (0..=2) to `alias` (None clears it), then normalizes.
+    pub fn set_fallback(&mut self, i: usize, alias: Option<String>) {
+        match i {
+            0 => self.fallback = alias,
+            1 => self.fallback2 = alias,
+            2 => self.fallback3 = alias,
+            _ => return,
+        }
+        self.normalize_fallbacks();
     }
 }
 
@@ -133,6 +179,9 @@ pub struct PatternSettings {
     pub orchestrator_context: String,
     pub stall_minutes: u64,
     pub gate_max_rounds: u32,
+    /// Who repairs what a gate round found: "owner" = the task's own worker when every finding is
+    /// in one task's files (else a fix worker); "fix-worker" = always a fresh fix worker.
+    pub gate_fix: String,
     pub check_timeout_secs: u64,
     pub max_tasks_per_phase: usize,
     /// Watchdog (WP7.2): seconds an expected-active agent may sit idle before the first nudge.
@@ -162,7 +211,13 @@ pub struct PatternSettings {
     /// on one task); 200k keeps it honest. 0 = the model's full window.
     #[serde(deserialize_with = "deserialize_context_cap")]
     pub context_cap: u64,
+    /// "inherit" = Claude Code agents load your user-level settings, hooks and memory as your own
+    /// sessions do. "project" = only the project's and local settings load.
+    pub claude_user_config: String,
 }
+
+/// The smallest context window a role limit or the pattern's cap may ask for.
+const MIN_CONTEXT: u64 = 16_000;
 
 pub(crate) fn parse_context_cap(text: &str) -> Option<u64> {
     let text = text.trim();
@@ -170,6 +225,32 @@ pub(crate) fn parse_context_cap(text: &str) -> Option<u64> {
         Some(0)
     } else {
         crate::util::parse_tokens(text)
+    }
+}
+
+fn deserialize_role_context<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RoleContext {
+        Tokens(u64),
+        Text(String),
+    }
+
+    match Option::<RoleContext>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RoleContext::Tokens(0)) => Ok(None),
+        Some(RoleContext::Tokens(tokens)) => Ok(Some(tokens)),
+        Some(RoleContext::Text(text)) => {
+            let t = text.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("none") {
+                return Ok(None);
+            }
+            match crate::util::parse_tokens(t) {
+                Some(0) => Ok(None),
+                Some(tokens) => Ok(Some(tokens)),
+                None => Err(serde::de::Error::custom("context must be a token count such as 200k or 1M, or 0 / off for no limit")),
+            }
+        }
     }
 }
 
@@ -205,6 +286,7 @@ impl Default for PatternSettings {
             orchestrator_context: "fresh".into(),
             stall_minutes: 6,
             gate_max_rounds: 3,
+            gate_fix: "owner".into(),
             check_timeout_secs: 900,
             max_tasks_per_phase: 8,
             watchdog_seconds: 90,
@@ -215,6 +297,7 @@ impl Default for PatternSettings {
             writable_roots: vec![],
             first_token_minutes: 4,
             context_cap: 0,
+            claude_user_config: "inherit".into(),
         }
     }
 }
@@ -336,7 +419,10 @@ impl Pattern {
     }
 
     pub fn from_toml(s: &str) -> Result<Pattern> {
-        let p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
+        let mut p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
+        for role in p.roles.values_mut() {
+            role.normalize_fallbacks();
+        }
         p.validate().map_err(|errs| anyhow!(errs.join("; ")))?;
         Ok(p)
     }
@@ -434,6 +520,9 @@ impl Pattern {
             if !PERMISSIONS.contains(&r.permission.as_str()) {
                 errs.push(format!("role '{n}': permission must be one of {} (got '{}')", PERMISSIONS.join(", "), r.permission));
             }
+            if let Some(c) = r.context.filter(|c| *c < MIN_CONTEXT) {
+                errs.push(format!("role '{n}': context must be at least 16k tokens (got {c})"));
+            }
             match r.parallel {
                 Some(p) if !PARALLEL_RANGE.contains(&p) => errs.push(format!("role '{n}': parallel must be from {} to {} (got {p})", PARALLEL_RANGE.start(), PARALLEL_RANGE.end())),
                 // only workers are spawned many at a time; on any other kind the number would be read by nothing
@@ -480,6 +569,15 @@ impl Pattern {
         }
         if !self.is_auto() && !self.settings.planner_loop && self.worker_roles().is_empty() {
             errs.push("pattern needs at least one role with kind = \"worker\"".into());
+        }
+        if !["inherit", "project"].contains(&self.settings.claude_user_config.as_str()) {
+            errs.push(format!("settings.claude_user_config must be inherit or project (got '{}')", self.settings.claude_user_config));
+        }
+        if !["owner", "fix-worker"].contains(&self.settings.gate_fix.as_str()) {
+            errs.push(format!("settings.gate_fix must be owner or fix-worker (got '{}')", self.settings.gate_fix));
+        }
+        if (1..MIN_CONTEXT).contains(&self.settings.context_cap) {
+            errs.push("settings.context_cap must be 0 (no cap) or at least 16k tokens".into());
         }
         if self.settings.max_parallel == 0 {
             errs.push("settings.max_parallel must be ≥ 1".into());
@@ -1041,9 +1139,145 @@ fn builtin_thorough() -> Pattern {
     p
 }
 
+/// Do two definitions of a role start the same process? (model, effort, sandbox, permission,
+/// instructions, tools-relevant flags) — description, glyph, colour, budget and fallbacks
+/// change nothing about a running agent.
+pub fn role_spawn_eq(a: &Role, b: &Role) -> bool {
+    a.kind == b.kind && a.model == b.model && a.effort == b.effort && a.sandbox == b.sandbox
+        && a.permission == b.permission && a.instructions.trim() == b.instructions.trim()
+        && a.mcp == b.mcp && a.can_spawn_swarm == b.can_spawn_swarm && a.parallel == b.parallel
+        && a.context == b.context
+}
+
+/// What `theirs` changed relative to `base`, applied on top of `ours`. Tables are merged key by
+/// key; arrays and scalars are taken whole. A key `theirs` removed is removed; a key only `ours`
+/// has (or changed) is kept.
+pub fn merge3(base: &toml::Value, ours: &toml::Value, theirs: &toml::Value) -> toml::Value {
+    use toml::Value;
+    if let (Value::Table(b), Value::Table(o), Value::Table(t)) = (base, ours, theirs) {
+        return Value::Table(merge3_tables(b, o, t));
+    }
+    if theirs == base { ours.clone() } else { theirs.clone() }
+}
+
+fn merge3_tables(base: &toml::Table, ours: &toml::Table, theirs: &toml::Table) -> toml::Table {
+    use toml::Value;
+    let mut keys: Vec<&String> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let empty = toml::Table::new();
+    let mut out = toml::Table::new();
+    for k in keys {
+        let (b, o, t) = (base.get(k), ours.get(k), theirs.get(k));
+        let present = [b, o, t];
+        let all_tables = present.iter().flatten().all(|v| v.is_table());
+        let taken = if all_tables && present.iter().any(|v| v.is_some()) {
+            let sub = merge3_tables(b.and_then(Value::as_table).unwrap_or(&empty), o.and_then(Value::as_table).unwrap_or(&empty), t.and_then(Value::as_table).unwrap_or(&empty));
+            if t.is_none() && b.is_some() { None } // theirs removed the whole table
+            else if sub.is_empty() && o.is_none() { None } else { Some(Value::Table(sub)) }
+        } else if t == b {
+            o.cloned()
+        } else {
+            t.cloned()
+        };
+        if let Some(v) = taken {
+            out.insert(k.clone(), v);
+        }
+    }
+    out
+}
+
+/// A run copy after adopting what changed in the saved pattern (`adopt`).
+pub struct Adoption {
+    pub pattern: Pattern,
+    /// One line per changed field: `roles.qa.model: sol → astra`.
+    pub changes: Vec<String>,
+    /// Roles (present before and after) whose model changed: their live agents are switched.
+    pub model_roles: Vec<String>,
+}
+
+fn render_change_value(v: Option<&toml::Value>) -> String {
+    match v {
+        None => "—".into(),
+        Some(toml::Value::String(s)) => crate::util::trunc(s, 40),
+        Some(v) => crate::util::trunc(&v.to_string(), 40),
+    }
+}
+
+fn diff_values(path: &str, ours: Option<&toml::Value>, merged: Option<&toml::Value>, out: &mut Vec<String>) {
+    use toml::Value;
+    if ours == merged {
+        return;
+    }
+    match (ours, merged) {
+        (Some(Value::Table(o)), Some(Value::Table(m))) => {
+            let mut keys: Vec<&String> = o.keys().chain(m.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                diff_values(&format!("{path}.{k}"), o.get(k), m.get(k), out);
+            }
+        }
+        (None, Some(Value::Table(_))) => out.push(format!("{path}: added")),
+        (Some(Value::Table(_)), None) => out.push(format!("{path}: removed")),
+        _ => {
+            let leaf = path.rsplit('.').next().unwrap_or(path);
+            if matches!(leaf, "instructions" | "description" | "task") {
+                out.push(format!("{path}: changed"));
+            } else {
+                out.push(format!("{path}: {} → {}", render_change_value(ours), render_change_value(merged)));
+            }
+        }
+    }
+}
+
+/// The run copy `ours` after adopting what changed in the saved pattern (`theirs`) since `base`.
+/// `Ok(None)` when nothing is to adopt. The name always stays `ours.name`.
+pub fn adopt(base_toml: &str, ours: &Pattern, theirs: &Pattern) -> std::result::Result<Option<Adoption>, String> {
+    use toml::Value;
+    let base: Value = toml::from_str(base_toml).map_err(|_| "the run's pattern base is unreadable".to_string())?;
+    let o = Value::try_from(ours).map_err(|e| e.to_string())?;
+    let t = Value::try_from(theirs).map_err(|e| e.to_string())?;
+    if t == base {
+        return Ok(None);
+    }
+    let mut merged = merge3(&base, &o, &t);
+    if let Value::Table(tbl) = &mut merged {
+        tbl.insert("name".into(), Value::String(ours.name.clone()));
+    }
+    let mut pattern: Pattern = merged.clone().try_into().map_err(|e: toml::de::Error| e.to_string())?;
+    pattern.source_dir = ours.source_dir.clone();
+    for role in pattern.roles.values_mut() {
+        role.normalize_fallbacks();
+    }
+    pattern.validate().map_err(|e| e.join("; "))?;
+    // compare after normalising, so a fallback gap closed by the merge is not reported twice
+    let merged = Value::try_from(&pattern).map_err(|e| e.to_string())?;
+    let mut changes = vec![];
+    diff_values("", Some(&o), Some(&merged), &mut changes);
+    let changes: Vec<String> = changes.into_iter().map(|c| c.trim_start_matches('.').to_string()).collect();
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    let model_roles = ours.roles.iter().filter(|(n, r)| pattern.roles.get(*n).is_some_and(|m| m.model != r.model)).map(|(n, _)| n.clone()).collect();
+    Ok(Some(Adoption { pattern, changes, model_roles }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_user_config_is_inherit_or_project() {
+        let mut p = Pattern::builtin();
+        assert_eq!(p.settings.claude_user_config, "inherit");
+        p.settings.claude_user_config = "project".into();
+        assert!(p.validate().is_ok());
+        p.settings.claude_user_config = "nothing".into();
+        assert!(p.validate().unwrap_err().iter().any(|e| e.contains("claude_user_config")));
+        let old = Pattern::from_toml(&toml::to_string(&Pattern::builtin()).unwrap().lines().filter(|l| !l.starts_with("claude_user_config")).collect::<Vec<_>>().join("\n")).unwrap();
+        assert_eq!(old.settings.claude_user_config, "inherit", "an old pattern file keeps today's behaviour");
+    }
 
     fn all_builtins() -> Vec<Pattern> {
         Pattern::names().into_iter().filter(|n| *n != NAME_AUTO).map(|n| Pattern::builtin_named(n).unwrap()).collect()
@@ -1236,8 +1470,69 @@ mod tests {
         assert_eq!(Pattern::from_toml(&zero).unwrap().settings.first_token_minutes, 0, "0 = off");
     }
 
+    #[test]
+    fn fallback_chains_close_gaps_drop_the_model_and_round_trip() {
+        let base = Pattern::builtin();
+        let model = base.roles["planner"].model.clone();
+        // an old file without the new keys loads unchanged
+        let old = Pattern::from_toml(&base.to_toml()).unwrap();
+        assert_eq!(old, base);
+        assert!(!base.to_toml().contains("fallback2"), "unset fallbacks are not written");
+        // fallback2 without fallback moves up
+        let mut gap = base.clone();
+        gap.roles.get_mut("planner").unwrap().fallback2 = Some("luna".into());
+        let back = Pattern::from_toml(&gap.to_toml()).unwrap();
+        let r = &back.roles["planner"];
+        assert_eq!((r.fallback.as_deref(), r.fallback2.as_deref(), r.fallback3.as_deref()), (Some("luna"), None, None));
+        // fallback = the role's own model is dropped
+        let mut same = base.clone();
+        same.roles.get_mut("planner").unwrap().fallback = Some(model.clone());
+        assert_eq!(Pattern::from_toml(&same.to_toml()).unwrap().roles["planner"].fallback, None);
+        // three distinct fallbacks round-trip
+        let mut three = base.clone();
+        {
+            let r = three.roles.get_mut("planner").unwrap();
+            r.fallback = Some("fa".into());
+            r.fallback2 = Some("fb".into());
+            r.fallback3 = Some("fc".into());
+        }
+        let back = Pattern::from_toml(&three.to_toml()).unwrap();
+        assert_eq!(back.roles["planner"].fallback_chain(), ["fa", "fb", "fc"]);
+        assert_eq!(back, three);
+        // set_fallback clears a slot and closes the gap
+        let mut r = three.roles["planner"].clone();
+        r.set_fallback(0, None);
+        assert_eq!((r.fallback.as_deref(), r.fallback2.as_deref(), r.fallback3.as_deref()), (Some("fb"), Some("fc"), None));
+        r.set_fallback(1, Some("fb".into()));
+        assert_eq!(r.fallback_chain(), ["fb"], "a duplicate goes");
+    }
+
     /// Every built-in caps the context at 200k; a pattern file from before the setting existed
     /// (or one written by hand without it) keeps the model's full window.
+    #[test]
+    fn a_role_context_limit_reads_text_writes_tokens_and_rejects_too_small() {
+        let mut p = Pattern::builtin();
+        let planner = p.flow.planner.clone();
+        let toml = p.to_toml();
+        assert!(!toml.contains("\ncontext = "), "no limit, nothing written");
+        p.roles.get_mut(&planner).unwrap().context = Some(250_000);
+        let toml = p.to_toml();
+        assert!(toml.contains("context = 250000"), "{toml}");
+        assert_eq!(Pattern::from_toml(&toml).unwrap().roles[&planner].context, Some(250_000));
+        let text = toml.replace("context = 250000", "context = \"250k\"");
+        assert_eq!(Pattern::from_toml(&text).unwrap().roles[&planner].context, Some(250_000));
+        for off in ["0", "\"off\"", "\"none\"", "\"\""] {
+            let t = toml.replace("context = 250000", &format!("context = {off}"));
+            assert_eq!(Pattern::from_toml(&t).unwrap().roles[&planner].context, None, "{off}");
+        }
+        let small = toml.replace("context = 250000", "context = 8000");
+        let err = Pattern::from_toml(&small).unwrap_err().to_string();
+        assert!(err.contains("context must be at least 16k tokens (got 8000)"), "{err}");
+        let cap = Pattern::builtin().to_toml().replace("context_cap = 200000", "context_cap = 8000");
+        let err = Pattern::from_toml(&cap).unwrap_err().to_string();
+        assert!(err.contains("settings.context_cap must be 0 (no cap) or at least 16k tokens"), "{err}");
+    }
+
     #[test]
     fn the_context_cap_is_200k_in_the_builtins_and_off_for_old_patterns() {
         for p in all_builtins() {
@@ -1557,5 +1852,84 @@ mod tests {
             let e = parse_parallel(bad).unwrap_err();
             assert!(e.contains("from 1 to 128"), "{bad}: {e}");
         }
+    }
+    fn adopt_base() -> Pattern {
+        Pattern::builtin_lean()
+    }
+
+    #[test]
+    fn adopt_keeps_the_runs_own_changes_and_takes_the_saved_ones() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.set_parallel(8);
+        let mut theirs = a.clone();
+        let old = theirs.roles["qa"].model.clone();
+        theirs.roles.get_mut("qa").unwrap().model = "x".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().expect("something to adopt");
+        assert_eq!(got.pattern.settings.max_parallel, 8, "the run's --parallel stays");
+        assert_eq!(got.pattern.roles["qa"].model, "x");
+        assert_eq!(got.changes, vec![format!("roles.qa.model: {old} → x")]);
+        assert_eq!(got.model_roles, vec!["qa".to_string()]);
+    }
+
+    #[test]
+    fn adopt_lets_the_saved_pattern_win_where_both_changed_the_same_field() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.roles.get_mut("qa").unwrap().model = "mine".into();
+        let mut theirs = a.clone();
+        theirs.roles.get_mut("qa").unwrap().model = "theirs".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().unwrap();
+        assert_eq!(got.pattern.roles["qa"].model, "theirs");
+    }
+
+    #[test]
+    fn adopt_nothing_when_the_saved_pattern_is_unchanged() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.roles.get_mut("qa").unwrap().model = "mine".into();
+        assert!(adopt(&a.to_toml(), &ours, &a).unwrap().is_none());
+        assert!(adopt("not [ toml", &ours, &a).is_err());
+    }
+
+    #[test]
+    fn adopt_follows_a_deleted_and_an_added_role() {
+        let a = adopt_base();
+        let mut theirs = a.clone();
+        theirs.roles.remove("worker-swarm");
+        theirs.groups.clear(); // a group may not name a role that is gone
+        theirs.roles.insert("extra".into(), Role { model: "m".into(), ..Role::default() });
+        let got = adopt(&a.to_toml(), &a, &theirs).unwrap().unwrap();
+        assert!(!got.pattern.roles.contains_key("worker-swarm"));
+        assert!(got.pattern.roles.contains_key("extra"));
+        assert!(got.changes.contains(&"roles.extra: added".to_string()), "{:?}", got.changes);
+        assert!(got.changes.contains(&"roles.worker-swarm: removed".to_string()), "{:?}", got.changes);
+        assert!(got.model_roles.is_empty());
+        assert_eq!(got.pattern.name, a.name);
+    }
+
+    #[test]
+    fn adopt_reports_long_text_as_changed_and_never_renames_the_run_copy() {
+        let a = adopt_base();
+        let mut ours = a.clone();
+        ours.name = "renamed-by-run".into();
+        let mut theirs = a.clone();
+        theirs.roles.get_mut("qa").unwrap().instructions = "something entirely different and quite long indeed".into();
+        theirs.name = "other".into();
+        let got = adopt(&a.to_toml(), &ours, &theirs).unwrap().unwrap();
+        assert_eq!(got.changes, vec!["roles.qa.instructions: changed".to_string()]);
+        assert_eq!(got.pattern.name, "renamed-by-run");
+    }
+
+    #[test]
+    fn role_spawn_eq_ignores_what_a_running_agent_does_not_see() {
+        let a = Role::default();
+        let mut b = a.clone();
+        b.description = "other".into();
+        b.glyph = "x".into();
+        b.fallback = Some("f".into());
+        assert!(role_spawn_eq(&a, &b));
+        b.model = "m".into();
+        assert!(!role_spawn_eq(&a, &b));
     }
 }

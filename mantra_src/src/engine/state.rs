@@ -43,10 +43,27 @@ pub struct RunState {
     /// `None` in a file written before the clock existed (its wall-clock span stands in).
     pub active_secs: Option<u64>,
     pub updated_unix: u64,
+    /// When Mantra was closed with this run unfinished (`App::shutdown`); cleared by a resume.
+    #[serde(default)]
+    pub closed_unix: Option<u64>,
     pub ws: Option<Workspace>,
+    /// `Run::nested_base` / `nested_run_base`.
+    #[serde(default)]
+    pub nested_base: Vec<(PathBuf, String)>,
+    #[serde(default)]
+    pub nested_run_base: Vec<(PathBuf, String)>,
     pub handoff: String,
     /// One line per gate/finale report so far (see `Run::gate_notes`).
     pub gate_notes: Vec<String>,
+    /// `Run::gate_seq` / `last_gate_file` (WP-2.8).
+    #[serde(default)]
+    pub gate_seq: u32,
+    #[serde(default)]
+    pub last_gate_file: Option<PathBuf>,
+    /// `Run::fix_owner` (WP-6.2): the task whose own worker repairs the current gate round. A
+    /// process restart restarts the gate from the merge and forgets it.
+    #[serde(default)]
+    pub fix_owner: Option<String>,
     pub workers: Vec<WorkerState>,
     pub agents: Vec<AgentState>,
     /// Phases already completed (for the summary screen after a resume).
@@ -55,6 +72,15 @@ pub struct RunState {
     /// run without groups writes the same `state.json` as before, and an older file loads with none.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub akasha: std::collections::BTreeMap<String, super::akasha::Block>,
+    /// Per slot: the model aliases a fallback already gave up on (`Run::fallback_used`), so a
+    /// resumed run does not go back to a dead model.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fallback_used: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per slot (planner, manager, orchestrator, gate, finale): the model the slot is pinned to —
+    /// your per-agent choice or a fallback (`Run::slot_models`). Saved on its own because a slot
+    /// may have no live agent when the state is written (the planner during plan review).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub slot_models: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -89,6 +115,10 @@ pub struct WorkerState {
     /// The alias this attempt runs on when the user switched it live (`Run::set_agent_model`);
     /// `None` = the role's model. A resume and the next attempt of the task keep it.
     pub model: Option<String>,
+    /// Seconds this attempt's agent was at work (`Worker::active`): halts and waiting excluded.
+    pub active_secs: u64,
+    /// Cancelled by a plan revision after it had finished (`Worker::superseded`).
+    pub superseded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -304,11 +334,17 @@ impl RunSummary {
     pub fn stage_label(&self) -> String {
         match &self.state {
             Ok(s) => {
-                let mut l = s.stage_label();
-                if s.halted.is_some() && !s.finished() {
-                    l.push_str(" · halted");
+                let l = s.stage_label();
+                // the state first: a long stage must not push it out of a narrow column
+                if s.finished() {
+                    l
+                } else if s.halted.is_some() {
+                    format!("halted · {l}")
+                } else if !Owner::load(&self.dir).is_some_and(|o| o.alive()) {
+                    format!("closed · {l}")
+                } else {
+                    l
                 }
-                l
             }
             Err(_) => "(v0.1 format)".into(),
         }
@@ -443,6 +479,9 @@ pub(crate) mod tests {
             id: "123-add-login".into(),
             title: "Add a login page".into(),
             gate_notes: vec!["phase 1 · QA round 1: pass — fine".into()],
+            gate_seq: 0,
+            last_gate_file: None,
+            fix_owner: None,
             project: PathBuf::from("/tmp/proj"),
             brief: "add login".into(),
             pattern: "mantra-default".into(),
@@ -456,12 +495,17 @@ pub(crate) mod tests {
             finished_unix: None,
             active_secs: Some(7),
             updated_unix: 20,
-            ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None, base_commit: None, initial_commit: false }),
+            closed_unix: None,
+            nested_base: vec![],
+            nested_run_base: vec![],
+            ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None, base_commit: None, initial_commit: false, nested: vec![] }),
             handoff: "phase 1 done".into(),
-            workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into(), transient: false, model: Some("sol".into()) }],
+            workers: vec![WorkerState { task: "p2-api".into(), title: "API".into(), role: "worker-big".into(), state: "done".into(), error: String::new(), attempt: 1, branch: "mantra-w/123-add-login/p2-api-1".into(), worktree: Some("/tmp/wt/p2-api-1".into()), adhoc: false, prompt: "build it".into(), effort: Some("high".into()), report: "done".into(), transient: false, model: Some("sol".into()), active_secs: 0, superseded: false }],
             agents: vec![AgentState { slot: "orchestrator".into(), name: "orchestrator".into(), role: "orchestrator".into(), provider: "openai".into(), model_alias: "astra".into(), effort: "high".into(), thread_id: Some("t-1".into()), cwd: "/tmp/wt/integration".into() }],
             history: vec![PhaseHistory { name: "Foundations".into(), workers: vec![("p1-a".into(), "A".into(), "◇".into(), true)], secs: 42 }],
             akasha: Default::default(),
+            fallback_used: Default::default(),
+            slot_models: Default::default(),
         }
     }
 

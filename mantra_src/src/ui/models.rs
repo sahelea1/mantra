@@ -27,7 +27,7 @@ pub(crate) const NOTE_COL: usize = 8;
 
 const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth", "wire"];
 /// The providers grid's column widths, `PROV_COLS` order.
-const PROV_WIDTHS: [usize; 8] = [10, 12, 26, 14, 8, 10, 12, 9];
+const PROV_WIDTHS: [usize; 8] = [12, 12, 26, 14, 8, 10, 12, 9];
 const PROV_ID_COL: usize = 0;
 const PROV_NAME_COL: usize = 1;
 const PROV_URL_COL: usize = 2;
@@ -764,7 +764,7 @@ pub fn models_key(app: &mut App, k: KeyEvent) {
                         }
                     }
                 }
-                Some(ProvRow::Codex) => app.discover(None),
+                Some(ProvRow::Codex) => app.discover(Some("openai".into())),
                 None => app.toast("add a provider first (ctrl+n)", crate::agent::Level::Info),
             }
         }
@@ -961,6 +961,8 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
                 theme::dim()
             } else if ci == EFFORT_COL {
                 theme::fg(effort_color(v))
+            } else if ci == PROVIDER_COL {
+                theme::fg(theme::named(app.registry.provider_color(&m.provider)))
             } else if ci == VISION_COL && m.vision {
                 theme::fg(theme::BLUE)
             } else if ci == NOTE_COL && v.starts_with("ok") {
@@ -1032,7 +1034,7 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
                 } else if !p.needs_key() {
                     (format!(" {} subscription (OAuth login)", theme::g("○", "-")), format!(" {} OAuth", theme::g("○", "-")), theme::dim())
                 } else {
-                    let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored in models.toml" };
+                    let key_msg = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) { "key set (env)" } else { "key stored (secrets.toml)" };
                     (format!(" {} {key_msg}", theme::g("✓", "ok")), format!(" {} key", theme::g("✓", "ok")), theme::fg(theme::GREEN))
                 };
                 let n = app.registry.models.iter().filter(|m| m.provider == p.id).count();
@@ -1040,7 +1042,15 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             }
         };
         let codex = *r == ProvRow::Codex;
-        let style = |_: usize, _: &str| if codex { theme::muted() } else { theme::text() };
+        // the id carries the provider's mark and colour, as it does beside a model elsewhere
+        let pid = match r {
+            ProvRow::Codex => "openai".to_string(),
+            ProvRow::Entry(i) => app.registry.providers[*i].id.clone(),
+        };
+        let mut vals = vals;
+        vals[PROV_ID_COL] = format!("{} {}", theme::g("■", "#"), vals[PROV_ID_COL]);
+        let pcol = theme::fg(theme::named(app.registry.provider_color(&pid)));
+        let style = |ci: usize, _: &str| if ci == PROV_ID_COL { pcol } else if codex { theme::muted() } else { theme::text() };
         let (mut spans, cur) = grid_cells(&vals, &pw, &pshow, style, this.then_some(ui.col), editing_prov.filter(|_| this));
         if let Some(c) = cur {
             cursor = Some((pinner.x + c as u16, pinner.y + pl.len() as u16));
@@ -1133,7 +1143,7 @@ fn keyflow_line(app: &App, k: &KeyFlow, width: usize) -> (Line<'static>, Option<
         _ => {
             spans.push(label("API key"));
             let x = Line::from(spans.clone()).width();
-            let after = if width >= x + 70 { "  (paste it — it is stored in models.toml, 0600)" } else { "  (paste it)" };
+            let after = if width >= x + 70 { "  (paste it — it is stored in secrets.toml, 0600)" } else { "  (paste it)" };
             let room = width.saturating_sub(x + w_of(after) + 1).max(16);
             if let Some(e) = edit {
                 let (shown, cur) = e.view(room);

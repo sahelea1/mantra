@@ -1511,7 +1511,7 @@ for line in sys.stdin:
             dynamic_tools: vec![], config: Default::default(), extra_args: vec![], resume_thread: None,
             thread_name: None, backend,
             envs: vec![("FAKE_BACKEND".into(), name.into()), ("TRACE".into(), dir.join("trace").to_string_lossy().into_owned())],
-            claude: (backend == Backend::ClaudeCode).then(|| ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: "task handoff".into(), mcp_sock: None, strict_mcp: false }),
+            claude: (backend == Backend::ClaudeCode).then(|| ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: "task handoff".into(), mcp_sock: None, strict_mcp: false, user_config_project: false }),
             bija: (backend == Backend::Bija).then(|| BijaSpawn { base_url: "http://unused".into(), wire: "openai-chat".into(), api_key_env: None, context_window: 1000, compact_pct: 85, system_prompt: "task handoff".into(), home: dir.clone(), sandbox: "none".into(), writable_roots: vec![], network: false, vision: false }),
             antigravity: None,
             mcp: vec![],

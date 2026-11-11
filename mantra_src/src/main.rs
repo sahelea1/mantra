@@ -855,10 +855,10 @@ fn runs_list() {
         println!("no runs yet — `mantra run \"<goal>\"` starts one (or `mantra --demo`)");
         return;
     }
-    println!("{:<36} {:<20} {:<18} {:>9}  id", "run", "project", "stage", "updated");
+    println!("{:<28} {:<20} {:<30} {:>9}  id", "run", "project", "stage", "updated");
     for r in &all {
         let project = r.project().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| r.project_key.rsplit_once('-').map(|(a, _)| a.to_string()).unwrap_or_else(|| r.project_key.clone()));
-        println!("{:<36} {:<20} {:<18} {:>9}  {}", util::trunc(&r.title(), 36), util::trunc(&project, 20), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), r.id);
+        println!("{:<28} {:<20} {:<30} {:>9}  {}", util::trunc(&r.title(), 28), util::trunc(&project, 20), util::trunc(&r.stage_label(), 30), engine::state::fmt_ago(r.updated_unix), r.id);
     }
     let n = all.iter().filter(|r| r.unfinished()).count();
     println!("\n{} run{}, {n} unfinished · mantra runs resume <id> · mantra runs delete <id>", all.len(), if all.len() == 1 { "" } else { "s" });
@@ -1304,7 +1304,7 @@ fn doctor() {
             if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
                 format!("${} set", p.env_key)
             } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-                "key stored in models.toml".to_string()
+                "key stored (secrets.toml)".to_string()
             } else if p.env_key.trim().is_empty() {
                 "no key".to_string()
             } else {
@@ -1464,7 +1464,7 @@ fn sandbox_helper_probe(cmd0: &str, cwd: &std::path::Path) -> Result<String, Str
 }
 
 /// The `provider` doctor row for the default model's provider: is the key source there (the
-/// env var set, or a key stored in models.toml), and does the endpoint accept it — checked with
+/// env var set, or a key stored in secrets.toml), and does the endpoint accept it — checked with
 /// `GET /models`, which is free on every provider; no inference request is ever sent. The verdict
 /// is `None` when there is nothing Mantra can check (Codex's own account, a subscription login).
 fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, String) {
@@ -1486,7 +1486,7 @@ fn provider_row(s: &config::Settings, r: &config::Registry) -> (Option<bool>, St
     let key_src = if !p.env_key.trim().is_empty() && std::env::var(p.env_key.trim()).map(|v| !v.trim().is_empty()).unwrap_or(false) {
         format!("${} set", p.env_key.trim())
     } else if p.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        "key stored in models.toml".to_string()
+        "key stored (secrets.toml)".to_string()
     } else {
         format!("${} NOT set and no key stored (/models to fix)", p.env_var_name())
     };

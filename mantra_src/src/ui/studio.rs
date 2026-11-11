@@ -3,7 +3,7 @@
 //! it from a description.
 
 use super::{theme, *};
-use crate::app::{App, EditTarget, StudioSel};
+use crate::app::{App, EditTarget, PickTarget, StudioSel};
 use crate::engine::pattern::{FinaleStep, PatternSettings, Role, COLORS, EFFORT_AUTO, KINDS, PARALLEL_RANGE, PERMISSIONS};
 use crate::ui::form::{self, Edit, Outcome, Start};
 use crate::ui::input::Act;
@@ -20,10 +20,10 @@ const WATCHDOG_SECONDS_MAX: u64 = 24 * 3600;
 const WATCHDOG_SECONDS_MIN: u64 = 15;
 const WATCHDOG_ESCALATE_MIN: u64 = 30;
 const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
+const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "fallback2", "fallback3", "context", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
-const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "allow_pattern_changes"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "gate_fix", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "claude_user_config", "allow_pattern_changes"];
 const ADD_STEP: &str = "+ add finale step";
 
 /// How a field takes keys (`ui::form`'s rules).
@@ -47,7 +47,7 @@ fn field_kind(entry: &str, field: &str) -> Kind {
     match entry {
         "⚙ settings" => match field {
             "name" | "description" | "writable_roots" => Kind::Text,
-            "isolation" | "orchestrator_context" => Kind::Choice,
+            "isolation" | "orchestrator_context" | "claude_user_config" | "gate_fix" => Kind::Choice,
             "network" | "review_plan" | "allow_pattern_changes" => Kind::Toggle,
             _ => Kind::Step,
         },
@@ -61,9 +61,23 @@ fn field_kind(entry: &str, field: &str) -> Kind {
             "instructions" => Kind::Lines,
             "description" | "mcp" => Kind::Text,
             "swarm" => Kind::Toggle,
-            "glyph" | "parallel" | "max_tokens" => Kind::Step,
+            "glyph" | "parallel" | "max_tokens" | "context" => Kind::Step,
             _ => Kind::Choice,
         },
+    }
+}
+
+/// The stops ←→ walks a role's `context` through (below the first is none).
+const CONTEXT_STEPS: [u64; 7] = [64_000, 128_000, 200_000, 272_000, 400_000, 500_000, 1_000_000];
+
+/// A role's context limit as the editor shows it: `250k`, `1M`, else the plain number.
+fn context_label(n: u64) -> String {
+    if n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n % 1000 == 0 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
     }
 }
 
@@ -120,15 +134,74 @@ fn flow_fields(app: &App) -> Vec<String> {
 fn fields(app: &App, entry: &str) -> Vec<String> {
     match entry {
         "⚙ settings" => PATTERN_FIELDS.iter().chain(SETTING_FIELDS)
-            .filter(|f| !app.studio.pattern.settings.planner_loop || !matches!(**f, "worker_retries" | "orchestrator_context" | "gate_max_rounds" | "check_timeout_secs" | "max_tasks_per_phase" | "review_minutes" | "manager_minutes"))
+            .filter(|f| !app.studio.pattern.settings.planner_loop || !matches!(**f, "worker_retries" | "orchestrator_context" | "gate_max_rounds" | "gate_fix" | "check_timeout_secs" | "max_tasks_per_phase" | "review_minutes" | "manager_minutes"))
             .map(|s| s.to_string()).collect(),
         "⇢ flow" => flow_fields(app),
         role => {
             // only workers run many at a time: on any other kind `parallel` would be a dead row
             let worker = app.studio.pattern.roles.get(role).map(|r| r.kind == "worker").unwrap_or(false);
-            ROLE_FIELDS.iter().filter(|f| worker || **f != "parallel").map(|s| s.to_string()).collect()
+            // an empty chain shows one fallback row, not three
+            let r = app.studio.pattern.roles.get(role);
+            let has = |i: usize| r.is_some_and(|r| r.fallback_chain().len() > i);
+            ROLE_FIELDS.iter().filter(|f| worker || **f != "parallel").filter(|f| match **f { "fallback2" => has(0), "fallback3" => has(1), _ => true }).map(|s| s.to_string()).collect()
         }
     }
+}
+
+/// The name a field is drawn with (the key, but the fallbacks are numbered).
+fn field_label(f: &str) -> &str {
+    match f {
+        "fallback" => "fallback 1",
+        "fallback2" => "fallback 2",
+        "fallback3" => "fallback 3",
+        f => f,
+    }
+}
+
+/// A role field that holds a model alias: ⏎ opens the picker on it.
+fn picker_field(f: &str) -> bool {
+    f == "model" || fallback_index(f).is_some()
+}
+
+/// Which fallback position (0..3) a role field is, if it is one.
+fn fallback_index(field: &str) -> Option<usize> {
+    match field {
+        "fallback" => Some(0),
+        "fallback2" => Some(1),
+        "fallback3" => Some(2),
+        _ => None,
+    }
+}
+
+/// The alias a role's `model` / `fallback*` field holds (None = unset).
+fn model_field_alias(r: &Role, field: &str) -> Option<String> {
+    match field {
+        "model" => Some(r.model.clone()),
+        "fallback" => r.fallback.clone(),
+        "fallback2" => r.fallback2.clone(),
+        "fallback3" => r.fallback3.clone(),
+        _ => None,
+    }
+    .filter(|a| !a.is_empty())
+}
+
+/// What a role's agents may use of the context on each of its models: the smallest of the
+/// model's own window, the role's `context` and the pattern's `context_cap` (unset ones ignored).
+/// "opus48 250k · gpt-6-sol 250k · glm-5.3 128k".
+fn context_now(app: &App, r: &Role) -> String {
+    let cap = app.studio.pattern.settings.context_cap;
+    let mut aliases = vec![r.model.clone()];
+    aliases.extend(r.fallback_chain());
+    aliases
+        .into_iter()
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            let w = app.registry.effective_context_window(&a, &app.settings.default_model);
+            let w = [Some(w), r.context, (cap > 0).then_some(cap)].into_iter().flatten().filter(|n| *n > 0).min().unwrap_or(w);
+            format!("{a} {}", context_label(w))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The finale step a `finale[i].…` field is about.
@@ -145,6 +218,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "name" => p.name.clone(),
                 "description" => p.description.clone(),
                 "isolation" => s.isolation.clone(),
+                "claude_user_config" => s.claude_user_config.clone(),
                 "network" => if s.network { "on".into() } else { "off".into() },
                 "writable_roots" => if s.writable_roots.is_empty() { "none".into() } else { s.writable_roots.join(", ") },
                 "max_parallel" => s.max_parallel.to_string(),
@@ -154,6 +228,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "orchestrator_context" => s.orchestrator_context.clone(),
                 "stall_minutes" => s.stall_minutes.to_string(),
                 "gate_max_rounds" => s.gate_max_rounds.to_string(),
+                "gate_fix" => s.gate_fix.clone(),
                 "check_timeout_secs" => s.check_timeout_secs.to_string(),
                 "max_tasks_per_phase" => s.max_tasks_per_phase.to_string(),
                 "watchdog_seconds" => s.watchdog_seconds.to_string(),
@@ -203,12 +278,13 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                     }
                 }
                 "effort" => r.effort.clone(),
-                "fallback" => r.fallback.clone().unwrap_or_else(|| "none".into()),
+                "fallback" | "fallback2" | "fallback3" => model_field_alias(r, field).unwrap_or_else(|| "none".into()),
                 "sandbox" => r.sandbox.clone(),
                 "permission" => r.permission.clone(),
                 "swarm" => if r.can_spawn_swarm { "on".into() } else { "off".into() },
                 "parallel" => r.parallel.map(|n| n.to_string()).unwrap_or_else(|| "none".into()),
                 "max_tokens" => r.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "none".into()),
+                "context" => r.context.map(context_label).unwrap_or_else(|| "none".into()),
                 "mcp" => if r.mcp.is_empty() { "none".into() } else { r.mcp.join(", ") },
                 "description" => r.description.clone(),
                 "instructions" => r.instructions.clone(),
@@ -224,7 +300,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
 fn edit_value(app: &App, entry: &str, field: &str) -> String {
     let v = get_value(app, entry, field);
     match field {
-        "max_tokens" | "parallel" | "writable_roots" | "mcp" if v == "none" => String::new(),
+        "max_tokens" | "context" | "parallel" | "writable_roots" | "mcp" if v == "none" => String::new(),
         "context_cap" if app.studio.pattern.settings.context_cap == 0 => "0".into(),
         "manager_minutes" if app.studio.pattern.settings.manager_minutes == 0 => "off".into(),
         _ => v,
@@ -241,6 +317,8 @@ fn choices(app: &App, entry: &str, field: &str) -> Vec<String> {
         "⚙ settings" => match field {
             "isolation" => list(&["auto", "worktree", "shared"]),
             "orchestrator_context" => list(&["fresh", "compact"]),
+            "claude_user_config" => list(&["inherit", "project"]),
+            "gate_fix" => list(&["owner", "fix-worker"]),
             _ => vec![],
         },
         "⇢ flow" => match field {
@@ -257,7 +335,12 @@ fn choices(app: &App, entry: &str, field: &str) -> Vec<String> {
                 // "auto" leads: Mantra picks the effort per spawn from the role's job
                 "effort" => std::iter::once(EFFORT_AUTO.to_string()).chain(app.registry.resolve(&r.model).efforts()).collect(),
                 // none leads, then every model alias but the role's own
-                "fallback" => std::iter::once("none".to_string()).chain(aliases().into_iter().filter(|a| *a != r.model)).collect(),
+                // (and not another fallback of the role)
+                "fallback" | "fallback2" | "fallback3" => {
+                    let own = fallback_index(field);
+                    let others: Vec<String> = [&r.fallback, &r.fallback2, &r.fallback3].into_iter().enumerate().filter(|(i, _)| Some(*i) != own).filter_map(|(_, v)| v.clone()).collect();
+                    std::iter::once("none".to_string()).chain(aliases().into_iter().filter(|a| *a != r.model && !others.contains(a))).collect()
+                }
                 "sandbox" => list(SANDBOXES),
                 "permission" => list(PERMISSIONS),
                 _ => vec![],
@@ -277,13 +360,15 @@ fn choice_value(app: &App, entry: &str, field: &str) -> String {
 
 /// Sets a choice field to `v`, one of its `choices`. A new model re-clamps a named effort to what
 /// it offers (`auto` stays auto).
-fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
+pub(crate) fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
     let reg = app.registry.clone();
     let p = &mut app.studio.pattern;
     match entry {
         "⚙ settings" => match field {
             "isolation" => p.settings.isolation = v.into(),
             "orchestrator_context" => p.settings.orchestrator_context = v.into(),
+            "claude_user_config" => p.settings.claude_user_config = v.into(),
+            "gate_fix" => p.settings.gate_fix = v.into(),
             _ => return,
         },
         "⇢ flow" => {
@@ -314,7 +399,11 @@ fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
                     }
                 }
                 "effort" => r.effort = v.into(),
-                "fallback" => r.fallback = if v == "none" { None } else { Some(v.into()) },
+                "fallback" | "fallback2" | "fallback3" => {
+                    if let Some(i) = fallback_index(field) {
+                        r.set_fallback(i, if v == "none" { None } else { Some(v.into()) });
+                    }
+                }
                 "sandbox" => r.sandbox = v.into(),
                 "permission" => r.permission = v.into(),
                 _ => return,
@@ -385,6 +474,12 @@ fn nudge(app: &mut App, entry: &str, field: &str, d: i32) {
                     let next = r.parallel.unwrap_or(0) as i64 + d as i64;
                     r.parallel = if next <= 0 { None } else { Some((next as usize).min(*PARALLEL_RANGE.end())) };
                 }
+                "context" => {
+                    let cur = r.context.and_then(|c| CONTEXT_STEPS.iter().position(|s| *s == c).or_else(|| CONTEXT_STEPS.iter().rposition(|s| *s < c)));
+                    let at = cur.map(|i| i as i64 + 1).unwrap_or(0);
+                    let next = (at + d as i64).clamp(0, CONTEXT_STEPS.len() as i64);
+                    r.context = (next > 0).then(|| CONTEXT_STEPS[next as usize - 1]);
+                }
                 "max_tokens" => {
                     let cur = r.max_tokens.unwrap_or(0) as i64;
                     let next = cur + d as i64 * 250_000;
@@ -419,8 +514,20 @@ pub fn apply_edit(app: &mut App, target: &EditTarget, text: &str) {
                     "glyph" => r.glyph = text.trim().chars().next().map(|c| c.to_string()).unwrap_or_default(),
                     "model" => r.model = text.to_string(),
                     "effort" => r.effort = text.to_string(),
-                    "fallback" => r.fallback = parse_fallback(text),
+                    "fallback" | "fallback2" | "fallback3" => {
+                        if let Some(i) = fallback_index(field) {
+                            r.set_fallback(i, parse_fallback(text));
+                        }
+                    }
                     "max_tokens" => r.max_tokens = text.replace(['_', ','], "").trim().parse().ok(),
+                    "context" => {
+                        let t = text.trim();
+                        if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("off") {
+                            r.context = None;
+                        } else if let Some(n) = crate::util::parse_tokens(t) {
+                            r.context = Some(n).filter(|n| *n > 0);
+                        }
+                    }
                     "mcp" => r.mcp = parse_mcp(text),
                     _ => {}
                 }
@@ -526,7 +633,7 @@ fn parse_roots(t: &str) -> Vec<String> {
 /// The pattern validated and, when valid, saved — what every commit ends in. Invalid, it stays
 /// unsaved ("● not saved" in the header, the first reason above the footer) until a later
 /// commit or ctrl+s finds it valid. Returns whether it was saved.
-fn save_pattern(app: &mut App) -> bool {
+pub(crate) fn save_pattern(app: &mut App) -> bool {
     match app.studio.pattern.validate() {
         Ok(()) => match app.studio.pattern.save() {
             Ok(_) => {
@@ -617,14 +724,25 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     } else if app.studio.saved.is_some_and(|t| t.elapsed() < crate::app::SAVED_SHOWN) {
         crumbs.push(Span::styled(format!("  {} saved", theme::g("✓", "ok")), theme::fg(theme::GREEN)));
     }
+    // a run that follows this pattern gets what is saved here
+    if let Some(run) = app.run.as_ref().filter(|r| r.is_active() && r.pattern.name == app.studio.pattern.name) {
+        let used: usize = 9 + crumbs.iter().map(|s| w_of(&s.content)).sum::<usize>() + 12;
+        let room = (area.width as usize).saturating_sub(used);
+        let long = format!("  ◈ the run \"{}\" follows this pattern — changes reach it when you leave (esc) or save (ctrl+s)", trunc(&run.title, 24));
+        let short = "  ◈ a run follows this pattern — applied on esc / ctrl+s".to_string();
+        let t = if area.width >= 110 && w_of(&long) <= room { long } else { trunc(&short, room) };
+        if room >= 12 {
+            crumbs.push(Span::styled(t, theme::fg(theme::TEAL)));
+        }
+    }
     let right = if errs.is_empty() { vec![Span::styled(format!("{} valid ", theme::g("✓", "ok")), theme::fg(theme::GREEN))] } else { vec![Span::styled(format!("{} {} issue(s) ", theme::g("✗", "x"), errs.len()), theme::fg(theme::RED))] };
     header(f, rows[0], crumbs, right);
 
     let wide = rows[1].width >= 120;
     let cols = if wide {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(34), Constraint::Min(40), Constraint::Length(44)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(36), Constraint::Min(40), Constraint::Length(44)]).split(rows[1])
     } else {
-        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(29), Constraint::Min(40)]).split(rows[1])
+        Layout::default().direction(Direction::Horizontal).constraints([Constraint::Length(33), Constraint::Min(40)]).split(rows[1])
     };
     let es = entries(app);
     let sel = sel_index(app);
@@ -645,8 +763,9 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
                 Span::raw(" "),
                 Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
                 Span::styled(format!("{:<13}", trunc(e, 13)), st),
-                // what the space, the glyph and the name leave, a column short of the border
-                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (linner.width as usize).saturating_sub(17)), theme::faint()),
+                crate::ui::provider_mark(&app.registry, &app.registry.resolve(&r.model).provider),
+                // what the space, the glyph, the name and the mark leave, a column short of the border
+                Span::styled(format!(" {}", trunc(&format!("{}·{}", r.model, r.effort), (linner.width as usize).saturating_sub(19))), theme::faint()),
             ])),
             None => {
                 if i > 0 && app.studio.pattern.roles.contains_key(&es[i - 1]) {
@@ -683,7 +802,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
     f.render_widget(fblk, cols[1]);
     // name column as wide as the longest name (settings has a 25-char one); the value column gets
     // the box's inner width less the name, and on the selected row its marker too
-    let nw = fs.iter().map(|f| w_of(f)).max().unwrap_or(0).max(19) + 1;
+    let nw = fs.iter().map(|f| w_of(field_label(f))).max().unwrap_or(0).max(if app.studio.pattern.roles.contains_key(&entry) { 13 } else { 19 }) + 1;
     let fw_all = (finner.width as usize).saturating_sub(2 + nw);
     let editing = app.edit.as_ref().filter(|e| e.target != EditTarget::NewRole);
     // the cursor of a field being edited, as (column, line of `fl`): the scroll is known only later
@@ -704,7 +823,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         if i == fsel {
             sel_line = fl.len();
         }
-        let name = Span::styled(format!("  {fname:<nw$}"), st);
+        let name = Span::styled(format!("  {:<nw$}", field_label(fname)), st);
         match editing.filter(|_| is) {
             // several lines: the field opens under its name, as many lines as there is room for
             Some(e) if e.multiline => {
@@ -729,6 +848,8 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
                 // what ←→ or ⏎ does on the selected field, after its value
                 let mark = match kind {
                     _ if !is => String::new(),
+                    // a model and the fallbacks also open the picker on ⏎ (the short mark when the row is narrow)
+                    Kind::Choice if picker_field(fname) && fw_all >= 40 => format!(" {} · {} list", theme::g("◂ ▸", "< >"), theme::g("⏎", "<enter>")),
                     Kind::Choice | Kind::Toggle | Kind::Step => format!(" {}", theme::g("◂ ▸", "< >")),
                     Kind::Text | Kind::Lines => format!(" {}", theme::g("⏎", "<enter>")),
                     Kind::Action => String::new(),
@@ -747,8 +868,35 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
                     ADD_STEP => if is { theme::bold(theme::accent()) } else { theme::muted() },
                     _ => theme::text(),
                 };
+                // a model (and a fallback) names its provider in the provider's colour
+                let rich: Option<Vec<Span<'static>>> = match (fname.as_str(), app.studio.pattern.roles.get(&entry)) {
+                    ("model" | "fallback" | "fallback2" | "fallback3", Some(r)) => match model_field_alias(r, fname) {
+                        None if fname != "model" => Some(vec![Span::styled("none", theme::dim())]),
+                        None => None,
+                        Some(alias) if app.registry.get(&alias).is_none() => Some(vec![Span::styled(format!("{} · ", trunc(&alias, fw.saturating_sub(17).max(3))), vstyle), Span::styled("not in /models", theme::fg(theme::RED))]),
+                        Some(alias) => {
+                            let m = app.registry.resolve(&alias);
+                            // the model id goes first when the field is too narrow for it and a chip
+                            let full = format!("{alias} · {} · ", m.model);
+                            let prefix = if fw >= w_of(&full) + 6 { full } else { format!("{alias} · ") };
+                            // the chip needs its mark, a space and some name; else the plain text above stands
+                            (fw >= w_of(&prefix) + 6).then(|| {
+                                let room = fw - w_of(&prefix) - 2;
+                                let mut v = vec![Span::styled(prefix, vstyle)];
+                                v.extend(crate::ui::provider_chip(&app.registry, &m.provider, room));
+                                v
+                            })
+                        }
+                    },
+                    _ => None,
+                };
                 if kind == Kind::Action {
                     fl.push(Line::from(vec![Span::styled(format!("  {fname}"), vstyle)]));
+                } else if let Some(spans) = rich {
+                    let mut line = vec![name];
+                    line.extend(spans);
+                    line.push(Span::styled(mark, theme::faint()));
+                    fl.push(Line::from(line));
                 } else {
                     fl.push(Line::from(vec![name, Span::styled(shown, vstyle), Span::styled(mark, theme::faint())]));
                 }
@@ -758,6 +906,18 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         if let Some(h) = field_hint(fname).filter(|_| is && editing.is_none()) {
             let pad = || vec![Span::raw("   ")];
             fl.extend(md::wrap(vec![Span::styled(h, theme::faint())], (finner.width as usize).saturating_sub(3), pad(), pad()));
+        }
+        // what the ceilings come to on each of the role's models
+        if is && editing.is_none() && fname == "context" {
+            if let Some(r) = app.studio.pattern.roles.get(&entry) {
+                fl.extend(md::wrap(vec![Span::styled(format!("now: {}", context_now(app, r)), theme::faint())], (finner.width as usize).saturating_sub(3), vec![Span::raw("   ")], vec![Span::raw("   ")]));
+            }
+        }
+        if is && editing.is_none() && fname == "context_cap" {
+            let first = app.studio.pattern.ordered_roles().into_iter().next().map(|(_, r)| context_now(app, &r));
+            if let Some(t) = first.map(|t| format!("now: {t}")).filter(|t| w_of(t) + 3 <= finner.width as usize) {
+                fl.push(Line::from(Span::styled(format!("   {t}"), theme::faint())));
+            }
         }
         if i == fsel {
             sel_end = fl.len() - 1;
@@ -790,7 +950,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         let p = &app.studio.pattern;
         let rg = |name: &str| -> Vec<Span<'static>> {
             match p.roles.get(name) {
-                Some(r) => vec![Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(name.to_string(), theme::text()), Span::styled(format!(" {}·{}", r.model, r.effort), theme::faint())],
+                Some(r) => vec![Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(name.to_string(), theme::text()), Span::raw(" "), crate::ui::provider_mark(&app.registry, &app.registry.resolve(&r.model).provider), Span::styled(format!(" {}·{}", r.model, r.effort), theme::faint())],
                 None => vec![Span::styled(format!("? {name}"), theme::fg(theme::RED))],
             }
         };
@@ -858,7 +1018,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
 
     // architect
     let acol = if app.studio.focus == 2 { theme::SIGNAL_RED } else { theme::FAINT };
-    let blk = block(&format!("{} architect{} — describe a change, it edits the pattern live", theme::g("★", "*"), if app.studio.focus == 2 { " · FOCUSED" } else { "" }), acol);
+    let blk = block(&format!("{} architect{} — describe a change, it edits the pattern as you watch", theme::g("★", "*"), if app.studio.focus == 2 { " · FOCUSED" } else { "" }), acol);
     let inner = blk.inner(rows[2]);
     f.render_widget(blk, rows[2]);
     let mut al: Vec<Line> = vec![];
@@ -939,15 +1099,18 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "name" => "A new name saves a copy of this pattern under it, and new runs use the copy.",
         "effort" => "auto = Mantra picks per spawn: medium to plan, supervise and gate, low for small and swarm workers, high for finale steps.",
         "parallel" => "How many workers of this role run at once, counted apart from the rest (1-128; worker-swarm has 16). none = it shares the pattern's max_parallel with the other roles without one.",
-        "fallback" => "The model that takes over when this role's model twice produces nothing within first_token_minutes. none = the manager is asked instead.",
+        "fallback" | "fallback2" | "fallback3" => "Tried in order when this role's model cannot go on: a usage limit, no output twice, empty turns twice, or a request its provider rejects. none = the run halts instead.",
+        "context" => "Ceiling on the context of this role's agents. The smallest of this, the pattern's context_cap and the running model's own window wins — also on a fallback model. none = no role limit.",
         "permission" => "never keeps the sandbox and skips prompts. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox. on-request / untrusted asks you (ctrl+g).",
         "swarm" => "Lets this role start a temporary swarm in Solo. Swarm children cannot spawn another swarm.",
+        "claude_user_config" => "inherit = Claude Code agents load your own user settings, hooks and memory. project = only this project's settings — faster starts, and your private rules stay out of the team.",
+        "gate_fix" => "owner = a gate finding goes back to the task's own worker when it is all in that task's files; anything broader goes to a fix worker. fix-worker = always a fresh fix worker.",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",
         "first_token_minutes" => "Minutes a turn may produce nothing before it is restarted; the second time the role's fallback model takes over. off = no deadline.",
         "allow_pattern_changes" => "Let the planner propose workflow edits. F3 toggles this permission for the active run.",
-        "context_cap" => "Run context ceiling: each agent keeps its model's configured window up to this cap. A smaller model window stays smaller. 0 = the model's full window; 200k is the built-in default.",
+        "context_cap" => "Run-wide context ceiling. Each agent gets the smallest of this, its role's context and its model's own window. 0 = no run-wide ceiling.",
         _ => return None,
     })
 }
@@ -1048,6 +1211,7 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
         match app.studio.pattern.validate() {
             Ok(()) => {
                 if save_pattern(app) {
+                    app.sync_run_pattern("the Studio");
                     let path = app.studio.pattern.source_dir.clone().unwrap_or_else(crate::config::patterns_dir).join(format!("{}.toml", crate::util::slug(&app.studio.pattern.name)));
                     app.toast(format!("saved {}", home_rel(&path)), crate::agent::Level::Ok);
                 }
@@ -1117,10 +1281,22 @@ pub fn studio_key(app: &mut App, k: KeyEvent) {
             }
         }
         KeyCode::Right | KeyCode::Enter if list => app.studio.focus = 1,
+        // a fallback is cleared (the chain closes up)
+        KeyCode::Backspace | KeyCode::Delete if !list && field.as_deref().and_then(fallback_index).is_some() && app.studio.pattern.roles.contains_key(&entry) => {
+            if let Some(f) = &field {
+                set_choice(app, &entry, f, "none");
+                save_pattern(app);
+            }
+        }
         KeyCode::Delete => delete(app, &entry, field.as_deref()),
         _ if list => {}
         KeyCode::Left | KeyCode::Right if matches!(kind, Kind::Choice | Kind::Toggle | Kind::Step) => changed(app, if k.code == KeyCode::Left { -1 } else { 1 }),
         KeyCode::Char(c @ ('+' | '-')) if matches!(kind, Kind::Choice | Kind::Toggle) || (kind == Kind::Step && field.as_deref() != Some("glyph")) => changed(app, if c == '-' { -1 } else { 1 }),
+        KeyCode::Char(' ') | KeyCode::Enter if field.as_deref().is_some_and(picker_field) && app.studio.pattern.roles.contains_key(&entry) => {
+            if let Some(f) = field.clone() {
+                app.open_model_picker(PickTarget::StudioField { role: entry.clone(), field: f });
+            }
+        }
         KeyCode::Char(' ') | KeyCode::Enter if matches!(kind, Kind::Choice | Kind::Toggle) => changed(app, 1),
         KeyCode::Enter if kind == Kind::Action => {
             let first_gate = app.studio.pattern.roles.iter().find(|(_, r)| r.kind == "gate").map(|(n, _)| n.clone()).unwrap_or_default();
@@ -1380,6 +1556,32 @@ mod tests {
         assert!(app.studio.pattern.validate().is_ok());
     }
 
+    /// A role's `context` shows none or e.g. 250k, steps through the usual windows, and the editor
+    /// takes 200k / 1M text and clears on none.
+    #[test]
+    fn a_roles_context_limit_steps_and_edits() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        assert!(fields(&app, "planner").contains(&"context".to_string()) && field_hint("context").is_some());
+        assert_eq!(get_value(&app, "planner", "context"), "none");
+        nudge(&mut app, "planner", "context", 1);
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(64_000));
+        nudge(&mut app, "planner", "context", 1);
+        assert_eq!(get_value(&app, "planner", "context"), "128k");
+        nudge(&mut app, "planner", "context", 20);
+        assert_eq!(get_value(&app, "planner", "context"), "1M");
+        let t = EditTarget::RoleField("planner".into(), "context".into());
+        apply_edit(&mut app, &t, "250k");
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(250_000));
+        assert_eq!(get_value(&app, "planner", "context"), "250k");
+        apply_edit(&mut app, &t, "garbage");
+        assert_eq!(app.studio.pattern.roles["planner"].context, Some(250_000), "garbage changes nothing");
+        apply_edit(&mut app, &t, "none");
+        assert_eq!(app.studio.pattern.roles["planner"].context, None);
+        nudge(&mut app, "planner", "context", -1);
+        assert_eq!(app.studio.pattern.roles["planner"].context, None);
+    }
+
     /// The fallback model cycles none → every other alias → none, and the editor's "none" clears it.
     #[test]
     fn the_fallback_cycles_through_none_and_the_other_models() {
@@ -1554,6 +1756,79 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.studio.pattern.roles["worker-small"].instructions, "first\nsecond");
             assert!(!app.studio.dirty);
+        });
+    }
+
+    /// An empty chain shows one fallback row; the next appears once the one before is set.
+    /// The cycle of a fallback skips the role's model and the role's other fallbacks.
+    #[test]
+    fn fallback_rows_appear_in_turn_and_the_cycle_skips_the_taken_models() {
+        let mut app = crate::web::snapshot::tests::test_app();
+        app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+        let has = |app: &App, f: &str| fields(app, "planner").iter().any(|x| x == f);
+        assert!(has(&app, "fallback") && !has(&app, "fallback2") && !has(&app, "fallback3"));
+        assert_eq!((field_label("fallback"), field_label("fallback3"), field_label("effort")), ("fallback 1", "fallback 3", "effort"));
+        nudge(&mut app, "planner", "fallback", 1);
+        let first = app.studio.pattern.roles["planner"].fallback.clone().unwrap();
+        assert!(has(&app, "fallback2") && !has(&app, "fallback3"));
+        let own = app.studio.pattern.roles["planner"].model.clone();
+        let c = choices(&app, "planner", "fallback2");
+        assert!(!c.contains(&own) && !c.contains(&first) && c[0] == "none", "{c:?}");
+        nudge(&mut app, "planner", "fallback2", 1);
+        let second = app.studio.pattern.roles["planner"].fallback2.clone().unwrap();
+        assert_ne!(second, first);
+        assert!(has(&app, "fallback3"));
+        // clearing the first closes the chain up
+        set_choice(&mut app, "planner", "fallback", "none");
+        let r = &app.studio.pattern.roles["planner"];
+        assert_eq!((r.fallback.as_deref(), r.fallback2.as_deref()), (Some(second.as_str()), None));
+        assert!(!has(&app, "fallback3") || r.fallback_chain().len() > 1);
+    }
+
+    /// ⏎ on a model or fallback row opens the picker on that field; Backspace clears a fallback.
+    #[test]
+    fn enter_on_a_model_field_opens_the_picker_and_backspace_clears_a_fallback() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            on_field(&mut app, "planner", "fallback");
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(app.overlays.last(), Some(crate::app::Overlay::ModelPicker { target: PickTarget::StudioField { role, field }, role_scope: false, filter, .. }) if role == "planner" && field == "fallback" && filter.is_empty()));
+            app.overlays.clear();
+            on_field(&mut app, "planner", "model");
+            press(&mut app, KeyCode::Char(' '));
+            assert!(matches!(app.overlays.last(), Some(crate::app::Overlay::ModelPicker { target: PickTarget::StudioField { field, .. }, .. }) if field == "model"));
+            app.overlays.clear();
+            on_field(&mut app, "planner", "fallback");
+            nudge(&mut app, "planner", "fallback", 1);
+            assert!(app.studio.pattern.roles["planner"].fallback.is_some());
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(app.studio.pattern.roles["planner"].fallback, None);
+        });
+    }
+
+    /// The form draws the fallback rows, the context row with its live line, and the roles list
+    /// with a space after the provider mark.
+    #[test]
+    fn the_role_form_draws_fallbacks_and_context_and_the_list_spaces_the_mark() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            app.studio.pattern = crate::engine::pattern::Pattern::builtin();
+            let r = app.studio.pattern.roles.get_mut("planner").unwrap();
+            r.fallback = Some("luna".into());
+            r.fallback2 = Some("gone-model".into());
+            r.context = Some(128_000);
+            on_field(&mut app, "planner", "context");
+            for w in [80u16, 112, 140] {
+                let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 44)).unwrap();
+                term.draw(|f| draw_studio(f, &mut app)).unwrap();
+                let b = term.backend().buffer();
+                let screen: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+                for want in ["fallback 1", "fallback 2", "fallback 3", "not in /models", "now: "] {
+                    assert!(screen.contains(want), "{w}: {want}\n{screen}");
+                }
+                assert!(screen.contains("■ ") && !screen.contains("■astra") && !screen.contains("■planner"), "{w}\n{screen}");
+            }
         });
     }
 }

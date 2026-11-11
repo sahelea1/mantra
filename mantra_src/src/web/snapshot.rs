@@ -82,6 +82,9 @@ pub struct ModelInfo {
     pub model: String,
     pub provider: String,
     pub provider_name: String,
+    /// The provider's colour name (`Registry::provider_color`), for the chip beside its name.
+    #[serde(default)]
+    pub provider_color: String,
     /// "codex" | "claude-code"
     pub backend: String,
     pub efforts: Vec<String>,
@@ -115,6 +118,12 @@ pub struct PatternRoleView {
     /// Model alias used when this role's model gives no first token in time (`Role.fallback`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// The whole fallback chain in order (`Role::fallback_chain`); `fallback` is its first.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    /// The role's own context limit in tokens (`Role.context`).
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 /// A pattern the start-run picker offers: built-ins first (in `Pattern::names()` order), then the
@@ -466,6 +475,14 @@ pub struct PlannerWaitView {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct FixPayload {
+    pub round: u32,
+    pub owner: Option<String>,
+    pub agent: Option<u32>,
+    pub returning: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RunView {
     pub id: String,
     /// The run's name for people (the plan's title, else the goal's first words); `id` stays the key.
@@ -487,6 +504,12 @@ pub struct RunView {
     pub completion_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_wait: Option<PlannerWaitView>,
+    /// The gate fix being drawn (WP-5.5): `null` outside a fix and the checks that follow it.
+    #[serde(default)]
+    pub fix: Option<FixPayload>,
+    /// `[round, max]` of the QA gate (round 0 outside the gate).
+    #[serde(default)]
+    pub gate_round: [u32; 2],
     pub plan_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner: Option<u32>,
@@ -1017,15 +1040,15 @@ fn stage_view(s: &Stage) -> StageView {
 /// respawned while the run is halted), so the web band offers Resume, not Retry, for those.
 /// A gate or turn retry is that band's "Retry gate" / "Retry turn" button, not a Resume.
 fn web_hint(hint: &str, reason: &HaltReason) -> String {
-    let h = hint.replace("space resumes once", "Resume once").replace("then space resumes", "then Resume").replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again");
+    let h = hint.replace("space resumes once", "Resume once").replace("then space resumes", "then Resume").replace("space retries the gate", "Retry gate runs it again").replace("space retries the turn", "Retry turn runs it again").replace("space retries its turn", "Retry turn runs it again");
     let mut h = h.replace("space ", "Resume ").replace("then space", "then Resume");
     if matches!(reason, HaltReason::ProviderRejected | HaltReason::Environment) {
         h = h.replace(" · r retry", ", then Resume").replace("then r retry", "then Resume");
     }
-    if h == "space resume" || h == "Resume resume" {
+    if h == "space resume" || h == "Resume resume" || h == "Resume resumes" {
         h = "Resume".into();
     }
-    h.replace("r respawn ", "Respawn ").replace("r retry", "Retry").replace("m switch model ", "Switch model ").replace("space retries", "Resume retries")
+    h.replace("r respawns ", "Respawn ").replace("r respawn ", "Respawn ").replace("r gives ", "Retry ").replace(" one more attempt", "").replace("m picks another model", "Switch model").replace("r retry", "Retry").replace("m switch model ", "Switch model ").replace("space retries", "Resume retries")
 }
 
 /// An `AttemptsExhausted` halt carries no agent: `spawn_task` refuses the respawn (and escalates)
@@ -1091,6 +1114,8 @@ pub fn run_view(app: &App, r: &Run) -> RunView {
         planner_loop: r.pattern.settings.planner_loop,
         completion_summary: (r.pattern.settings.planner_loop && !r.handoff.is_empty() && r.stage == Stage::Done).then(|| r.handoff.clone()),
         planner_wait: r.planner_wait_info().map(|w| PlannerWaitView { due_at: w.due_unix.saturating_mul(1000), condition: w.condition.clone() }),
+        fix: r.fix_view().map(|f| FixPayload { round: f.round, owner: f.owner, agent: f.agent, returning: f.returning }),
+        gate_round: { let (a, b) = r.gate_rounds(); [a, b] },
         plan_version: r.plan_version,
         planner: r.planner,
         manager: r.manager,
@@ -1232,6 +1257,7 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 model: m.model.clone(),
                 provider: m.provider.clone(),
                 provider_name: app.registry.provider_name(&m.provider),
+                provider_color: app.registry.provider_color(&m.provider).into(),
                 backend: backend_str(app.registry.backend_of(m)).into(),
                 efforts: m.efforts(),
                 default_effort: m.default_effort.clone(),
@@ -1246,7 +1272,11 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
             .map(|p| p.ordered_roles())
             .unwrap_or_default()
             .into_iter()
-            .map(|(name, role)| PatternRoleView {
+            .map(|(name, role)| {
+            let fallbacks = role.fallback_chain();
+            PatternRoleView {
+                fallbacks: fallbacks.clone(),
+                context: role.context,
                 name,
                 kind: role.kind,
                 glyph: role.glyph,
@@ -1256,8 +1286,8 @@ pub fn app_info(app: &App, env: &Env, patterns: &[PatternInfoView]) -> AppInfo {
                 effort: role.effort,
                 sandbox: role.sandbox,
                 can_spawn_swarm: role.can_spawn_swarm,
-                fallback: role.fallback,
-            })
+                fallback: fallbacks.first().cloned(),
+            }})
             .collect(),
         push_enabled: env.push,
         tls: env.tls,
@@ -1612,6 +1642,10 @@ pub(crate) mod tests {
             idle_prompts: vec![],
             transient: false,
             model: None,
+            status_asked: false,
+            active: std::time::Duration::ZERO,
+            superseded: false,
+            owner_fix_failed: false, owner_fixing: None, fix_started: None,
         }
     }
 
@@ -1759,6 +1793,22 @@ pub(crate) mod tests {
         assert_eq!(json["stage"]["label"], "phase 1 · fix r2");
     }
 
+    #[test]
+    fn the_run_payload_carries_the_gate_fix_and_round() {
+        let app = test_app();
+        let mut run = crate::engine::run::Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert!(json["fix"].is_null(), "{json}");
+        assert_eq!(json["gate_round"][0], 0);
+        run.stage = Stage::Phase { idx: 0, step: PhaseStep::Fix { round: 2 } };
+        let json = serde_json::to_value(run_view(&app, &run)).unwrap();
+        assert_eq!(json["fix"]["round"], 2);
+        assert_eq!(json["fix"]["returning"], false);
+        assert!(json["fix"]["owner"].is_null());
+        assert_eq!(json["gate_round"][0], 2);
+        assert_eq!(json["gate_round"][1], run.pattern.settings.gate_max_rounds);
+    }
+
     /// Token counts travel with their cached share — per agent and for the run — so the web
     /// chips and the run hero can read a big total as what it mostly was.
     #[test]
@@ -1852,6 +1902,8 @@ pub(crate) mod tests {
         app.pattern_name = "my-split".into();
         app.project = dir.clone();
         own.roles.get_mut("planner").unwrap().fallback = Some("backup".into());
+        own.roles.get_mut("planner").unwrap().fallback2 = Some("backup2".into());
+        own.roles.get_mut("planner").unwrap().context = Some(200_000);
         own.roles.get_mut("planner").unwrap().can_spawn_swarm = true;
         std::fs::write(pats.join("my-split.toml"), own.to_toml()).unwrap();
         let info = app_info(&app, &Env::default(), &pattern_list(&dir));
@@ -1860,6 +1912,8 @@ pub(crate) mod tests {
         let roles = json["pattern_roles"].as_array().unwrap();
         let planner = roles.iter().find(|r| r["name"] == "planner").unwrap();
         assert_eq!(planner["fallback"], "backup");
+        assert_eq!((planner["fallbacks"].clone(), planner["context"].clone()), (serde_json::json!(["backup", "backup2"]), serde_json::json!(200_000)));
+        assert!(json["models"].as_array().unwrap().iter().all(|m| m["provider_color"].as_str().is_some_and(|c| !c.is_empty())), "every model entry carries its provider's colour");
         assert_eq!(planner["can_spawn_swarm"], true);
         assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r.get("fallback").is_none()));
         assert!(roles.iter().filter(|r| r["name"] != "planner").all(|r| r["can_spawn_swarm"] == false), "the default role snapshot opts out");

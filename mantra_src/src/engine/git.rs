@@ -26,6 +26,10 @@ pub struct Workspace {
     /// the worktrees had something to branch from. Logged once, when the run starts.
     #[serde(default)]
     pub initial_commit: bool,
+    /// Not a repository itself, but holding some (relative to `integ`): shared mode only. QA
+    /// diffs these (`review_diff`) instead of finding nothing.
+    #[serde(default)]
+    pub nested: Vec<PathBuf>,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -171,6 +175,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
         note,
         base_commit: None,
         initial_commit: false,
+        nested: vec![],
     };
     if isolation == "shared" {
         return Ok(shared(None));
@@ -181,7 +186,13 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
             if isolation == "worktree" {
                 return Err("isolation = worktree needs a git repository".into());
             }
-            return Ok(shared(Some("not a git repo — workers share the project directory".into())));
+            let mut ws = shared(Some("not a git repo — workers share the project directory".into()));
+            ws.nested = nested_repos(project);
+            if !ws.nested.is_empty() {
+                let names: Vec<String> = ws.nested.iter().take(4).map(|p| p.display().to_string()).collect();
+                ws.note = Some(format!("not a git repo — workers share the project directory; {} repositories inside it ({}) are diffed for QA", ws.nested.len(), names.join(", ")));
+            }
+            return Ok(ws);
         }
     };
     // `git init` and nothing else: an unborn HEAD has nothing to branch a worktree from. One empty
@@ -225,6 +236,7 @@ pub fn setup(project: &Path, run_id: &str, isolation: &str) -> Result<Workspace,
             _ => None,
         },
         initial_commit,
+        nested: vec![],
     })
 }
 
@@ -281,6 +293,24 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<bool, String> {
     protect_decisions(dir)?;
     commit(dir, &["-q", "-m", message])?;
     Ok(true)
+}
+
+/// Bring a worker's worktree up to the integration branch before it repairs its own work
+/// (other tasks' merges, an earlier fix). Commits what the worker left uncommitted first.
+/// `Err` = it does not merge cleanly (the merge is aborted; the worktree is as before).
+pub fn sync_worker(ws: &Workspace, dir: &Path) -> Result<(), String> {
+    if !ws.worktree || dir == ws.integ {
+        return Ok(());
+    }
+    // a generic fix worker edits the integrated copy and nothing commits that until the phase
+    // commit: without this the merge below would not carry those edits
+    commit_all(&ws.integ, "mantra: integrated state before a repair")?;
+    commit_all(dir, "mantra: before fix")?;
+    if let Err(e) = git_with_identity(dir, &["merge", "--no-edit", &ws.branch]) {
+        let _ = git(dir, &["merge", "--abort"]);
+        return Err(format!("the task's worktree does not merge with the integrated copy: {}", e.lines().next().unwrap_or("")));
+    }
+    Ok(())
 }
 
 pub struct MergeResult {
@@ -445,10 +475,10 @@ const DIFF_EXCLUDES: &[&str] = &[":(exclude)*.lock", ":(exclude)package-lock.jso
 /// Blocking — run it on a background thread. Worktree mode marks new files "intent to add" first
 /// (Mantra commits everything with `add -A` anyway) so they show up as additions; in shared mode
 /// the user's index is left alone and untracked files are only listed.
-pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize) -> ReviewDiff {
+pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize, bases: &[(PathBuf, String)]) -> ReviewDiff {
     let dir = ws.integ.as_path();
     if git(dir, &["rev-parse", "--git-dir"]).is_err() {
-        return ReviewDiff::default();
+        return if !ws.worktree && !ws.nested.is_empty() { nested_review_diff(ws, max_bytes, bases) } else { ReviewDiff::default() };
     }
     let base = if ws.worktree {
         let phase = (span == DiffSpan::Phase).then(|| git(dir, &["log", "-1", "--format=%H", "--grep=^mantra: phase ", "HEAD"]).ok().filter(|h| !h.is_empty())).flatten();
@@ -487,6 +517,108 @@ pub fn review_diff(ws: &Workspace, span: DiffSpan, max_bytes: usize) -> ReviewDi
         diff.truncate(cut);
     }
     ReviewDiff { stat, diff, truncated }
+}
+
+/// Git work trees directly inside a non-repository project directory, at most two levels deep
+/// (`a/.git`, `a/b/.git`), as paths relative to `project`, sorted; hidden directories and anything
+/// over 200 entries per directory are skipped.
+pub fn nested_repos(project: &Path) -> Vec<PathBuf> {
+    fn subdirs(dir: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+        rd.take(200)
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.') && e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect()
+    }
+    let mut found = vec![];
+    for a in subdirs(project) {
+        if a.join(".git").exists() {
+            found.push(a);
+            continue;
+        }
+        for b in subdirs(&a) {
+            if b.join(".git").exists() {
+                found.push(b);
+            }
+        }
+    }
+    let mut rel: Vec<PathBuf> = found.iter().filter_map(|p| p.strip_prefix(project).ok().map(Path::to_path_buf)).collect();
+    rel.sort();
+    rel
+}
+
+/// `HEAD` of each nested repository (`repo\tsha` lines): the base of the phase about to start.
+pub fn nested_heads(ws: &Workspace) -> Vec<(PathBuf, String)> {
+    ws.nested.iter().filter_map(|r| git(&ws.integ.join(r), &["rev-parse", "HEAD"]).ok().filter(|h| !h.is_empty()).map(|h| (r.clone(), h))).collect()
+}
+
+/// What `dir` looks like as a git work tree: `HEAD`, `status --porcelain` and the whole `git diff`,
+/// one text. `None` when `dir` is not a work tree.
+fn tree_print_of(dir: &Path) -> Option<String> {
+    git(dir, &["rev-parse", "--is-inside-work-tree"]).ok().filter(|t| t == "true")?;
+    let head = git(dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let status = git(dir, &["status", "--porcelain"]).unwrap_or_default();
+    let diff = git(dir, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD"]).unwrap_or_default();
+    Some(format!("{head}\n{status}\n{diff}"))
+}
+
+/// A fingerprint source for the workspace after the checks ran (WP-2.9): the work tree's own
+/// `tree_print_of`, or — for a shared directory that is not a repository — that of every nested
+/// repository, one after the other. `None` when there is no git state to look at. The caller
+/// hashes it.
+pub fn tree_print(dir: &Path, ws: Option<&Workspace>) -> Option<String> {
+    if let Some(p) = tree_print_of(dir) {
+        return Some(p);
+    }
+    let ws = ws?;
+    let parts: Vec<String> = ws.nested.iter().filter_map(|r| tree_print_of(&ws.integ.join(r)).map(|p| format!("{}\n{p}", r.display()))).collect();
+    if parts.is_empty() { None } else { Some(parts.join("\n--\n")) }
+}
+
+/// The review of a shared, non-repository project: each nested repository's working tree against
+/// its base, under a heading, `max_bytes` split evenly between those with changes.
+fn nested_review_diff(ws: &Workspace, max_bytes: usize, bases: &[(PathBuf, String)]) -> ReviewDiff {
+    let mut parts: Vec<(String, String, String)> = vec![];
+    for rel in &ws.nested {
+        let Some((_, b)) = bases.iter().find(|(r, _)| r == rel) else { continue };
+        let dir = ws.integ.join(rel);
+        let mut stat_args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat=100", b.as_str(), "--"];
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", b.as_str(), "--"];
+        for a in [&mut args, &mut stat_args] {
+            a.push(".");
+            a.extend(DIFF_EXCLUDES.iter().copied());
+        }
+        let mut stat = git(&dir, &stat_args).unwrap_or_default();
+        let diff = git(&dir, &args).unwrap_or_default();
+        let fresh = git(&dir, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+        let list: Vec<&str> = fresh.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !list.is_empty() {
+            let shown = list.iter().take(30).copied().collect::<Vec<_>>().join(", ");
+            let more = if list.len() > 30 { format!(" … and {} more", list.len() - 30) } else { String::new() };
+            stat.push_str(&format!("\nuntracked (new) files: {shown}{more}"));
+        }
+        if stat.trim().is_empty() && diff.trim().is_empty() {
+            continue;
+        }
+        let head = format!("## repository {} (since {})", rel.display(), &b[..b.len().min(8)]);
+        parts.push((head, stat, diff));
+    }
+    let each = max_bytes / parts.len().max(1);
+    let mut out = ReviewDiff::default();
+    for (head, stat, mut diff) in parts {
+        if diff.len() > each {
+            let mut cut = each;
+            while cut > 0 && !diff.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            diff.truncate(cut);
+            out.truncated = true;
+        }
+        out.stat.push_str(&format!("{head}\n{}\n\n", stat.trim()));
+        out.diff.push_str(&format!("{head}\n{}\n\n", diff.trim()));
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -551,51 +683,93 @@ pub fn discard_check_artifacts(dir: &Path, before: &StatusSnapshot) -> Vec<Strin
     dropped
 }
 
-pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration) -> Vec<CheckResult> {
+/// The shell gate checks run in: `bash` when there is one (checks are written for it), else `sh`.
+fn check_shell() -> &'static str {
+    static SHELL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
+            return "bash";
+        }
+        let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join("bash").is_file())).unwrap_or(false);
+        if on_path { "bash" } else { "sh" }
+    })
+}
+
+/// One run of `cmd` (stderr folded into stdout by its own first line, so a heredoc terminator at
+/// the end of `cmd` stays alone on its line). Returns the exit code (`None`: timeout or lost) and
+/// the whole output.
+fn run_one_check(dir: &Path, cmd: &str, timeout: Duration, trace: bool) -> Result<(Option<i32>, String), String> {
+    let start = Instant::now();
+    let mut c = Command::new(check_shell());
+    if trace {
+        c.arg("-x");
+    }
+    let child = c.arg("-c").arg(format!("exec 2>&1\n{cmd}")).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let mut child = child.map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut o) = stdout {
+            use std::io::Read;
+            let mut buf = vec![];
+            let _ = o.read_to_end(&mut buf);
+            s = String::from_utf8_lossy(&buf).into_owned();
+        }
+        s
+    });
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code(),
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break None,
+        }
+    };
+    Ok((code, reader.join().unwrap_or_default()))
+}
+
+/// Run the gate checks in order. With `log_dir`, the full output of every check is also written
+/// to `{log_dir}/{label}.log`.
+pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration, log_dir: Option<&Path>, label: &str) -> Vec<CheckResult> {
     let mut out = vec![];
+    let mut log = String::new();
     for cmd in cmds {
         let start = Instant::now();
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{cmd} 2>&1"))
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
+        let (code, full) = match run_one_check(dir, cmd, timeout, false) {
+            Ok(r) => r,
             Err(e) => {
-                out.push(CheckResult { cmd: cmd.clone(), ok: false, code: None, output: e.to_string(), secs: 0 });
+                log.push_str(&format!("$ {cmd}\nexit error\n0s\n{e}\n\n"));
+                out.push(CheckResult { cmd: cmd.clone(), ok: false, code: None, output: e, secs: 0 });
                 continue;
             }
         };
-        let stdout = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut o) = stdout {
-                use std::io::Read;
-                let _ = o.read_to_string(&mut s);
-            }
-            s
-        });
-        let code = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st.code(),
-                Ok(None) if start.elapsed() > timeout => {
-                    let _ = child.kill();
-                    break None;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break None,
-            }
-        };
-        let mut output = reader.join().unwrap_or_default();
+        let mut output = full.clone();
         crate::util::tail_bytes(&mut output, 6000);
         if code.is_none() {
             output.push_str("\n[mantra] check timed out");
         }
-        out.push(CheckResult { cmd: cmd.clone(), ok: code == Some(0), code, output, secs: start.elapsed().as_secs() });
+        // A failing check that printed nothing: run it once more with a trace, so QA can see which clause failed.
+        if code.is_some() && code != Some(0) && output.trim().is_empty() {
+            if let Ok((_, traced)) = run_one_check(dir, cmd, timeout, true) {
+                let mut t = traced;
+                crate::util::tail_bytes(&mut t, 2000);
+                output = format!("[mantra] no output — trace of a second run (bash -x):\n{t}");
+            }
+        }
+        let secs = start.elapsed().as_secs();
+        log.push_str(&format!("$ {cmd}\nexit {}\n{secs}s\n{full}\n", code.map(|c| c.to_string()).unwrap_or_else(|| "timeout".into())));
+        if !full.ends_with('\n') {
+            log.push('\n');
+        }
+        out.push(CheckResult { cmd: cmd.clone(), ok: code == Some(0), code, output, secs });
+    }
+    if let Some(d) = log_dir {
+        if std::fs::create_dir_all(d).is_ok() {
+            let _ = std::fs::write(d.join(format!("{label}.log")), log);
+        }
     }
     out
 }
@@ -625,6 +799,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worker);
         git(dir, &["worktree", "add", "-q", "-b", "test-worker", &worker.to_string_lossy(), "HEAD"]).unwrap();
         worker
+    }
+
+    fn check_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mantra-checks-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_heredoc_check_passes_and_keeps_its_output() {
+        let dir = check_dir("heredoc");
+        let res = run_checks(&dir, &["cat <<'EOS'\nhello\nEOS".to_string()], Duration::from_secs(10), None, "t");
+        assert!(res[0].ok, "{:?}", res[0]);
+        assert_eq!(res[0].output, "hello\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_python_heredoc_check_passes() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = check_dir("pyheredoc");
+        let res = run_checks(&dir, &["python3 - <<'EOS'\nprint(1)\nEOS".to_string()], Duration::from_secs(10), None, "t");
+        assert!(res[0].ok, "{:?}", res[0]);
+        assert_eq!(res[0].output.trim(), "1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_silent_failing_check_gets_a_trace_and_the_log_keeps_every_command() {
+        let dir = check_dir("trace");
+        let logs = dir.join("logs");
+        let cmds = vec!["echo fine".to_string(), "false".to_string()];
+        let res = run_checks(&dir, &cmds, Duration::from_secs(10), Some(&logs), "phase-1-checks-1");
+        assert!(res[0].ok);
+        assert!(!res[1].ok);
+        assert_eq!(res[1].code, Some(1));
+        assert!(res[1].output.contains("trace of a second run"), "{:?}", res[1].output);
+        let log = std::fs::read_to_string(logs.join("phase-1-checks-1.log")).unwrap();
+        assert!(log.contains("$ echo fine") && log.contains("$ false") && log.contains("exit 1") && log.contains("fine\n"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -776,7 +993,7 @@ mod tests {
         std::fs::write(dir.join("worker.txt"), "by a worker\n").unwrap();
         let before = status_snapshot(&dir).unwrap();
         let cmds = vec!["mkdir -p __pycache__ && echo x > __pycache__/t.pyc && echo two >> tracked.txt && echo l > run.log".to_string()];
-        let res = run_checks(&dir, &cmds, Duration::from_secs(10));
+        let res = run_checks(&dir, &cmds, Duration::from_secs(10), None, "t");
         assert!(res[0].ok, "{}", res[0].output);
         let mut dropped = discard_check_artifacts(&dir, &before);
         dropped.sort();
@@ -808,7 +1025,7 @@ mod tests {
         assert_eq!(before.get("def").map(String::as_str), Some("R "), "{before:?}");
         assert_eq!(before.get("zzz.txt").map(String::as_str), Some("??"), "{before:?}");
         assert!(!before.contains_key("abc"), "the rename source is not an entry: {before:?}");
-        let res = run_checks(&dir, &["echo x > scratch.txt".to_string()], Duration::from_secs(10));
+        let res = run_checks(&dir, &["echo x > scratch.txt".to_string()], Duration::from_secs(10), None, "t");
         assert!(res[0].ok);
         assert_eq!(discard_check_artifacts(&dir, &before), vec!["scratch.txt"]);
         assert!(dir.join("zzz.txt").exists(), "a worker's file is never deleted");
@@ -816,7 +1033,7 @@ mod tests {
     }
 
     fn test_ws(dir: &Path, base: Option<String>) -> Workspace {
-        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base, initial_commit: false }
+        Workspace { worktree: true, repo: dir.to_path_buf(), integ: dir.to_path_buf(), branch: "main".into(), base_branch: "main".into(), git_common_dir: None, note: None, base_commit: base, initial_commit: false, nested: vec![] }
     }
 
     #[test]
@@ -831,13 +1048,13 @@ mod tests {
         std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.join("Cargo.lock"), "lock\n").unwrap();
         let ws = test_ws(&dir, Some(base));
-        let phase = review_diff(&ws, DiffSpan::Phase, 100_000);
+        let phase = review_diff(&ws, DiffSpan::Phase, 100_000, &[]);
         assert!(phase.stat.contains("tracked.txt") && phase.stat.contains("new.rs"), "{}", phase.stat);
         assert!(!phase.stat.contains("one.txt"), "phase one is already committed: {}", phase.stat);
         assert!(!phase.stat.contains("Cargo.lock") && !phase.diff.contains("Cargo.lock"), "lockfiles stay out");
         assert!(phase.diff.contains("+two") && phase.diff.contains("+fn main() {}"), "{}", phase.diff);
         assert!(!phase.truncated);
-        let run = review_diff(&ws, DiffSpan::Run, 100_000);
+        let run = review_diff(&ws, DiffSpan::Run, 100_000, &[]);
         assert!(run.stat.contains("one.txt") && run.stat.contains("new.rs"), "the run reaches back to its base: {}", run.stat);
         assert!(run.render().contains("one.txt"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -848,7 +1065,7 @@ mod tests {
         let dir = temp_repo("review-cap");
         std::fs::write(dir.join("big.txt"), "é".repeat(5000)).unwrap();
         let ws = test_ws(&dir, None);
-        let d = review_diff(&ws, DiffSpan::Phase, 1000);
+        let d = review_diff(&ws, DiffSpan::Phase, 1000, &[]);
         assert!(d.truncated);
         assert!(d.diff.len() <= 1000, "{}", d.diff.len());
         assert!(d.render().contains("diff cut here"));
@@ -862,7 +1079,7 @@ mod tests {
         std::fs::write(dir.join("fresh.txt"), "new\n").unwrap();
         let mut ws = test_ws(&dir, None);
         ws.worktree = false;
-        let d = review_diff(&ws, DiffSpan::Phase, 100_000);
+        let d = review_diff(&ws, DiffSpan::Phase, 100_000, &[]);
         assert!(d.stat.contains("tracked.txt"), "{}", d.stat);
         assert!(d.stat.contains("untracked (new) files: fresh.txt"), "{}", d.stat);
         let status = git(&dir, &["status", "--porcelain"]).unwrap();
@@ -875,9 +1092,66 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mantra-git-norepo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ws = test_ws(&dir, None);
-        let d = review_diff(&ws, DiffSpan::Run, 1000);
+        let d = review_diff(&ws, DiffSpan::Run, 1000, &[]);
         assert!(d.is_empty());
         assert!(d.render().contains("no git diff"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_repos_finds_two_levels_and_skips_hidden_and_deeper() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for p in ["a/.git", "b/c/.git", "b/c/d/.git", ".hidden/.git", "x/y/z/.git"] {
+            std::fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        assert_eq!(nested_repos(&dir), vec![PathBuf::from("a"), PathBuf::from("b/c")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_print_changes_with_the_work_and_covers_nested_repositories() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        git(&app, &["init", "-q"]).unwrap();
+        std::fs::write(app.join("f.txt"), "one\n").unwrap();
+        commit_all(&app, "init").unwrap();
+        assert!(tree_print(&dir.join("nope"), None).is_none());
+        let ws = setup(&dir, "p1", "auto").unwrap();
+        let before = tree_print(&dir, Some(&ws)).expect("the nested repository is looked at");
+        assert_eq!(tree_print(&dir, Some(&ws)).unwrap(), before, "no change, same print");
+        std::fs::write(app.join("f.txt"), "two\n").unwrap();
+        assert_ne!(tree_print(&dir, Some(&ws)).unwrap(), before);
+        assert_ne!(tree_print(&app, None).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_diff_of_a_non_repo_with_a_nested_repo_shows_work_since_the_base() {
+        let dir = std::env::temp_dir().join(format!("mantra-git-nested-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, clean) = (dir.join("app"), dir.join("clean"));
+        for r in [&a, &clean] {
+            std::fs::create_dir_all(r).unwrap();
+            git(r, &["init", "-q"]).unwrap();
+            std::fs::write(r.join("f.txt"), "one\n").unwrap();
+            commit_all(r, "init").unwrap();
+        }
+        let ws = setup(&dir, "n1", "auto").unwrap();
+        assert!(!ws.worktree);
+        assert_eq!(ws.nested, vec![PathBuf::from("app"), PathBuf::from("clean")]);
+        assert!(ws.note.as_deref().unwrap().contains("2 repositories inside it (app, clean) are diffed for QA"), "{:?}", ws.note);
+        let bases = nested_heads(&ws);
+        assert_eq!(bases.len(), 2);
+        assert!(review_diff(&ws, DiffSpan::Phase, 100_000, &bases).is_empty());
+        std::fs::write(a.join("f.txt"), "one\ntwo\n").unwrap();
+        commit_all(&a, "work").unwrap();
+        let d = review_diff(&ws, DiffSpan::Phase, 100_000, &bases);
+        assert!(d.diff.contains("## repository app (since "), "{}", d.diff);
+        assert!(d.diff.contains("+two"), "{}", d.diff);
+        assert!(!d.render().contains("clean"), "a clean repository contributes nothing: {}", d.render());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -886,7 +1160,7 @@ mod tests {
         let dir = temp_repo("clean");
         std::fs::write(dir.join("tracked.txt"), "edited by a worker\n").unwrap();
         let before = status_snapshot(&dir).unwrap();
-        let res = run_checks(&dir, &["true".to_string()], Duration::from_secs(10));
+        let res = run_checks(&dir, &["true".to_string()], Duration::from_secs(10), None, "t");
         assert!(res[0].ok);
         assert!(discard_check_artifacts(&dir, &before).is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "edited by a worker\n");
@@ -946,5 +1220,58 @@ mod tests {
             let _ = std::fs::remove_dir_all(&plain);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+    #[test]
+    fn sync_worker_carries_uncommitted_edits_of_the_integrated_copy() {
+        let dir = temp_repo("syncinteg");
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let mut ws = test_ws(&dir, None);
+        ws.branch = branch;
+        let worker = worker_repo(&dir, "syncinteg");
+        // a generic fix worker edited the integrated copy; nothing committed it
+        std::fs::write(dir.join("tracked.txt"), "fixed in integ\n").unwrap();
+        sync_worker(&ws, &worker).unwrap();
+        assert_eq!(std::fs::read_to_string(worker.join("tracked.txt")).unwrap(), "fixed in integ\n");
+        // the owner now changes the same file and its branch merges without a "would be overwritten"
+        std::fs::write(worker.join("tracked.txt"), "fixed in integ\nowner\n").unwrap();
+        commit_all(&worker, "owner repair").unwrap();
+        let wbranch = git(&worker, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let m = merge_workers(&ws, &[("t1".to_string(), worker.clone(), wbranch)]);
+        assert!(m.blocked.is_empty(), "{:?}", m.blocked);
+        assert!(m.conflicts.is_empty(), "{:?}", m.conflicts);
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "fixed in integ\nowner\n");
+        let _ = git(&dir, &["worktree", "remove", "--force", &worker.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn sync_worker_brings_in_the_integrated_state_and_a_conflict_leaves_the_worktree_clean() {
+        let dir = temp_repo("sync");
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let mut ws = test_ws(&dir, None);
+        ws.branch = branch;
+        let worker = worker_repo(&dir, "sync");
+        // another task's work lands on the integration branch; this worker has an uncommitted file
+        std::fs::write(dir.join("other.txt"), "theirs\n").unwrap();
+        commit_all(&dir, "other task").unwrap();
+        std::fs::write(worker.join("mine.txt"), "mine\n").unwrap();
+        sync_worker(&ws, &worker).unwrap();
+        assert_eq!(std::fs::read_to_string(worker.join("other.txt")).unwrap(), "theirs\n");
+        assert!(worker.join("mine.txt").exists(), "its own work is kept");
+        assert_eq!(git(&worker, &["status", "--porcelain"]).unwrap(), "", "its leftovers were committed first");
+        // a shared workspace has nothing to sync
+        let mut shared = ws.clone();
+        shared.worktree = false;
+        assert!(sync_worker(&shared, &worker).is_ok());
+        // both sides change the same line: Err, the merge is aborted, nothing is left half-done
+        std::fs::write(dir.join("tracked.txt"), "integrated\n").unwrap();
+        commit_all(&dir, "integrated edit").unwrap();
+        std::fs::write(worker.join("tracked.txt"), "worker\n").unwrap();
+        let e = sync_worker(&ws, &worker).unwrap_err();
+        assert!(e.starts_with("the task's worktree does not merge with the integrated copy"), "{e}");
+        assert_eq!(git(&worker, &["status", "--porcelain"]).unwrap(), "");
+        assert!(git(&worker, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_err(), "no merge in progress");
+        assert_eq!(std::fs::read_to_string(worker.join("tracked.txt")).unwrap(), "worker\n");
+        let _ = git(&dir, &["worktree", "remove", "--force", &worker.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

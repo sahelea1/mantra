@@ -152,7 +152,9 @@ fn clean(text: &str) -> Result<String, String> {
     }
     let n = text.chars().count();
     if n > MAX_NOTE_CHARS {
-        return Err(format!("a note holds at most {MAX_NOTE_CHARS} characters (this one has {n}): say it shorter, or split it into separate notes"));
+        let head: Vec<char> = text.chars().take(MAX_NOTE_CHARS).collect();
+        let tail: String = head[head.len().saturating_sub(40)..].iter().collect();
+        return Err(format!("a note holds at most {MAX_NOTE_CHARS} characters (this one has {n}): say it shorter, or split it into separate notes. The first {MAX_NOTE_CHARS} characters end at: \"…{tail}\"."));
     }
     Ok(text.to_string())
 }
@@ -469,6 +471,7 @@ mod tests {
         let long = "x".repeat(MAX_NOTE_CHARS + 1);
         let e = b.note("w1", &long, false, 0).unwrap_err();
         assert!(e.contains("at most 1000") && e.contains("1001"), "{e}");
+        assert!(e.ends_with(&format!("end at: \"…{}\".", "x".repeat(40))), "{e}");
         assert_eq!(Block::new("g", 2048).note("w1", &"x".repeat(MAX_NOTE_CHARS), false, 0), Ok(1), "the longest note is fine where there is room");
         assert_eq!(b.note("w1", &"x".repeat(950), false, 0), Ok(1));
         // the block is near its 1024 chars now: the next note does not fit

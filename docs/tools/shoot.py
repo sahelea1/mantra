@@ -96,10 +96,33 @@ def mandala():
     t.kill()
 
 
+def codex_pattern(mhome: str) -> str:
+    """The default pattern on the demo's Codex mock aliases, saved as `shot-codex` in `mhome`.
+    The built-in patterns run on Bija; the scripted failures (`MANTRA_MOCK_BADMODEL`) belong to
+    the Codex mock, so a scene that needs one runs this copy."""
+    import glob
+    import re
+    probe = Term(f'{BIN} --demo --pattern mantra-default run "x"', cols=110, rows=30,
+                 env={"HOME": mhome, "MANTRA_HOME": os.path.join(mhome, ".mantra"),
+                      "MANTRA_DEMO_PROJECT": os.path.join(mhome, "code", "todo-api"),
+                      "MANTRA_MOCK_SPEED": "8", "TERM": "tmux-256color", "LANG": "en_US.UTF-8"},
+                 name="mantrashot-probe")
+    probe.wait("plan review", 90)
+    probe.kill()
+    src = open(sorted(glob.glob(os.path.join(mhome, ".mantra", "runs", "*", "*", "pattern.toml")))[-1]).read()
+    src = re.sub(r'^name = "mantra-default"$', 'name = "shot-codex"', src, count=1, flags=re.M)
+    src = re.sub(r'^(model|fallback[23]?) = "([^"]+)"$', lambda m: f'{m[1]} = "{m[2]}-codex"', src, flags=re.M)
+    os.makedirs(os.path.join(mhome, ".mantra", "patterns"), exist_ok=True)
+    open(os.path.join(mhome, ".mantra", "patterns", "shot-codex.toml"), "w").write(src)
+    shutil.rmtree(os.path.join(mhome, ".mantra", "runs"), ignore_errors=True)
+    return "shot-codex"
+
+
 def halt():
     """A typed halt: the amber band with the reason and the key that fixes it."""
-    t = start(cols=130, rows=30, args='--demo run "trigger a bad model"',
-              extra_env={"MANTRA_MOCK_BADMODEL": "1"})
+    h = home()
+    t = start(cols=130, rows=30, args=f'--demo --pattern {codex_pattern(h)} run "trigger a bad model"',
+              extra_env={"MANTRA_MOCK_BADMODEL": "1"}, mhome=h)
     if t.wait("plan review", 90):
         t.send("a")
     t.wait("halted", 90)
@@ -163,8 +186,21 @@ def models():
     t.kill()
 
 
+def gatefix():
+    """A failed QA round going back to the worker that wrote the code: the badge on its card,
+    the edge from the gate, the gate card saying who repairs."""
+    t = start(cols=124, rows=30, args='--demo --pattern mantra-default run "build a tiny todo CLI"',
+              extra_env={"MANTRA_MOCK_GATE_FAIL": "1", "MANTRA_MOCK_SPEED": "0.6"})
+    if t.wait("plan review", 120):
+        t.send("a")
+    t.wait("its own work", 240)
+    t.sleep(0.4)
+    shoot(t, f"{OUT}/gate-fix.png", "mantra — a gate fix by the task's own worker")
+    t.kill()
+
+
 SCENES = {"solo": solo, "mandala": mandala, "halt": halt, "runs": runs,
-          "studio": studio, "models": models}
+          "studio": studio, "models": models, "gatefix": gatefix}
 
 if __name__ == "__main__":
     # A tmux server started earlier keeps its own global environment, which new sessions
