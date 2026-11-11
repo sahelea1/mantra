@@ -242,3 +242,35 @@ Each scenario is one of the day's failures. "Then" is what must happen after thi
 | Running every gate check once at plan submission | checks are shell commands the user approves at plan review; running them earlier breaks that rule |
 | `--continue-from <run>` | new feature |
 | Provider colour override in the UI | the colour is assigned automatically and stored; hand-editing `models.toml` is enough for now |
+
+---
+
+## As built: where the release differs from this plan
+
+The plan was implemented in full. These points were decided differently during implementation
+and review; the code, the manual and the design notes describe what was built.
+
+- **Trouble is marked per model, not per provider (WP-1.3).** A usage limit, a rejected request
+  or empty turns mark the model that failed; another model of the same provider in the chain is
+  still tried (a limit on one model says nothing about its sibling). Only silence marks the
+  whole provider. Found while preparing the live test: with provider-wide marks a chain such as
+  Opus → Sonnet on one subscription would never have used its second entry.
+- **Slot pins are saved on their own (WP-1.3, WP-3.x).** `state.json` carries `slot_models`; a
+  pin used to be restored from the slot's saved agent and was lost when the slot had no live
+  agent at the time (the planner during plan review). Found in a live run.
+- **`+`/`-` in the model picker (WP-5.2)** step the context window only while the filter is
+  empty; with a filter they are typed into it, because nearly every model id contains `-`.
+- **Pattern adoption advances its base on an empty merge (WP-3.2)**, so a change that the run
+  already had is not adopted again later as a change back.
+- **Owner fixes commit the integrated copy first (WP-6.2)**, so an earlier fix worker's
+  uncommitted edits reach the owner and its repair merges.
+- **A plan draft is dropped once the run has moved on (WP-8.1)**: a patch only builds on a
+  rejected plan while the plan version and the phase are still the ones it was rejected at.
+- **The fix-sandbox notice (WP-2.10)** is journaled only when the worker's backend really runs
+  without its sandbox (Codex).
+- **`qa_ok` is not persisted (WP-2.4)**: after a restart in the checks step QA runs once more
+  rather than trusting a pass it cannot see.
+- **The registry reload (WP-3.1)** keeps the models in memory when `models.toml` does not parse,
+  and is not triggered by Mantra's own saves.
+- **Demo and tooling.** `MANTRA_MOCK_GATE_FAIL` makes the demo's QA fail one round (the stress
+  script runs both fix routes end to end); the screenshot tool has a gate-fix scene.

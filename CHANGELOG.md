@@ -2,6 +2,66 @@
 
 All notable changes to Mantra are recorded here.
 
+## v0.12.0 — 2026-11-11
+
+A stability release: no new workflow, the existing one made dependable. It comes out of a long
+production run and its review; the plan it follows is in `docs/plans/stability-0.12/`.
+
+- **Usage limits and fallbacks.** Claude Code's subscription wording (`You've hit your 5-hour
+  limit`) is recognised as a usage limit instead of being retried as a transient error. A role
+  carries up to three fallback models (`fallback`, `fallback2`, `fallback3`), tried in order on
+  a usage limit, no output twice, empty turns twice or a rejected request. The model that failed
+  is avoided for a while — another model of the same provider is still tried; only silence marks
+  the whole provider. The role's own model is never rewritten, a fallen-back agent stays on its
+  fallback across respawns and restarts, and a halt about one agent's provider lets the others
+  finish their turn. An empty turn is asked again once and is no longer taken for a finished one.
+- **The gate.** Checks run under `bash` with their output kept whole in `<run dir>/checks/`; a
+  check with a heredoc can pass. Only the newest checks run counts, nothing starts while the run
+  is halted, and a phase is never handed off without a QA pass. QA has a third verdict for a
+  check that is itself wrong (`plan_defect`), which goes to the planner instead of a fix worker.
+  A QA agent that is waiting for an answer is not treated as silent. A plan revision at the gate
+  cancels the stale fix and re-runs the checks. Reports are written to `<run dir>/gate/` and
+  handed on whole; a long one is cut at a line with a pointer to its file.
+- **Who fixes.** A failed QA round goes back to the worker that wrote the code when every finding
+  is in one task's files (`gate_fix = "owner"`, the default; `"fix-worker"` keeps the old way),
+  with a fix worker as the fallback whenever the owner cannot take or finish it. The stage draws
+  it: a badge on the owner's card or a fix card, and an edge from the gate.
+- **Resume.** A run adopts what changed in its saved pattern — on resume and while it is live,
+  for the current phase too — by a three-way merge that keeps the run's own changes and journals
+  every adopted one. `models.toml` edited on disk is picked up. The planner re-attaches to its
+  session or starts from a context pack. `mantra runs` says `halted · …` or `closed · …`, the
+  journal records a close, and a resumed run lists the model of every role.
+- **Models.** An optional context limit per role; the smallest of role limit, pattern cap and
+  the model's window wins, for a fallback model too. `ctrl+d` reads the Claude Code model list
+  from the installed CLI (Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5 are built in as well)
+  and the Codex account's models. Every provider has a colour, shown with its name wherever a
+  model is shown or chosen.
+- **Model picker and Studio.** One picker for agents, roles and Studio fields: type to filter,
+  `tab` switches between this agent and its role, and it works on stopped, finished and failed
+  agents (the choice applies to the next start) and on cards without an agent. The Studio shows
+  fallback 1–3 and the context limit with the provider of each model.
+- **Stage.** Every card can be selected, also finished workers, the gate and unstarted tasks;
+  `r`, `x` and `c` ask for a second press. The halt band says the run is stopped and what
+  resumes it, keeps line breaks visible, and task counters count tasks, not attempts.
+- **Messages.** What you queued for an agent survives its failed turn, respawn or fallback, and
+  what was sent just before a halt is delivered again on resume. `⏎` queues and `ctrl+f` sends
+  now on the overview as in a zoomed view.
+- **Plan patches.** `mantra_patch_plan` changes parts of a plan (one check, one task) without
+  re-sending it, a rejected plan is kept as a draft to patch, and `mantra_read_plan` returns an
+  outline for a large plan.
+- **Journal and small truths.** The journal keeps whole texts and names who acted (`by you`).
+  "No output for …" measures the turn that is running. Scope tripwires compare like with like.
+  QA gets a diff when the project root is not a repository but holds some. Durations count
+  active time. `claude_user_config = "project"` starts Claude Code agents without your
+  user-level settings (`--setting-sources project,local`; its effect on a user-level
+  `CLAUDE.md` is untested).
+- **Web.** Provider colours, the fallback chain and the context limit per role, "this run only"
+  for a role's model, and a chip on the agent that repairs a gate round.
+- **Compatibility.** Pattern and state files from 0.11 load unchanged. A run saved by 0.12
+  carries new fields; one that was halted during gate checks cannot be opened by an older
+  Mantra.
+- **Current release.** Bump both Mantra and Bija to 0.12.0.
+
 ## v0.11.0 — 2026-11-10
 
 - **Mantra Akasha.** Run a single phase with a planner, a configurable read-only advisor and
