@@ -551,51 +551,93 @@ pub fn discard_check_artifacts(dir: &Path, before: &StatusSnapshot) -> Vec<Strin
     dropped
 }
 
-pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration) -> Vec<CheckResult> {
+/// The shell gate checks run in: `bash` when there is one (checks are written for it), else `sh`.
+fn check_shell() -> &'static str {
+    static SHELL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
+            return "bash";
+        }
+        let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join("bash").is_file())).unwrap_or(false);
+        if on_path { "bash" } else { "sh" }
+    })
+}
+
+/// One run of `cmd` (stderr folded into stdout by its own first line, so a heredoc terminator at
+/// the end of `cmd` stays alone on its line). Returns the exit code (`None`: timeout or lost) and
+/// the whole output.
+fn run_one_check(dir: &Path, cmd: &str, timeout: Duration, trace: bool) -> Result<(Option<i32>, String), String> {
+    let start = Instant::now();
+    let mut c = Command::new(check_shell());
+    if trace {
+        c.arg("-x");
+    }
+    let child = c.arg("-c").arg(format!("exec 2>&1\n{cmd}")).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let mut child = child.map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut o) = stdout {
+            use std::io::Read;
+            let mut buf = vec![];
+            let _ = o.read_to_end(&mut buf);
+            s = String::from_utf8_lossy(&buf).into_owned();
+        }
+        s
+    });
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code(),
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break None,
+        }
+    };
+    Ok((code, reader.join().unwrap_or_default()))
+}
+
+/// Run the gate checks in order. With `log_dir`, the full output of every check is also written
+/// to `{log_dir}/{label}.log`.
+pub fn run_checks(dir: &Path, cmds: &[String], timeout: Duration, log_dir: Option<&Path>, label: &str) -> Vec<CheckResult> {
     let mut out = vec![];
+    let mut log = String::new();
     for cmd in cmds {
         let start = Instant::now();
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{cmd} 2>&1"))
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
+        let (code, full) = match run_one_check(dir, cmd, timeout, false) {
+            Ok(r) => r,
             Err(e) => {
-                out.push(CheckResult { cmd: cmd.clone(), ok: false, code: None, output: e.to_string(), secs: 0 });
+                log.push_str(&format!("$ {cmd}\nexit error\n0s\n{e}\n\n"));
+                out.push(CheckResult { cmd: cmd.clone(), ok: false, code: None, output: e, secs: 0 });
                 continue;
             }
         };
-        let stdout = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut o) = stdout {
-                use std::io::Read;
-                let _ = o.read_to_string(&mut s);
-            }
-            s
-        });
-        let code = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st.code(),
-                Ok(None) if start.elapsed() > timeout => {
-                    let _ = child.kill();
-                    break None;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break None,
-            }
-        };
-        let mut output = reader.join().unwrap_or_default();
+        let mut output = full.clone();
         crate::util::tail_bytes(&mut output, 6000);
         if code.is_none() {
             output.push_str("\n[mantra] check timed out");
         }
-        out.push(CheckResult { cmd: cmd.clone(), ok: code == Some(0), code, output, secs: start.elapsed().as_secs() });
+        // A failing check that printed nothing: run it once more with a trace, so QA can see which clause failed.
+        if code.is_some() && code != Some(0) && output.trim().is_empty() {
+            if let Ok((_, traced)) = run_one_check(dir, cmd, timeout, true) {
+                let mut t = traced;
+                crate::util::tail_bytes(&mut t, 2000);
+                output = format!("[mantra] no output — trace of a second run (bash -x):\n{t}");
+            }
+        }
+        let secs = start.elapsed().as_secs();
+        log.push_str(&format!("$ {cmd}\nexit {}\n{secs}s\n{full}\n", code.map(|c| c.to_string()).unwrap_or_else(|| "timeout".into())));
+        if !full.ends_with('\n') {
+            log.push('\n');
+        }
+        out.push(CheckResult { cmd: cmd.clone(), ok: code == Some(0), code, output, secs });
+    }
+    if let Some(d) = log_dir {
+        if std::fs::create_dir_all(d).is_ok() {
+            let _ = std::fs::write(d.join(format!("{label}.log")), log);
+        }
     }
     out
 }
@@ -625,6 +667,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worker);
         git(dir, &["worktree", "add", "-q", "-b", "test-worker", &worker.to_string_lossy(), "HEAD"]).unwrap();
         worker
+    }
+
+    fn check_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mantra-checks-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_heredoc_check_passes_and_keeps_its_output() {
+        let dir = check_dir("heredoc");
+        let res = run_checks(&dir, &["cat <<'EOS'\nhello\nEOS".to_string()], Duration::from_secs(10), None, "t");
+        assert!(res[0].ok, "{:?}", res[0]);
+        assert_eq!(res[0].output, "hello\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_python_heredoc_check_passes() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = check_dir("pyheredoc");
+        let res = run_checks(&dir, &["python3 - <<'EOS'\nprint(1)\nEOS".to_string()], Duration::from_secs(10), None, "t");
+        assert!(res[0].ok, "{:?}", res[0]);
+        assert_eq!(res[0].output.trim(), "1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_silent_failing_check_gets_a_trace_and_the_log_keeps_every_command() {
+        let dir = check_dir("trace");
+        let logs = dir.join("logs");
+        let cmds = vec!["echo fine".to_string(), "false".to_string()];
+        let res = run_checks(&dir, &cmds, Duration::from_secs(10), Some(&logs), "phase-1-checks-1");
+        assert!(res[0].ok);
+        assert!(!res[1].ok);
+        assert_eq!(res[1].code, Some(1));
+        assert!(res[1].output.contains("trace of a second run"), "{:?}", res[1].output);
+        let log = std::fs::read_to_string(logs.join("phase-1-checks-1.log")).unwrap();
+        assert!(log.contains("$ echo fine") && log.contains("$ false") && log.contains("exit 1") && log.contains("fine\n"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -776,7 +861,7 @@ mod tests {
         std::fs::write(dir.join("worker.txt"), "by a worker\n").unwrap();
         let before = status_snapshot(&dir).unwrap();
         let cmds = vec!["mkdir -p __pycache__ && echo x > __pycache__/t.pyc && echo two >> tracked.txt && echo l > run.log".to_string()];
-        let res = run_checks(&dir, &cmds, Duration::from_secs(10));
+        let res = run_checks(&dir, &cmds, Duration::from_secs(10), None, "t");
         assert!(res[0].ok, "{}", res[0].output);
         let mut dropped = discard_check_artifacts(&dir, &before);
         dropped.sort();
@@ -808,7 +893,7 @@ mod tests {
         assert_eq!(before.get("def").map(String::as_str), Some("R "), "{before:?}");
         assert_eq!(before.get("zzz.txt").map(String::as_str), Some("??"), "{before:?}");
         assert!(!before.contains_key("abc"), "the rename source is not an entry: {before:?}");
-        let res = run_checks(&dir, &["echo x > scratch.txt".to_string()], Duration::from_secs(10));
+        let res = run_checks(&dir, &["echo x > scratch.txt".to_string()], Duration::from_secs(10), None, "t");
         assert!(res[0].ok);
         assert_eq!(discard_check_artifacts(&dir, &before), vec!["scratch.txt"]);
         assert!(dir.join("zzz.txt").exists(), "a worker's file is never deleted");
@@ -886,7 +971,7 @@ mod tests {
         let dir = temp_repo("clean");
         std::fs::write(dir.join("tracked.txt"), "edited by a worker\n").unwrap();
         let before = status_snapshot(&dir).unwrap();
-        let res = run_checks(&dir, &["true".to_string()], Duration::from_secs(10));
+        let res = run_checks(&dir, &["true".to_string()], Duration::from_secs(10), None, "t");
         assert!(res[0].ok);
         assert!(discard_check_artifacts(&dir, &before).is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "edited by a worker\n");

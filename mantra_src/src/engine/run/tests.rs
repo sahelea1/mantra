@@ -3167,6 +3167,21 @@ fn checks_and_diff_job_runs_the_commands_and_reviews_the_workspace() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn check_summary_prints_the_exit_code_plainly_and_points_at_the_log() {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    run.dir = PathBuf::from("/tmp/run-x");
+    run.checks = vec![
+        CheckResult { cmd: "false".into(), ok: false, code: Some(1), output: "boom".into(), secs: 1 },
+        CheckResult { cmd: "sleep 99".into(), ok: false, code: None, output: String::new(), secs: 5 },
+    ];
+    run.checks_label = "phase-1-checks-3".into();
+    let s = run.check_summary();
+    assert!(s.contains("$ false → FAIL (exit 1)"), "{s}");
+    assert!(s.contains("FAIL (timed out)"), "{s}");
+    assert!(s.contains("(full output of every check: /tmp/run-x/checks/phase-1-checks-3.log)"), "{s}");
+}
+
 // Pause boundary --------------------------------------------------------------------------
 
 fn two_phase_plan() -> Plan {

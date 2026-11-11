@@ -474,6 +474,10 @@ pub struct Run {
     /// The latest gate report said the fixes are big (`mantra_gate_report big=true`): the fix
     /// worker is then `worker-big`.
     gate_big: bool,
+    /// Counts the checks jobs started in this run (their log files are named after it).
+    checks_gen: u64,
+    /// The label of the newest checks log (`checks/<label>.log` in the run dir).
+    checks_label: String,
     /// One line per gate report and finale report of the run so far — what later reviewers start
     /// from instead of re-deriving it. Saved with the state.
     pub gate_notes: Vec<String>,
@@ -662,6 +666,8 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             gate_big: false,
+            checks_gen: 0,
+            checks_label: String::new(),
             gate_nudges: 0,
             resume_note: None,
             gate_notes: vec![],
@@ -2341,12 +2347,16 @@ Then summarize in 2-4 lines.",
         // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
         // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
         let tidy = ws.as_ref().map(|w| w.worktree).unwrap_or(false);
+        self.checks_gen += 1;
+        let label = format!("phase-{}-{}-{}", idx + 1, if after_fix { "after-fix" } else if round > 0 { "verify" } else { "checks" }, self.checks_gen);
+        self.checks_label = label.clone();
+        let log_dir = self.dir.join("checks");
         let tag = if after_fix { JobTag::FixChecks { phase: idx, round } } else { JobTag::Checks { phase: idx, round } };
         ctx.job(
             tag,
             Box::new(move || {
                 let before = if tidy { git::status_snapshot(&dir) } else { None };
-                let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout) };
+                let results = if checks.is_empty() { vec![] } else { git::run_checks(&dir, &checks, timeout, Some(&log_dir), &label) };
                 let dropped = before.map(|b| git::discard_check_artifacts(&dir, &b)).unwrap_or_default();
                 let diff = ws.as_ref().map(|w| git::review_diff(w, git::DiffSpan::Phase, GATE_DIFF_BYTES)).unwrap_or_default();
                 JobOut::Checks(results, dropped, diff)
@@ -2358,15 +2368,29 @@ Then summarize in 2-4 lines.",
         if self.checks.is_empty() {
             return "(no gate checks defined)".into();
         }
-        self.checks
+        let list = self
+            .checks
             .iter()
             .map(|c| {
                 let mut o = c.output.clone();
                 crate::util::tail_bytes(&mut o, 1500);
-                format!("$ {} → {}\n{}", c.cmd, if c.ok { "PASS".to_string() } else { format!("FAIL (exit {:?})", c.code) }, if c.ok { String::new() } else { o })
+                let verdict = if c.ok {
+                    "PASS".to_string()
+                } else {
+                    match c.code {
+                        Some(n) => format!("FAIL (exit {n})"),
+                        None => "FAIL (timed out)".to_string(),
+                    }
+                };
+                format!("$ {} → {}\n{}", c.cmd, verdict, if c.ok { String::new() } else { o })
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if self.checks_label.is_empty() {
+            list
+        } else {
+            format!("{list}\n(full output of every check: {}/checks/{}.log)", self.dir.display(), self.checks_label)
+        }
     }
 
     fn spawn_gate(&mut self, ctx: &mut dyn Ctx, idx: usize) {
@@ -2957,7 +2981,13 @@ Then summarize in 2-4 lines.",
     /// agent. True when every check passed (or there were none).
     fn record_checks(&mut self, results: Vec<CheckResult>, dropped: Vec<String>, diff: git::ReviewDiff) -> bool {
         for c in &results {
-            self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s)", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
+            let why = if c.ok {
+                String::new()
+            } else {
+                let first = c.output.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                format!("{}{}", match c.code { Some(n) => format!(", exit {n}"), None => ", timed out".into() }, if first.is_empty() { String::new() } else { format!(": {}", trunc(first, 80)) })
+            };
+            self.log(if c.ok { "✓" } else { "✗" }, if c.ok { "green" } else { "red" }, format!("check `{}` {} ({}s{why})", trunc(&c.cmd, 40), if c.ok { "passed" } else { "failed" }, c.secs));
         }
         if !dropped.is_empty() {
             self.log("⌫", "blue", format!("dropped {} file(s) left behind by checks", dropped.len()));

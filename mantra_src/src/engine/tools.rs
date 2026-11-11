@@ -434,7 +434,7 @@ mantra-role: planner
   resumes by itself), `mantra_resume_run` (the plan is right; a note for the stuck agent), `mantra_ask_user`.
 - Plan hygiene: keep the tooling later gates need (virtualenvs, node_modules, build caches) until the last
   phase — cleanup tasks belong in the final phase, never in one whose gate still needs them. Gate `checks`
-  must run as-is on this machine; prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping.
+  run with `bash -c` from the workspace root, exactly as written (several lines and heredocs are fine) and are re-run every gate round, so they must be repeatable. Prefer what exists (`python3 -m pytest`, `cargo test`) over bootstrapping. Every check must be able to pass at the end of its own phase: never check for something a later phase produces. Checks state facts about the work, not about the current workflow or model names. A zero-hit audit needs an allow-list for real external identifiers; never ask workers to paraphrase real names to satisfy a check. Evidence a check points at must be newer than the last change to what it proves.
 - In the final verification step you may spawn ad-hoc workers (`mantra_spawn_adhoc`), then `mantra_wait`,
   and finish with `mantra_gate_report`.
 - Keep the plan proportional to the goal: a small goal is 1-2 phases, submitted in your first turn. An
