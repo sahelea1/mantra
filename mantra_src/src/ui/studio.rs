@@ -675,7 +675,8 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
                 Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
                 Span::styled(format!("{:<13}", trunc(e, 13)), st),
                 // what the space, the glyph and the name leave, a column short of the border
-                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (linner.width as usize).saturating_sub(17)), theme::faint()),
+                crate::ui::provider_mark(&app.registry, &app.registry.resolve(&r.model).provider),
+                Span::styled(trunc(&format!("{}·{}", r.model, r.effort), (linner.width as usize).saturating_sub(18)), theme::faint()),
             ])),
             None => {
                 if i > 0 && app.studio.pattern.roles.contains_key(&es[i - 1]) {
@@ -776,8 +777,28 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
                     ADD_STEP => if is { theme::bold(theme::accent()) } else { theme::muted() },
                     _ => theme::text(),
                 };
+                // a model (and a fallback) names its provider in the provider's colour
+                let chip = match (fname.as_str(), app.studio.pattern.roles.get(&entry)) {
+                    ("model" | "fallback", Some(r)) if kind != Kind::Lines => {
+                        let alias = if fname == "model" { Some(r.model.clone()) } else { r.fallback.clone() }.filter(|a| !a.is_empty());
+                        alias.and_then(|alias| {
+                            let m = app.registry.resolve(&alias);
+                            // the model id goes first when the field is too narrow for it and a chip
+                            let full = format!("{alias} · {} · ", m.model);
+                            let prefix = if fw >= w_of(&full) + 6 { full } else { format!("{alias} · ") };
+                            // the chip needs its mark, a space and some name; else the plain text above stands
+                            (fw >= w_of(&prefix) + 6).then(|| { let room = fw - w_of(&prefix) - 2; (prefix, crate::ui::provider_chip(&app.registry, &m.provider, room)) })
+                        })
+                    }
+                    _ => None,
+                };
                 if kind == Kind::Action {
                     fl.push(Line::from(vec![Span::styled(format!("  {fname}"), vstyle)]));
+                } else if let Some((prefix, chip)) = chip {
+                    let mut line = vec![name, Span::styled(prefix, vstyle)];
+                    line.extend(chip);
+                    line.push(Span::styled(mark, theme::faint()));
+                    fl.push(Line::from(line));
                 } else {
                     fl.push(Line::from(vec![name, Span::styled(shown, vstyle), Span::styled(mark, theme::faint())]));
                 }
@@ -819,7 +840,7 @@ pub fn draw_studio(f: &mut Frame, app: &mut App) {
         let p = &app.studio.pattern;
         let rg = |name: &str| -> Vec<Span<'static>> {
             match p.roles.get(name) {
-                Some(r) => vec![Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(name.to_string(), theme::text()), Span::styled(format!(" {}·{}", r.model, r.effort), theme::faint())],
+                Some(r) => vec![Span::styled(format!("{} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))), Span::styled(name.to_string(), theme::text()), Span::raw(" "), crate::ui::provider_mark(&app.registry, &app.registry.resolve(&r.model).provider), Span::styled(format!("{}·{}", r.model, r.effort), theme::faint())],
                 None => vec![Span::styled(format!("? {name}"), theme::fg(theme::RED))],
             }
         };

@@ -2320,6 +2320,7 @@ impl App {
             self.models_ui.dirty = false;
             return Ok(());
         }
+        self.registry.assign_provider_colors();
         match self.registry.save() {
             Ok(()) => {
                 self.models_ui.dirty = false;
@@ -5099,6 +5100,29 @@ done"#;
         assert!(keys.contains("esc"), "{keys:?}");
         let row = rows.iter().find(|l| l.contains("longalias9")).expect("model row");
         assert!(row.contains("medium") && row.contains("ctx"), "{row:?}");
+    }
+
+    /// Every model row of the picker names its provider with the mark and name in that provider's
+    /// colour, and the picker still fits 80 columns.
+    #[test]
+    fn the_model_picker_shows_each_provider_in_its_colour() {
+        use ratatui::style::Color;
+        let mut app = screen_app();
+        app.registry.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), color: "violet".into(), kind: crate::config::ProviderKind::Bija, ..Default::default() });
+        app.registry.models.push(crate::config::ModelEntry { alias: "glm".into(), model: "z/glm-5.3".into(), provider: "riti".into(), ..Default::default() });
+        app.overlays.push(Overlay::ModelPicker { sel: 0, target: None });
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let y = (0..buf.area.height).find(|&y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().contains("glm")).expect("glm row");
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        assert!(row.contains("Riti"), "{row:?}");
+        let x = row.find("Riti").map(|b| row[..b].chars().count()).unwrap() as u16;
+        let want = crate::ui::theme::c(crate::ui::theme::VIOLET);
+        assert_eq!(buf[(x, y)].fg, want, "the name is in the provider's colour");
+        assert_eq!(buf[(x - 2, y)].fg, want, "so is the mark");
+        assert_ne!(buf[(x, y)].fg, Color::Reset);
+        assert!(row.chars().count() <= 80);
     }
 
     fn mcp_server(command: &str, args: &[&str], enabled: bool) -> crate::config::McpServer {

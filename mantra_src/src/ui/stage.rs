@@ -419,7 +419,7 @@ fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]
     let width = area.width.saturating_sub(2).min(68);
     let x = area.x + (area.width - width) / 2;
     let top = Rect::new(x, area.y, width, area.height.min(4));
-    agent_card(cv, top, run, Some(planner), "planner", &planner.glyph, theme::named(&planner.color), vec![], selected == Some(planner.id));
+    agent_card(cv, top, run, app, Some(planner), "planner", &planner.glyph, theme::named(&planner.color), vec![], selected == Some(planner.id));
     if area.height < 6 { return; }
     let children: Vec<_> = nodes.iter().filter(|id| **id != planner.id).filter_map(|id| app.agents.get(id)).collect();
     if children.is_empty() {
@@ -432,7 +432,7 @@ fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]
         let y = area.y + 5 + (i as u16 / columns) * 4;
         if y + 3 > area.bottom() { break; }
         let rect = Rect::new(area.x + (i as u16 % columns) * column_width, y, column_width.saturating_sub(1), (area.bottom() - y).min(4));
-        agent_card(cv, rect, run, Some(agent), &agent.name, &agent.glyph, theme::named(&agent.color), vec![], selected == Some(agent.id));
+        agent_card(cv, rect, run, app, Some(agent), &agent.name, &agent.glyph, theme::named(&agent.color), vec![], selected == Some(agent.id));
     }
 }
 
@@ -463,7 +463,8 @@ fn welcome(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("   {} ", theme::role_glyph(&r.glyph)), theme::bold(theme::fg(theme::named(&r.color)))),
             Span::styled(format!("{name:<nw$}"), theme::text()),
             Span::styled(format!("{:<kw$}", r.kind), theme::faint()),
-            Span::styled(format!("{} · ", m.alias), theme::muted()),
+            crate::ui::provider_mark(&app.registry, &m.provider),
+            Span::styled(format!(" {} · ", m.alias), theme::muted()),
         ];
         if lowered {
             // requested→used: the model doesn't offer the configured effort
@@ -568,7 +569,7 @@ fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a:
     let eff = a.map(|a| a.effort.clone()).or_else(|| t.effort.clone()).or_else(|| role.map(|r| r.effort.clone())).unwrap_or_default();
     let (d, tot) = a.map(|a| a.plan_progress()).unwrap_or((0, 0));
     let eff = if app.registry.resolve(&m_alias).efforts().is_empty() { String::new() } else { eff };
-    let mut l1 = vec![Span::styled(if eff.is_empty() { m_alias.clone() } else { format!("{m_alias}·") }, if dimmed { theme::faint() } else { theme::muted() }), Span::styled(eff.clone(), if dimmed { theme::faint() } else { theme::fg(effort_color(&eff)) })];
+    let mut l1 = vec![crate::ui::provider_mark(&app.registry, &app.registry.resolve(&m_alias).provider), Span::raw(" "), Span::styled(if eff.is_empty() { m_alias.clone() } else { format!("{m_alias}·") }, if dimmed { theme::faint() } else { theme::muted() }), Span::styled(eff.clone(), if dimmed { theme::faint() } else { theme::fg(effort_color(&eff)) })];
     if tot > 0 {
         let bar: String = (0..tot).map(|i| if i < d { theme::g("▰", "#") } else { theme::g("▱", "-") }).collect();
         l1.push(Span::styled(format!("  {bar} {d}/{tot}"), theme::dim()));
@@ -681,7 +682,7 @@ fn attempt_model(w: Option<&Worker>, a: Option<&Agent>, role: Option<&Role>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
+fn agent_card(cv: &mut Cv, r: Rect, run: &Run, app: &App, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
     if let Some(a) = a { cv.node(a.id, r); }
     let v = match a {
         None => V::NotStarted,
@@ -716,9 +717,12 @@ fn agent_card(cv: &mut Cv, r: Rect, run: &Run, a: Option<&Agent>, name: &str, gl
     let (x, y, iw) = (r.x as i32 + 2, r.y as i32, r.width as i32 - 4);
     let mut title = vec![Span::raw(" "), Span::styled(format!("{} ", theme::role_glyph(glyph)), theme::bold(theme::fg(color))), Span::styled(name.to_string(), theme::bold(theme::text()))];
     if let Some(a) = a {
-        let m = if a.effort.is_empty() { format!("  {} ", a.model_alias) } else { format!("  {}·{} ", a.model_alias, a.effort) };
-        if (w_of(name) + w_of(&m) + 6) as i32 <= iw {
-            title.push(Span::styled(m, theme::dim()));
+        let m = if a.effort.is_empty() { format!("{} ", a.model_alias) } else { format!("{}·{} ", a.model_alias, a.effort) };
+        // two spaces, the provider's mark and a space come before the model
+        if (w_of(name) + w_of(&m) + 4 + 6) as i32 <= iw {
+            title.push(Span::styled("  ", theme::dim()));
+            title.push(crate::ui::provider_mark(&app.registry, &a.provider));
+            title.push(Span::styled(format!(" {m}"), theme::dim()));
         }
     }
     title.push(Span::raw(" "));
@@ -765,7 +769,7 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         _ => vec![Span::styled("exploring the repo & designing phases…", theme::faint())],
     };
     let sel = nodes.first().copied() == run.planner && app.sel == 0;
-    agent_card(cv, r, run, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
+    agent_card(cv, r, run, app, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
     if let Some(a) = a {
         let lines = a.tail_lines((h as usize).saturating_sub(5));
         for (i, l) in lines.iter().enumerate() {
@@ -860,13 +864,13 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let last = oa.and_then(|a| a.tail_lines(1).pop()).unwrap_or_default();
         vec![Span::styled(trunc(&last, (orch_w as usize).saturating_sub(4)), theme::faint())]
     };
-    agent_card(cv, orch, run, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
+    agent_card(cv, orch, run, app, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
     if show_planner {
         let pr = Rect { x: (x0 + 1) as u16, y: y0 as u16, width: 26, height: 3 };
         let pa = run.planner.and_then(|p| app.agents.get(&p));
         let pcol = role_col(run, &run.pattern.flow.planner);
         let pglyph = run.pattern.role(&run.pattern.flow.planner).map(|r| r.glyph.clone()).unwrap_or_else(|| "✦".into());
-        agent_card(cv, pr, run, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
+        agent_card(cv, pr, run, app, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
         // planner → orchestrator edge when briefing
         let ey = y0 + 1;
         let (ex1, ex2) = (x0 + 27, orch.x as i32 - 1);
@@ -889,7 +893,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let ma = run.manager.and_then(|m| app.agents.get(&m));
         let mcol = role_col(run, &run.pattern.flow.manager);
         let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
-        agent_card(cv, mr, run, ma, "manager", &mglyph, mcol, vec![], run.manager.is_some() && run.manager == sel);
+        agent_card(cv, mr, run, app, ma, "manager", &mglyph, mcol, vec![], run.manager.is_some() && run.manager == sel);
         let ey = y0 + 1;
         let (ex1, ex2) = (orch.x as i32 + orch.width as i32, mr.x as i32 - 1);
         if ex2 > ex1 {
@@ -1054,7 +1058,7 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         let round = if let PhaseStep::Gate { round } = step { format!("round {round} · ") } else { String::new() };
         let mut l = vec![Span::styled(round, theme::fg(col))];
         l.extend(line2);
-        agent_card(cv, r, run, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
+        agent_card(cv, r, run, app, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
     }
 }
 
@@ -1070,7 +1074,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
         let r = Rect { x: x as u16, y: y as u16, width: w as u16, height: 3 };
         if i == idx {
             let a = run.finale_agent.and_then(|a| app.agents.get(&a));
-            agent_card(cv, Rect { height: 4, ..r }, run, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
+            agent_card(cv, Rect { height: 4, ..r }, run, app, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
             y += 4;
         } else {
             let (st, mark) = if i < idx { (theme::fg(theme::mix_rgb(theme::GREEN, theme::FAINT)), theme::g("✓", "v")) } else { (theme::faint(), theme::g("○", "o")) };
@@ -1095,7 +1099,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
             let mcol = role_col(run, &run.pattern.flow.manager);
             let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
             let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 3 };
-            agent_card(cv, r, run, ma, "manager", &mglyph, mcol, vec![], Some(m) == sel);
+            agent_card(cv, r, run, app, ma, "manager", &mglyph, mcol, vec![], Some(m) == sel);
             ay += 4;
         }
     }
@@ -1257,7 +1261,7 @@ mod tests {
         app.studio.pattern.roles.insert("orchestrator".into(), orch);
         let lines = welcome_lines(&app, 120);
         let row = lines.iter().find(|l| l.contains("orchestrator")).expect("orchestrator row");
-        assert!(row.contains("orchestrator testing · high"), "{row:?}");
+        assert!(row.contains(&format!("orchestrator {} testing · high", theme::g("■", "#"))), "{row:?}");
         assert!(!row.contains("orchestratortesting"), "{row:?}");
     }
 

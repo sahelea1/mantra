@@ -192,6 +192,18 @@ pub fn web_badges(app: &App) -> Vec<Span<'static>> {
     v
 }
 
+/// "■ Riti": the provider's mark and name, both in the provider's colour. `max` = columns for
+/// the name. The one way a provider is named next to a model.
+pub fn provider_chip(reg: &crate::config::Registry, provider_id: &str, max: usize) -> Vec<Span<'static>> {
+    let st = theme::fg(theme::named(reg.provider_color(provider_id)));
+    vec![Span::styled(format!("{} ", theme::g("■", "#")), st), Span::styled(trunc(&reg.provider_name(provider_id), max), st)]
+}
+
+/// "■" alone in the provider's colour, for places with no room for the name.
+pub fn provider_mark(reg: &crate::config::Registry, provider_id: &str) -> Span<'static> {
+    Span::styled(theme::g("■", "#").to_string(), theme::fg(theme::named(reg.provider_color(provider_id))))
+}
+
 /// "sol · high ▰▰▰▱▱ · ctx 23%" chip for an agent.
 pub fn model_chip(a: &Agent, app: &App) -> Vec<Span<'static>> {
     let m = app.registry.resolve(&a.model_alias);
@@ -206,8 +218,8 @@ pub fn model_chip(a: &Agent, app: &App) -> Vec<Span<'static>> {
     // Only worth naming the provider once there's more than one to confuse it with (the built-in
     // "openai" is implicit and never shown on its own).
     if !app.registry.providers.is_empty() {
-        v.push(Span::styled(" · via ", theme::faint()));
-        v.push(Span::styled(app.registry.provider_name(&m.provider), theme::dim()));
+        v.push(Span::styled(" · ", theme::faint()));
+        v.extend(provider_chip(&app.registry, &m.provider, 24));
     }
     if let Some(p) = a.ctx_percent() {
         let col = if p >= 85 { theme::RED } else if p >= 65 { theme::AMBER } else { theme::MUTED };
@@ -559,6 +571,24 @@ mod tests {
         asciify(&mut buf);
         assert!(buf.content.iter().all(|c| c.symbol().is_ascii()));
         assert_eq!(buf[(0, 0)].symbol(), "!");
+    }
+
+    /// A provider is named by a mark and its name, both in its colour; ASCII mode gets `#`.
+    #[test]
+    fn the_provider_chip_carries_the_providers_colour_and_an_ascii_mark() {
+        let mut reg = crate::config::Registry::defaults();
+        reg.providers.push(crate::config::ProviderEntry { id: "riti".into(), name: "Riti".into(), color: "violet".into(), ..Default::default() });
+        let text = |v: &[Span]| v.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let chip = provider_chip(&reg, "riti", 14);
+        assert_eq!(chip[0].style, theme::fg(theme::VIOLET));
+        assert_eq!(chip[1].style, theme::fg(theme::VIOLET));
+        assert_eq!(provider_mark(&reg, "riti").style, theme::fg(theme::VIOLET));
+        assert_eq!(text(&provider_chip(&reg, "riti", 3)), format!("{} Ri…", theme::g("■", "#")));
+        assert_eq!(provider_chip(&reg, "openai", 20)[1].style, theme::fg(theme::BLUE), "the Codex account is blue");
+        theme::init(&crate::config::Settings { glyphs: "ascii".into(), ..Default::default() });
+        let ascii = text(&provider_chip(&reg, "riti", 14));
+        theme::init(&crate::config::Settings::default());
+        assert_eq!(ascii, "# Riti");
     }
 
     #[test]

@@ -562,7 +562,16 @@ pub struct ProviderEntry {
     /// Extra request headers (e.g. anthropic-beta or anthropic-workspace-id). Values are secrets.
     #[serde(default, skip_serializing)]
     pub headers: BTreeMap<String, String>,
+    /// One of `engine::pattern::COLORS`: the colour this provider is marked with wherever a model
+    /// is shown or chosen. Assigned automatically when empty (`Registry::assign_provider_colors`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
 }
+
+/// Colours providers are given, in order. Red and gray are left out (failure, disabled).
+pub const PROVIDER_COLORS: &[&str] = &["cyan", "violet", "saffron", "teal", "rose", "green", "amber", "blue"];
+/// Codex's own account has no [[provider]] entry; its colour is fixed.
+pub const CODEX_ACCOUNT_COLOR: &str = "blue";
 
 impl std::fmt::Debug for ProviderEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -572,7 +581,7 @@ impl std::fmt::Debug for ProviderEntry {
 
 impl Default for ProviderEntry {
     fn default() -> Self {
-        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new(), headers: BTreeMap::new() }
+        ProviderEntry { id: String::new(), name: String::new(), base_url: String::new(), env_key: String::new(), api_key: None, wire_api: String::new(), kind: ProviderKind::default(), auth: "subscription".into(), wire: String::new(), headers: BTreeMap::new(), color: String::new() }
     }
 }
 
@@ -1200,13 +1209,14 @@ impl Registry {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => match toml::from_str::<Registry>(&s) {
                 Ok(mut r) if !r.models.is_empty() => {
-                    let changed = r.migrate(&s, codex_available());
+                    let colours_changed = r.assign_provider_colors();
+                    let changed = r.migrate(&s, codex_available()) || colours_changed;
                     r.restore_secrets_and_migrate(changed);
                     r
                 }
                 // No models at all: preserve configured providers, but do not create implicit
                 // providers or models.
-                Ok(mut r) => { r.restore_secrets_and_migrate(false); r },
+                Ok(mut r) => { let colours_changed = r.assign_provider_colors(); r.restore_secrets_and_migrate(colours_changed); r },
                 Err(_e) => {
                     // `save` refuses to write over the file while it does not parse (`unparseable`).
                     crate::mlog!("models.toml invalid; using defaults until it is fixed");
@@ -1264,6 +1274,38 @@ impl Registry {
             atomic_write_restricted(&Self::path(), &text)
         } else {
             atomic_write(&Self::path(), &text)
+        }
+    }
+
+    /// Gives every provider without a (valid) colour the first palette colour no other
+    /// provider uses; when all are used, the palette repeats by position. True when changed.
+    pub fn assign_provider_colors(&mut self) -> bool {
+        let valid = |c: &str| crate::engine::pattern::COLORS.contains(&c);
+        let mut used: Vec<String> = self.providers.iter().filter(|p| valid(&p.color)).map(|p| p.color.clone()).collect();
+        let mut changed = false;
+        for (i, p) in self.providers.iter_mut().enumerate() {
+            if valid(&p.color) {
+                continue;
+            }
+            let pick = PROVIDER_COLORS.iter().find(|c| !used.iter().any(|u| u == *c)).copied().unwrap_or(PROVIDER_COLORS[i % PROVIDER_COLORS.len()]);
+            p.color = pick.to_string();
+            used.push(p.color.clone());
+            changed = true;
+        }
+        changed
+    }
+
+    /// The colour name for a provider id ("" or "openai" = the Codex account). An unknown id is
+    /// gray; a provider not given a colour yet (a registry built by hand) takes the palette
+    /// colour of its position, which is what `assign_provider_colors` would give it first.
+    pub fn provider_color(&self, id: &str) -> &str {
+        if id.is_empty() || id == "openai" {
+            return CODEX_ACCOUNT_COLOR;
+        }
+        match self.providers.iter().position(|p| p.id == id) {
+            Some(i) if !self.providers[i].color.is_empty() => &self.providers[i].color,
+            Some(i) => PROVIDER_COLORS[i % PROVIDER_COLORS.len()],
+            None => "gray",
         }
     }
 
@@ -1528,6 +1570,33 @@ fn write_restricted(tmp: &Path, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_colours_are_distinct_kept_repaired_and_assigned_once() {
+        let mut r = Registry::defaults();
+        r.providers = (0..8).map(|i| ProviderEntry { id: format!("p{i}"), ..Default::default() }).collect();
+        assert!(r.assign_provider_colors());
+        let mut seen: Vec<&str> = r.providers.iter().map(|p| p.color.as_str()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 8, "eight providers, eight colours");
+        assert!(!r.assign_provider_colors(), "nothing to do the second time");
+        // a colour that is set stays; an invalid one is repaired with a colour no one else has
+        let mut r = Registry::defaults();
+        r.providers = vec![
+            ProviderEntry { id: "a".into(), color: "amber".into(), ..Default::default() },
+            ProviderEntry { id: "b".into(), color: "chartreuse".into(), ..Default::default() },
+            ProviderEntry { id: "c".into(), ..Default::default() },
+        ];
+        assert!(r.assign_provider_colors());
+        assert_eq!(r.providers[0].color, "amber");
+        assert_eq!((r.providers[1].color.as_str(), r.providers[2].color.as_str()), ("cyan", "violet"));
+        assert_eq!((r.provider_color("b"), r.provider_color("openai"), r.provider_color(""), r.provider_color("nobody")), ("cyan", "blue", "blue", "gray"));
+        // more providers than colours: the palette repeats by position
+        r.providers = (0..10).map(|i| ProviderEntry { id: format!("p{i}"), ..Default::default() }).collect();
+        r.assign_provider_colors();
+        assert!(r.providers.iter().all(|p| PROVIDER_COLORS.contains(&p.color.as_str())));
+    }
 
     /// Explicitly seeded legacy Bija defaults for tests of their runtime behavior.
     fn legacy_bija_registry() -> Registry {
@@ -2134,7 +2203,11 @@ mod tests {
             std::fs::write(Registry::path(), format!("{by_hand}[[provider]]\nid = \"bija\"\nkind = \"bija\"\n")).unwrap();
             let hand = Registry::load();
             assert!(hand.models.iter().all(|m| !m.vision), "{:?}", hand.models.iter().map(|m| (&m.alias, m.vision)).collect::<Vec<_>>());
-            assert!(std::fs::read_to_string(Registry::path()).unwrap().contains("[[provider]]\nid = \"bija\"\nkind = \"bija\"\n"), "left as written, not re-saved");
+            // the one write is the providers' colours (WP-5.1); nothing else is switched on, and a second load writes nothing
+            let written = std::fs::read_to_string(Registry::path()).unwrap();
+            assert!(written.contains("color = \"") && !written.contains("vision = true"), "{written}");
+            Registry::load();
+            assert_eq!(std::fs::read_to_string(Registry::path()).unwrap(), written, "not re-saved");
         });
     }
 

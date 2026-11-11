@@ -41,7 +41,7 @@ fn draw_one(f: &mut Frame, app: &App, i: usize) -> Option<usize> {
         Overlay::Halt { scroll } => return halt(f, area, app, *scroll),
         Overlay::NewRun { sel, list, goal } => new_run(f, area, app, *sel, list, goal.as_ref()),
         Overlay::Select(s) => select(f, area, s),
-        Overlay::Discover(st) => discover(f, area, st),
+        Overlay::Discover(st) => discover(f, area, app, st),
         Overlay::Runs { sel, list, confirm, others } => runs(f, area, app, *sel, list, *confirm, *others),
         Overlay::Qr => super::settings::draw_qr(f, area, app),
         Overlay::Akasha { scroll, group } => return Some(akasha(f, area, app, group.as_deref(), *scroll)),
@@ -151,7 +151,6 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
             band = Some(l.len());
         }
         let ctx = if app.registry.backend_of(m) == crate::config::ProviderKind::Antigravity { "agy context".into() } else { m.context_window.map(|c| format!("{}k ctx", c / 1000)).unwrap_or_else(|| "default ctx".into()) };
-        let via = if narrow { app.registry.provider_name(&m.provider) } else { format!("via {} {}", app.registry.provider_name(&m.provider), backend_glyph(&app.registry, &m.provider)) };
         // Two aliases can point at the same model id through different providers — the provider
         // column above already distinguishes them; call it out too so it isn't missed.
         let also_via: Vec<String> = app.registry.models.iter().filter(|o| o.model == m.model && o.provider != m.provider).map(|o| app.registry.provider_name(&o.provider)).collect();
@@ -162,9 +161,19 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: Option
             // width + 1: an 11-character alias (`astra-codex`) must not touch the model id
             Span::styled(format!("{:<12}", trunc(&m.alias, 11)), st),
             Span::styled(format!("{:<mw$}", trunc(&m.model, mw - 1)), theme::muted()),
-            Span::styled(format!(" {:<vw$}", trunc(&via, vw - 1)), theme::dim()),
-            Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))),
+            Span::raw(" "),
         ];
+        // the provider's chip (its colour), then the backend tag in what the column has left
+        let chip = crate::ui::provider_chip(&app.registry, &m.provider, if narrow { vw - 3 } else { 14 });
+        let chip_w = Line::from(chip.clone()).width();
+        row.extend(chip);
+        if narrow {
+            row.push(Span::raw(" ".repeat(vw.saturating_sub(chip_w))));
+        } else {
+            row.push(Span::raw(" ".repeat(16usize.saturating_sub(chip_w))));
+            row.push(Span::styled(format!("{:<w$}", backend_glyph(&app.registry, &m.provider), w = vw - 16), theme::faint()));
+        }
+        row.push(Span::styled(format!("{:<7}", eff), theme::fg(effort_color(&eff))));
         if !narrow {
             row.push(Span::styled(format!("{:<8}", theme::effort_bar(&eff, &m.efforts())), theme::fg(effort_color(&eff))));
         }
@@ -573,7 +582,7 @@ fn akasha_lines(rendered: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
+fn discover(f: &mut Frame, area: Rect, app: &App, st: &crate::app::DiscoverState) {
     use crate::discover::CState;
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     clear(f, area, r);
@@ -640,7 +649,7 @@ fn discover(f: &mut Frame, area: Rect, st: &crate::app::DiscoverState) {
         let st_row = if is { theme::bold(theme::accent()) } else { base };
         l.push(Line::from(vec![
             Span::styled(format!(" {} ", mark), st_row),
-            Span::styled(format!("{:<10} ", trunc(&c.provider, 10)), if is { st_row } else { theme::muted() }),
+            Span::styled(format!("{:<10} ", trunc(&c.provider, 10)), theme::fg(theme::named(app.registry.provider_color(&c.provider)))),
             Span::styled(format!("{:<mw$} ", trunc(&c.model, mw)), st_row),
             Span::styled(format!("{:<14} ", trunc(&ctx, 14)), if c.context_known { theme::muted() } else { theme::fg(theme::AMBER) }),
             Span::styled(format!("{:<13} ", trunc(&eff, 13)), theme::muted()),

@@ -27,7 +27,7 @@ pub(crate) const NOTE_COL: usize = 8;
 
 const PROV_COLS: &[&str] = &["id", "name", "base_url", "env_key", "api_key", "kind", "auth", "wire"];
 /// The providers grid's column widths, `PROV_COLS` order.
-const PROV_WIDTHS: [usize; 8] = [10, 12, 26, 14, 8, 10, 12, 9];
+const PROV_WIDTHS: [usize; 8] = [12, 12, 26, 14, 8, 10, 12, 9];
 const PROV_ID_COL: usize = 0;
 const PROV_NAME_COL: usize = 1;
 const PROV_URL_COL: usize = 2;
@@ -961,6 +961,8 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
                 theme::dim()
             } else if ci == EFFORT_COL {
                 theme::fg(effort_color(v))
+            } else if ci == PROVIDER_COL {
+                theme::fg(theme::named(app.registry.provider_color(&m.provider)))
             } else if ci == VISION_COL && m.vision {
                 theme::fg(theme::BLUE)
             } else if ci == NOTE_COL && v.starts_with("ok") {
@@ -1040,7 +1042,15 @@ pub fn draw_models(f: &mut Frame, app: &mut App) {
             }
         };
         let codex = *r == ProvRow::Codex;
-        let style = |_: usize, _: &str| if codex { theme::muted() } else { theme::text() };
+        // the id carries the provider's mark and colour, as it does beside a model elsewhere
+        let pid = match r {
+            ProvRow::Codex => "openai".to_string(),
+            ProvRow::Entry(i) => app.registry.providers[*i].id.clone(),
+        };
+        let mut vals = vals;
+        vals[PROV_ID_COL] = format!("{} {}", theme::g("■", "#"), vals[PROV_ID_COL]);
+        let pcol = theme::fg(theme::named(app.registry.provider_color(&pid)));
+        let style = |ci: usize, _: &str| if ci == PROV_ID_COL { pcol } else if codex { theme::muted() } else { theme::text() };
         let (mut spans, cur) = grid_cells(&vals, &pw, &pshow, style, this.then_some(ui.col), editing_prov.filter(|_| this));
         if let Some(c) = cur {
             cursor = Some((pinner.x + c as u16, pinner.y + pl.len() as u16));
