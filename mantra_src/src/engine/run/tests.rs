@@ -1618,9 +1618,9 @@ fn checks_failing_after_a_qa_pass_go_to_a_fix_worker() {
     run.orchestrator = Some(orch);
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
     assert!(!run.halted());
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { round: 1 }, .. }), "{:?}", run.stage);
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker takes the failing checks");
@@ -1685,7 +1685,7 @@ fn merge_conflicts_go_to_a_fix_worker_because_the_gate_cannot_merge() {
     run.plan = Some(one_task_phase());
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } };
     run.conflicts = vec!["mantra-w/r/p1-a-1".into()];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: run.checks_gen }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
     assert!(run.gate_agent.is_none(), "no QA agent reads a tree that is not merged yet");
     let w = run.workers.iter().find(|w| w.task.id == "fix-0").expect("a worker merges the branches, before QA round 1");
     assert_eq!(w.task.role, "worker-big");
@@ -2001,15 +2001,16 @@ fn identical_verify_failures_escalate_before_the_rounds_run_out() {
     run.planner = Some(planner);
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
     let fail = || vec![CheckResult { cmd: "uv venv .venv".into(), ok: false, code: Some(2), output: "error: Permission denied".into(), secs: 0 }];
     // QA passed, the checks still fail: fix-1 takes the output…
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
     assert!(!run.halted());
     let w = run.workers.iter().find(|w| w.task.id == "fix-1").expect("a fix worker");
     assert!(w.prompt.contains("Permission denied"), "{}", w.prompt);
     // …and when the very same failure is still there afterwards, nobody is fixing it
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail(), vec![], git::ReviewDiff::default()));
     assert!(run.halted(), "the identical failure twice means nobody is fixing it");
     assert!(run.halt.as_ref().unwrap().message.contains("identically"));
     assert!(ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]") && t.contains("uv venv")));
@@ -2023,10 +2024,11 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     let gate = ctx.add_idle();
     run.gate_agent = Some(gate);
     run.plan = Some(one_task_phase());
-    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
     let fail = |out: &str| vec![CheckResult { cmd: "cargo test".into(), ok: false, code: Some(101), output: out.into(), secs: 0 }];
-    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1 }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
-    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1 }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }));
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("first failure"), vec![], git::ReviewDiff::default()));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 1 } };
+    run.on_job(&mut ctx, JobTag::FixChecks { phase: 0, round: 1, gen: run.checks_gen }, JobOut::Checks(fail("a different failure"), vec![], git::ReviewDiff { stat: " src/a.rs | 2 +-".into(), diff: "+new line".into(), truncated: false }));
     assert!(!run.halted());
     let g2 = run.gate_agent.expect("round 2");
     assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 2 }, .. }), "{:?}", run.stage);
@@ -2035,8 +2037,8 @@ fn a_changed_check_failure_after_a_fix_goes_to_the_next_qa_round() {
     // the last round has no fix after it: a failure there halts
     let mut r2 = Run::new(PathBuf::from("."), no_manager(), "test".into());
     r2.plan = Some(one_task_phase());
-    r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 3 } };
-    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3 }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
+    r2.stage = Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 3 } };
+    r2.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 3, gen: run.checks_gen }, JobOut::Checks(fail("still"), vec![], git::ReviewDiff::default()));
     assert!(r2.halted());
     assert_eq!(r2.halt.as_ref().unwrap().reason, HaltReason::GateExhausted);
     assert!(r2.workers.is_empty(), "no fix worker after the last round");
@@ -3103,12 +3105,12 @@ fn checks_are_a_background_job_that_also_brings_the_phase_diff() {
     run.run_checks(&mut ctx, 0, 0);
     run.run_checks(&mut ctx, 0, 1);
     run.run_checks_after_fix(&mut ctx, 0, 1);
-    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }", "Checks { phase: 0, round: 1 }", "FixChecks { phase: 0, round: 1 }"]);
+    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0, gen: 1 }", "Checks { phase: 0, round: 1, gen: 2 }", "FixChecks { phase: 0, round: 1, gen: 3 }"]);
     // with no checks defined: the first round still needs the diff (a job); a verify has nothing to do
     run.plan.as_mut().unwrap().phases[0].gate.checks.clear();
     ctx.jobs.clear();
     run.run_checks(&mut ctx, 0, 0);
-    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0 }"]);
+    assert_eq!(ctx.jobs, vec!["Checks { phase: 0, round: 0, gen: 4 }"]);
     run.stage = Stage::Phase { idx: 0, step: PhaseStep::Gate { round: 1 } };
     run.run_checks(&mut ctx, 0, 1);
     assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Handoff }, "a verify with no checks hands off");
@@ -3180,6 +3182,36 @@ fn check_summary_prints_the_exit_code_plainly_and_points_at_the_log() {
     assert!(s.contains("$ false → FAIL (exit 1)"), "{s}");
     assert!(s.contains("FAIL (timed out)"), "{s}");
     assert!(s.contains("(full output of every check: /tmp/run-x/checks/phase-1-checks-3.log)"), "{s}");
+}
+
+#[test]
+fn only_the_newest_checks_run_counts() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), no_manager(), "test".into());
+    let mut plan = one_task_phase();
+    plan.phases[0].gate.checks = vec!["true".into()];
+    run.plan = Some(plan);
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Merging };
+    run.run_checks(&mut ctx, 0, 0);
+    let first = run.checks_gen;
+    run.run_checks(&mut ctx, 0, 0);
+    assert_eq!(run.checks_gen, first + 1);
+    let said = |run: &Run| run.pulse.iter().filter(|p| p.text.contains("superseded")).count();
+    // the older run lands first: nothing happens
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    assert_eq!(run.stage, Stage::Phase { idx: 0, step: PhaseStep::Checks { round: 0 } });
+    assert!(run.gate_agent.is_none());
+    assert_eq!(said(&run), 1);
+    // the newest one is handled
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 0, gen: first + 1 }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    assert!(run.gate_agent.is_some(), "the current run's result starts QA");
+    assert_eq!(said(&run), 1);
+    // a result for a run that a stage change made meaningless is ignored too
+    run.checks_gen += 1;
+    let g = run.checks_gen;
+    run.on_job(&mut ctx, JobTag::Checks { phase: 0, round: 1, gen: g }, JobOut::Checks(vec![], vec![], git::ReviewDiff::default()));
+    assert_eq!(said(&run), 2, "the stage is no longer Checks");
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Gate { round: 1 }, .. }));
 }
 
 // Pause boundary --------------------------------------------------------------------------

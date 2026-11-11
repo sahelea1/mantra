@@ -30,9 +30,9 @@ pub enum JobTag {
     Setup,
     WorkerWt { task: String, attempt: u32 },
     Merge { phase: usize },
-    Checks { phase: usize, round: u32 },
+    Checks { phase: usize, round: u32, gen: u64 },
     /// The checks re-run after a fix worker finished a gate round (`round` is the round it fixed).
-    FixChecks { phase: usize, round: u32 },
+    FixChecks { phase: usize, round: u32, gen: u64 },
     Cleanup { phase: usize },
     Finish,
     Land,
@@ -2046,6 +2046,7 @@ Then summarize in 2-4 lines.",
             return;
         };
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+        self.checks_gen += 1;
         self.phase_started = Instant::now();
         self.last_review = Instant::now();
         self.workers.clear();
@@ -2347,11 +2348,12 @@ Then summarize in 2-4 lines.",
         // Checks leave things behind (`__pycache__`, build scratch, a formatter's edits); only in
         // worktree mode does Mantra commit afterwards, so only there is the working copy tidied.
         let tidy = ws.as_ref().map(|w| w.worktree).unwrap_or(false);
+        // only the newest checks run counts: an older one still in flight is ignored when it lands
         self.checks_gen += 1;
         let label = format!("phase-{}-{}-{}", idx + 1, if after_fix { "after-fix" } else if round > 0 { "verify" } else { "checks" }, self.checks_gen);
         self.checks_label = label.clone();
         let log_dir = self.dir.join("checks");
-        let tag = if after_fix { JobTag::FixChecks { phase: idx, round } } else { JobTag::Checks { phase: idx, round } };
+        let tag = if after_fix { JobTag::FixChecks { phase: idx, round, gen: self.checks_gen } } else { JobTag::Checks { phase: idx, round, gen: self.checks_gen } };
         ctx.job(
             tag,
             Box::new(move || {
@@ -2785,6 +2787,7 @@ Then summarize in 2-4 lines.",
         if !self.is_active() {
             return;
         }
+        self.checks_gen += 1;
         for a in self.all_agents() {
             if ctx.agent(a).map(|x| x.busy()).unwrap_or(false) {
                 ctx.interrupt(a);
@@ -2891,7 +2894,10 @@ Then summarize in 2-4 lines.",
                 self.conflicts = m.conflicts;
                 self.run_checks(ctx, phase, 0);
             }
-            (JobTag::Checks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
+            (JobTag::Checks { phase, round, gen }, JobOut::Checks(results, dropped, diff)) => {
+                if self.checks_result_stale(gen, phase) {
+                    return;
+                }
                 let all_ok = self.record_checks(results, dropped, diff);
                 if round == 0 {
                     // Merge conflicts are not for a read-only QA agent to resolve: a fix worker
@@ -2940,7 +2946,10 @@ Then summarize in 2-4 lines.",
                     );
                 }
             }
-            (JobTag::FixChecks { phase, round }, JobOut::Checks(results, dropped, diff)) => {
+            (JobTag::FixChecks { phase, round, gen }, JobOut::Checks(results, dropped, diff)) => {
+                if self.checks_result_stale(gen, phase) {
+                    return;
+                }
                 let all_ok = self.record_checks(results, dropped, diff);
                 if !all_ok {
                     // A fix that leaves the very same failure behind did nothing: stop here.
@@ -2975,6 +2984,16 @@ Then summarize in 2-4 lines.",
             (JobTag::Finish, _) => {}
             _ => {}
         }
+    }
+
+    /// A checks result that is not the newest run's, or that lands outside its phase's checks
+    /// step, no longer means anything: journal it and let the caller drop it.
+    fn checks_result_stale(&mut self, gen: u64, phase: usize) -> bool {
+        if gen != self.checks_gen || self.phase_idx() != Some(phase) || !matches!(self.stage, Stage::Phase { step: PhaseStep::Checks { .. }, .. }) {
+            self.log("⎔", "gray", "ignored the result of a checks run that was superseded");
+            return true;
+        }
+        false
     }
 
     /// Take a checks run's results: journal them, keep them and the phase diff for the next gate
@@ -5625,6 +5644,7 @@ Then summarize in 2-4 lines.",
             w.state = WState::Cancelled;
         }
         self.stage = Stage::Phase { idx, step: PhaseStep::Orchestrating };
+        self.checks_gen += 1;
         self.checks.clear();
         self.conflicts.clear();
         self.gate_report = None;
