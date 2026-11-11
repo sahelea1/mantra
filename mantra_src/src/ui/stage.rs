@@ -1276,14 +1276,15 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>
     }
 }
 
-/// The number of findings in a QA report: lines that start with `1.`, `-`, `*` or `F1`.
+/// The number of findings in a QA report: list items — `- `, `* `, `1.` / `1)` and `F1` — not
+/// `**Findings**` headings or `---` rules.
 fn finding_count(report: &str) -> usize {
     report
         .lines()
         .map(str::trim_start)
         .filter(|l| {
             let rest = l.trim_start_matches(|c: char| c.is_ascii_digit());
-            l.starts_with(['-', '*']) || (l.starts_with('F') && l[1..].starts_with(|c: char| c.is_ascii_digit())) || (rest.len() < l.len() && rest.starts_with('.'))
+            l.starts_with("- ") || l.starts_with("* ") || (l.starts_with('F') && l[1..].starts_with(|c: char| c.is_ascii_digit())) || (rest.len() < l.len() && rest.starts_with(['.', ')']))
         })
         .count()
 }
@@ -1510,6 +1511,12 @@ fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_list_items_are_findings() {
+        let report = "**Findings**\n---\n***\n- one\n* two\n3. three\n4) four\nF5 five\n  - nested\n-dash\n**bold** text\nplain";
+        assert_eq!(finding_count(report), 6);
+    }
+
     use super::*;
     use crate::config::{ModelEntry, Registry, Settings};
     use crate::hub::Hub;

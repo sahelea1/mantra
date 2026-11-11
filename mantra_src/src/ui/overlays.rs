@@ -152,7 +152,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: &PickT
     // at the bottom stay as they are: a box that ended inside the composer left its bottom border
     // under the overlay); beyond that the rows scroll and the selection stays in view.
     let room = if area.height >= 16 { Rect { height: area.height - 4, ..area } } else { area };
-    let r = centered(room, 132, n as u16 + 7);
+    let r = centered(room, 132, n.max(1) as u16 + 7);
     clear(f, area, r);
     let iw = r.width.saturating_sub(2) as usize;
     let vis = (r.height.saturating_sub(2) as usize).saturating_sub(5).max(1);
@@ -333,7 +333,7 @@ fn model_picker(f: &mut Frame, area: Rect, app: &App, sel: usize, target: &PickT
     if matches!(target, PickTarget::Agent(_)) && alive {
         keys.push("←→ effort");
     }
-    if !narrow {
+    if !narrow && filter.is_empty() {
         keys.push("+/- ctx");
     }
     keys.push("⏎ apply");
@@ -982,10 +982,15 @@ pub fn key(app: &mut App, k: KeyEvent) {
                                 }
                             } else if !app.agent_alive(a) {
                                 let name = app.agents.get(&a).map(|x| x.name.clone()).unwrap_or_default();
-                                match app.with_run(|r, _| r.pin_next_model(a, &alias)) {
-                                    Some(Ok(())) => app.toast(format!("{name}: its next start uses {alias}"), crate::agent::Level::Ok),
-                                    Some(Err(e)) => app.toast(e, crate::agent::Level::Warn),
-                                    None => app.toast(format!("{name} is not running"), crate::agent::Level::Warn),
+                                let problem = if app.registry.get(&alias).is_none() { Some("unknown model".to_string()) } else { app.registry.alias_problem(&alias) };
+                                if let Some(e) = problem {
+                                    app.toast(e, crate::agent::Level::Warn);
+                                } else {
+                                    match app.with_run(|r, _| r.pin_next_model(a, &alias)) {
+                                        Some(Ok(())) => app.toast(format!("{name}: its next start uses {alias}"), crate::agent::Level::Ok),
+                                        Some(Err(e)) => app.toast(e, crate::agent::Level::Warn),
+                                        None => app.toast(format!("{name} is not running"), crate::agent::Level::Warn),
+                                    }
                                 }
                             } else {
                                 match app.set_model(a, &alias) {
@@ -1031,7 +1036,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
                     };
                     stay = false;
                 }
-                KeyCode::Char(c @ ('+' | '-')) => {
+                KeyCode::Char(c @ ('+' | '-')) if filter.is_empty() => {
                     const STEPS: &[u64] = &[16_000, 32_000, 64_000, 128_000, 200_000, 262_000, 272_000, 400_000, 524_000, 1_000_000];
                     let d: i64 = if c == '+' { 1 } else { -1 };
                     if let Some(PickRow::Model(mi)) = rows.get(sel) {

@@ -343,6 +343,12 @@ pub fn merge_with_builtins(found: Vec<Candidate>, provider_id: &str) -> Vec<Cand
 
 /// The models the logged-in Claude Code offers, from its own `initialize` answer. Blocking
 /// (spawns `claude`, waits at most 12 s); call it off the UI task. `Err` = could not ask.
+/// Session markers and credentials of the Mantra that runs this probe are not passed on; the user's
+/// own config directory is, or a custom one never yields the live model list.
+fn drop_env_for_claude_probe(k: &str) -> bool {
+    (k.starts_with("CLAUDE") && k != "CLAUDE_CONFIG_DIR") || k.starts_with("ANTHROPIC_")
+}
+
 pub fn claude_cli_models(claude_cmd: &[String], provider_id: &str) -> Result<Vec<Candidate>, String> {
     use std::io::{BufRead, BufReader};
     let (prog, base_args) = claude_cmd.split_first().ok_or("no claude command")?;
@@ -351,7 +357,7 @@ pub fn claude_cli_models(claude_cmd: &[String], provider_id: &str) -> Result<Vec
     let mut c = Command::new(prog);
     c.args(base_args).args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
     for (k, _) in std::env::vars() {
-        if k.starts_with("CLAUDE") || k.starts_with("ANTHROPIC_") {
+        if drop_env_for_claude_probe(&k) {
             c.env_remove(&k);
         }
     }
@@ -513,6 +519,15 @@ pub fn apply(reg: &mut Registry, cands: &[Candidate]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_claude_probe_keeps_the_config_dir_and_drops_the_session_markers() {
+        assert!(!drop_env_for_claude_probe("CLAUDE_CONFIG_DIR"));
+        for k in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_API_KEY"] {
+            assert!(drop_env_for_claude_probe(k), "{k}");
+        }
+        assert!(!drop_env_for_claude_probe("PATH"));
+    }
+
     use super::*;
     #[test]
     fn discovery_sends_messages_auth_version_and_custom_headers() {

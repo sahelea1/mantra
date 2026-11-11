@@ -1209,29 +1209,34 @@ impl Registry {
     }
 
     pub fn load() -> Registry {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => match toml::from_str::<Registry>(&s) {
-                Ok(mut r) if !r.models.is_empty() => {
-                    let colours_changed = r.assign_provider_colors();
-                    let changed = r.migrate(&s, codex_available()) || colours_changed;
-                    r.restore_secrets_and_migrate(changed);
-                    r
-                }
-                // No models at all: preserve configured providers, but do not create implicit
-                // providers or models.
-                Ok(mut r) => { let colours_changed = r.assign_provider_colors(); r.restore_secrets_and_migrate(colours_changed); r },
-                Err(_e) => {
-                    // `save` refuses to write over the file while it does not parse (`unparseable`).
-                    crate::mlog!("models.toml invalid; using defaults until it is fixed");
-                    Registry::defaults()
-                }
-            },
-            Err(_) => {
-                // A missing/unreadable public registry must never clear the separate secrets
-                // file. The first explicit model edit will create models.toml.
+        match Self::try_load() {
+            Ok(r) => r,
+            Err(e) => {
+                // `save` refuses to write over a file that does not parse (`unparseable`); a missing
+                // public registry must never clear the separate secrets file. The first explicit
+                // model edit will create models.toml.
+                crate::mlog!("models.toml: {e}; using defaults until it is fixed");
                 Registry::defaults()
             }
         }
+    }
+
+    /// Like `load`, but a missing or unparseable models.toml is an error, not the defaults: the
+    /// reload of a running Mantra keeps what it has rather than replace it with a stand-in.
+    pub fn try_load() -> Result<Registry, String> {
+        let s = std::fs::read_to_string(Self::path()).map_err(|e| format!("cannot read {}: {e}", Self::path().display()))?;
+        let mut r = toml::from_str::<Registry>(&s).map_err(|e| format!("invalid: {e}"))?;
+        if !r.models.is_empty() {
+            let colours_changed = r.assign_provider_colors();
+            let changed = r.migrate(&s, codex_available()) || colours_changed;
+            r.restore_secrets_and_migrate(changed);
+        } else {
+            // No models at all: preserve configured providers, but do not create implicit
+            // providers or models.
+            let colours_changed = r.assign_provider_colors();
+            r.restore_secrets_and_migrate(colours_changed);
+        }
+        Ok(r)
     }
 
     fn restore_secrets_and_migrate(&mut self, changed: bool) {
