@@ -93,6 +93,13 @@ impl Run {
         if let (Some(p), Stage::Setup | Stage::Planning | Stage::Review) = (&pending, &self.stage) {
             self.log("‖", "amber", format!("{} was due at the pause — the plan is submitted again instead", p.label()));
         }
+        if matches!(self.stage, Stage::Phase { .. } | Stage::Finale { .. }) && self.planner.is_none() {
+            // the first lazy spawn of the planner re-attaches to its session — if it would run on
+            // the same model as the saved one (a session cannot move to another backend)
+            let name = self.pattern.flow.planner.clone();
+            let now = self.slot_models.get("planner").cloned().filter(|m| self.knows_model(m)).unwrap_or_else(|| self.role(&name).model);
+            self.planner_thread = st.agents.iter().find(|a| a.slot == "planner" && a.model_alias == now).and_then(|a| a.thread_id.clone());
+        }
         match self.stage.clone() {
             Stage::Setup => self.start(ctx),
             Stage::Planning => self.resume_planning(ctx, st),
@@ -199,7 +206,7 @@ impl Run {
         // never be interpreted as consent just because the process was resumed.
         if let Some(proposal) = &self.pending_pattern {
             let text = format!("Approve workflow change {} → {}? {}\nReply 'approve' or send feedback. Proposed workflow:\n{}", self.pattern.name, proposal.pattern.name, proposal.reason, proposal.pattern.to_toml());
-            let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+            let (p, _) = self.planner_with_preface(ctx);
             self.question = Some(super::run::Question { from: p, text: text.clone(), since: Instant::now() });
             self.alerts.push(text);
         }

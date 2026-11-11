@@ -250,6 +250,18 @@ pub enum WState {
 
 /// Whether a worker holds one of its class's slots: preparing its worktree, running, or waiting
 /// out a retry delay — what the per-class caps count (`Run::slots_taken`).
+/// Why an agent was respawned, from the note its replacement got.
+fn respawn_why(note: Option<&str>) -> &'static str {
+    match note {
+        Some(n) if n.starts_with("[mantra:watchdog]") => "watchdog",
+        Some(n) if n.starts_with("[mantra:fallback]") => "fallback model",
+        Some(n) if n.starts_with("The workflow") || n.starts_with("Workflow") => "workflow changed",
+        Some(n) if n.contains("lost its session") => "session lost",
+        Some(_) => "requested",
+        None => "by you",
+    }
+}
+
 fn holds_slot(w: &Worker) -> bool {
     matches!(w.state, WState::Preparing | WState::Running | WState::Retrying(_))
 }
@@ -543,6 +555,9 @@ pub struct Run {
     pub(super) planner_wait: Option<PlannerWait>,
     /// Refresh after the current tool result and turn have completed.
     planner_refresh_pending: bool,
+    /// The saved session of the planner of a run resumed in a phase or the finale; the first lazy
+    /// spawn of the planner re-attaches to it (`planner_with_preface`).
+    pub(super) planner_thread: Option<String>,
     /// Emergency stops are deliberate; late process events must not auto-restart them.
     killed_agents: HashSet<AgentId>,
     /// Agents waiting on an answer from the rung above them (worker/gate/finale → orchestrator,
@@ -731,6 +746,7 @@ impl Run {
             pending_pattern: None,
             planner_wait: None,
             planner_refresh_pending: false,
+            planner_thread: None,
             killed_agents: HashSet::new(),
             pending_questions: HashMap::new(),
             last_review: Instant::now(),
@@ -1285,8 +1301,8 @@ impl Run {
                         if !self.handoff.is_empty() {
                             self.begin_handoff(ctx, idx);
                         } else if self.planner_wait.is_none() && self.question.is_none() {
-                            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
-                            self.prompt_loop_planner(ctx, p, "The phase resumed. Check the workspace and continue from the saved plan.");
+                            let (p, pre) = self.planner_with_preface(ctx);
+                            self.prompt_loop_planner(ctx, p, &format!("{pre}The phase resumed. Check the workspace and continue from the saved plan."));
                         }
                     } else {
                         self.fill_slots(ctx);
@@ -1520,10 +1536,7 @@ impl Run {
     /// (gate exhausted, attempts exhausted) is handed to the planner with everything it needs to
     /// decide — revise the phase, give the stuck agent a hint and resume, or ask the user.
     fn escalate_to_planner(&mut self, ctx: &mut dyn Ctx, message: String) {
-        let p = match self.planner {
-            Some(p) => p,
-            None => self.spawn_planner(ctx),
-        };
+        let (p, pre) = self.planner_with_preface(ctx);
         let (phase, facts) = self.escalation_context(ctx);
         self.escalation_open = true;
         self.log("✦", "saffron", format!("escalated to the planner: {}", trunc(&message, 60)));
@@ -1531,7 +1544,7 @@ impl Run {
         ctx.prompt(
             p,
             format!(
-                "[mantra:escalation] {message}
+                "{pre}[mantra:escalation] {message}
 
 We are in {phase}; the run is halted until you act.
 {facts}
@@ -1997,6 +2010,7 @@ Then summarize in 2-4 lines.",
     /// `resume`: a saved thread/session id to re-attach to (`mantra runs resume`).
     pub(super) fn spawn_planner_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         self.planner_refresh_pending = false;
+        self.planner_thread = None;
         let name = self.pattern.flow.planner.clone();
         let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
@@ -2022,6 +2036,44 @@ Then summarize in 2-4 lines.",
         };
         self.planner = Some(id);
         id
+    }
+
+    /// The planner, spawned when there is none: re-attached to its saved session when there is one,
+    /// otherwise fresh with a context pack. Returns its id and the preface its next prompt must
+    /// start with ("" for a planner that was already there).
+    pub(super) fn planner_with_preface(&mut self, ctx: &mut dyn Ctx) -> (AgentId, String) {
+        if let Some(p) = self.planner {
+            return (p, String::new());
+        }
+        let thread = self.planner_thread.take();
+        let attached = thread.is_some();
+        let p = self.spawn_planner_with(ctx, thread);
+        let pre = if attached {
+            format!("[mantra:resume] Mantra restarted; you are re-attached as this run's planner and your earlier conversation still holds. The run is at {}, plan v{}.\n\n", super::state::stage_label(&self.stage), self.plan_version)
+        } else {
+            format!("{}\n\n", self.planner_context_pack())
+        };
+        (p, pre)
+    }
+
+    /// Everything a planner that starts mid-run needs: the brief, the plan in outline, the current
+    /// phase in full, the recent journal.
+    fn planner_context_pack(&self) -> String {
+        let Some(plan) = &self.plan else { return self.planning_prompt() };
+        let cur = self.phase_idx();
+        let mut s = format!(
+            "[mantra:respawn] You are this run's planner, starting with a fresh session (the earlier planner's session is not available). Continue from stage {}, plan v{}.\n\nRun brief:\n{}\n\nPlan: {} — {}\n",
+            super::state::stage_label(&self.stage), self.plan_version, self.brief, plan.title, trunc(&plan.summary, 1500)
+        );
+        for (i, ph) in plan.phases.iter().enumerate() {
+            let state = match cur { Some(c) if i == c => "CURRENT", Some(c) if i > c => "pending", Some(_) => "done", None if matches!(self.stage, Stage::Finale { .. } | Stage::Done) => "done", None => "pending" };
+            s.push_str(&format!("- phase {} [{}]: {} ({} tasks) — {state}\n", i + 1, ph.id, ph.name, ph.tasks.len()));
+        }
+        if let Some(phase) = self.current_phase() {
+            s.push_str(&format!("\nCurrent phase:\n```json\n{}\n```\n", serde_json::to_string_pretty(phase).unwrap_or_default()));
+        }
+        s.push_str(&format!("Recent journal:\n{}\nCall mantra_read_phase for live task states and mantra_read_plan for another phase.", self.journal_text(25)));
+        s
     }
 
     pub(super) fn planning_prompt(&self) -> String {
@@ -2127,8 +2179,8 @@ Then summarize in 2-4 lines.",
 
         if self.pattern.settings.planner_loop {
             self.planner_nudges = 0;
-            let p = self.planner.unwrap_or_else(|| self.spawn_planner(ctx));
-            self.prompt_loop_planner(ctx, p, "The plan is ready. Begin the single execution phase.");
+            let (p, pre) = self.planner_with_preface(ctx);
+            self.prompt_loop_planner(ctx, p, &format!("{pre}The plan is ready. Begin the single execution phase."));
             self.save_state();
             return;
         }
@@ -4463,10 +4515,10 @@ Then summarize in 2-4 lines.",
                 // Even an answer to a supervisor enters through the planner. It decides how
                 // to brief the requester and retains the ordinary chain of command.
                 self.pending_questions.insert(q.from, q.text.clone());
-                let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+                let (p, pre) = self.planner_with_preface(ctx);
                 self.mark_edge(p);
                 self.log("›", "rose", format!("you → planner (answer for {who}): {}", trunc(text, 60)));
-                ctx.prompt(p, format!("[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
+                ctx.prompt(p, format!("{pre}[from the user] Answering the {who}'s question ({}):\n{text}\nDecide the next action and reply to the {who} with mantra_prompt; brief the orchestrator or resume the run as needed.", q.text));
                 return;
             }
             self.log("›", "rose", format!("you → {who} (answer): {}", trunc(text, 60)));
@@ -4489,10 +4541,7 @@ Then summarize in 2-4 lines.",
             }
             Stage::Review => self.plan_feedback(ctx, text),
             Stage::Phase { .. } | Stage::Finale { .. } => {
-                let p = match self.planner {
-                    Some(p) => p,
-                    None => self.spawn_planner(ctx),
-                };
+                let (p, pre) = self.planner_with_preface(ctx);
                 let orch_last = self.orchestrator.and_then(|o| ctx.agent(o)).map(|o| o.log_text(12)).unwrap_or_default();
                 let status = self.status_text(ctx);
                 let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "finale".into());
@@ -4500,7 +4549,7 @@ Then summarize in 2-4 lines.",
                 self.mark_edge(p);
                 ctx.prompt(
                     p,
-                    format!("[mantra:reprompt] The user says:\n{text}\n\nWe are in {phase}.\nWorkers:\n{status}\nOrchestrator's recent log:\n{}\nDecide: pause agents if needed, revise the plan if needed (mantra_revise_plan), brief the orchestrator (mantra_brief_orchestrator). Then summarize.", trunc(&orch_last, 3000)),
+                    format!("{pre}[mantra:reprompt] The user says:\n{text}\n\nWe are in {phase}.\nWorkers:\n{status}\nOrchestrator's recent log:\n{}\nDecide: pause agents if needed, revise the plan if needed (mantra_revise_plan), brief the orchestrator (mantra_brief_orchestrator). Then summarize.", trunc(&orch_last, 3000)),
                 );
             }
             Stage::Done | Stage::Failed(_) => self.log("ℹ", "gray", "this run is finished — start a new one with /run <goal>"),
@@ -4527,11 +4576,15 @@ Then summarize in 2-4 lines.",
         }
         self.planner_wait = None;
         let _ = name;
-        let target = self.planner.or_else(|| self.is_active().then(|| self.spawn_planner(ctx)));
+        let (target, pre) = match self.planner {
+            Some(p) => (Some(p), String::new()),
+            None if self.is_active() => { let (p, pre) = self.planner_with_preface(ctx); (Some(p), pre) }
+            None => (None, String::new()),
+        };
         match target {
             Some(a) => {
                 self.mark_edge(a);
-                ctx.prompt_mode(a, format!("[from the user] {text}"), mode);
+                ctx.prompt_mode(a, format!("{pre}[from the user] {text}"), mode);
                 self.log("›", "rose", format!("you → planner: {}", trunc(text, 60)));
                 true
             }
@@ -4822,6 +4875,7 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_manager(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        let why = respawn_why(note.as_deref());
         let old_manager = self.manager.take();
         if let Some(old) = old_manager {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
@@ -4841,7 +4895,7 @@ Then summarize in 2-4 lines.",
             prompt.push_str(&format!("\n\nOPEN WATCHDOG CASE — {} has been idle and nobody got it moving. Find out why (mantra_log) and get it moving: mantra_prompt, mantra_respawn / mantra_retry, mantra_set_effort, or mantra_brief_orchestrator.", c.about));
         }
         ctx.prompt(id, self.with_akasha(id, prompt));
-        self.log("↻", "violet", "manager respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("manager respawned ({why})"));
     }
 
     /// Spawn a fresh orchestrator agent for the current phase (extracted out of `start_phase` so
@@ -4933,6 +4987,8 @@ Then summarize in 2-4 lines.",
     }
 
     fn respawn_planner(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        let why = respawn_why(note.as_deref());
+        let handoff = self.planner.and_then(|old| ctx.agent(old)).map(|a| a.handoff_context());
         let shared_finale = self.planner.is_some() && self.finale_agent == self.planner && matches!(self.stage, Stage::Finale { .. });
         let old_planner = self.planner.take();
         if let Some(old) = old_planner {
@@ -4973,11 +5029,17 @@ Then summarize in 2-4 lines.",
         } else {
             self.planning_prompt()
         };
+        let resume = match handoff.filter(|h| !h.trim().is_empty()) {
+            Some(h) => format!("{resume}\n\nFor continuity, what the previous planner session held:\n{}", trunc(&h, 16_000)),
+            None => resume,
+        };
         ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
-        self.log("↻", "violet", "planner respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("planner respawned ({why})"));
     }
 
     fn respawn_orchestrator(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
+        let why = respawn_why(note.as_deref());
+        let handoff = self.orchestrator.and_then(|old| ctx.agent(old)).map(|a| a.handoff_context());
         let old_orch = self.orchestrator.take();
         if let Some(old) = old_orch {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
@@ -4996,11 +5058,16 @@ Then summarize in 2-4 lines.",
             idx + 1,
             total
         );
+        let resume = match handoff.filter(|h| !h.trim().is_empty()) {
+            Some(h) => format!("{resume}\n\nFor continuity, what the previous orchestrator session held:\n{}", trunc(&h, 6_000)),
+            None => resume,
+        };
         ctx.prompt(id, self.with_akasha(id, join_note(note, resume)));
-        self.log("↻", "violet", "orchestrator respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("orchestrator respawned ({why})"));
     }
 
     fn respawn_gate(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let why = respawn_why(note.as_deref());
         let idx = self.phase_idx()?;
         let round = match self.stage {
             Stage::Phase { step: PhaseStep::Gate { round }, .. } => round,
@@ -5024,11 +5091,12 @@ Then summarize in 2-4 lines.",
         if let (Some(n), Some(g)) = (note, self.gate_agent) {
             ctx.prompt(g, format!("[mantra:respawn] {n}"));
         }
-        self.log("↻", "violet", "gate respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("gate respawned ({why})"));
         Some(RESPAWNED)
     }
 
     fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
+        let why = respawn_why(note.as_deref());
         let Stage::Finale { idx } = self.stage else { return None };
         if let Some(old) = self.finale_agent.take() {
             if Some(old) != self.planner {
@@ -5045,7 +5113,7 @@ Then summarize in 2-4 lines.",
         if let (Some(n), Some(a)) = (note, self.finale_agent) {
             ctx.prompt(a, format!("[mantra:respawn] {n}"));
         }
-        self.log("↻", "violet", "finale agent respawned (watchdog/manual)");
+        self.log("↻", "violet", format!("finale agent respawned ({why})"));
         Some(RESPAWNED)
     }
 
@@ -5732,15 +5800,15 @@ Then summarize in 2-4 lines.",
         self.pattern.settings.allow_pattern_changes = previous.settings.allow_pattern_changes;
         // Existing workers keep their live process, scope and worktree. New spawns use the new
         // role definitions; fixed supervisors are refreshed only when their definition changed.
-        if previous.flow.manager != self.pattern.flow.manager || previous.roles.get(&previous.flow.manager) != self.pattern.roles.get(&self.pattern.flow.manager) {
+        if previous.flow.manager != self.pattern.flow.manager || !matches!((previous.roles.get(&previous.flow.manager), self.pattern.roles.get(&self.pattern.flow.manager)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if let Some(m) = self.manager.take() { ctx.stop(m, true); }
             if self.phase_idx().is_some() { self.ensure_manager(ctx); }
         }
-        if previous.flow.orchestrator != self.pattern.flow.orchestrator || previous.roles.get(&previous.flow.orchestrator) != self.pattern.roles.get(&self.pattern.flow.orchestrator) {
+        if previous.flow.orchestrator != self.pattern.flow.orchestrator || !matches!((previous.roles.get(&previous.flow.orchestrator), self.pattern.roles.get(&self.pattern.flow.orchestrator)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) { self.respawn_orchestrator(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
             else if let Some(o) = self.orchestrator.take() { ctx.stop(o, true); }
         }
-        if previous.flow.phase_gate != self.pattern.flow.phase_gate || previous.roles.get(&previous.flow.phase_gate) != self.pattern.roles.get(&self.pattern.flow.phase_gate) {
+        if previous.flow.phase_gate != self.pattern.flow.phase_gate || !matches!((previous.roles.get(&previous.flow.phase_gate), self.pattern.roles.get(&self.pattern.flow.phase_gate)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if self.gate_agent.is_some() { self.respawn_gate(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
         }
         if let Stage::Finale { idx } = self.stage {
@@ -5749,7 +5817,7 @@ Then summarize in 2-4 lines.",
         self.log("✦", "saffron", format!("workflow {} → {}: {}", previous.name, self.pattern.name, proposal.reason));
         self.save_state();
         if let Some(p) = self.planner {
-            let changed = previous.flow.planner != self.pattern.flow.planner || previous.roles.get(&previous.flow.planner) != self.pattern.roles.get(&self.pattern.flow.planner) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
+            let changed = previous.flow.planner != self.pattern.flow.planner || !matches!((previous.roles.get(&previous.flow.planner), self.pattern.roles.get(&self.pattern.flow.planner)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) || previous.worker_roles() != self.pattern.worker_roles() || previous.settings.planner_loop != self.pattern.settings.planner_loop;
             if changed {
                 if ctx.agent(p).is_some_and(|ag| ag.busy()) { self.planner_refresh_pending = true; }
                 else { self.respawn_planner(ctx, Some("Workflow approved; use the updated role instructions and tools.".into())); }
@@ -5764,14 +5832,14 @@ Then summarize in 2-4 lines.",
     pub(super) fn planner_wait_tick(&mut self, ctx: &mut dyn Ctx) {
         let due = self.planner_wait.as_ref().is_some_and(|w| w.due_unix <= crate::util::unix_secs());
         if !due || self.halted() || !self.is_active() { return; }
-        let p = match self.planner { Some(p) => p, None => self.spawn_planner(ctx) };
+        let (p, pre) = self.planner_with_preface(ctx);
         if ctx.agent(p).is_some_and(|ag| ag.busy()) { return; }
         let wait = self.planner_wait.take().unwrap();
         // Clear and persist before dispatch so subsequent ticks cannot enqueue duplicates.
         self.log("◷", "teal", "planner external-condition check is due");
         self.save_state();
         self.mark_edge(p);
-        ctx.prompt(p, format!("[mantra:external-condition] Scheduled re-entry is due. Inspect this condition once: {}\nInstructions: {}\nThe condition has not been evaluated by Mantra. Report the observed result; if still pending schedule a bounded re-entry instead of a sleep/poll loop.", wait.condition, wait.on_reentry));
+        ctx.prompt(p, format!("{pre}[mantra:external-condition] Scheduled re-entry is due. Inspect this condition once: {}\nInstructions: {}\nThe condition has not been evaluated by Mantra. Report the observed result; if still pending schedule a bounded re-entry instead of a sleep/poll loop.", wait.condition, wait.on_reentry));
     }
 
     pub fn pending_pattern_review(&self) -> bool { self.pending_pattern.is_some() }
@@ -5942,10 +6010,7 @@ Then summarize in 2-4 lines.",
         let to_planner = Some(a) == self.orchestrator || Some(a) == self.manager || matches!(self.stage, Stage::Finale { .. }) || self.orchestrator.is_none();
         self.pending_questions.insert(a, q.clone());
         if to_planner {
-            let p = match self.planner {
-                Some(p) => p,
-                None => self.spawn_planner(ctx),
-            };
+            let (p, pre) = self.planner_with_preface(ctx);
             let answer_with = if Some(a) == self.orchestrator { "mantra_brief_orchestrator" } else { "mantra_prompt" };
             self.log("?", "amber", format!("{from} asks the planner: {}", trunc(&q, 70)));
             let phase = self.phase_idx().map(|i| format!("phase {}", i + 1)).unwrap_or_else(|| "the finale".into());
@@ -5953,7 +6018,7 @@ Then summarize in 2-4 lines.",
             self.mark_edge(p);
             ctx.prompt(
                 p,
-                format!("[mantra:question] The {from} asks:\n{q}\n\nWe are in {phase}. Workers:\n{status}\nYou are the top of the chain of command: decide yourself whenever the answer keeps the end product and the plan's intent, and answer with {answer_with}. Ask the user (mantra_ask_user) only if it changes what is being built, its scope, or is a trade-off only they can make."),
+                format!("{pre}[mantra:question] The {from} asks:\n{q}\n\nWe are in {phase}. Workers:\n{status}\nYou are the top of the chain of command: decide yourself whenever the answer keeps the end product and the plan's intent, and answer with {answer_with}. Ask the user (mantra_ask_user) only if it changes what is being built, its scope, or is a trade-off only they can make."),
             );
             ("forwarded to the planner — its answer arrives as a message. Call mantra_wait if you have nothing else to do meanwhile.".into(), true)
         } else {

@@ -28,6 +28,8 @@ struct TestCtx {
     items: Vec<(AgentId, Vec<Value>, bool)>,
     /// The vision jobs, run as they were asked for (on this thread), waiting for `settle`.
     finished: Vec<(JobTag, JobOut)>,
+    /// Every `ctx.spawn_resumed`: the agent it gave and the thread it was re-attached to.
+    resumed: Vec<(AgentId, String)>,
 }
 #[derive(Clone, Debug)]
 struct Spawned {
@@ -47,7 +49,7 @@ struct Spawned {
 impl TestCtx {
     // Tests below exercise the Conductor's decisions without making a provider call.
     fn new() -> TestCtx {
-        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], carried: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![] }
+        TestCtx { agents: HashMap::new(), next: 1, interrupted: vec![], prompts: vec![], spawned_instructions: vec![], spawns: vec![], jobs: vec![], stopped: vec![], carried: vec![], efforts_set: vec![], renamed: vec![], spawned_models: vec![], notified: vec![], items: vec![], finished: vec![], resumed: vec![] }
     }
     /// Hands every finished vision job back to `run`, as the app's event loop would.
     fn settle(&mut self, run: &mut Run) {
@@ -358,6 +360,11 @@ fn mk_worker(id: &str, role: &str, agent: AgentId, state: WState) -> Worker {
     }
 }
 impl Ctx for TestCtx {
+    fn spawn_resumed(&mut self, r: SpawnReq, thread: String) -> AgentId {
+        let id = self.spawn(r);
+        self.resumed.push((id, thread));
+        id
+    }
     fn spawn(&mut self, r: SpawnReq) -> AgentId {
         let id = self.next;
         self.next += 1;
@@ -5508,4 +5515,103 @@ fn adopting_an_orchestrator_model_change_leaves_the_agent_to_the_live_switch_but
     assert!(ctx.stopped.contains(&o));
     assert!(ctx.prompts.iter().any(|(_, t)| t.contains("The workflow was updated by the user; continue the phase.")), "{:?}", ctx.prompts);
     let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// ── WP-3.3: the planner keeps its memory across restarts and respawns ──
+
+/// A run in phase 1 `Orchestrating` of a two-task plan, saved to disk and reopened the way
+/// `resume_run` does; `thread` is the saved planner session (None: no session was saved).
+fn resumed_in_phase(tag: &str, thread: Option<&str>, model: Option<&str>) -> (Run, TestCtx) {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "build the thing".into());
+    run.dir = scratch_dir(tag);
+    run.plan = Some(class_phase(2, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.save_state();
+    let mut st = RunState::load(&run.dir).unwrap();
+    if let Some(t) = thread {
+        let alias = model.map(String::from).unwrap_or_else(|| run.role(&run.pattern.flow.planner.clone()).model);
+        st.agents.push(AgentState { slot: "planner".into(), name: "planner".into(), role: run.pattern.flow.planner.clone(), provider: "openai".into(), model_alias: alias, effort: "high".into(), thread_id: Some(t.into()), cwd: "/tmp".into() });
+    }
+    let mut again = Run::from_state(&st, Pattern::builtin(), run.plan.clone(), run.dir.clone());
+    if model.is_some() {
+        // the saved alias is no longer configured: it cannot come back as a pin
+        let own = again.role(&again.pattern.flow.planner.clone()).model;
+        again.set_known_models(HashMap::from([(own, 100_000)]));
+    }
+    let mut ctx = TestCtx::new();
+    again.resume_boot(&mut ctx, &st);
+    (again, ctx)
+}
+
+#[test]
+fn a_planner_with_a_saved_session_is_reattached_on_its_first_use_after_a_phase_resume() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-reattach", Some("t-plan"), None);
+    assert!(run.planner.is_none() && ctx.spawned("planner").is_empty(), "no planner at boot");
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    let p = run.planner.expect("spawned lazily");
+    assert_eq!(ctx.resumed, vec![(p, "t-plan".to_string())]);
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1;
+    assert!(prompt.starts_with("[mantra:resume] Mantra restarted; you are re-attached"), "{prompt}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_planner_saved_on_another_model_is_not_reattached() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-other-model", Some("t-plan"), Some("some-other-alias"));
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    assert!(ctx.resumed.is_empty());
+    let p = run.planner.unwrap();
+    assert!(ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1.starts_with("[mantra:respawn] You are this run's planner"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_planner_without_a_saved_session_starts_with_a_context_pack() {
+    let (mut run, mut ctx) = resumed_in_phase("planner-pack", None, None);
+    run.escalate_to_planner(&mut ctx, "stuck".into());
+    let p = run.planner.unwrap();
+    assert!(ctx.resumed.is_empty());
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == p).unwrap().1;
+    assert!(prompt.starts_with("[mantra:respawn] You are this run's planner"), "{prompt}");
+    assert!(prompt.contains("build the thing") && prompt.contains("\"id\": \"b0\"") && prompt.contains("CURRENT") && prompt.contains("[mantra:escalation]"), "{prompt}");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_change_that_does_not_concern_the_planner_does_not_respawn_it() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "planner-desc");
+    let p = run.spawn_planner(&mut ctx);
+    let mut pattern = run.pattern.clone();
+    let name = pattern.flow.planner.clone();
+    pattern.roles.get_mut(&name).unwrap().description = "a different description".into();
+    run.install_pattern(&mut ctx, PatternProposal { pattern, reason: "wording".into() });
+    assert_eq!(run.planner, Some(p));
+    assert!(!ctx.stopped.contains(&p));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn a_respawned_planner_inherits_the_queue_and_its_predecessors_last_words() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "planner-continuity");
+    let old = run.spawn_planner(&mut ctx);
+    ctx.agents.get_mut(&old).unwrap().push_user("decide about the cache layer");
+    run.respawn_planner(&mut ctx, Some("[mantra:watchdog] stalled".into()));
+    let new = run.planner.unwrap();
+    assert_ne!(new, old);
+    assert!(ctx.carried.contains(&(old, new)));
+    let prompt = &ctx.prompts.iter().rev().find(|(a, _)| *a == new).unwrap().1;
+    assert!(prompt.contains("For continuity, what the previous planner session held:") && prompt.contains("decide about the cache layer"), "{prompt}");
+    assert!(run.pulse.iter().any(|p| p.text == "planner respawned (watchdog)"));
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn respawn_reasons_are_told() {
+    assert_eq!(respawn_why(None), "by you");
+    assert_eq!(respawn_why(Some("[mantra:fallback] x")), "fallback model");
+    assert_eq!(respawn_why(Some("The workflow was updated by the user; continue")), "workflow changed");
+    assert_eq!(respawn_why(Some("Your previous process lost its session")), "session lost");
+    assert_eq!(respawn_why(Some("try again")), "requested");
 }
