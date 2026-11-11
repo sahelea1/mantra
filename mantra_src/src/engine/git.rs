@@ -302,6 +302,9 @@ pub fn sync_worker(ws: &Workspace, dir: &Path) -> Result<(), String> {
     if !ws.worktree || dir == ws.integ {
         return Ok(());
     }
+    // a generic fix worker edits the integrated copy and nothing commits that until the phase
+    // commit: without this the merge below would not carry those edits
+    commit_all(&ws.integ, "mantra: integrated state before a repair")?;
     commit_all(dir, "mantra: before fix")?;
     if let Err(e) = git_with_identity(dir, &["merge", "--no-edit", &ws.branch]) {
         let _ = git(dir, &["merge", "--abort"]);
@@ -1217,6 +1220,28 @@ mod tests {
             let _ = std::fs::remove_dir_all(&plain);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+    #[test]
+    fn sync_worker_carries_uncommitted_edits_of_the_integrated_copy() {
+        let dir = temp_repo("syncinteg");
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let mut ws = test_ws(&dir, None);
+        ws.branch = branch;
+        let worker = worker_repo(&dir, "syncinteg");
+        // a generic fix worker edited the integrated copy; nothing committed it
+        std::fs::write(dir.join("tracked.txt"), "fixed in integ\n").unwrap();
+        sync_worker(&ws, &worker).unwrap();
+        assert_eq!(std::fs::read_to_string(worker.join("tracked.txt")).unwrap(), "fixed in integ\n");
+        // the owner now changes the same file and its branch merges without a "would be overwritten"
+        std::fs::write(worker.join("tracked.txt"), "fixed in integ\nowner\n").unwrap();
+        commit_all(&worker, "owner repair").unwrap();
+        let wbranch = git(&worker, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let m = merge_workers(&ws, &[("t1".to_string(), worker.clone(), wbranch)]);
+        assert!(m.blocked.is_empty(), "{:?}", m.blocked);
+        assert!(m.conflicts.is_empty(), "{:?}", m.conflicts);
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "fixed in integ\nowner\n");
+        let _ = git(&dir, &["worktree", "remove", "--force", &worker.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn sync_worker_brings_in_the_integrated_state_and_a_conflict_leaves_the_worktree_clean() {

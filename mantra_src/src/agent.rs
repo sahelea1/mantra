@@ -1174,6 +1174,10 @@ pub fn is_transport_error(kind: Option<ErrKind>, msg: &str) -> bool {
 /// "… session limit …", "… weekly limit …", "… Opus limit …") and its close relatives.
 /// `m` is lower-cased by the caller.
 pub fn subscription_limit_text(m: &str) -> bool {
+    // "Context limit reached · /compact or /clear to continue" is a full context, not the plan's quota
+    if m.contains("context") {
+        return false;
+    }
     (m.contains("hit your") && m.contains("limit"))
         || m.contains("limit reached")
         || m.contains("out of extra usage")
@@ -1574,6 +1578,10 @@ mod tests {
             assert!(!is_transport_error(None, msg), "{msg}");
         }
         assert!(!is_usage_limit_error(None, "hit the limit of 3 retries"));
+        let ctx_full = "Context limit reached · /compact or /clear to continue";
+        assert!(!subscription_limit_text(&ctx_full.to_lowercase()));
+        assert!(!is_usage_limit_error(None, ctx_full));
+        assert!(subscription_limit_text("limit reached · resets 9:20pm"));
     }
 
     #[test]

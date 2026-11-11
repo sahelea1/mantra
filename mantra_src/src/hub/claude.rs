@@ -1008,11 +1008,11 @@ impl Translator {
 /// widen this once that variant lands, with no change needed here beyond the returned key.
 fn classify_claude_error(v: &Value, msg: &str, rate_limited: bool) -> Option<&'static str> {
     let m = msg.to_lowercase();
+    if m.contains("prompt is too long") || (m.contains("context") && (m.contains("too long") || m.contains("exceed") || m.contains("limit reached"))) {
+        return Some("contextWindowExceeded");
+    }
     if rate_limited || crate::agent::subscription_limit_text(&m) {
         return Some("usageLimitExceeded");
-    }
-    if m.contains("prompt is too long") || (m.contains("context") && (m.contains("too long") || m.contains("exceed"))) {
-        return Some("contextWindowExceeded");
     }
     if m.contains("max_budget") || m.contains("budget exceeded") {
         return Some("usageLimitExceeded");
@@ -1081,6 +1081,15 @@ fn tool_result_text(block: &Value, tool_use_result: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use crate::agent::{Agent, Kind, Signal};
+
+    /// A full context is told apart from the subscription limit, even when the CLI also set the flag.
+    #[test]
+    fn a_context_overflow_is_not_a_usage_limit() {
+        let ctx = "Context limit reached · /compact or /clear to continue";
+        assert_eq!(classify_claude_error(&json!({}), ctx, false), Some("contextWindowExceeded"));
+        assert_eq!(classify_claude_error(&json!({}), "You've hit your 5-hour limit · resets 9:20pm", false), Some("usageLimitExceeded"));
+        assert_eq!(classify_claude_error(&json!({}), "Limit reached · resets 9:20pm", false), Some("usageLimitExceeded"));
+    }
 
     /// The stream CLI may produce init only after its first input. A held prompt must
     /// bootstrap a resumed planner, and a second prompt must still start a real turn.

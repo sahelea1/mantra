@@ -510,6 +510,9 @@ pub struct Run {
     pub plan: Option<Plan>,
     /// The last plan the validator rejected (with any patches applied since): `mantra_patch_plan` builds on it.
     pub plan_draft: Option<Plan>,
+    /// `(plan_version, phase_idx())` when `plan_draft` was stored: a draft from an earlier plan or
+    /// phase is stale and `mantra_patch_plan` drops it.
+    plan_draft_at: (u32, Option<usize>),
     pub plan_version: u32,
     pub planner: Option<AgentId>,
     /// The run-wide supervisor (`flow.manager`), spawned when the first phase starts and re-spawned
@@ -540,6 +543,9 @@ pub struct Run {
     /// the findings the round was started with, and the owners' reports of this phase so far
     /// (task, round, report) for the next QA agent.
     pub(crate) fix_owner: Option<String>,
+    /// An `OwnerSync`/`OwnerMerge` job is in flight (runtime only): the owner looks `(Done, None)`
+    /// meanwhile, and the job's result continues the flow.
+    owner_job: bool,
     /// The fix that just ended while its checks re-run (WP-5.5): what the canvas draws as the
     /// edge coming back. Cleared when the next QA round spawns or the phase leaves the gate.
     pub(crate) fix_done: Option<FixView>,
@@ -763,6 +769,7 @@ impl Run {
             pending: None,
             plan: None,
             plan_draft: None,
+            plan_draft_at: (0, None),
             plan_version: 0,
             planner: None,
             manager: None,
@@ -778,6 +785,7 @@ impl Run {
             gate_big: false,
             gate_fix_by: None,
             fix_owner: None,
+            owner_job: false,
             fix_done: None,
             fix_findings: String::new(),
             owner_fixes: vec![],
@@ -1488,6 +1496,13 @@ impl Run {
         let live = self.all_agents();
         for a in paused.clone() {
             if Some(a) == except || !live.contains(&a) || self.edges.get(&a).map(|t| *t >= t0).unwrap_or(false) {
+                // skipped, but a message held for it must still arrive (a plain prompt, as below)
+                if live.contains(&a) {
+                    if let Some(held) = self.redeliver.remove(&a).filter(|h| !h.is_empty()) {
+                        self.mark_edge(a);
+                        ctx.prompt(a, self.with_akasha(a, held.join("\n\n")));
+                    }
+                }
                 continue;
             }
             let mut text = String::from("[mantra:resume] The run was paused and is resuming now. Continue where you left off.");
@@ -2361,7 +2376,9 @@ Then summarize in 2-4 lines.",
         self.phase_started = Instant::now();
         self.last_review = Instant::now();
         self.workers.clear();
+        self.plan_draft = None;
         self.fix_owner = None;
+        self.owner_job = false;
         self.fix_done = None;
         self.fix_findings.clear();
         self.owner_fixes.clear();
@@ -2574,6 +2591,15 @@ Then summarize in 2-4 lines.",
             Some(t) => ctx.spawn_resumed(req, t),
             None => ctx.spawn(req),
         };
+        // the agent this one replaces for the same task (a fallback restarts the same worker, a
+        // retry is the next attempt): the user's queued messages follow it
+        let replaced_agent = if resumed { None } else { self.workers[wi].agent.or_else(|| { let t = &self.workers[wi].task.id; self.workers[..wi].iter().rev().find(|x| x.task.id == *t).and_then(|x| x.agent) }) }.filter(|o| *o != id);
+        if let Some(old) = replaced_agent {
+            ctx.carry_over(old, id);
+            if !self.replaced.contains(&(old, id)) {
+                self.replaced.push((old, id));
+            }
+        }
         let w = &mut self.workers[wi];
         w.agent = Some(id);
         w.wt = Some(dir);
@@ -2962,6 +2988,7 @@ Then summarize in 2-4 lines.",
         match (self.ws.clone(), self.workers[wi].wt.clone()) {
             (Some(ws), Some(dir)) => {
                 ctx.job(JobTag::OwnerSync { phase: idx, round, task }, Box::new(move || JobOut::Text(git::sync_worker(&ws, &dir).map(|_| String::new()))));
+                self.owner_job = true;
             }
             _ => self.owner_fix_go(ctx, idx, round, wi),
         }
@@ -2999,7 +3026,14 @@ Then summarize in 2-4 lines.",
         match (self.ws.clone(), w.wt.clone()) {
             (Some(ws), Some(dir)) if ws.worktree => {
                 let list = vec![(w.task.id.clone(), dir, w.branch.clone())];
-                ctx.job(JobTag::OwnerMerge { phase: idx, round }, Box::new(move || JobOut::Merge(git::merge_workers(&ws, &list))));
+                ctx.job(JobTag::OwnerMerge { phase: idx, round }, Box::new(move || {
+                    // a generic fix worker's edits of the integrated copy are uncommitted: commit them so the merge cannot trip over them
+                    if let Err(e) = git::commit_all(&ws.integ, "mantra: integrated state before a repair") {
+                        return JobOut::Merge(git::MergeResult { merged: vec![], conflicts: vec![], blocked: vec![e], log: String::new() });
+                    }
+                    JobOut::Merge(git::merge_workers(&ws, &list))
+                }));
+                self.owner_job = true;
             }
             _ => self.on_fix_done(ctx, idx, round),
         }
@@ -3091,9 +3125,13 @@ Then summarize in 2-4 lines.",
     /// A halt was lifted while a fix worker owned the phase: pick up where it is.
     fn resume_fix(&mut self, ctx: &mut dyn Ctx, idx: usize, round: u32) {
         if let Some(t) = self.fix_owner.clone() {
+            // the sync or the merge is still running: its result continues the flow
+            if self.owner_job {
+                return;
+            }
             match self.workers.iter().rev().find(|w| !w.adhoc && w.task.id == t).map(|w| (w.state.clone(), w.owner_fixing)) {
-                // still repairing: the halt's "continue where you left off" re-prompt reaches it
-                Some((WState::Running, Some(_))) => {}
+                // still repairing (or waiting out a retry of that turn): the halt's "continue where you left off" re-prompt reaches it
+                Some((WState::Running | WState::Retrying(_), Some(_))) => {}
                 Some((WState::Done, None)) => self.on_fix_done(ctx, idx, round),
                 _ => {
                     self.fix_owner = None;
@@ -3451,6 +3489,7 @@ Then summarize in 2-4 lines.",
                 self.run_checks(ctx, phase, 0);
             }
             (JobTag::OwnerSync { phase, round, task }, JobOut::Text(r)) => {
+                self.owner_job = false;
                 // a revision or a restart moved the run on: nothing waits for this any more
                 let current = matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) && self.fix_owner.as_deref() == Some(task.as_str());
                 let Some(wi) = self.workers.iter().rposition(|w| !w.adhoc && w.task.id == task).filter(|_| current) else { return };
@@ -3466,6 +3505,7 @@ Then summarize in 2-4 lines.",
                 }
             }
             (JobTag::OwnerMerge { phase, round }, JobOut::Merge(m)) => {
+                self.owner_job = false;
                 if !matches!(self.stage, Stage::Phase { idx, step: PhaseStep::Fix { round: r2 } } if idx == phase && r2 == round) {
                     return;
                 }
@@ -4191,9 +4231,7 @@ Then summarize in 2-4 lines.",
                 self.workers[wi].prompt = join_note(Some(note), task_prompt.clone());
                 self.launch_worker(ctx, wi, dir, branch);
                 self.workers[wi].prompt = task_prompt;
-                if let Some(new) = self.workers[wi].agent.filter(|n| *n != a) {
-                    self.replaced.push((a, new));
-                }
+                // `launch_worker` has carried the queue over and recorded the replacement
                 true
             } else {
                 false
@@ -4337,7 +4375,7 @@ Then summarize in 2-4 lines.",
                 }
                 // A first turn that ends without the closing lines is asked for them once; a
                 // second one (or a follow-up on a done worker) counts as done, so this never loops.
-                if status_line.is_none() && self.workers[wi].state != WState::Done && !self.workers[wi].status_asked {
+                if status_line.is_none() && self.workers[wi].state != WState::Done && !self.workers[wi].status_asked && !self.halted() {
                     if let Some(a) = agent {
                         self.workers[wi].status_asked = true;
                         self.log("?", "amber", format!("{tid} ended its turn without a STATUS line — asking for it"));
@@ -5384,6 +5422,7 @@ Then summarize in 2-4 lines.",
         }
         let id = self.spawn_manager_with(ctx, None);
         if let Some(old) = old_manager {
+            ctx.carry_over(old, id);
             self.replaced.push((old, id));
         }
         self.mark_edge(id);
@@ -5552,6 +5591,7 @@ Then summarize in 2-4 lines.",
         }
         let id = self.spawn_orchestrator(ctx);
         if let Some(old) = old_orch {
+            ctx.carry_over(old, id);
             self.replaced.push((old, id));
         }
         self.mark_edge(id);
@@ -5591,6 +5631,7 @@ Then summarize in 2-4 lines.",
         }
         self.spawn_gate_at_round(ctx, idx, round);
         if let (Some(old), Some(g)) = (old_gate, self.gate_agent) {
+            ctx.carry_over(old, g);
             self.replaced.push((old, g));
         }
         if let (Some(n), Some(g)) = (note, self.gate_agent) {
@@ -5603,8 +5644,10 @@ Then summarize in 2-4 lines.",
     fn respawn_finale(&mut self, ctx: &mut dyn Ctx, note: Option<String>) -> Option<&'static str> {
         let why = respawn_why(note.as_deref());
         let Stage::Finale { idx } = self.stage else { return None };
+        let mut old_finale = None;
         if let Some(old) = self.finale_agent.take() {
             if Some(old) != self.planner {
+                old_finale = Some(old);
                 self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
                 ctx.stop(old, true);
             }
@@ -5615,6 +5658,10 @@ Then summarize in 2-4 lines.",
             return Some(RESPAWN_DEFERRED);
         }
         self.start_finale(ctx, idx);
+        if let (Some(old), Some(new)) = (old_finale, self.finale_agent.filter(|n| Some(*n) != old_finale)) {
+            ctx.carry_over(old, new);
+            self.replaced.push((old, new));
+        }
         if let (Some(n), Some(a)) = (note, self.finale_agent) {
             ctx.prompt(a, format!("[mantra:respawn] {n}"));
         }
@@ -5696,6 +5743,7 @@ Then summarize in 2-4 lines.",
         if let Err(errs) = validation_plan.validate(&self.pattern) {
             self.log("✗", "amber", format!("plan rejected ({} issue(s))", errs.len()));
             self.plan_draft = Some(plan);
+            self.plan_draft_at = (self.plan_version, self.phase_idx());
             return (format!("REJECTED — fix these and resubmit:\n- {}\nThe plan you sent is kept as a draft: fix it with mantra_patch_plan (only the changed parts) instead of sending it again.", errs.join("\n- ")), false);
         }
         self.plan_draft = None;
@@ -5872,6 +5920,9 @@ Then summarize in 2-4 lines.",
                 }
                 let reason = s("reason");
                 if reason.trim().is_empty() { return ("REJECTED: say why the plan changes".into(), false); }
+                if self.plan_draft.is_some() && self.plan_draft_at != (self.plan_version, self.phase_idx()) {
+                    self.plan_draft = None; // from an earlier plan or phase: patch the live plan
+                }
                 let base = match self.plan_draft.clone().or_else(|| self.plan.clone()) {
                     Some(p) => p,
                     None => return ("REFUSED: there is no plan yet — submit one with mantra_submit_plan".into(), false),
@@ -6601,6 +6652,7 @@ Then summarize in 2-4 lines.",
             }
         }
         self.fix_owner = None;
+        self.owner_job = false;
         self.fix_done = None;
         self.fix_findings.clear();
     }

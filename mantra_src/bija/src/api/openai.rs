@@ -234,8 +234,10 @@ impl Stream {
                     self.on_tool_delta(choice_index, call, on_delta);
                 }
             }
-            if self.finish.is_none() {
-                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                // first non-null wins, except that a tool-call reason beats an earlier "stop" of another choice
+                let calls = |r: &str| matches!(r, "tool_calls" | "function_call");
+                if self.finish.as_deref().map_or(true, |old| calls(reason) && !calls(old)) {
                     self.finish = Some(reason.to_string());
                 }
             }
@@ -370,6 +372,7 @@ fn no_missing_calls(reason: Option<&str>, parsed: usize) -> Result<(), ApiError>
 
 fn finish_of(reason: Option<&str>, has_calls: bool) -> Finish {
     match reason {
+        Some("stop") if has_calls => Finish::ToolCalls,
         Some("stop") => Finish::Stop,
         Some("tool_calls") | Some("function_call") => Finish::ToolCalls,
         Some("length") => Finish::Length,
@@ -463,6 +466,25 @@ mod tests {
         let (_, _, calls) = assistant(&resp);
         let summary: Vec<(&str, &str, Value)> = calls.iter().map(|c| (c.id.as_str(), c.name.as_str(), c.args.clone())).collect();
         assert_eq!(summary, vec![("a", "read_file", json!({"path": "x"})), ("b", "glob", json!({"pattern": "*.rs"})), ("c", "list_dir", json!({}))]);
+    }
+
+    #[test]
+    fn a_tool_call_choice_wins_over_another_choices_stop() {
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"x","function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":1,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let mut s = Stream::default();
+        for e in events {
+            s.on_event(e, &mut |_| {}).expect("event");
+        }
+        let resp = s.finish(true).expect("finish");
+        assert_eq!(assistant(&resp).2.len(), 1);
+        assert_eq!(resp.finish, Finish::ToolCalls);
+        // without calls the first non-null reason stays
+        let mut s = Stream::default();
+        s.on_event(r#"{"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"},{"index":1,"delta":{"content":"b"},"finish_reason":"length"}]}"#, &mut |_| {}).expect("event");
+        assert_eq!(s.finish(true).expect("finish").finish, Finish::Stop);
     }
 
     #[test]
