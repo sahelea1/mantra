@@ -209,6 +209,9 @@ pub struct PatternSettings {
     /// on one task); 200k keeps it honest. 0 = the model's full window.
     #[serde(deserialize_with = "deserialize_context_cap")]
     pub context_cap: u64,
+    /// "inherit" = Claude Code agents load your user-level settings, hooks and memory as your own
+    /// sessions do. "project" = only the project's and local settings load.
+    pub claude_user_config: String,
 }
 
 /// The smallest context window a role limit or the pattern's cap may ask for.
@@ -291,6 +294,7 @@ impl Default for PatternSettings {
             writable_roots: vec![],
             first_token_minutes: 4,
             context_cap: 0,
+            claude_user_config: "inherit".into(),
         }
     }
 }
@@ -562,6 +566,9 @@ impl Pattern {
         }
         if !self.is_auto() && !self.settings.planner_loop && self.worker_roles().is_empty() {
             errs.push("pattern needs at least one role with kind = \"worker\"".into());
+        }
+        if !["inherit", "project"].contains(&self.settings.claude_user_config.as_str()) {
+            errs.push(format!("settings.claude_user_config must be inherit or project (got '{}')", self.settings.claude_user_config));
         }
         if (1..MIN_CONTEXT).contains(&self.settings.context_cap) {
             errs.push("settings.context_cap must be 0 (no cap) or at least 16k tokens".into());
@@ -1129,6 +1136,18 @@ fn builtin_thorough() -> Pattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_user_config_is_inherit_or_project() {
+        let mut p = Pattern::builtin();
+        assert_eq!(p.settings.claude_user_config, "inherit");
+        p.settings.claude_user_config = "project".into();
+        assert!(p.validate().is_ok());
+        p.settings.claude_user_config = "nothing".into();
+        assert!(p.validate().unwrap_err().iter().any(|e| e.contains("claude_user_config")));
+        let old = Pattern::from_toml(&toml::to_string(&Pattern::builtin()).unwrap().lines().filter(|l| !l.starts_with("claude_user_config")).collect::<Vec<_>>().join("\n")).unwrap();
+        assert_eq!(old.settings.claude_user_config, "inherit", "an old pattern file keeps today's behaviour");
+    }
 
     fn all_builtins() -> Vec<Pattern> {
         Pattern::names().into_iter().filter(|n| *n != NAME_AUTO).map(|n| Pattern::builtin_named(n).unwrap()).collect()

@@ -23,7 +23,7 @@ const SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access
 const ROLE_FIELDS: &[&str] = &["kind", "glyph", "color", "model", "effort", "fallback", "context", "sandbox", "permission", "swarm", "parallel", "max_tokens", "mcp", "description", "instructions"];
 /// The pattern's own fields, first in its settings entry: a new name saves a copy under it.
 const PATTERN_FIELDS: &[&str] = &["name", "description"];
-const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "allow_pattern_changes"];
+const SETTING_FIELDS: &[&str] = &["isolation", "network", "writable_roots", "max_parallel", "worker_retries", "review_plan", "orchestrator_context", "stall_minutes", "gate_max_rounds", "check_timeout_secs", "max_tasks_per_phase", "watchdog_seconds", "watchdog_escalate_seconds", "review_minutes", "manager_minutes", "first_token_minutes", "context_cap", "claude_user_config", "allow_pattern_changes"];
 const ADD_STEP: &str = "+ add finale step";
 
 /// How a field takes keys (`ui::form`'s rules).
@@ -47,7 +47,7 @@ fn field_kind(entry: &str, field: &str) -> Kind {
     match entry {
         "⚙ settings" => match field {
             "name" | "description" | "writable_roots" => Kind::Text,
-            "isolation" | "orchestrator_context" => Kind::Choice,
+            "isolation" | "orchestrator_context" | "claude_user_config" => Kind::Choice,
             "network" | "review_plan" | "allow_pattern_changes" => Kind::Toggle,
             _ => Kind::Step,
         },
@@ -159,6 +159,7 @@ fn get_value(app: &App, entry: &str, field: &str) -> String {
                 "name" => p.name.clone(),
                 "description" => p.description.clone(),
                 "isolation" => s.isolation.clone(),
+                "claude_user_config" => s.claude_user_config.clone(),
                 "network" => if s.network { "on".into() } else { "off".into() },
                 "writable_roots" => if s.writable_roots.is_empty() { "none".into() } else { s.writable_roots.join(", ") },
                 "max_parallel" => s.max_parallel.to_string(),
@@ -256,6 +257,7 @@ fn choices(app: &App, entry: &str, field: &str) -> Vec<String> {
         "⚙ settings" => match field {
             "isolation" => list(&["auto", "worktree", "shared"]),
             "orchestrator_context" => list(&["fresh", "compact"]),
+            "claude_user_config" => list(&["inherit", "project"]),
             _ => vec![],
         },
         "⇢ flow" => match field {
@@ -299,6 +301,7 @@ fn set_choice(app: &mut App, entry: &str, field: &str, v: &str) {
         "⚙ settings" => match field {
             "isolation" => p.settings.isolation = v.into(),
             "orchestrator_context" => p.settings.orchestrator_context = v.into(),
+            "claude_user_config" => p.settings.claude_user_config = v.into(),
             _ => return,
         },
         "⇢ flow" => {
@@ -993,6 +996,7 @@ fn field_hint(field: &str) -> Option<&'static str> {
         "context" => "Optional ceiling on the context window of this role's agents, on top of the pattern's context_cap and the model's own window: the smallest wins. none = no role limit. Examples: 128k, 200k, 1M (at least 16k).",
         "permission" => "never keeps the sandbox and skips prompts. BYPASS-SANDBOX-DANGER skips prompts AND the sandbox. on-request / untrusted asks you (ctrl+g).",
         "swarm" => "Lets this role start a temporary swarm in Solo. Swarm children cannot spawn another swarm.",
+        "claude_user_config" => "inherit = Claude Code agents load your own user settings, hooks and memory. project = only this project's settings — faster starts, and your private rules stay out of the team.",
         "network" => "on = workspace-write agents may use the network (package managers, docs).",
         "writable_roots" => "Extra directories sandboxed agents may write, comma-separated (~ = your home). Toolchain caches are added automatically.",
         "mcp" => "MCP servers this role's agents get, by their name in /settings (e.g. blender), comma-separated. * = every enabled one, none = no server.",

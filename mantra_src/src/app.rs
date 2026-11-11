@@ -439,6 +439,9 @@ pub struct AgentOpts {
     /// The MCP servers this agent gets, resolved by the caller (`Settings::mcp_for` on Solo's
     /// `solo_mcp` or the role's `mcp`); empty for everything else (architect, probes).
     pub mcp: Vec<(String, crate::config::McpServer)>,
+    /// "project" = a Claude Code agent loads only the project's and local settings (`--setting-sources
+    /// project,local`); anything else = the user's own settings load too.
+    pub claude_user_config: String,
 }
 
 /// The name `--demo` registers its stand-in MCP server under (`mantra mock-mcp`).
@@ -690,7 +693,7 @@ fn agent_spec(hub: &mut Hub, reg: &Registry, o: &AgentOpts) -> (SpawnSpec, Strin
             }
         }
         let strict_mcp = claude_strict_mcp(&o);
-        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge(), strict_mcp }), None, None)
+        (vec![], envs, Some(crate::hub::ClaudeSpawn { auth, base_url, autocompact: cw, system_prompt: o.instructions.clone(), mcp_sock: hub.ensure_bridge(), strict_mcp, user_config_project: o.claude_user_config == "project" }), None, None)
     } else if backend == crate::hub::Backend::Bija {
         let (spawn, envs) = bija_spawn(reg, &m, &o, cw, compact_pct);
         (vec![], envs, None, Some(spawn), None)
@@ -901,7 +904,7 @@ impl Ctx for Ctxt<'_> {
             self.hub,
             self.agents,
             self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: r.claude_user_config.clone(),
                 name: r.name,
                 role: r.role_name,
                 glyph: r.role.glyph.clone(),
@@ -930,7 +933,7 @@ impl Ctx for Ctxt<'_> {
             self.hub,
             self.agents,
             self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: r.claude_user_config.clone(),
                 name: r.name,
                 role: r.role_name,
                 glyph: r.role.glyph.clone(),
@@ -1194,7 +1197,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: "solo".into(),
                 role: "solo".into(),
                 glyph: "●".into(),
@@ -1893,7 +1896,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: "architect".into(),
                 role: "architect".into(),
                 glyph: "★".into(),
@@ -1948,7 +1951,7 @@ impl App {
             &mut self.hub,
             &mut self.agents,
             &self.registry,
-            AgentOpts {
+            AgentOpts { claude_user_config: String::new(),
                 name: format!("probe:{alias}"),
                 role: "probe".into(),
                 glyph: "·".into(),
@@ -2775,7 +2778,7 @@ impl App {
                     let backend = self.registry.backend_of(&model);
                     let mcp = self.settings.mcp_for(&self.settings.solo_mcp);
                     let approval = self.agents.get(&parent).map(|a| a.approval.clone()).unwrap_or_else(|| self.settings.approval_mode.clone());
-                    let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
+                    let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts { claude_user_config: String::new(),
                         name: format!("solo subagent · {alias}"), role: "solo-subagent".into(), glyph: "◇".into(), color: "blue".into(),
                         model_alias: alias.to_string(), effort: args.get("effort").and_then(Value::as_str).map(str::to_string), cwd: self.project.clone(),
                         approval, sandbox: role_sandbox(&self.settings.sandbox, backend),
@@ -4341,7 +4344,7 @@ done"#;
         let mut reg = Registry::defaults();
         reg.add_codex_model("test-codex", "test").unwrap();
         for (permission, resume) in [("never", false), (crate::config::BYPASS_SANDBOX_DANGER, false), (crate::config::BYPASS_SANDBOX_DANGER, true)] {
-            let id = spawn_agent(&mut hub, &mut agents, &reg, AgentOpts {
+            let id = spawn_agent(&mut hub, &mut agents, &reg, AgentOpts { claude_user_config: String::new(),
                 name: "test".into(), role: "worker".into(), glyph: "◇".into(), color: "teal".into(),
                 model_alias: "test-codex".into(), effort: None, cwd: dir.clone(),
                 approval: permission.into(), sandbox: "read-only".into(), instructions: String::new(), tools: vec![],
@@ -4375,7 +4378,7 @@ done"#;
         let mut hub = Hub::new(vec!["true".into()], vec![], vec![], vec![], ev_tx, false);
         let mut agents = BTreeMap::new();
         let reg = Registry::defaults();
-        let opts = |effort: Option<&str>| AgentOpts {
+        let opts = |effort: Option<&str>| AgentOpts { claude_user_config: String::new(),
             name: "w".into(),
             role: "worker-small".into(),
             glyph: "◇".into(),
@@ -4460,7 +4463,7 @@ done"#;
         a.turn_active = true;
         a.queued.push("also check tests".into());
         a.push_user("Build the parser without changing the wire format");
-        a.launch_options = Some(Box::new(AgentOpts {
+        a.launch_options = Some(Box::new(AgentOpts { claude_user_config: String::new(),
             name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(),
             model_alias: "sol".into(), effort: Some("medium".into()), cwd: PathBuf::from("."),
             approval: "never".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(),
@@ -4609,7 +4612,7 @@ done"#;
         reg.providers.push(crate::config::ProviderEntry { id: "local".into(), kind: bija, base_url: "http://127.0.0.1:11434/v1".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "big".into(), provider: "gw".into(), model: "big-1".into(), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "small".into(), provider: "local".into(), model: "local-model".into(), ..Default::default() });
-        let o = AgentOpts {
+        let o = AgentOpts { claude_user_config: String::new(),
             name: "w".into(),
             role: "worker".into(),
             glyph: "·".into(),
@@ -5363,7 +5366,7 @@ done"#;
     /// the user's own `claude mcp` servers, as it had them before the vision tools came.
     #[test]
     fn claude_is_strict_except_for_solo_with_the_vision_tools_alone() {
-        let o = |tools: Vec<Value>, mcp: Vec<(String, crate::config::McpServer)>| AgentOpts {
+        let o = |tools: Vec<Value>, mcp: Vec<(String, crate::config::McpServer)>| AgentOpts { claude_user_config: String::new(),
             name: "solo".into(),
             role: "solo".into(),
             glyph: "●".into(),
@@ -5486,7 +5489,7 @@ done"#;
         reg.providers.push(crate::config::ProviderEntry { id: "agy".into(), kind: crate::config::ProviderKind::Antigravity, api_key: Some("must-not-leak".into()), ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "google".into(), provider: "agy".into(), model: "account-model".into(), efforts: vec!["low".into(), "medium".into(), "high".into()], ..Default::default() });
         let (mut hub, _commands) = test_hub_with(1);
-        let opts = AgentOpts {
+        let opts = AgentOpts { claude_user_config: String::new(),
             name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "google".into(), effort: Some("max".into()), cwd: PathBuf::from("."), approval: "on-request".into(), sandbox: "workspace-write".into(), instructions: "Keep the public API stable".into(), tools: vec![json!({"name":"mantra_status"})], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(123456), resume_thread: None, thread_name: None, mcp: vec![],
         };
         let (spec, _, lowered) = agent_spec(&mut hub, &reg, &opts);
@@ -5506,7 +5509,7 @@ done"#;
         reg.providers.push(crate::config::ProviderEntry { id: "cx".into(), kind: crate::config::ProviderKind::Codex, ..Default::default() });
         reg.models.push(crate::config::ModelEntry { alias: "cx-big".into(), provider: "cx".into(), model: "cx-big".into(), context_window: Some(1_000_000), ..Default::default() });
         let (mut hub, _commands) = test_hub_with(1);
-        let opts = AgentOpts {
+        let opts = AgentOpts { claude_user_config: String::new(),
             name: "worker".into(), role: "worker".into(), glyph: "x".into(), color: "teal".into(), model_alias: "cx-big".into(), effort: None, cwd: PathBuf::from("."), approval: "never".into(), sandbox: "workspace-write".into(), instructions: String::new(), tools: vec![], extra_writable: vec![], network: false, writable_roots: vec![], context_override: Some(500_000), resume_thread: None, thread_name: None, mcp: vec![],
         };
         let (spec, _, _) = agent_spec(&mut hub, &reg, &opts);

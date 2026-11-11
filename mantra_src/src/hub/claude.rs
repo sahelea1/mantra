@@ -59,6 +59,8 @@ pub struct ClaudeSpawn {
     /// Solo agent, which has always had the user's servers. An agent given servers of Mantra's
     /// (`SpawnSpec.mcp`) is strict either way.
     pub strict_mcp: bool,
+    /// `--setting-sources project,local`: the user's own Claude settings, hooks and memory stay out.
+    pub user_config_project: bool,
 }
 
 /// Runs one `claude` process for the lifetime of a single spawn attempt (a crash returns
@@ -462,6 +464,9 @@ fn build_args(id: AgentId, spec: &SpawnSpec, cs: &ClaudeSpawn, model: &str, effo
         }
         a.push("--mcp-config".into());
         a.push(mcp_config_json(id, bridge, &spec.mcp).to_string());
+    }
+    if cs.user_config_project {
+        a.extend(["--setting-sources".into(), "project,local".into()]);
     }
     a.extend(sandbox_args(&spec.sandbox, &spec.cwd));
     if cs.auth == "api_key" {
@@ -1088,7 +1093,7 @@ mod tests {
             developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
             extra_args: vec![], resume_thread: Some("saved-planner".into()), thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
-            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+            claude: Some(ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
             bija: None, antigravity: None, mcp: vec![],
         };
@@ -1149,7 +1154,7 @@ done"#;
             developer_instructions: String::new(), dynamic_tools: vec![], config: Default::default(),
             extra_args: vec![], resume_thread: None, thread_name: None,
             backend: crate::config::ProviderKind::ClaudeCode, envs: vec![],
-            claude: Some(ClaudeSpawn { auth: "subscription".into(), base_url: String::new(),
+            claude: Some(ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(),
                 autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false }),
             bija: None, antigravity: None, mcp: vec![],
         };
@@ -1200,7 +1205,7 @@ done"#;
             antigravity: None,
             mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "api_key".into(), base_url: "https://api.libertai.io/v1".into(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: None, strict_mcp: true };
         let args = build_args(1, &spec, &cs, "sonnet5", "high", "abc-123", true, &[]);
         assert!(args.windows(2).any(|w| w == ["--resume".to_string(), "abc-123".to_string()]));
         assert!(!args.contains(&"--session-id".to_string()));
@@ -1212,6 +1217,10 @@ done"#;
         assert!(args.windows(2).any(|w| w == ["--tools".to_string(), "Read,Glob,Grep,WebFetch".to_string()]));
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.windows(2).any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#]), "a strict agent with no servers must receive an empty config");
+        assert!(!args.contains(&"--setting-sources".to_string()), "inherit is today's behaviour");
+        let project = ClaudeSpawn { user_config_project: true, ..cs.clone() };
+        let args_project = build_args(1, &spec, &project, "sonnet5", "", "abc-123", false, &[]);
+        assert!(args_project.windows(2).any(|w| w == ["--setting-sources", "project,local"]));
         let solo = ClaudeSpawn { strict_mcp: false, ..cs.clone() };
         let args_solo = build_args(1, &spec, &solo, "sonnet5", "", "abc-123", false, &[]);
         assert!(!args_solo.contains(&"--mcp-config".to_string()), "ordinary Solo keeps its MCP settings");
@@ -1261,7 +1270,7 @@ done"#;
             antigravity: None,
             mcp: vec![],
         };
-        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(), autocompact: 200_000, system_prompt: "be nice".into(), mcp_sock: Some(std::path::PathBuf::from("/tmp/mantra-9.sock")), strict_mcp: true };
         let args = build_args(7, &spec, &cs, "sonnet5", "high", "abc-123", false, &[]);
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         // Solo bridged for its vision tools alone keeps the user's own `claude mcp` servers
@@ -1314,7 +1323,7 @@ done"#;
             serde_json::from_str(&args[i + 1]).expect("valid JSON")
         };
         // no bridge (Solo, or no tools): the servers alone, and no word about mcp__mantra__
-        let cs = ClaudeSpawn { auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false };
+        let cs = ClaudeSpawn { user_config_project: false, auth: "subscription".into(), base_url: String::new(), autocompact: 0, system_prompt: String::new(), mcp_sock: None, strict_mcp: false };
         let args = build_args(3, &spec, &cs, "m", "", "s-1", false, &[]);
         assert!(args.contains(&"--strict-mcp-config".to_string()), "servers of Mantra's: strict even for Solo");
         let cfg = config_of(&args);

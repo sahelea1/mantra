@@ -186,7 +186,7 @@ impl App {
                     mcp.clone(),
                 ),
             };
-            let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts {
+            let child = spawn_agent(&mut self.hub, &mut self.agents, &self.registry, AgentOpts { claude_user_config: String::new(),
                 name, role: role_name.into(), glyph, color, model_alias: task.model.clone(), effort: task.effort,
                 cwd: cwd.clone(), approval, sandbox, instructions,
                 tools: { let mut t = if advisor.is_some() { vec![] } else { tools::swarm_member_note_tools() }; if model.vision { t.extend(tools::vision_tools()); } t },

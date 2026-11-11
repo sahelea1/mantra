@@ -546,7 +546,7 @@ mod tests {
     /// A switchable fixture follows the production spawn path, retaining its launch policy.
     /// Test hubs have empty backend commands, so these tests cannot contact a provider.
     fn spawn_launchable_test_agent(app: &mut App, name: &str, role: &str) -> AgentId {
-        let id = crate::app::spawn_agent(&mut app.hub, &mut app.agents, &app.registry, crate::app::AgentOpts {
+        let id = crate::app::spawn_agent(&mut app.hub, &mut app.agents, &app.registry, crate::app::AgentOpts { claude_user_config: String::new(),
             name: name.into(), role: role.into(), glyph: "x".into(), color: "text".into(),
             model_alias: "sol".into(), effort: Some("medium".into()), cwd: std::path::PathBuf::from("."),
             approval: "never".into(), sandbox: "workspace-write".into(), instructions: "fixture task".into(),

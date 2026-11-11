@@ -92,6 +92,9 @@ pub struct SpawnReq {
     /// The MCP servers the agent asks for: the role's `mcp` (names, or `"*"`), set by `Run::role_req`
     /// — the one funnel every spawn goes through. The app resolves them against its settings.
     pub mcp: Vec<String>,
+    /// The pattern's `settings.claude_user_config` ("inherit" | "project"), set by `Run::role_req`;
+    /// empty = inherit.
+    pub claude_user_config: String,
 }
 
 /// How a message reaches an agent that might already be mid-turn. `Auto` is the engine's own
@@ -942,6 +945,7 @@ impl Run {
     pub(super) fn role_req(&self, req: SpawnReq) -> SpawnReq {
         let mut req = self.akasha_req(req);
         req.mcp = req.role.mcp.clone();
+        req.claude_user_config = self.pattern.settings.claude_user_config.clone();
         if req.role.can_spawn_swarm {
             req.tools.extend(tools::swarm_tools());
             req.instructions.push_str(tools::SWARM_OWNER_PROTOCOL);
@@ -1930,7 +1934,7 @@ Then summarize in 2-4 lines.",
         let name = self.pattern.flow.planner.clone();
         let role = self.role_for_slot("planner", &name);
         let wr = self.pattern.worker_roles();
-        let req = SpawnReq {
+        let req = SpawnReq { claude_user_config: String::new(),
             name: "planner".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2228,7 +2232,7 @@ Then summarize in 2-4 lines.",
         let extra_writable = if w.adhoc { self.integ_writable() } else { vec![] };
         let effort = self.effort_for(requested, &rname, &role, false);
         let thread_name = self.thread_name(&rname);
-        let req = SpawnReq { name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
+        let req = SpawnReq { claude_user_config: String::new(), name, role_name: rname.clone(), role, cwd: dir.clone(), instructions, tools: tools::worker_tools(), effort, extra_writable, context_override, thread_name, network: self.pattern.settings.network, writable_roots: self.pattern.settings.writable_roots.clone(), mcp: vec![] };
         let req = self.role_req(req);
         let id = match resume {
             Some(t) => ctx.spawn_resumed(req, t),
@@ -2430,7 +2434,7 @@ Then summarize in 2-4 lines.",
             Some(n) => format!("{prompt}\n\n{n}"),
             None => prompt,
         };
-        let id = ctx.spawn(self.role_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
             name: name.clone(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -2689,7 +2693,7 @@ Then summarize in 2-4 lines.",
             }
             p
         } else {
-            ctx.spawn(self.role_req(SpawnReq {
+            ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
                 name: step.role.clone(),
                 effort,
                 thread_name: self.thread_name(&step.role),
@@ -4364,7 +4368,7 @@ Then summarize in 2-4 lines.",
     pub(super) fn spawn_manager_with(&mut self, ctx: &mut dyn Ctx, resume: Option<String>) -> AgentId {
         let name = self.pattern.flow.manager.trim().to_string();
         let role = self.role_for_slot("manager", &name);
-        let req = SpawnReq {
+        let req = SpawnReq { claude_user_config: String::new(),
             name: "manager".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
@@ -4664,7 +4668,7 @@ Then summarize in 2-4 lines.",
         let plan = self.plan.clone().unwrap_or_default();
         let name = self.pattern.flow.orchestrator.clone();
         let role = self.role_for_slot("orchestrator", &name);
-        let id = ctx.spawn(self.role_req(SpawnReq {
+        let id = ctx.spawn(self.role_req(SpawnReq { claude_user_config: String::new(),
             name: "orchestrator".into(),
             effort: self.effort_for(None, &name, &role, false),
             thread_name: self.thread_name(&name),
