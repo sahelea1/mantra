@@ -5271,6 +5271,24 @@ fn fallback_used_survives_a_resume() {
     let _ = std::fs::remove_dir_all(&run.dir);
 }
 
+/// A slot's pinned model (a fallback, or the user's choice) is saved even while the slot has no
+/// live agent — the planner during plan review — so a second restart does not lose it.
+#[test]
+fn a_slot_pin_survives_a_restart_without_a_live_agent() {
+    let (mut run, _ctx) = chain_run("slot-pin-state");
+    run.stage = Stage::Review;
+    run.slot_models.insert("planner".into(), "pb".into());
+    assert!(run.planner.is_none(), "no agent is live for the slot");
+    run.save_state();
+    let st = RunState::load(&run.dir).unwrap();
+    assert_eq!(st.slot_models.get("planner").map(String::as_str), Some("pb"));
+    let mut back = Run::from_state(&st, run.pattern.clone(), None, run.dir.clone());
+    back.resume_boot(&mut TestCtx::new(), &st);
+    assert_eq!(back.slot_models.get("planner").map(String::as_str), Some("pb"));
+    assert!(back.pulse.iter().any(|p| p.text == "planner comes back on pb (switched live before the restart)"), "{:?}", back.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
 fn empty_turn_setup(tag: &str, fallback: bool) -> (Run, TestCtx, AgentId) {
     let mut ctx = TestCtx::new();
     let mut pat = no_manager();

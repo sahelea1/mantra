@@ -1040,6 +1040,7 @@ impl Run {
             history: self.history.iter().map(|h| PhaseHistory { name: h.name.clone(), workers: h.workers.clone(), secs: h.duration.as_secs() }).collect(),
             akasha: self.akasha.clone(),
             fallback_used: self.fallback_used.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            slot_models: self.slot_models.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
         .save(&self.dir);
     }

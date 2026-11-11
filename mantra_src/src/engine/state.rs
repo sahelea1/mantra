@@ -76,6 +76,11 @@ pub struct RunState {
     /// resumed run does not go back to a dead model.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fallback_used: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per slot (planner, manager, orchestrator, gate, finale): the model the slot is pinned to —
+    /// your per-agent choice or a fallback (`Run::slot_models`). Saved on its own because a slot
+    /// may have no live agent when the state is written (the planner during plan review).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub slot_models: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -500,6 +505,7 @@ pub(crate) mod tests {
             history: vec![PhaseHistory { name: "Foundations".into(), workers: vec![("p1-a".into(), "A".into(), "◇".into(), true)], secs: 42 }],
             akasha: Default::default(),
             fallback_used: Default::default(),
+            slot_models: Default::default(),
         }
     }
 

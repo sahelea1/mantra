@@ -456,7 +456,9 @@ impl Run {
         };
         let roles = roles.into_iter().chain(finale_role.map(|r| ("finale", r)));
         for (slot, role_name) in roles {
-            let Some(saved) = st.agents.iter().find(|a| a.slot == slot).map(|a| a.model_alias.trim().to_string()).filter(|m| !m.is_empty()) else { continue };
+            // the saved pin itself; else (an older state file) what the slot's saved agent ran on
+            let pinned = st.slot_models.get(slot).cloned();
+            let Some(saved) = pinned.or_else(|| st.agents.iter().find(|a| a.slot == slot).map(|a| a.model_alias.trim().to_string())).filter(|m| !m.is_empty()) else { continue };
             if self.adopted_roles.contains(&role_name) {
                 if saved != self.role(&role_name).model {
                     self.log("⚙", "blue", format!("{slot}: your per-agent model {saved} gives way to the role's new model {}", self.role(&role_name).model));
