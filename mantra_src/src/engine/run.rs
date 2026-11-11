@@ -1885,7 +1885,8 @@ Then summarize in 2-4 lines.",
                     }
                 }
                 PhaseStep::Gate { .. } => {
-                    if let Some(g) = self.gate_agent.filter(|g| !asking(*g)) {
+                    let chain_busy = self.orchestrator.is_some_and(|o| self.pending_questions.contains_key(&o));
+                    if let Some(g) = self.gate_agent.filter(|g| !asking(*g) && !chain_busy) {
                         v.push((g, Expect::Gating));
                     }
                 }
@@ -3434,8 +3435,11 @@ Then summarize in 2-4 lines.",
         if Some(a) == self.gate_agent {
             if let Stage::Phase { idx, step: PhaseStep::Gate { round } } = self.stage.clone() {
                 let report = self.gate_report.clone().or_else(|| parse_gate_from_text(ctx.agent(a).and_then(|x| x.final_message.clone()).as_deref()));
-                if report.is_none() && self.pending_questions.contains_key(&a) {
-                    self.log("?", "amber", format!("{} waits for an answer", self.name_of(a)));
+                // QA asked; the orchestrator answered and passed the question up to the planner
+                // (so QA's own entry is gone): it is still waiting, not silent
+                let chain_busy = self.orchestrator.is_some_and(|o| self.pending_questions.contains_key(&o));
+                if report.is_none() && (self.pending_questions.contains_key(&a) || chain_busy) {
+                    self.log("?", "amber", format!("{} waits for an answer{}", self.name_of(a), if chain_busy { " (the question is with the planner)" } else { "" }));
                     return;
                 }
                 match report {
@@ -3793,9 +3797,16 @@ Then summarize in 2-4 lines.",
             "completed" => {
                 let status_line = report.lines().map(|l| l.trim().to_lowercase()).find(|l| l.starts_with("status:"));
                 // It asked the orchestrator something and stopped to wait: that is not "done".
-                if waiting && status_line.is_none() {
+                // (also when it wrote `STATUS: blocked` after asking: it waits, it did not fail)
+                let says_done = status_line.as_deref().map(|l| l.contains("done")).unwrap_or(false);
+                if waiting && !says_done {
                     self.log("?", "amber", format!("{tid} waits for an answer"));
                     return;
+                }
+                if waiting {
+                    if let Some(a) = agent {
+                        self.pending_questions.remove(&a);
+                    }
                 }
                 // A first turn that ends without the closing lines is asked for them once; a
                 // second one (or a follow-up on a done worker) counts as done, so this never loops.

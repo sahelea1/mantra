@@ -1863,6 +1863,50 @@ fn a_plan_defect_report_goes_to_the_planner_not_to_a_fix_worker() {
     }
 }
 
+/// WP-2.6: the orchestrator answered QA and passed the question up; QA is waiting, not silent.
+#[test]
+fn qa_waiting_for_the_planner_is_not_nudged_for_a_report() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, gate) = gate_run_with_checks(&mut ctx, 1);
+    let orch = ctx.add_idle();
+    run.orchestrator = Some(orch);
+    // QA's own question was answered; the orchestrator's question to the planner is open
+    run.pending_questions.insert(orch, "may the check use network?".into());
+    gate_says(&mut ctx, &mut run, gate, "I asked; waiting.");
+    assert!(!ctx.prompts.iter().any(|(a, p)| *a == gate && p.contains("[mantra:gate]")), "{:?}", ctx.prompts);
+    assert_eq!(run.gate_nudges, 0);
+    assert!(!run.halted());
+    assert!(run.expected_active().iter().all(|(a, _)| *a != gate), "the watchdog leaves the waiting QA agent alone");
+    // without the open question it is expected to act
+    run.pending_questions.clear();
+    assert!(run.expected_active().iter().any(|(a, _)| *a == gate));
+}
+
+/// WP-2.6: a fix worker that asked and then wrote `STATUS: blocked` waits; after the answer and
+/// a `STATUS: done` turn the fix is over.
+#[test]
+fn a_fix_worker_that_asked_and_wrote_blocked_waits_instead_of_halting() {
+    let mut ctx = TestCtx::new();
+    let (mut run, _planner, _gate) = gate_run_with_checks(&mut ctx, 1);
+    run.start_fix(&mut ctx, 0, 1, "src/a.rs is wrong".into(), false);
+    let attempt = run.workers.iter().find(|w| w.task.id == "fix-1").unwrap().attempt;
+    run.on_job(&mut ctx, JobTag::WorkerWt { task: "fix-1".into(), attempt }, JobOut::Wt(Ok((PathBuf::from("."), String::new()))));
+    let agent = run.workers.iter().find(|w| w.task.id == "fix-1").and_then(|w| w.agent).unwrap();
+    run.pending_questions.insert(agent, "which module?".into());
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: blocked\nSUMMARY: need an answer".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert!(!run.halted(), "{:?}", run.halt.as_ref().map(|h| &h.message));
+    assert!(run.pulse.iter().any(|p| p.text.contains("waits for an answer")));
+    assert!(matches!(run.stage, Stage::Phase { step: PhaseStep::Fix { .. }, .. }));
+    assert!(ctx.jobs.is_empty());
+    // the answer arrives and the worker finishes
+    ctx.agents.get_mut(&agent).unwrap().final_message = Some("STATUS: done\nSUMMARY: fixed".into());
+    run.on_turn_done(&mut ctx, agent, "completed", None, None);
+    assert!(!run.halted());
+    assert!(!run.pending_questions.contains_key(&agent));
+    assert!(ctx.jobs.iter().any(|j| j.starts_with("FixChecks")), "on_fix_done ran: {:?}", ctx.jobs);
+}
+
 #[test]
 fn paths_in_finds_the_files_a_report_names() {
     let dir = std::env::temp_dir().join(format!("mantra-paths-{}", std::process::id()));
