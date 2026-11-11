@@ -1844,6 +1844,25 @@ fn the_big_flag_is_read_leniently() {
     assert!(!run.gate_big);
 }
 
+/// WP-2.5: QA says the check is wrong, not the work: the planner is asked, no fix worker.
+#[test]
+fn a_plan_defect_report_goes_to_the_planner_not_to_a_fix_worker() {
+    for report in [
+        json!({"pass": false, "summary": "check 3 (`cargo foo`) cannot pass here: no such target", "plan_defect": true}),
+        json!({"pass": false, "summary": "PLAN DEFECT: check 3 (`cargo foo`) cannot pass here: no such target"}),
+    ] {
+        let mut ctx = TestCtx::new();
+        let (mut run, planner, gate) = gate_run_with_checks(&mut ctx, 1);
+        let (_, ok) = run.handle_tool(&mut ctx, gate, "mantra_gate_report", &report);
+        assert!(ok);
+        run.on_turn_done(&mut ctx, gate, "completed", None, None);
+        assert_eq!(run.halt.as_ref().expect("halted").reason, HaltReason::GateExhausted);
+        assert!(!run.workers.iter().any(|w| w.task.id == "fix-1"), "no fix worker");
+        assert!(ctx.spawned("fix-1").is_empty());
+        assert!(ctx.prompts.iter().any(|(a, p)| *a == planner && p.contains("cannot pass here: no such target") && p.contains("plan defect")), "{:?}", ctx.prompts);
+    }
+}
+
 #[test]
 fn paths_in_finds_the_files_a_report_names() {
     let dir = std::env::temp_dir().join(format!("mantra-paths-{}", std::process::id()));

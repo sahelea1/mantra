@@ -176,11 +176,12 @@ fn read_phase_tool() -> Value {
 fn gate_report_tool() -> Value {
     tool(
         "mantra_gate_report",
-        "Report the gate verdict. pass=true only when the criteria are met and checks are green. On fail, `summary` lists every finding as file, what is wrong, what to change.",
+        "Report the gate verdict. pass=true only when the criteria are met and checks are green. On fail, `summary` lists every finding as file, what is wrong, what to change — or, when the only problem is a wrong check, set plan_defect=true.",
         json!({
             "pass": {"type": "boolean"},
             "summary": {"type": "string"},
-            "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"}
+            "big": {"type": "boolean", "description": "fail only: the fixes span several files or need design work (a bigger worker takes them)"},
+            "plan_defect": {"type": "boolean", "description": "fail only: nothing is wrong with the work — a gate check itself is wrong, or cannot pass in this phase or on this machine. No fix worker is sent; the planner is asked to amend the check. Name the check and say why in the summary."}
         }),
         &["pass", "summary"],
     )
@@ -513,9 +514,9 @@ mantra-role: gate
 - When done, call `mantra_gate_report` with pass=true/false and a summary. Then end your turn.
 - On fail the summary is the work order for a fix worker: every finding with file, what is wrong, what to change.
   Set big=true only if the fixes span several files or need design work.
-- Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails. A check that is wrong,
-  or cannot pass on this machine, is a plan problem: say so with `mantra_ask` (it goes up the chain; the planner
-  can amend the checks) and wait.
+- Mantra re-runs the gate checks after a pass. Never report pass while a gate check fails.
+- A check that is itself wrong, or cannot pass in this phase or on this machine, is a plan problem, not a failure of the work: report it with mantra_gate_report(pass=false, plan_defect=true) and name the check. Do not use mantra_ask for that and do not wait — the planner gets your report and amends the check.
+- Use mantra_ask only for a real question about the work. After asking, end your turn; you are woken with the answer and report then.
 "#;
 
 /// Appended to a member's instructions together with `akasha_tools`.

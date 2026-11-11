@@ -494,6 +494,7 @@ pub struct Run {
     /// The latest gate report said the fixes are big (`mantra_gate_report big=true`): the fix
     /// worker is then `worker-big`.
     gate_big: bool,
+    gate_plan_defect: bool,
     /// Counts the checks jobs started in this run (their log files are named after it).
     checks_gen: u64,
     /// A QA agent passed the phase in the current gate round and the verify checks are what is
@@ -701,6 +702,7 @@ impl Run {
             conflicts: vec![],
             gate_report: None,
             gate_big: false,
+            gate_plan_defect: false,
             checks_gen: 0,
             qa_ok: false,
             checks_label: String::new(),
@@ -2502,6 +2504,7 @@ Then summarize in 2-4 lines.",
         self.stage = Stage::Phase { idx, step: PhaseStep::Gate { round } };
         self.gate_report = None;
         self.gate_big = false;
+        self.gate_plan_defect = false;
         self.qa_ok = false;
         self.gate_nudges = 0;
         if round <= 1 {
@@ -3461,6 +3464,14 @@ Then summarize in 2-4 lines.",
                     Some((false, why)) => {
                         let big = self.gate_big;
                         self.note_gate(idx, round, false, &why);
+                        if self.gate_plan_defect {
+                            self.log("◎", "amber", format!("gate round {round}: plan defect — the planner is asked, no fix worker"));
+                            self.halt_and_escalate_full(ctx, HaltReason::GateExhausted, Some(a),
+                                format!("phase {} gate: QA reports a plan defect — {}", idx + 1, trunc(&why, 80)),
+                                format!("phase {} gate: QA reports a plan defect (a gate check is wrong or cannot pass here; the work itself is not at fault). Amend the check with mantra_revise_plan.\n\n{why}", idx + 1),
+                                None);
+                            return;
+                        }
                         // L4 loop protection (WP12.4/WP6): two consecutive gate reports blocked on
                         // the same thing will never resolve themselves — halt now instead of
                         // spending the remaining rounds repeating the same failed fix.
@@ -5546,6 +5557,11 @@ Then summarize in 2-4 lines.",
                     Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
                     _ => false,
                 };
+                self.gate_plan_defect = match args.get("plan_defect") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(t)) => t.trim().eq_ignore_ascii_case("true"),
+                    _ => false,
+                } || (!pass && summary.trim().to_lowercase().starts_with("plan defect"));
                 self.gate_report = Some((pass, summary));
                 (format!("recorded: {}. End your turn now.", if pass { "pass" } else { "fail" }), true)
             }
