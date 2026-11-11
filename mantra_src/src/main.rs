@@ -855,10 +855,10 @@ fn runs_list() {
         println!("no runs yet — `mantra run \"<goal>\"` starts one (or `mantra --demo`)");
         return;
     }
-    println!("{:<36} {:<20} {:<18} {:>9}  id", "run", "project", "stage", "updated");
+    println!("{:<28} {:<20} {:<30} {:>9}  id", "run", "project", "stage", "updated");
     for r in &all {
         let project = r.project().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| r.project_key.rsplit_once('-').map(|(a, _)| a.to_string()).unwrap_or_else(|| r.project_key.clone()));
-        println!("{:<36} {:<20} {:<18} {:>9}  {}", util::trunc(&r.title(), 36), util::trunc(&project, 20), util::trunc(&r.stage_label(), 18), engine::state::fmt_ago(r.updated_unix), r.id);
+        println!("{:<28} {:<20} {:<30} {:>9}  {}", util::trunc(&r.title(), 28), util::trunc(&project, 20), util::trunc(&r.stage_label(), 30), engine::state::fmt_ago(r.updated_unix), r.id);
     }
     let n = all.iter().filter(|r| r.unfinished()).count();
     println!("\n{} run{}, {n} unfinished · mantra runs resume <id> · mantra runs delete <id>", all.len(), if all.len() == 1 { "" } else { "s" });

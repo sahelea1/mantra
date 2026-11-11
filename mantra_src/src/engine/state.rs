@@ -43,6 +43,9 @@ pub struct RunState {
     /// `None` in a file written before the clock existed (its wall-clock span stands in).
     pub active_secs: Option<u64>,
     pub updated_unix: u64,
+    /// When Mantra was closed with this run unfinished (`App::shutdown`); cleared by a resume.
+    #[serde(default)]
+    pub closed_unix: Option<u64>,
     pub ws: Option<Workspace>,
     /// `Run::nested_base` / `nested_run_base`.
     #[serde(default)]
@@ -317,11 +320,17 @@ impl RunSummary {
     pub fn stage_label(&self) -> String {
         match &self.state {
             Ok(s) => {
-                let mut l = s.stage_label();
-                if s.halted.is_some() && !s.finished() {
-                    l.push_str(" · halted");
+                let l = s.stage_label();
+                // the state first: a long stage must not push it out of a narrow column
+                if s.finished() {
+                    l
+                } else if s.halted.is_some() {
+                    format!("halted · {l}")
+                } else if !Owner::load(&self.dir).is_some_and(|o| o.alive()) {
+                    format!("closed · {l}")
+                } else {
+                    l
                 }
-                l
             }
             Err(_) => "(v0.1 format)".into(),
         }
@@ -469,6 +478,7 @@ pub(crate) mod tests {
             finished_unix: None,
             active_secs: Some(7),
             updated_unix: 20,
+            closed_unix: None,
             nested_base: vec![],
             nested_run_base: vec![],
             ws: Some(Workspace { worktree: true, repo: "/tmp/proj".into(), integ: "/tmp/wt/integration".into(), branch: "mantra/123-add-login".into(), base_branch: "main".into(), git_common_dir: Some("/tmp/proj/.git".into()), note: None, base_commit: None, initial_commit: false, nested: vec![] }),

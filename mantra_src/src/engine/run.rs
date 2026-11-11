@@ -544,6 +544,8 @@ pub struct Run {
     /// When the run completed or stopped (`Stage::Done` / `Failed`): `elapsed` stops here, so
     /// the duration a finished run shows stays put.
     pub finished_unix: Option<u64>,
+    /// Set by `App::shutdown`, written to `state.json`, cleared by `resume_boot`.
+    pub closed_unix: Option<u64>,
     /// Active (not halted, not finished) run time — see `elapsed`. `active_secs` is the sum of
     /// the closed active spans; `active_since` is the start of the open one (unix secs), `None`
     /// while halted or after the run ends.
@@ -740,6 +742,7 @@ impl Run {
             agent_meta: HashMap::new(),
             started_unix: crate::util::unix_secs(),
             finished_unix: None,
+            closed_unix: None,
             active_secs: 0,
             active_since: Some(crate::util::unix_secs()),
             question: None,
@@ -929,6 +932,7 @@ impl Run {
             finished_unix: self.finished_unix,
             active_secs: Some(self.elapsed().as_secs()),
             updated_unix: crate::util::unix_secs(),
+            closed_unix: self.closed_unix,
             ws: self.ws.clone(),
             nested_base: self.nested_base.clone(),
             nested_run_base: self.nested_run_base.clone(),
@@ -1816,6 +1820,14 @@ Then summarize in 2-4 lines.",
 
     pub(super) fn status_text(&self, ctx: &dyn Ctx) -> String {
         let mut s = String::new();
+        if let Some(h) = &self.halt {
+            s.push_str(&format!(
+                "RUN HALTED ({}) for {}: {}\nNothing starts until it is resumed (planner: mantra_revise_plan or mantra_resume_run; user: space).\n",
+                reason_label(h.reason),
+                fmt_dur(h.since.elapsed()),
+                trunc(&h.message, 300)
+            ));
+        }
         for w in &self.workers {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, tok, el) = match a {
@@ -1853,7 +1865,7 @@ Then summarize in 2-4 lines.",
     /// What a `mantra_status` reader would act on: stage, worker states, activity, step progress and
     /// the waiting/paused/stopped flags. Clocks and token counts are left out on purpose.
     pub(super) fn status_fingerprint(&self, ctx: &dyn Ctx) -> String {
-        let mut s = format!("{:?}|", self.stage);
+        let mut s = format!("{:?}|{}|", self.stage, self.halted());
         for w in &self.workers {
             let a = w.agent.and_then(|a| ctx.agent(a));
             let (act, prog, stopped) = match a {

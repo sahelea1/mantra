@@ -71,7 +71,8 @@ impl Run {
     /// Pick the run back up at a safe boundary (see the module doc).
     pub fn resume_boot(&mut self, ctx: &mut dyn Ctx, st: &RunState) {
         let label = state::stage_label(&self.stage);
-        let was = st.halted.as_ref().map(|h| format!(" (it was halted: {h})")).unwrap_or_default();
+        let was = st.halted.as_ref().map(|h| if h == "paused by you" { " (you had paused it)".to_string() } else { format!(" (it was halted: {h})") }).unwrap_or_default();
+        self.closed_unix = None;
         self.log("↻", "saffron", format!("resumed at {label}{was}"));
         self.restore_slot_models(st);
         if let Some(ws) = self.ws.clone() {
@@ -210,7 +211,34 @@ impl Run {
             self.question = Some(super::run::Question { from: p, text: text.clone(), since: Instant::now() });
             self.alerts.push(text);
         }
+        if self.is_active() {
+            self.log_roles();
+        }
         self.save_state();
+    }
+
+    /// One journal line with the model each supervisor and worker role runs on now, so a resume
+    /// is never silent about models. A per-agent choice (pin) is marked with `*`.
+    fn log_roles(&mut self) {
+        let mut starred = false;
+        let mut part = |run: &Run, slot: &str, role: &str, label: &str| {
+            let pin = run.slot_models.get(slot).filter(|m| run.knows_model(m));
+            starred |= pin.is_some();
+            let alias = pin.cloned().unwrap_or_else(|| run.pattern.roles.get(role).map(|r| r.model.clone()).unwrap_or_default());
+            format!("{label} {alias}{}", if pin.is_some() { "*" } else { "" })
+        };
+        let f = self.pattern.flow.clone();
+        let mut parts = vec![part(self, "planner", &f.planner, "planner")];
+        if !self.pattern.settings.planner_loop {
+            parts.push(part(self, "orchestrator", &f.orchestrator, "orchestrator"));
+            parts.push(part(self, "gate", &f.phase_gate, &f.phase_gate));
+        }
+        for r in self.pattern.worker_roles() {
+            let alias = self.pattern.roles.get(&r).map(|x| x.model.clone()).unwrap_or_default();
+            parts.push(format!("{r} {alias}"));
+        }
+        let note = if starred { " (* = your per-agent choice)" } else { "" };
+        self.log("⚙", "blue", format!("roles: {}{note}", parts.join(" · ")));
     }
 
     /// The manager (`flow.manager`) comes back with its own thread when the state has one — its

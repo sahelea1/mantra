@@ -2831,7 +2831,7 @@ fn a_failed_turn_goes_to_the_manager_and_then_to_the_user_not_the_planner() {
     assert_eq!(run.halt.as_ref().unwrap().reason, HaltReason::AgentTurnFailed);
     let manager = run.manager.expect("the manager gets the failed turn");
     let esc = ctx.prompts.iter().find(|(a, t)| *a == manager && t.contains("[mantra:escalation]")).map(|(_, t)| t.clone()).unwrap();
-    assert!(esc.contains("mantra_respawn") && esc.contains("left for the user") && !esc.contains("mantra_revise_plan"), "{esc}");
+    assert!(esc.contains("mantra_respawn") && esc.contains("left for the user") && !esc.contains("- mantra_revise_plan"), "{esc}");
     assert!(!ctx.prompts.iter().any(|(a, t)| *a == planner && t.contains("[mantra:escalation]")));
     // the manager respawns the gate: that lifts the halt
     ctx.prompts.clear();
@@ -5614,4 +5614,57 @@ fn respawn_reasons_are_told() {
     assert_eq!(respawn_why(Some("The workflow was updated by the user; continue")), "workflow changed");
     assert_eq!(respawn_why(Some("Your previous process lost its session")), "session lost");
     assert_eq!(respawn_why(Some("try again")), "requested");
+}
+
+// ── WP-3.4: a halted, quit or resumed run says so everywhere ──
+
+#[test]
+fn a_halted_runs_status_text_starts_with_the_halt() {
+    let mut ctx = TestCtx::new();
+    let mut run = spawned_phase(&mut ctx, class_phase(1, 0), "status-halted");
+    let calm = run.status_fingerprint(&ctx);
+    assert!(!run.status_text(&ctx).contains("RUN HALTED"));
+    run.halt(&mut ctx, HaltReason::GateExhausted, None, "the gate gave up".into());
+    let text = run.status_text(&ctx);
+    assert!(text.starts_with("RUN HALTED (gate exhausted) for "), "{text}");
+    assert!(text.contains("the gate gave up") && text.contains("Nothing starts until it is resumed"), "{text}");
+    assert_ne!(calm, run.status_fingerprint(&ctx), "a halt is a change a status reader must see");
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+#[test]
+fn runs_are_labelled_halted_closed_or_live_with_the_state_first() {
+    use crate::engine::state::RunSummary;
+    let dir = scratch_dir("labels");
+    std::fs::create_dir_all(&dir).unwrap();
+    let st = |halted: Option<&str>, stage: Stage| RunState { stage, halted: halted.map(String::from), ..Default::default() };
+    let row = |s: RunState| RunSummary { id: "1-x".into(), dir: dir.clone(), project_key: "p".into(), state: Ok(s), updated_unix: 0 };
+    let working = Stage::Phase { idx: 1, step: PhaseStep::Orchestrating };
+    assert_eq!(row(st(Some("gate gave up"), working.clone())).stage_label(), "halted · phase 2 · working");
+    assert_eq!(row(st(None, working.clone())).stage_label(), "closed · phase 2 · working", "no owner.json: nobody has it open");
+    assert_eq!(row(st(None, Stage::Done)).stage_label(), "done");
+    crate::engine::state::Owner::this_process().write(&dir);
+    assert_eq!(row(st(None, working)).stage_label(), "phase 2 · working", "a live owner");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resuming_a_paused_run_says_you_had_paused_it_and_lists_the_roles() {
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "goal".into());
+    run.dir = scratch_dir("resume-roles");
+    run.plan = Some(class_phase(1, 0));
+    run.stage = Stage::Phase { idx: 0, step: PhaseStep::Orchestrating };
+    run.save_state();
+    let mut st = RunState::load(&run.dir).unwrap();
+    st.halted = Some("paused by you".into());
+    st.closed_unix = Some(5);
+    let mut again = Run::from_state(&st, Pattern::builtin(), run.plan.clone(), run.dir.clone());
+    again.closed_unix = st.closed_unix;
+    let mut ctx = TestCtx::new();
+    again.resume_boot(&mut ctx, &st);
+    let lines: Vec<String> = again.pulse.iter().map(|p| p.text.clone()).collect();
+    assert!(lines.iter().any(|l| l.ends_with("(you had paused it)")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("roles: planner ") && l.contains(" · orchestrator ")), "{lines:?}");
+    assert!(again.closed_unix.is_none() && RunState::load(&again.dir).unwrap().closed_unix.is_none());
+    let _ = std::fs::remove_dir_all(&run.dir);
 }

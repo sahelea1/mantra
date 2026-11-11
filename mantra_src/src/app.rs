@@ -4023,6 +4023,12 @@ impl App {
 
     /// Stops every agent; the caller awaits the result before the runtime goes (`hub::Stopping`).
     pub fn shutdown(&mut self) -> crate::hub::Stopping {
+        if let Some(run) = self.run.as_mut().filter(|r| r.is_active()) {
+            run.closed_unix = Some(crate::util::unix_secs());
+            let (stage, id) = (crate::engine::state::stage_label(&run.stage), run.id.clone());
+            run.log("⏻", "gray", format!("Mantra was closed with the run at {stage} — reopen it with: mantra runs resume {id}"));
+            run.save_state();
+        }
         self.hub.shutdown_all()
     }
 }
