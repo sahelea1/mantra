@@ -1080,6 +1080,36 @@ fn a_busy_but_silent_agent_is_journalled_once_per_spell() {
     assert!(!run.halted());
 }
 
+/// An agent idle for 40 minutes and just prompted has a 40-minute-old `last_event`; that is not
+/// silence of the turn that just began.
+#[test]
+fn a_freshly_prompted_agent_is_not_silent_but_a_stale_turn_is() {
+    let mut ctx = TestCtx::new();
+    let mut run = Run::new(PathBuf::from("."), Pattern::builtin(), "test".into());
+    let planner = ctx.add_idle();
+    ready(&mut ctx, planner);
+    run.planner = Some(planner);
+    run.stage = Stage::Planning;
+    let stall_secs = run.pattern.settings.stall_minutes * 60;
+    let lines = |r: &Run| r.pulse.iter().filter(|p| p.text.contains("no output for")).count();
+
+    ctx.set_idle_secs(planner, 40 * 60);
+    {
+        let ag = ctx.agents.get_mut(&planner).unwrap();
+        ag.awaiting_start = true;
+        ag.turn_wait_since = Some(Instant::now());
+    }
+    run.watchdog_tick(&mut ctx);
+    assert_eq!(lines(&run), 0, "{:?}", run.pulse.iter().map(|p| p.text.clone()).collect::<Vec<_>>());
+
+    {
+        let ag = ctx.agents.get_mut(&planner).unwrap();
+        ag.turn_wait_since = Some(Instant::now() - Duration::from_secs(stall_secs + 60));
+    }
+    run.watchdog_tick(&mut ctx);
+    assert_eq!(lines(&run), 1);
+}
+
 #[test]
 fn f3_loop_protection_respawns_a_repeatedly_prompted_idle_worker() {
     let mut ctx = TestCtx::new();

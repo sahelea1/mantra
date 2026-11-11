@@ -288,7 +288,7 @@ const QUIET_AFTER: Duration = Duration::from_secs(20);
 /// model reasons, so a `last_event` that stops moving is the one honest "is it stuck?" signal we
 /// have — shown only past a threshold, so a normal turn never gains noise.
 pub(crate) fn quiet_for(a: &Agent) -> Option<Duration> {
-    let d = a.last_event.elapsed();
+    let d = a.turn_silence()?;
     (producing(a) && d >= QUIET_AFTER).then_some(d)
 }
 

@@ -308,6 +308,17 @@ impl Agent {
         self.turn_active || self.awaiting_start
     }
 
+    /// How long the turn in flight has been silent: since its last event, but never longer than
+    /// the turn itself has been running. None when no turn is in flight.
+    pub fn turn_silence(&self) -> Option<Duration> {
+        if !self.busy() {
+            return None;
+        }
+        let since_turn = self.turn_wait_since.or(self.turn_started).map(|t| t.elapsed());
+        let since_event = self.last_event.elapsed();
+        Some(since_turn.map(|t| t.min(since_event)).unwrap_or(since_event))
+    }
+
     /// How long the turn in flight has produced nothing at all (no tokens, no text, no tool
     /// activity) — `None` when there is no such turn, or when silence is expected: a hand stop,
     /// an approval being waited on, a compaction.

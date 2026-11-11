@@ -3856,11 +3856,11 @@ Then summarize in 2-4 lines.",
         let mut events = vec![];
         for w in &mut self.workers {
             let Some(a) = w.agent.and_then(|a| ctx.agent(a)) else { continue };
-            if w.state == WState::Running && a.busy() && !a.swarm_waiting && a.last_event.elapsed() > stall && !w.stall_flagged {
+            if w.state == WState::Running && a.busy() && !a.swarm_waiting && a.turn_silence().is_some_and(|q| q > stall) && !w.stall_flagged {
                 w.stall_flagged = true;
                 events.push(format!("TRIPWIRE: {} has shown no activity for {} minutes (last: {}).", w.task.id, stall.as_secs() / 60, a.activity));
             }
-            if a.last_event.elapsed() < stall {
+            if a.turn_silence().unwrap_or_default() < stall {
                 w.stall_flagged = false;
             }
             let limit = self.pattern.role(&w.task.role).and_then(|r| r.max_tokens);
@@ -3978,7 +3978,7 @@ Then summarize in 2-4 lines.",
         for (a, expect) in self.expected_active() {
             seen.push(a);
             let Some(agent) = ctx.agent(a) else { continue };
-            let quiet = agent.last_event.elapsed();
+            let quiet = agent.turn_silence().unwrap_or_default();
             if quiet < stall {
                 // It spoke: the spell is over, and the next one is worth reporting again.
                 self.silent_flagged.remove(&a);
@@ -3986,7 +3986,7 @@ Then summarize in 2-4 lines.",
                 // Workers are deliberately left out: `tick`'s stall tripwire already reports them,
                 // and does more with it (the orchestrator is told, so it can steer or respawn).
                 let name = self.name_of(a);
-                self.log("⏳", "amber", format!("{name}: no output for {} — still connected", fmt_dur(quiet)));
+                self.log("⏳", "amber", format!("{name}: no output for {} — its turn is still running", fmt_dur(quiet)));
             }
             // A deliberate stop is not idleness: an agent the user stopped by hand is waiting for
             // them, so it is never nudged, respawned or escalated on. Its ladder is dropped too —
