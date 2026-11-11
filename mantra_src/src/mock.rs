@@ -632,7 +632,10 @@ pub(crate) fn mock_auto_pattern(prompt: &str) -> Value {
     if let Some(preferred) = aliases.first() {
         for role in pattern.roles.values_mut() {
             if !aliases.contains(&role.model.as_str()) { role.model = (*preferred).to_string(); }
-            if role.fallback.as_ref().is_some_and(|f| !aliases.contains(&f.as_str())) { role.fallback = None; }
+            for f in [&mut role.fallback, &mut role.fallback2, &mut role.fallback3] {
+                if f.as_ref().is_some_and(|f| !aliases.contains(&f.as_str())) { *f = None; }
+            }
+            role.normalize_fallbacks();
         }
     }
     json!({"toml": pattern.to_toml(), "reason": "Use a lean workflow for this demo task: independent workers build disjoint modules, then checks and a fresh QA agent verify them. This creates Auto's concrete roles before planning work."})

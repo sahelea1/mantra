@@ -5171,9 +5171,9 @@ Then summarize in 2-4 lines.",
         }
         if !self.known_models.is_empty() {
             for (name, role) in &pattern.roles {
-                if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}'", role.model)); }
-                if let Some(fallback) = &role.fallback {
-                    if !self.known_models.contains_key(fallback) { return Err(format!("role '{name}' names an unconfigured fallback model alias '{fallback}'")); }
+                if !self.known_models.contains_key(&role.model) { return Err(format!("role '{name}' names an unconfigured model alias '{}' (not in /models of this running Mantra)", role.model)); }
+                for alias in role.fallback_chain() {
+                    if !self.known_models.contains_key(&alias) { return Err(format!("role '{name}' names an unconfigured fallback model alias '{alias}' (not in /models of this running Mantra)")); }
                 }
             }
         }

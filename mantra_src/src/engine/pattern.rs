@@ -34,6 +34,12 @@ pub struct Role {
     /// `settings.first_token_minutes` with no output at all (a gateway that accepts the turn and
     /// never answers). Unset: the second time goes to the manager like any other watchdog case.
     pub fallback: Option<String>,
+    /// Second and third fallback, tried in order after `fallback`. Each is optional; a later one
+    /// without the earlier ones is moved up on load (`normalize_fallbacks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback3: Option<String>,
     /// MCP servers this role's agents get (names from `settings.mcp_servers`, or `"*"` for every
     /// enabled one). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -64,9 +70,45 @@ impl Default for Role {
             instructions: String::new(),
             max_tokens: None,
             fallback: None,
+            fallback2: None,
+            fallback3: None,
             parallel: None,
             can_spawn_swarm: false,
         }
+    }
+}
+
+impl Role {
+    /// The fallbacks in order: non-empty, without duplicates, without the role's own model.
+    pub fn fallback_chain(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for f in [&self.fallback, &self.fallback2, &self.fallback3].into_iter().flatten() {
+            let f = f.trim();
+            if !f.is_empty() && f != self.model && !out.iter().any(|o| o == f) {
+                out.push(f.to_string());
+            }
+        }
+        out
+    }
+
+    /// Rewrites the three fields from `fallback_chain()` (so gaps close and duplicates go).
+    pub fn normalize_fallbacks(&mut self) {
+        let mut chain = self.fallback_chain().into_iter();
+        self.fallback = chain.next();
+        self.fallback2 = chain.next();
+        self.fallback3 = chain.next();
+    }
+
+    /// Sets position `i` (0..=2) to `alias` (None clears it), then normalizes.
+    #[allow(dead_code)] // the Studio's and the web's fallback editors (WP-5.3, WP-5.7)
+    pub fn set_fallback(&mut self, i: usize, alias: Option<String>) {
+        match i {
+            0 => self.fallback = alias,
+            1 => self.fallback2 = alias,
+            2 => self.fallback3 = alias,
+            _ => return,
+        }
+        self.normalize_fallbacks();
     }
 }
 
@@ -336,7 +378,10 @@ impl Pattern {
     }
 
     pub fn from_toml(s: &str) -> Result<Pattern> {
-        let p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
+        let mut p: Pattern = toml::from_str(s).map_err(|e| anyhow!("{e}"))?;
+        for role in p.roles.values_mut() {
+            role.normalize_fallbacks();
+        }
         p.validate().map_err(|errs| anyhow!(errs.join("; ")))?;
         Ok(p)
     }
@@ -1234,6 +1279,43 @@ mod tests {
         assert_eq!(back.roles["planner"].fallback.as_deref(), Some("sol"));
         let zero = toml.replace("first_token_minutes = 4", "first_token_minutes = 0");
         assert_eq!(Pattern::from_toml(&zero).unwrap().settings.first_token_minutes, 0, "0 = off");
+    }
+
+    #[test]
+    fn fallback_chains_close_gaps_drop_the_model_and_round_trip() {
+        let base = Pattern::builtin();
+        let model = base.roles["planner"].model.clone();
+        // an old file without the new keys loads unchanged
+        let old = Pattern::from_toml(&base.to_toml()).unwrap();
+        assert_eq!(old, base);
+        assert!(!base.to_toml().contains("fallback2"), "unset fallbacks are not written");
+        // fallback2 without fallback moves up
+        let mut gap = base.clone();
+        gap.roles.get_mut("planner").unwrap().fallback2 = Some("luna".into());
+        let back = Pattern::from_toml(&gap.to_toml()).unwrap();
+        let r = &back.roles["planner"];
+        assert_eq!((r.fallback.as_deref(), r.fallback2.as_deref(), r.fallback3.as_deref()), (Some("luna"), None, None));
+        // fallback = the role's own model is dropped
+        let mut same = base.clone();
+        same.roles.get_mut("planner").unwrap().fallback = Some(model.clone());
+        assert_eq!(Pattern::from_toml(&same.to_toml()).unwrap().roles["planner"].fallback, None);
+        // three distinct fallbacks round-trip
+        let mut three = base.clone();
+        {
+            let r = three.roles.get_mut("planner").unwrap();
+            r.fallback = Some("fa".into());
+            r.fallback2 = Some("fb".into());
+            r.fallback3 = Some("fc".into());
+        }
+        let back = Pattern::from_toml(&three.to_toml()).unwrap();
+        assert_eq!(back.roles["planner"].fallback_chain(), ["fa", "fb", "fc"]);
+        assert_eq!(back, three);
+        // set_fallback clears a slot and closes the gap
+        let mut r = three.roles["planner"].clone();
+        r.set_fallback(0, None);
+        assert_eq!((r.fallback.as_deref(), r.fallback2.as_deref(), r.fallback3.as_deref()), (Some("fb"), Some("fc"), None));
+        r.set_fallback(1, Some("fb".into()));
+        assert_eq!(r.fallback_chain(), ["fb"], "a duplicate goes");
     }
 
     /// Every built-in caps the context at 200k; a pattern file from before the setting existed

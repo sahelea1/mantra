@@ -467,7 +467,7 @@ fn bridge_problem_line(why: &str) -> String {
 /// Whether any role of `pattern` runs on Claude Code — its model, or the fallback it may switch to.
 fn pattern_uses_cli_bridge(registry: &Registry, pattern: &Pattern) -> bool {
     let on_claude = |alias: &str| matches!(registry.backend_of(&registry.resolve(alias)), crate::config::ProviderKind::ClaudeCode | crate::config::ProviderKind::Antigravity);
-    pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback.as_deref().is_some_and(|f| !f.trim().is_empty() && on_claude(f)))
+    pattern.roles.values().any(|r| on_claude(&r.model) || r.fallback_chain().iter().any(|f| on_claude(f)))
 }
 
 /// settings.toml's `[mcp_servers]` when the file is there and parses (`App::refresh_mcp_servers`).
@@ -1686,9 +1686,12 @@ impl App {
                         role.model = alias.clone();
                         rebound_roles += 1;
                     }
-                    if role.fallback.as_deref().is_some_and(|f| !f.is_empty() && self.registry.get(f).is_none()) {
-                        role.fallback = Some(alias.clone());
+                    for f in [&mut role.fallback, &mut role.fallback2, &mut role.fallback3] {
+                        if f.as_deref().is_some_and(|f| !f.is_empty() && self.registry.get(f).is_none()) {
+                            *f = Some(alias.clone());
+                        }
                     }
+                    role.normalize_fallbacks();
                 }
             }
         }

@@ -700,6 +700,11 @@ impl BaseUrl {
 
 /// Minimal `scheme://host[:port][/path]` parse — enough to know where a request goes without
 /// pulling in a URL crate. `None` for anything that isn't http(s) with a plausible host.
+/// A role's fallback chain labelled for messages: `fallback`, `fallback 2`, `fallback 3`.
+fn fallback_labels(chain: &[String]) -> Vec<(String, String)> {
+    chain.iter().enumerate().map(|(i, a)| (if i == 0 { "fallback".to_string() } else { format!("fallback {}", i + 1) }, a.clone())).collect()
+}
+
 fn parse_base_url(raw: &str) -> Option<BaseUrl> {
     let (scheme, rest) = raw.trim().split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -1411,7 +1416,8 @@ impl Registry {
         let mut out = vec![];
         for (name, role) in pattern.ordered_roles() {
             if role.sandbox == "read-only" && role.permission != BYPASS_SANDBOX_DANGER {
-                for (label, alias) in std::iter::once(("model", role.model.as_str())).chain(role.fallback.as_deref().filter(|f| !f.trim().is_empty()).map(|f| ("fallback", f))) {
+                for (label, alias) in std::iter::once(("model".to_string(), role.model.clone())).chain(fallback_labels(&role.fallback_chain())) {
+                    let alias = alias.as_str();
                     if self.get(alias).is_some_and(|m| self.backend_of(m) == ProviderKind::Antigravity) {
                         out.push(format!("{name}: {label} '{alias}' uses Antigravity, which cannot enforce read-only; choose another backend or explicitly change the role sandbox"));
                     }
@@ -1422,8 +1428,10 @@ impl Registry {
             }
             // The fallback is only ever used when the primary has already failed twice, so a
             // typo in it must surface here, not at 3 a.m. in the middle of a run.
-            if let Some(why) = role.fallback.as_deref().filter(|f| !f.trim().is_empty()).and_then(|f| self.alias_problem(f)) {
-                out.push(format!("{name}: fallback {why}"));
+            for (label, alias) in fallback_labels(&role.fallback_chain()) {
+                if let Some(why) = self.alias_problem(&alias) {
+                    out.push(format!("{name}: {label} {why}"));
+                }
             }
         }
         out
