@@ -2,7 +2,7 @@
 
 use super::{theme, *};
 use crate::agent::Agent;
-use crate::app::App;
+use crate::app::{App, StageNode};
 use crate::engine::pattern::Role;
 use crate::engine::plan::Task;
 use crate::engine::run::{HaltReason, PhaseStep, Run, Stage, WState, Worker};
@@ -11,16 +11,25 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use std::time::Duration;
 
+/// Is the card of agent `a` (or, with none, of `slot`) the selected one?
+fn is_sel(sel: &Option<StageNode>, a: Option<AgentId>, slot: &'static str) -> bool {
+    match (sel, a) {
+        (Some(StageNode::Agent(s)), Some(a)) => *s == a,
+        (Some(StageNode::Slot(s)), None) => *s == slot,
+        _ => false,
+    }
+}
+
 // ───────────────────────────── low-level canvas ─────────────────────────────
 
 struct Cv<'a> {
     buf: &'a mut Buffer,
     clip: Rect,
-    nodes: Vec<(AgentId, u16, u16)>,
+    nodes: Vec<(StageNode, u16, u16)>,
 }
 
 impl Cv<'_> {
-    fn node(&mut self, id: AgentId, r: Rect) {
+    fn node(&mut self, id: StageNode, r: Rect) {
         if r.y >= self.clip.y && r.y + r.height <= self.clip.y + self.clip.height && r.x >= self.clip.x && r.x + r.width <= self.clip.x + self.clip.width {
             self.nodes.push((id, r.x + r.width / 2, r.y));
         }
@@ -412,16 +421,16 @@ fn draw_canvas(f: &mut Frame, area: Rect, app: &mut App) {
     app.stage_nav = cv.nodes;
 }
 
-fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
+fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[StageNode]) {
     let Some(planner) = run.planner.and_then(|p| app.agents.get(&p)) else { return };
     if area.height < 3 || area.width < 6 { return; }
-    let selected = nodes.get(app.sel).copied();
+    let selected = nodes.get(app.sel).cloned();
     let width = area.width.saturating_sub(2).min(68);
     let x = area.x + (area.width - width) / 2;
     let top = Rect::new(x, area.y, width, area.height.min(4));
-    agent_card(cv, top, run, app, Some(planner), "planner", &planner.glyph, theme::named(&planner.color), vec![], selected == Some(planner.id));
+    agent_card(cv, top, run, app, Some(planner), "planner", &planner.glyph, theme::named(&planner.color), vec![], is_sel(&selected, Some(planner.id), "planner"), "planner");
     if area.height < 6 { return; }
-    let children: Vec<_> = nodes.iter().filter(|id| **id != planner.id).filter_map(|id| app.agents.get(id)).collect();
+    let children: Vec<_> = nodes.iter().filter_map(|n| match n { StageNode::Agent(id) if *id != planner.id => app.agents.get(id), _ => None }).collect();
     if children.is_empty() {
         cv.put(x as i32 + 1, area.y as i32 + 5, "Advisor and swarm agents appear here when called.", theme::muted());
         return;
@@ -432,7 +441,7 @@ fn akasha_phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]
         let y = area.y + 5 + (i as u16 / columns) * 4;
         if y + 3 > area.bottom() { break; }
         let rect = Rect::new(area.x + (i as u16 % columns) * column_width, y, column_width.saturating_sub(1), (area.bottom() - y).min(4));
-        agent_card(cv, rect, run, app, Some(agent), &agent.name, &agent.glyph, theme::named(&agent.color), vec![], selected == Some(agent.id));
+        agent_card(cv, rect, run, app, Some(agent), &agent.name, &agent.glyph, theme::named(&agent.color), vec![], is_sel(&selected, Some(agent.id), "planner"), "planner");
     }
 }
 
@@ -524,7 +533,7 @@ fn card_border(base: (u8, u8, u8), v: V, a: Option<&Agent>) -> (Style, bool) {
 
 #[allow(clippy::too_many_arguments)]
 fn worker_card(cv: &mut Cv, r: Rect, run: &Run, t: &Task, w: Option<&Worker>, a: Option<&Agent>, selected: bool, app: &App) {
-    if let Some(id) = w.and_then(|w| w.agent) { cv.node(id, r); }
+    cv.node(w.and_then(|w| w.agent).map(StageNode::Agent).unwrap_or_else(|| StageNode::Task(t.id.clone())), r);
     let role: Option<&Role> = run.pattern.role(&t.role);
     let base = role.map(|r| theme::named(&r.color)).unwrap_or(theme::TEAL);
     let v = vstate(w, a);
@@ -682,8 +691,8 @@ fn attempt_model(w: Option<&Worker>, a: Option<&Agent>, role: Option<&Role>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agent_card(cv: &mut Cv, r: Rect, run: &Run, app: &App, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool) {
-    if let Some(a) = a { cv.node(a.id, r); }
+fn agent_card(cv: &mut Cv, r: Rect, run: &Run, app: &App, a: Option<&Agent>, name: &str, glyph: &str, color: (u8, u8, u8), line2: Vec<Span<'static>>, selected: bool, slot: &'static str) {
+    cv.node(a.map(|a| StageNode::Agent(a.id)).unwrap_or(StageNode::Slot(slot)), r);
     let v = match a {
         None => V::NotStarted,
         Some(a) => match &a.status {
@@ -754,7 +763,7 @@ fn agent_card(cv: &mut Cv, r: Rect, run: &Run, app: &App, a: Option<&Agent>, nam
 
 // ───────────────────────────── stages ─────────────────────────────
 
-fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
+fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[StageNode]) {
     let a = run.planner.and_then(|p| app.agents.get(&p));
     let role = run.pattern.role(&run.pattern.flow.planner).cloned().unwrap_or_default();
     let w = (area.width as i32 - 4).clamp(30, 76);
@@ -768,8 +777,8 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         (_, Some(Status::Starting)) | (_, None) => vec![Span::styled("starting codex…", theme::faint())],
         _ => vec![Span::styled("exploring the repo & designing phases…", theme::faint())],
     };
-    let sel = nodes.first().copied() == run.planner && app.sel == 0;
-    agent_card(cv, r, run, app, a, "planner", &role.glyph, theme::named(&role.color), line2, sel);
+    let sel = is_sel(&nodes.get(app.sel).cloned(), run.planner, "planner");
+    agent_card(cv, r, run, app, a, "planner", &role.glyph, theme::named(&role.color), line2, sel, "planner");
     if let Some(a) = a {
         let lines = a.tail_lines((h as usize).saturating_sub(5));
         for (i, l) in lines.iter().enumerate() {
@@ -784,9 +793,9 @@ fn planning(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     }
 }
 
-fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
+fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[StageNode]) {
     let Some(ph) = run.current_phase().cloned() else { return };
-    let sel = nodes.get(app.sel).copied();
+    let sel = nodes.get(app.sel).cloned();
     let (x0, y0, w, h) = (area.x as i32, area.y as i32, area.width as i32, area.height as i32);
     let cx = x0 + w / 2;
     let n = ph.tasks.len().max(1) as i32;
@@ -814,11 +823,11 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         for t in &ph.tasks {
             let wk = worker_of(t);
             let a = wk.and_then(|w| w.agent).and_then(|a| app.agents.get(&a));
-            if let Some(id) = wk.and_then(|w| w.agent) { cv.node(id, Rect { x: area.x, y: y as u16, width: area.width, height: 1 }); }
+            cv.node(wk.and_then(|w| w.agent).map(StageNode::Agent).unwrap_or_else(|| StageNode::Task(t.id.clone())), Rect { x: area.x, y: y as u16, width: area.width, height: 1 });
             let v = vstate(wk, a);
             let col = role_col(run, &t.role);
             let glyph = run.pattern.role(&t.role).map(|r| theme::role_glyph(&r.glyph)).unwrap_or_default();
-            let is_sel = wk.and_then(|w| w.agent).is_some() && wk.and_then(|w| w.agent) == sel;
+            let is_sel = match wk.and_then(|w| w.agent) { Some(id) => sel == Some(StageNode::Agent(id)), None => sel == Some(StageNode::Task(t.id.clone())) };
             let act = match (v, a) {
                 (V::Waiting, Some(a)) if a.swarm_waiting => "waiting for Akasha swarm".into(),
                 (V::Waiting, _) => "needs approval · ctrl+g".into(),
@@ -839,7 +848,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
 
     // ── top row: planner mini-node + orchestrator (+ the manager mini-node on the right)
     let show_planner = w >= 84;
-    let show_manager = show_planner && run.manager.is_some() && w >= 90;
+    let show_manager = show_planner && (run.manager.is_some() || run.pattern.manager_role().is_some()) && w >= 90;
     // The orchestrator stays centred over the fork, but shifts to clear the side nodes.
     let orch_w = if show_manager {
         (w - 60).clamp(30, 56)
@@ -860,17 +869,19 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     let running = run.workers.iter().filter(|w| w.state == WState::Running).count();
     let watching = if running > 0 && oa.map(|a| !producing(a)).unwrap_or(false) {
         vec![Span::styled(format!("{} watching {running} worker{}", theme::g("◉", "@"), if running == 1 { "" } else { "s" }), theme::fg(theme::GREEN))]
+    } else if oa.is_none() {
+        vec![Span::styled("starts with the phase", theme::faint())]
     } else {
         let last = oa.and_then(|a| a.tail_lines(1).pop()).unwrap_or_default();
         vec![Span::styled(trunc(&last, (orch_w as usize).saturating_sub(4)), theme::faint())]
     };
-    agent_card(cv, orch, run, app, oa, "orchestrator", &oglyph, ocol, watching, run.orchestrator.is_some() && run.orchestrator == sel);
+    agent_card(cv, orch, run, app, oa, "orchestrator", &oglyph, ocol, watching, is_sel(&sel, run.orchestrator, "orchestrator"), "orchestrator");
     if show_planner {
         let pr = Rect { x: (x0 + 1) as u16, y: y0 as u16, width: 26, height: 3 };
         let pa = run.planner.and_then(|p| app.agents.get(&p));
         let pcol = role_col(run, &run.pattern.flow.planner);
         let pglyph = run.pattern.role(&run.pattern.flow.planner).map(|r| r.glyph.clone()).unwrap_or_else(|| "✦".into());
-        agent_card(cv, pr, run, app, pa, "planner", &pglyph, pcol, vec![], run.planner.is_some() && run.planner == sel);
+        agent_card(cv, pr, run, app, pa, "planner", &pglyph, pcol, vec![], is_sel(&sel, run.planner, "planner"), "planner");
         // planner → orchestrator edge when briefing
         let ey = y0 + 1;
         let (ex1, ex2) = (x0 + 27, orch.x as i32 - 1);
@@ -893,7 +904,7 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
         let ma = run.manager.and_then(|m| app.agents.get(&m));
         let mcol = role_col(run, &run.pattern.flow.manager);
         let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
-        agent_card(cv, mr, run, app, ma, "manager", &mglyph, mcol, vec![], run.manager.is_some() && run.manager == sel);
+        agent_card(cv, mr, run, app, ma, "manager", &mglyph, mcol, vec![], is_sel(&sel, run.manager, "manager"), "manager");
         let ey = y0 + 1;
         let (ex1, ex2) = (orch.x as i32 + orch.width as i32, mr.x as i32 - 1);
         if ex2 > ex1 {
@@ -984,7 +995,8 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
             };
             cv.ch(*c, y_card(r) - 1, dc, dst);
             let rect = Rect { x: (*c - cw / 2) as u16, y: y_card(r) as u16, width: cw as u16, height: card_h as u16 };
-            worker_card(cv, rect, run, t, wk, a, aid.is_some() && aid == sel, app);
+            let node = aid.map(StageNode::Agent).unwrap_or_else(|| StageNode::Task(t.id.clone()));
+            worker_card(cv, rect, run, t, wk, a, sel.as_ref() == Some(&node), app);
         }
     }
 
@@ -1009,10 +1021,10 @@ fn phase(cv: &mut Cv, area: Rect, app: &App, run: &Run, nodes: &[AgentId]) {
     cv.ch(cx, yb + 2, line("│", "|"), jst);
     let gw = (w - 4).clamp(30, 56);
     let gr = Rect { x: (cx - gw / 2) as u16, y: (yb + 3) as u16, width: gw as u16, height: 4 };
-    gate_card(cv, gr, app, run, sel);
+    gate_card(cv, gr, app, run, &sel);
 }
 
-fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
+fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: &Option<StageNode>) {
     let gname = run.pattern.flow.phase_gate.clone();
     let role = run.pattern.role(&gname).cloned().unwrap_or_default();
     let col = theme::named(&role.color);
@@ -1049,7 +1061,12 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         if matches!(step, PhaseStep::Handoff) {
             st = theme::fg(theme::GREEN);
         }
-        cv.boxed(r, st, false, matches!(step, PhaseStep::Orchestrating));
+        let selected = is_sel(sel, None, "gate");
+        cv.node(StageNode::Slot("gate"), r);
+        if selected {
+            st = st.fg(theme::c(theme::SIGNAL_RED)).add_modifier(Modifier::BOLD);
+        }
+        cv.boxed(r, st, selected, matches!(step, PhaseStep::Orchestrating) && !selected);
         cv.spans(r.x as i32 + 1, r.y as i32, &[Span::raw(" "), Span::styled(format!("{} ", theme::role_glyph(&role.glyph)), theme::bold(theme::fg(col))), Span::styled(format!("gate · {gname} "), theme::bold(theme::text()))], r.width as i32 - 2);
         let l1 = if matches!(step, PhaseStep::Handoff) { format!("{} passed — handing off", theme::g("✓", "v")) } else { format!("{} · {}", role.model, role.effort) };
         cv.put(r.x as i32 + 2, r.y as i32 + 1, &trunc(&l1, (r.width as usize).saturating_sub(4)), theme::dim());
@@ -1058,12 +1075,12 @@ fn gate_card(cv: &mut Cv, r: Rect, app: &App, run: &Run, sel: Option<AgentId>) {
         let round = if let PhaseStep::Gate { round } = step { format!("round {round} · ") } else { String::new() };
         let mut l = vec![Span::styled(round, theme::fg(col))];
         l.extend(line2);
-        agent_card(cv, r, run, app, ga, &format!("gate · {gname}"), &role.glyph, col, l, run.gate_agent.is_some() && run.gate_agent == sel);
+        agent_card(cv, r, run, app, ga, &format!("gate · {gname}"), &role.glyph, col, l, is_sel(sel, run.gate_agent, "gate"), "gate");
     }
 }
 
-fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[AgentId]) {
-    let sel = nodes.get(app.sel).copied();
+fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[StageNode]) {
+    let sel = nodes.get(app.sel).cloned();
     let steps = &run.pattern.flow.finale;
     let w = (area.width as i32 - 4).clamp(30, 60);
     let x = area.x as i32 + 2;
@@ -1074,7 +1091,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
         let r = Rect { x: x as u16, y: y as u16, width: w as u16, height: 3 };
         if i == idx {
             let a = run.finale_agent.and_then(|a| app.agents.get(&a));
-            agent_card(cv, Rect { height: 4, ..r }, run, app, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], run.finale_agent.is_some() && run.finale_agent == sel);
+            agent_card(cv, Rect { height: 4, ..r }, run, app, a, &s.role, &role.glyph, col, vec![Span::styled(trunc(&s.task, (w as usize).saturating_sub(4)), theme::faint())], is_sel(&sel, run.finale_agent, "finale"), "finale");
             y += 4;
         } else {
             let (st, mark) = if i < idx { (theme::fg(theme::mix_rgb(theme::GREEN, theme::FAINT)), theme::g("✓", "v")) } else { (theme::faint(), theme::g("○", "o")) };
@@ -1094,12 +1111,12 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
     let aw = (area.x as i32 + area.width as i32 - ax - 1).min(34);
     let mut ay = area.y as i32;
     if aw >= 20 {
-        if let Some(m) = run.manager {
-            let ma = app.agents.get(&m);
+        if run.manager.is_some() || run.pattern.manager_role().is_some() {
+            let ma = run.manager.and_then(|m| app.agents.get(&m));
             let mcol = role_col(run, &run.pattern.flow.manager);
             let mglyph = run.pattern.role(&run.pattern.flow.manager).map(|r| r.glyph.clone()).unwrap_or_else(|| "◈".into());
             let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 3 };
-            agent_card(cv, r, run, app, ma, "manager", &mglyph, mcol, vec![], Some(m) == sel);
+            agent_card(cv, r, run, app, ma, "manager", &mglyph, mcol, vec![], is_sel(&sel, run.manager, "manager"), "manager");
             ay += 4;
         }
     }
@@ -1119,7 +1136,7 @@ fn finale(cv: &mut Cv, area: Rect, app: &App, run: &Run, idx: usize, nodes: &[Ag
         for wk in adhoc {
             let a = wk.agent.and_then(|a| app.agents.get(&a));
             let r = Rect { x: ax as u16, y: ay as u16, width: aw as u16, height: 4 };
-            worker_card(cv, r, run, &wk.task, Some(wk), a, wk.agent.is_some() && wk.agent == sel, app);
+            worker_card(cv, r, run, &wk.task, Some(wk), a, wk.agent.is_some() && sel == wk.agent.map(StageNode::Agent), app);
             ay += 5;
         }
     }
@@ -1204,7 +1221,24 @@ fn draw_pulse(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_peek(f: &mut Frame, area: Rect, app: &App) {
     let nodes = app.stage_nodes();
-    let Some(a) = nodes.get(app.sel).and_then(|id| app.agents.get(id)) else { return };
+    let Some(node) = nodes.get(app.sel) else { return };
+    let Some(a) = (match node { StageNode::Agent(id) => app.agents.get(id), _ => None }) else {
+        // a card with no agent: one line on what it is and what m does for it
+        let role = app.node_role(node).unwrap_or_default();
+        let r = app.run.as_ref().and_then(|r| r.pattern.roles.get(&role));
+        let (glyph, model, provider) = match r {
+            Some(r) => (theme::role_glyph(&r.glyph), r.model.clone(), Some(app.registry.resolve(&r.model).provider)),
+            None => ("◇".to_string(), String::new(), None),
+        };
+        let col = r.map(|r| theme::named(&r.color)).unwrap_or(theme::MUTED);
+        let mut l = vec![Span::styled(format!(" {glyph} {} ", app.node_name(node)), theme::bold(theme::fg(col))), Span::styled(format!("· role {role} · {model} "), theme::dim())];
+        if let Some(p) = provider {
+            l.extend(crate::ui::provider_chip(&app.registry, &p, 24));
+        }
+        l.push(Span::styled(" · not running — m sets the role's model for this run", theme::dim()));
+        f.render_widget(Paragraph::new(Line::from(l)).block(Block::default().borders(Borders::TOP).border_style(theme::faint())), area);
+        return;
+    };
     let col = theme::named(&a.color);
     let st = match &a.status {
         Status::Busy => format!("running {}", a.turn_started.map(|t| fmt_dur(t.elapsed())).unwrap_or_default()),
@@ -1319,12 +1353,38 @@ mod tests {
         let mut app = phase_app();
         let large = frame(&mut app, 120, 36).join("\n");
         assert!(large.contains("focus:input"));
-        assert_eq!(app.stage_nav.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![3, 10, 11]);
+        assert_eq!(app.stage_nav.iter().filter_map(|(id, _, _)| match id { StageNode::Agent(a) => Some(*a), _ => None }).collect::<Vec<_>>(), vec![3, 10, 11]);
         let small = frame(&mut app, 40, 12).join("\n");
         assert!(small.contains("FOCUSED"), "{small}");
-        assert_eq!(app.stage_nav.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![10, 11], "a hidden orchestrator is not an arrow destination");
+        assert_eq!(app.stage_nav.iter().filter_map(|(id, _, _)| match id { StageNode::Agent(a) => Some(*a), _ => None }).collect::<Vec<_>>(), vec![10, 11], "a hidden orchestrator is not an arrow destination");
         assert_eq!(app.stage_nav[0].1, app.stage_nav[1].1);
         assert!(app.stage_nav[0].2 < app.stage_nav[1].2);
+    }
+
+    /// The gate slot and an unstarted task are cards: they register in the navigation, the selected
+    /// one gets the heavy border, and the peek strip says what it is and that m sets its model.
+    #[test]
+    fn a_slot_and_an_unstarted_task_can_be_selected_and_say_what_they_are() {
+        let mut app = phase_app();
+        let mut task = crate::engine::plan::Task { id: "p1-db".into(), role: "worker-small".into(), title: "set up the db".into(), ..Default::default() };
+        task.title = "set up the db".into();
+        app.run.as_mut().unwrap().plan.as_mut().unwrap().phases[0].tasks.push(task);
+        frame(&mut app, 120, 40);
+        let nav: Vec<StageNode> = app.stage_nav.iter().map(|(n, _, _)| n.clone()).collect();
+        assert!(nav.contains(&StageNode::Slot("gate")) && nav.contains(&StageNode::Task("p1-db".into())), "{nav:?}");
+        // an arrow key from the last worker row reaches the gate card
+        app.canvas_focus = true;
+        app.sel = app.stage_nodes().iter().position(|n| *n == StageNode::Task("p1-db".into())).unwrap();
+        app.on_event(crate::app::AppEvent::Term(ratatui::crossterm::event::Event::Key(ratatui::crossterm::event::KeyEvent::new(ratatui::crossterm::event::KeyCode::Down, ratatui::crossterm::event::KeyModifiers::NONE))));
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Slot("gate"));
+        let lines = frame(&mut app, 120, 40);
+        let screen = lines.join("\n");
+        assert!(screen.contains('┏') || screen.contains('+'), "{screen}");
+        assert!(screen.contains("not running — m sets the role's model for this run"), "{screen}");
+        assert!(screen.contains("role qa") || screen.contains("role gate") || screen.contains("· role "), "{screen}");
+        for l in &lines {
+            assert!(w_of(l) <= 120, "{l}");
+        }
     }
 
     #[test]
@@ -1418,7 +1478,7 @@ mod tests {
         add_agent(&mut app, 21, "fix-7");
         let rows = frame(&mut app, 140, 40);
         assert_eq!(rows.iter().filter(|r| r.contains("fix-7")).count(), 1, "{}", rows.join("\n"));
-        assert!(app.stage_nodes().contains(&21) && !app.stage_nodes().contains(&20));
+        assert!(app.stage_agents().contains(&21) && !app.stage_agents().contains(&20));
     }
 
     /// A role asking for an effort its model doesn't offer shows requested→used.

@@ -110,10 +110,19 @@ pub enum PickTarget {
     /// A run or Solo agent (live or not).
     Agent(AgentId),
     /// A role of the active run with no agent to hang it on (an empty slot, a task not started).
-    #[allow(dead_code)] // opened from a stage card without an agent (WP-5.4)
     RunRole(String),
     /// A field of the pattern open in the Studio: `field` is "model", "fallback", "fallback2" or "fallback3".
     StudioField { role: String, field: String },
+}
+
+/// A selectable card of the stage.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StageNode {
+    Agent(AgentId),
+    /// A fixed slot with no agent right now: "planner" | "manager" | "orchestrator" | "gate" | "finale".
+    Slot(&'static str),
+    /// A task of the current phase whose newest attempt has no agent yet (not started, queued).
+    Task(String),
 }
 
 /// One selectable row of the model picker.
@@ -388,7 +397,10 @@ pub struct App {
     pub toast: Option<(String, Instant, Level)>,
     pub sel: usize,
     /// Centers of the cards actually visible in the last overview frame.
-    pub stage_nav: Vec<(AgentId, u16, u16)>,
+    pub stage_nav: Vec<(StageNode, u16, u16)>,
+    /// `r` / `x` / `c` pressed once on a stage card: the key, the card and when. A second press
+    /// of the same key on the same card within 2.5 s does it.
+    pub armed: Option<(char, StageNode, Instant)>,
     /// When the halt the stage selection last jumped to began: a new halt about one agent
     /// selects it once, so the band's `m` / `r` act on the agent it names.
     halt_seen: Option<Instant>,
@@ -1103,6 +1115,7 @@ impl App {
             toast: None,
             sel: 0,
             stage_nav: vec![],
+            armed: None,
             halt_seen: None,
             sel_follow: None,
             canvas_focus: false,
@@ -1422,8 +1435,8 @@ impl App {
     pub fn land_on_overview(&mut self) {
         self.set_screen(Screen::Stage);
         self.canvas_focus = true;
-        let orch = self.run.as_ref().and_then(|r| r.orchestrator);
-        self.sel = self.stage_nodes().iter().position(|a| Some(*a) == orch).unwrap_or(0);
+        let orch = self.run.as_ref().and_then(|r| r.orchestrator).map(StageNode::Agent);
+        self.sel = self.stage_nodes().iter().position(|n| Some(n) == orch.as_ref()).unwrap_or(0);
     }
 
     /// The agent the current view is about (Solo agent, zoomed agent, or stage selection).
@@ -1431,7 +1444,7 @@ impl App {
         match self.screen {
             Screen::Solo => self.solo,
             Screen::Zoom(a) => Some(a),
-            Screen::Stage => self.stage_nodes().get(self.sel).copied(),
+            Screen::Stage => self.stage_nodes().get(self.sel).and_then(|n| self.node_agent(n)),
             Screen::Studio => self.studio.architect,
             Screen::Models | Screen::Settings => None,
         }
@@ -1455,37 +1468,110 @@ impl App {
     /// same-named cards. Earlier attempts stay reachable through the zoomed view's log and the
     /// pulse. Tasks of the current phase come in plan order; tasks outside it (ad-hoc fix workers,
     /// the finale's fixes) follow in the order they were started.
-    pub fn stage_nodes(&self) -> Vec<AgentId> {
+    pub fn stage_nodes(&self) -> Vec<StageNode> {
         let Some(r) = &self.run else { return vec![] };
-        let mut v = vec![];
-        v.extend(r.planner);
-        if r.pattern.settings.planner_loop {
-            if let Some(group) = r.planner.and_then(|p| self.swarms.get(&p)) { v.extend(&group.children); }
+        let live = r.is_active() && r.stage != Stage::Setup;
+        let looped = r.pattern.settings.planner_loop;
+        let in_phase = matches!(r.stage, Stage::Phase { .. }) && !looped;
+        let mut v: Vec<StageNode> = vec![];
+        match r.planner {
+            Some(p) => v.push(StageNode::Agent(p)),
+            None if live && !looped && matches!(r.stage, Stage::Planning | Stage::Review | Stage::Phase { .. }) => v.push(StageNode::Slot("planner")),
+            None => {}
         }
-        v.extend(r.manager);
-        v.extend(r.orchestrator);
-        let mut tasks: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
+        if looped {
+            if let Some(group) = r.planner.and_then(|p| self.swarms.get(&p)) {
+                v.extend(group.children.iter().map(|c| StageNode::Agent(*c)));
+            }
+        }
+        match r.manager {
+            Some(m) => v.push(StageNode::Agent(m)),
+            None if live && !looped && r.pattern.manager_role().is_some() && matches!(r.stage, Stage::Phase { .. } | Stage::Finale { .. }) => v.push(StageNode::Slot("manager")),
+            None => {}
+        }
+        match r.orchestrator {
+            Some(o) => v.push(StageNode::Agent(o)),
+            None if live && in_phase => v.push(StageNode::Slot("orchestrator")),
+            None => {}
+        }
+        let phase_ids: Vec<&str> = r.current_phase().map(|p| p.tasks.iter().map(|t| t.id.as_str()).collect()).unwrap_or_default();
+        let mut tasks = phase_ids.clone();
         for w in &r.workers {
             if !tasks.contains(&w.task.id.as_str()) {
                 tasks.push(&w.task.id);
             }
         }
         for id in tasks {
-            // a newest attempt still queued (no agent yet) has no node, like its card
+            // the newest attempt's agent; a task of the phase without one yet is a card too
             let newest = r.workers.iter().rev().find(|w| w.task.id == id).and_then(|w| w.agent);
-            if let Some(a) = newest {
-                if !v.contains(&a) {
-                    v.push(a);
-                }
+            match newest {
+                Some(a) if !v.contains(&StageNode::Agent(a)) => v.push(StageNode::Agent(a)),
+                Some(_) => {}
+                None if phase_ids.contains(&id) => v.push(StageNode::Task(id.to_string())),
+                None => {}
             }
         }
-        v.extend(r.gate_agent);
-        if let Some(f) = r.finale_agent {
-            if !v.contains(&f) {
-                v.push(f);
-            }
+        match r.gate_agent {
+            Some(g) => v.push(StageNode::Agent(g)),
+            None if live && in_phase => v.push(StageNode::Slot("gate")),
+            None => {}
+        }
+        match r.finale_agent {
+            Some(f) if !v.contains(&StageNode::Agent(f)) => v.push(StageNode::Agent(f)),
+            Some(_) => {}
+            None if live && matches!(r.stage, Stage::Finale { .. }) => v.push(StageNode::Slot("finale")),
+            None => {}
         }
         v
+    }
+
+    /// The agents of the stage cards, in card order (a slot or a task without one has none).
+    pub fn stage_agents(&self) -> Vec<AgentId> {
+        self.stage_nodes().into_iter().filter_map(|n| match n {
+            StageNode::Agent(a) => Some(a),
+            _ => None,
+        }).collect()
+    }
+
+    /// The agent behind a card: its own, or the last one a gate / orchestrator slot had.
+    pub fn node_agent(&self, n: &StageNode) -> Option<AgentId> {
+        match n {
+            StageNode::Agent(a) => Some(*a),
+            StageNode::Slot("gate") => self.run.as_ref().and_then(|r| r.last_gate_agent),
+            StageNode::Slot("orchestrator") => self.run.as_ref().and_then(|r| r.last_orchestrator),
+            _ => None,
+        }
+    }
+
+    /// The pattern role behind a card.
+    pub fn node_role(&self, n: &StageNode) -> Option<String> {
+        let r = self.run.as_ref()?;
+        let f = &r.pattern.flow;
+        let named = |s: &str| Some(s.to_string()).filter(|s| !s.trim().is_empty());
+        match n {
+            StageNode::Agent(a) => r.role_name_of(*a),
+            StageNode::Slot("planner") => named(&f.planner),
+            StageNode::Slot("manager") => named(&f.manager),
+            StageNode::Slot("orchestrator") => named(&f.orchestrator),
+            StageNode::Slot("gate") => named(&f.phase_gate),
+            StageNode::Slot("finale") => match r.stage {
+                Stage::Finale { idx } => f.finale.get(idx).map(|s| s.role.clone()),
+                _ => None,
+            },
+            StageNode::Slot(_) => None,
+            StageNode::Task(id) => r.current_phase().and_then(|p| p.tasks.iter().find(|t| &t.id == id)).map(|t| t.role.clone()),
+        }
+    }
+
+    /// What a card is called: the agent's name, the slot, the task id.
+    pub fn node_name(&self, n: &StageNode) -> String {
+        match (n, &self.run) {
+            (StageNode::Agent(a), Some(r)) => r.name_of(*a),
+            (StageNode::Slot("gate"), Some(r)) => format!("gate · {}", r.pattern.flow.phase_gate),
+            (StageNode::Slot(s), _) => s.to_string(),
+            (StageNode::Task(id), _) => id.clone(),
+            (StageNode::Agent(a), None) => a.to_string(),
+        }
     }
 
     /// What `effort = "auto"` means for this agent right now: its role's job in the open run (a
@@ -2725,7 +2811,7 @@ impl App {
             return;
         };
         if let Some(a) = newest.agent {
-            if let Some(i) = self.stage_nodes().iter().position(|n| *n == a) {
+            if let Some(i) = self.stage_nodes().iter().position(|n| *n == StageNode::Agent(a)) {
                 self.sel = i;
             }
             self.sel_follow = None;
@@ -2741,7 +2827,7 @@ impl App {
             return;
         }
         let (since, agent) = (h.since, h.agent);
-        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == a)) {
+        if let Some(i) = agent.and_then(|a| self.stage_nodes().iter().position(|n| *n == StageNode::Agent(a))) {
             self.sel = i;
         }
         self.halt_seen = Some(since);
@@ -3589,6 +3675,8 @@ impl App {
     fn stage_key(&mut self, k: KeyEvent) -> bool {
         let nodes = self.stage_nodes();
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        // a second r / x / c on the same card does it; any other key disarms
+        let armed = self.armed.take();
         if k.code == KeyCode::Tab && self.suggestions().is_empty() {
             self.canvas_focus = !self.canvas_focus;
             return true;
@@ -3598,10 +3686,10 @@ impl App {
             match k.code {
                 KeyCode::Left | KeyCode::Up | KeyCode::Right | KeyCode::Down => {
                     self.sel_follow = None;
-                    let visible: Vec<_> = self.stage_nav.iter().filter(|(id, _, _)| nodes.contains(id)).copied().collect();
+                    let visible: Vec<_> = self.stage_nav.iter().filter(|(id, _, _)| nodes.contains(id)).cloned().collect();
                     if !visible.is_empty() {
-                        let selected = nodes.get(self.sel).copied();
-                        let origin = visible.iter().find(|(id, _, _)| Some(*id) == selected);
+                        let selected = nodes.get(self.sel).cloned();
+                        let origin = visible.iter().find(|(id, _, _)| Some(id) == selected.as_ref());
                         let next = origin.and_then(|(_, x, y)| {
                             visible.iter().filter_map(|(id, nx, ny)| {
                                 let dx = *nx as i32 - *x as i32;
@@ -3613,9 +3701,9 @@ impl App {
                                     _ => (dy, dx.abs()),
                                 };
                                 let distance = if matches!(k.code, KeyCode::Up | KeyCode::Down) { (forward, sideways) } else { (sideways, forward) };
-                                (forward > 0).then_some((distance, *id))
+                                (forward > 0).then_some((distance, id.clone()))
                             }).min_by_key(|(distance, _)| *distance).map(|(_, id)| id)
-                        }).or_else(|| origin.is_none().then(|| visible[0].0));
+                        }).or_else(|| origin.is_none().then(|| visible[0].0.clone()));
                         if let Some(id) = next {
                             if let Some(i) = nodes.iter().position(|a| *a == id) { self.sel = i; }
                         }
@@ -3640,16 +3728,15 @@ impl App {
             }
         }
         if k.code == KeyCode::Enter && (self.canvas_focus || self.input.is_empty()) {
-            if let Some(a) = nodes.get(self.sel) {
-                self.set_screen(Screen::Zoom(*a));
-                self.canvas_focus = false;
+            if let Some(n) = nodes.get(self.sel) {
+                self.zoom_node(n);
             }
             return true;
         }
         if !self.canvas_focus {
             return false;
         }
-        let selected = nodes.get(self.sel).copied();
+        let selected = nodes.get(self.sel).cloned();
         match k.code {
             KeyCode::Char(' ') => {
                 self.with_run(|r, c| r.toggle_pause(c));
@@ -3662,48 +3749,36 @@ impl App {
                     self.land_on_overview();
                 }
             }
-            KeyCode::Char('x') => {
-                if let Some(a) = selected {
-                    self.interrupt_by_user(a);
+            KeyCode::Char(c @ ('x' | 'r' | 'c')) => {
+                if let Some(n) = selected {
+                    self.card_action(c, n, armed);
                 }
             }
-            KeyCode::Char('r') => {
-                if let Some(a) = selected {
-                    let crashed = self.agents.get(&a).map(|x| matches!(x.status, Status::Crashed(_))).unwrap_or(false);
-                    if crashed {
-                        self.hub.send(a, Cmd::Restart);
-                    } else if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
-                        match res {
-                            Ok(what) => {
-                                // a worker's new attempt has no node until its agent exists
-                                self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
-                                self.toast(what, Level::Info);
-                            }
-                            Err(msg) => self.toast(msg, Level::Warn),
+            KeyCode::Char(c @ ('+' | '=' | '-')) => {
+                if let Some(n) = selected {
+                    match n {
+                        StageNode::Agent(a) if self.agent_alive(a) => self.step_effort(a, if c == '-' { -1 } else { 1 }),
+                        n => {
+                            let name = self.node_name(&n);
+                            self.toast(format!("{name} is not running — its role's effort is set in the Studio"), Level::Info);
                         }
                     }
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                if let Some(a) = selected {
-                    self.step_effort(a, 1);
-                }
-            }
-            KeyCode::Char('-') => {
-                if let Some(a) = selected {
-                    self.step_effort(a, -1);
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(a) = selected {
-                    self.compact_agent(a);
-                }
-            }
             KeyCode::Char('m') => {
                 // On a halted run this is the fix for `ProviderRejected`: pick a different model
-                // for the affected agent (WP6.6). Works on any selected agent, halted or not.
-                if let Some(a) = selected {
-                    self.open_model_picker(PickTarget::Agent(a));
+                // for the affected agent (WP6.6). Works on any selected card: an agent's own model,
+                // or the role's model for this run when the card has no agent yet.
+                match selected {
+                    Some(StageNode::Agent(a)) => self.open_model_picker(PickTarget::Agent(a)),
+                    Some(n) => match self.node_role(&n) {
+                        Some(role) => self.open_model_picker(PickTarget::RunRole(role)),
+                        None => {
+                            let name = self.node_name(&n);
+                            self.toast(format!("{name} has no role to set a model for"), Level::Info);
+                        }
+                    },
+                    None => {}
                 }
             }
             KeyCode::Char('?') => self.overlays.push(Overlay::Help { scroll: 0 }),
@@ -3717,12 +3792,14 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => {
                 // 1-9 jump: select the nth node and zoom straight in.
                 let idx = (c as usize) - ('1' as usize);
-                if let Some(a) = nodes.get(idx) {
+                if let Some(n) = nodes.get(idx) {
                     // the user chose a card: a respawned task no longer pulls the selection back
                     self.sel_follow = None;
                     self.sel = idx;
-                    self.set_screen(Screen::Zoom(*a));
-                    self.canvas_focus = false;
+                    if let StageNode::Agent(a) = n {
+                        self.set_screen(Screen::Zoom(*a));
+                        self.canvas_focus = false;
+                    }
                 }
             }
             KeyCode::Char(c) if c.is_alphanumeric() => {
@@ -3733,6 +3810,90 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// ⏎ on a stage card: zoom into its agent (a finished or stopped one too — its log is
+    /// read-only), or say why there is nothing to zoom into.
+    fn zoom_node(&mut self, n: &StageNode) {
+        if let Some(a) = self.node_agent(n).filter(|a| self.agents.contains_key(a)) {
+            self.set_screen(Screen::Zoom(a));
+            self.canvas_focus = false;
+            return;
+        }
+        match n {
+            StageNode::Task(id) => self.toast(format!("{id} has not started yet — p shows it in the plan"), Level::Info),
+            n => {
+                let name = self.node_name(n);
+                self.toast(format!("{name} has not started yet"), Level::Info);
+            }
+        }
+    }
+
+    /// `r`, `x` and `c` on a stage card. The first press says what it will do; the second, on the
+    /// same card within 2.5 s, does it. A crashed agent restarts at once (nothing to lose).
+    fn card_action(&mut self, key: char, n: StageNode, armed: Option<(char, StageNode, Instant)>) {
+        let name = self.node_name(&n);
+        // the agent the key acts on: the card's own, or — for `r` — the gate's last one once the stage waits on it
+        let gate_waits = self.run.as_ref().is_some_and(|r| matches!(&r.stage, Stage::Phase { step, .. } if !matches!(step, crate::engine::run::PhaseStep::Orchestrating)));
+        let target = match &n {
+            StageNode::Agent(a) => Some(*a),
+            StageNode::Slot("gate") if key == 'r' && gate_waits => self.node_agent(&n),
+            _ => None,
+        };
+        let Some(a) = target else {
+            return match (&n, key) {
+                (StageNode::Task(id), 'r') => self.toast(format!("the orchestrator starts {id}; r works once it has run"), Level::Info),
+                (_, 'r') => self.toast(format!("{name} is not running — nothing to restart"), Level::Info),
+                _ => self.toast(format!("{name} is not running"), Level::Info),
+            };
+        };
+        if key != 'r' && !self.agent_alive(a) {
+            return self.toast(format!("{name} is not running"), Level::Info);
+        }
+        let crashed = self.agents.get(&a).is_some_and(|x| matches!(x.status, Status::Crashed(_)));
+        if !(key == 'r' && crashed) {
+            let again = armed.is_some_and(|(k, an, t)| k == key && an == n && t.elapsed() < Duration::from_millis(2500));
+            if !again {
+                self.armed = Some((key, n, Instant::now()));
+                let what = match key {
+                    'r' => format!("press r again to respawn {name} (it starts over with a fresh session)"),
+                    'x' => format!("press x again to interrupt {name}"),
+                    _ => format!("press c again to compact {name}'s context"),
+                };
+                return self.toast(what, Level::Warn);
+            }
+        }
+        match key {
+            'x' => {
+                if self.interrupt_by_user(a) {
+                    self.run_log("■", "amber", format!("{name} interrupted (by you)"));
+                }
+            }
+            'c' => {
+                self.compact_agent(a);
+                self.run_log("⇣", "violet", format!("{name}: context compaction requested (by you)"));
+            }
+            _ if crashed => self.hub.send(a, Cmd::Restart),
+            _ => {
+                if let Some(res) = self.with_run(|r, c| r.respawn(c, a, None)) {
+                    match res {
+                        Ok(what) => {
+                            // a worker's new attempt has no node until its agent exists
+                            self.sel_follow = self.run.as_ref().and_then(|r| r.workers.iter().find(|w| w.agent == Some(a))).map(|w| w.task.id.clone());
+                            self.toast(what, Level::Info);
+                        }
+                        Err(msg) => self.toast(msg, Level::Warn),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A line in the run's journal, when there is a run.
+    fn run_log(&mut self, glyph: &'static str, color: &'static str, text: String) {
+        if let Some(r) = self.run.as_mut() {
+            r.log(glyph, color, text);
+        }
     }
 
     /// What the input could become: a command for `/…`, a command's argument for `/akasha …`
@@ -3795,7 +3956,7 @@ impl App {
     /// The run's agents as the stage shows them (card order): name, then role and model.
     pub fn run_agent_choices(&self) -> Vec<Choice> {
         let Some(r) = &self.run else { return vec![] };
-        self.stage_nodes()
+        self.stage_agents()
             .into_iter()
             .map(|a| {
                 let role = r.role_name_of(a).unwrap_or_default();
@@ -5084,7 +5245,7 @@ done"#;
         run.halt = Some(halt(Some(3)));
         app.run = Some(run);
         app.select_halted_agent();
-        assert_eq!(app.stage_nodes()[app.sel], 3, "the halted agent is selected");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(3), "the halted agent is selected");
         app.sel = 0;
         app.select_halted_agent();
         assert_eq!(app.sel, 0, "the same halt does not pull the selection back");
@@ -5094,7 +5255,7 @@ done"#;
         std::thread::sleep(Duration::from_millis(2));
         app.run.as_mut().unwrap().halt = Some(halt(Some(3)));
         app.select_halted_agent();
-        assert_eq!(app.stage_nodes()[app.sel], 3, "a new halt moves it again");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(3), "a new halt moves it again");
     }
 
     #[tokio::test]
@@ -5193,7 +5354,7 @@ done"#;
         app.screen = Screen::Stage;
         // The list is planner, manager, orchestrator, workers, gate. The screen is different:
         // planner -> orchestrator -> manager across the top, then workers, then the gate.
-        app.stage_nav = vec![(1, 10, 0), (3, 40, 0), (2, 70, 0), (10, 25, 7), (11, 55, 7), (20, 40, 15)];
+        app.stage_nav = [(1, 10, 0), (3, 40, 0), (2, 70, 0), (10, 25, 7), (11, 55, 7), (20, 40, 15)].map(|(a, x, y)| (StageNode::Agent(a), x, y)).to_vec();
         app.canvas_focus = true;
         app.stage_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(3), "right follows the screen, not the role list");
@@ -5204,7 +5365,7 @@ done"#;
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(20));
         // A narrow frame only shows the worker list. Fixed roles and offscreen cards are skipped.
-        app.stage_nav = vec![(10, 20, 0), (11, 20, 1)];
+        app.stage_nav = [(10, 20, 0), (11, 20, 1)].map(|(a, x, y)| (StageNode::Agent(a), x, y)).to_vec();
         app.stage_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.focus_agent(), Some(10));
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -5235,20 +5396,23 @@ done"#;
         run.workers.push(attempt("p1-tooling", 2, Some(11), WState::Running));
         run.workers.push(attempt("p1-ui", 1, None, WState::Queued));
         app.run = Some(run);
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 12], "one node per task, the newest attempt, in plan order; a queued task has no card and no node");
-        assert_eq!(app.stage_nodes().iter().position(|a| *a == 11), Some(2), "p1-tooling's node is where its card is: right after the fixed roles");
+        assert_eq!(app.stage_agents(), vec![1, 3, 11, 12], "one node per task, the newest attempt, in plan order; a queued task has no card and no node");
+        assert_eq!(app.stage_agents().iter().position(|a| *a == 11), Some(2), "p1-tooling's node is where its card is: right after the fixed roles");
+        // the empty slots and the unstarted task are cards too, in card order
+        assert_eq!(app.stage_nodes(), vec![StageNode::Agent(1), StageNode::Slot("manager"), StageNode::Agent(3), StageNode::Agent(11), StageNode::Agent(12), StageNode::Task("p1-ui".into()), StageNode::Slot("gate")]);
         // ↓ from p1-tooling lands on p1-api, not on p1-tooling's cancelled attempt
-        app.sel = 2;
+        app.sel = 3;
         app.canvas_focus = true;
         app.stage_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.stage_nodes()[app.sel], 12);
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(12));
         // a newest attempt still queued hides the task's older agent as its card would
         app.run.as_mut().unwrap().workers.push(attempt("p1-api", 2, None, WState::Preparing));
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11]);
+        assert_eq!(app.stage_agents(), vec![1, 3, 11]);
+        assert!(app.stage_nodes().contains(&StageNode::Task("p1-api".into())));
         // a fix worker outside the phase's tasks keeps a node after them, so it stays reachable
         app.run.as_mut().unwrap().workers.push(attempt("fix-1", 1, Some(20), WState::Running));
         app.run.as_mut().unwrap().gate_agent = Some(30);
-        assert_eq!(app.stage_nodes(), vec![1, 3, 11, 20, 30]);
+        assert_eq!(app.stage_agents(), vec![1, 3, 11, 20, 30]);
     }
 
     /// `r` on a worker: its new attempt has no node until its agent exists, so the shorter
@@ -5269,14 +5433,15 @@ done"#;
         run.workers.push(attempt("p1-ui", 1, Some(11), WState::Cancelled));
         run.workers.push(attempt("p1-ui", 2, None, WState::Preparing));
         app.run = Some(run);
-        app.sel = 2;
+        let pos = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).unwrap();
+        app.sel = pos(&app, StageNode::Task("p1-ui".into()));
         app.sel_follow = Some("p1-ui".into());
         app.tick();
-        assert_eq!(app.stage_nodes(), vec![3, 10]);
-        assert_eq!(app.sel, 1, "clamped to the last card while the new attempt has none");
+        assert_eq!(app.stage_agents(), vec![3, 10]);
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Task("p1-ui".into()), "on the task's card while the new attempt has no agent");
         app.run.as_mut().unwrap().workers[2].agent = Some(12);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 12, "and back on p1-ui once it has");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(12), "and back on p1-ui once it has");
         assert_eq!(app.sel_follow, None);
         // an arrow key in between is the user choosing: nothing follows any more
         app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 3, None, WState::Preparing));
@@ -5285,16 +5450,17 @@ done"#;
         app.stage_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         app.run.as_mut().unwrap().workers[3].agent = Some(13);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 10, "the selection stays on p1-api, where ← put it");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10), "the selection stays on p1-api, where ← put it");
         // and so is a 1–9 jump
         app.run.as_mut().unwrap().workers.push(attempt("p1-ui", 4, None, WState::Preparing));
         app.sel_follow = Some("p1-ui".into());
         app.canvas_focus = true;
-        app.stage_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert_eq!(app.stage_nodes()[app.sel], 10);
+        let digit = char::from_digit(pos(&app, StageNode::Agent(10)) as u32 + 1, 10).unwrap();
+        app.stage_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10));
         app.run.as_mut().unwrap().workers[4].agent = Some(14);
         app.tick();
-        assert_eq!(app.stage_nodes()[app.sel], 10, "the jump is the user choosing too");
+        assert_eq!(app.stage_nodes()[app.sel], StageNode::Agent(10), "the jump is the user choosing too");
     }
 
     /// The reported bug: Solo with a run up used to come back to the stage, because leaving the
@@ -6283,6 +6449,68 @@ done"#;
             assert_eq!(Pattern::load("pick-role", &app.project).unwrap().roles["orchestrator"].model, "sol", "the saved pattern is untouched");
             assert!(said(&app).iter().any(|l| l == "role orchestrator: model → luna for this run (by you) — the saved pattern is unchanged"), "{:?}", said(&app));
             assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("role orchestrator → luna (this run)"));
+            app.run = None;
+        });
+    }
+
+    /// Every stage card can be selected, agent or not: `m` on an empty slot picks the role's
+    /// model, ⏎ zooms into the slot's last agent (or says there is none), and `r`, `x` and `c` need
+    /// a second press on the same card to act.
+    #[tokio::test]
+    async fn empty_stage_cards_are_selectable_and_r_x_c_press_twice() {
+        crate::web::snapshot::tests::with_mantra_home(|| {
+            let mut app = crate::web::snapshot::tests::test_app();
+            let (orch, worker) = picker_run(&mut app, "pick-stage", crate::engine::run::WState::Running);
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            let at = |app: &App, n: StageNode| app.stage_nodes().iter().position(|x| *x == n).expect("the card");
+            assert!(app.stage_nodes().contains(&StageNode::Slot("gate")), "{:?}", app.stage_nodes());
+            let gate_role = app.run.as_ref().unwrap().pattern.flow.phase_gate.clone();
+            // m on the gate slot: the role's model for this run
+            app.sel = at(&app, StageNode::Slot("gate"));
+            assert_eq!(app.node_name(&StageNode::Slot("gate")), format!("gate · {gate_role}"));
+            press(&mut app, KeyCode::Char('m'));
+            assert!(matches!(app.overlays.last(), Some(Overlay::ModelPicker { target: PickTarget::RunRole(r), .. }) if *r == gate_role));
+            app.overlays.clear();
+            // ⏎ with no gate agent yet says so; once there was one it zooms into it
+            press(&mut app, KeyCode::Enter);
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.ends_with("has not started yet")), "{:?}", app.toast);
+            assert_eq!(app.screen, Screen::Stage);
+            app.run.as_mut().unwrap().last_gate_agent = Some(worker);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Zoom(worker), "the retired gate agent's log");
+            app.set_screen(Screen::Stage);
+            app.canvas_focus = true;
+            // r once only arms; the key on another card or another key in between disarms
+            app.sel = at(&app, StageNode::Agent(orch));
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again to respawn orchestrator")), "{:?}", app.toast);
+            press(&mut app, KeyCode::Char('x'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "press x again to interrupt orchestrator"), "{:?}", app.toast);
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again")), "x then r does not respawn: {:?}", app.toast);
+            press(&mut app, KeyCode::Char('c'));
+            assert!(app.toast.as_ref().is_some_and(|t| t.0 == "press c again to compact orchestrator's context"), "{:?}", app.toast);
+            // the second press acts
+            press(&mut app, KeyCode::Char('c'));
+            assert!(said(&app).iter().any(|l| l == "orchestrator: context compaction requested (by you)"), "{:?}", said(&app));
+            press(&mut app, KeyCode::Char('r'));
+            press(&mut app, KeyCode::Char('r'));
+            assert!(!app.toast.as_ref().is_some_and(|t| t.0.starts_with("press r again")), "{:?}", app.toast);
+            // a task nobody started: selectable, and the keys say why they do nothing
+            app.run.as_mut().unwrap().workers.clear();
+            let task = StageNode::Task("t1".into());
+            app.sel = at(&app, task.clone());
+            for (key, said_so) in [('r', "the orchestrator starts t1; r works once it has run"), ('x', "t1 is not running"), ('c', "t1 is not running"), ('+', "t1 is not running — its role's effort is set in the Studio")] {
+                app.toast = None;
+                press(&mut app, KeyCode::Char(key));
+                assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some(said_so));
+            }
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("t1 has not started yet — p shows it in the plan"));
+            press(&mut app, KeyCode::Char('m'));
+            assert!(matches!(app.overlays.last(), Some(Overlay::ModelPicker { target: PickTarget::RunRole(r), .. }) if r == "worker-small"));
+            app.overlays.clear();
             app.run = None;
         });
     }

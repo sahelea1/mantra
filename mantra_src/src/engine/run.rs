@@ -544,7 +544,9 @@ pub struct Run {
     pub(super) gate_seq: u32,
     pub(super) last_gate_file: Option<PathBuf>,
     /// The gate agent that was retired last: `mantra_log` can still read it.
-    last_gate_agent: Option<AgentId>,
+    pub(crate) last_gate_agent: Option<AgentId>,
+    /// The orchestrator that was retired last: the stage's empty orchestrator slot zooms into it.
+    pub(crate) last_orchestrator: Option<AgentId>,
     /// Fingerprint of the workspace after the newest checks run, and as it was when the last fix
     /// worker started: equal means that fix changed nothing (`on_job`, `FixChecks`).
     tree_print: Option<String>,
@@ -768,6 +770,7 @@ impl Run {
             gate_seq: 0,
             last_gate_file: None,
             last_gate_agent: None,
+            last_orchestrator: None,
             tree_print: None,
             fix_base_print: None,
             git_write_said: false,
@@ -1176,6 +1179,15 @@ impl Run {
         let role = self.role_name_of(a).and_then(|n| self.pattern.role(&n).and_then(|r| r.context));
         let halved = self.workers.iter().find(|w| w.agent == Some(a)).and_then(|w| w.context_override);
         role.into_iter().chain(halved).chain((cap > 0).then_some(cap)).filter(|w| *w > 0).min()
+    }
+
+    /// Takes the orchestrator out of the run, remembering it for `last_orchestrator`.
+    fn take_orchestrator(&mut self) -> Option<AgentId> {
+        let o = self.orchestrator.take();
+        if o.is_some() {
+            self.last_orchestrator = o;
+        }
+        o
     }
 
     pub fn phase_idx(&self) -> Option<usize> {
@@ -3079,7 +3091,7 @@ Then summarize in 2-4 lines.",
             return;
         }
         if self.pattern.settings.orchestrator_context != "compact" {
-            if let Some(o) = self.orchestrator.take() {
+            if let Some(o) = self.take_orchestrator() {
                 self.tokens_prev += ctx.agent(o).map(|x| x.tokens_total).unwrap_or(0);
                 ctx.stop(o, true);
             }
@@ -3088,7 +3100,7 @@ Then summarize in 2-4 lines.",
         if idx + 1 < n {
             self.start_phase(ctx, idx + 1);
         } else {
-            if let Some(o) = self.orchestrator.take() {
+            if let Some(o) = self.take_orchestrator() {
                 ctx.stop(o, true);
             }
             self.start_finale(ctx, 0);
@@ -5418,7 +5430,7 @@ Then summarize in 2-4 lines.",
     fn respawn_orchestrator(&mut self, ctx: &mut dyn Ctx, note: Option<String>) {
         let why = respawn_why(note.as_deref());
         let handoff = self.orchestrator.and_then(|old| ctx.agent(old)).map(|a| a.handoff_context());
-        let old_orch = self.orchestrator.take();
+        let old_orch = self.take_orchestrator();
         if let Some(old) = old_orch {
             self.tokens_prev += ctx.agent(old).map(|x| x.tokens_total).unwrap_or(0);
             ctx.stop(old, true);
@@ -6163,7 +6175,7 @@ Then summarize in 2-4 lines.",
             if self.orchestrator.is_some() && differs(&previous.flow.orchestrator, &p.flow.orchestrator, &p) {
                 if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) {
                     self.respawn_orchestrator(ctx, Some("The workflow was updated by the user; continue the phase.".into()));
-                } else if let Some(o) = self.orchestrator.take() {
+                } else if let Some(o) = self.take_orchestrator() {
                     ctx.stop(o, true);
                 }
             }
@@ -6300,7 +6312,7 @@ Then summarize in 2-4 lines.",
         }
         if previous.flow.orchestrator != self.pattern.flow.orchestrator || !matches!((previous.roles.get(&previous.flow.orchestrator), self.pattern.roles.get(&self.pattern.flow.orchestrator)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if matches!(self.stage, Stage::Phase { step: PhaseStep::Orchestrating, .. }) { self.respawn_orchestrator(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
-            else if let Some(o) = self.orchestrator.take() { ctx.stop(o, true); }
+            else if let Some(o) = self.take_orchestrator() { ctx.stop(o, true); }
         }
         if previous.flow.phase_gate != self.pattern.flow.phase_gate || !matches!((previous.roles.get(&previous.flow.phase_gate), self.pattern.roles.get(&self.pattern.flow.phase_gate)), (Some(a), Some(b)) if super::pattern::role_spawn_eq(a, b)) {
             if self.gate_agent.is_some() { self.respawn_gate(ctx, Some(format!("Workflow changed: {}", proposal.reason))); }
